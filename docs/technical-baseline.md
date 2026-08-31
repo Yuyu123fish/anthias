@@ -1,44 +1,97 @@
 # Anthias 技术基线
 
-状态：产品路线已确认，技术基线等待重新选择。
+状态：TypeScript、UI-neutral Agent、TUI 优先和 OpenAI-compatible 模型基线已由 Feature 001 实现，当前等待开发者验收。
 
-2026-08-30，开发者撤销了 Java/JVM 技术路线及其派生工程决定，并随后确认“可分叉的 Coding Agent”产品路线。本文当前只记录撤销事实和下一轮选型边界，不代表任何候选技术已经确认。
+2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
 ## 已撤销的决定
 
-- Java、JDK 25、Maven 与 Maven Wrapper；
-- 根聚合工程和 `apps/server`、`apps/cli` 模块布局；
-- JLine 全屏 TUI 与 JVM 单进程运行形态；
-- Virtual Threads、`StructuredTaskScope` 和 JDK Preview 参数；
-- OpenAI Java SDK、DeepSeek 固定模型与 Responses API 适配方案；
-- JUnit、Spotless 和 Java 专属代码约定；
-- Feature 001、Feature 002 基于上述基线形成的全部技术决定。
+- Java、JDK、Maven、JLine 以及相关 Java 专属约定；
+- Anthias 必须以 Desktop + Local Agent Host 运行的产品形态；
+- Electron、React 和独立 Host 是首个 Feature 的强制基线；
+- JSON-RPC 2.0、MessagePort、Protocol DTO 和双向运行时校验是 Agent 的公共 Interface；
+- 为单一内存对话提前建立 ConversationId、TurnId、RunId、快照和五类 Run 通知；
+- 旧 Feature 001 的全部代码、Plan、Tasks、Report 和“已实现”状态。
 
-这些内容只存在于 Git 历史和归档材料中，不得作为新实现的默认起点。
+这些内容不再构成当前实现起点。未来 Desktop Feature 可以重新评估 Electron、进程隔离和传输协议，但必须由当时的真实需求证明其复杂度。
 
-## 当前待定项
+## 已确认的技术方向
 
-- 编程语言和版本；
-- 运行时、依赖管理、构建与发布方式；
-- 用户交互形态及其 UI/终端技术；
-- Agent 执行循环、模型协议与 Tool 调用的职责边界；
-- 并发、取消、子进程和资源所有权模型；
-- 模块与包布局；
-- 测试、格式化、静态检查和调试工具；
-- Windows 优先还是跨平台优先。
+- 语言与运行时：Strict TypeScript、Node.js 24 LTS、ESM；
+- 依赖与工作区：pnpm workspace；
+- 核心形态：Agent 是与界面无关的深模块，通过小而稳定的接口隐藏消息、模型流、取消和后续 Tool Loop；
+- 首个入口：TUI 与 Agent 在同一进程直接协作，不经过 RPC；
+- 可观察性：Agent 以类似 pi 的 emit / subscribe 方式发布有序 AgentEvent；
+- Desktop 兼容：未来 Desktop 适配器可以转发相同命令与事件，Agent 不依赖 Electron、React、MessagePort 或序列化协议；
+- 模型：AI SDK Core 只允许留在具体模型适配器内部，不把其类型传播到 Agent 接口；
+- 首个模型接入：单一 OpenAI-compatible Provider，不建设 Provider Registry；
+- 参考模型：DeepSeek V4 Flash，通过 OpenAI-compatible Chat Completions 使用；它只是一组配置，不产生专用实现；
+- 自动验证：通过注入的确定性 Model Stream 验证 Agent 行为，不默认访问真实模型、外部网络或付费 API。
 
-TypeScript 当前是开发者倾向的优先候选，但尚未确认为 Anthias 的技术基线。
+Feature 001 已根据 Node.js 24 环境固定 TypeScript、Vitest、Biome 与 AI SDK 依赖版本，并生成 pnpm lockfile；package manifest 与 lockfile 是具体版本事实源。
 
-## 产品路线带来的选型要求
+## 模块与接口
 
-- 能自然表达编码任务、检查点、执行分支和候选结果，而不把这些产品概念绑定到某个 UI、模型 SDK 或 Git 实现。
-- 不同执行分支的候选状态需要相互隔离，具体采用 Git branch、worktree、补丁、文件覆盖层或其他机制仍待比较。
-- 后续需要支持从共同检查点继续多个候选方向，并向上层提供可比较结果；具体持久化、恢复和事件模型尚未决定。
-- 运行时必须能明确管理每个执行分支产生的命令、进程、文件句柄和取消边界，不能让分支之间共享失控的副作用。
+### Agent 模块
 
-## 新基线的确认条件
+Agent 持有消息 transcript、当前流式消息、是否正在运行以及取消所需的资源。对调用者只提供以下行为：
 
-- 先由可分叉产品路线的最小闭环给出真实需求，再比较语言和生态。
-- 候选语言需要直接、自然地表达普通函数和可调用 Tool，避免为了函数式调用额外建立静态类外壳。
-- 每项选择都要说明它怎样降低 Coding Agent 的实现复杂度，以及付出的运行时、生态、发布和维护代价。
-- 新基线经开发者明确确认后才写入版本、目录结构或工程初始化内容。
+- 读取当前只读 state；
+- 提交一条 prompt；
+- 取消当前运行；
+- 订阅 AgentEvent，并能取消订阅。
+
+Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
+
+### 模型适配器
+
+Model Adapter 把 Agent 的消息 transcript 和 AbortSignal 转换为一次模型流，并把模型输出转换为 Agent 可消费的增量。生产实现使用 OpenAI-compatible 接口；测试实现使用确定性本地流。两者形成当前唯一真实可替换 seam。
+
+### TUI 适配器
+
+TUI 负责终端输入、输出和用户停止操作。它直接调用 Agent，并订阅 AgentEvent；它不自行推进 Agent 生命周期，也不维护第二份业务状态。
+
+Feature 001 使用 Node.js `readline` 的普通行式 TUI；未来交互方式可以调整，但不能改变 Agent Interface。
+
+### 未来 Desktop 适配器
+
+Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要跨进程时，可以在 Agent 外增加 Adapter，将界面命令映射为 prompt / abort，并将 AgentEvent 转发给界面。序列化、运行时校验和进程生命周期只存在于该 Adapter，不进入 Agent Module。
+
+## 事件方向
+
+Feature 001 的事件只表达 Agent 已经发生的生命周期和消息变化。事件按产生顺序同步交给当前订阅者；交互 Adapter 根据事件渲染，不通过事件反向控制 Agent。
+
+基础事件包含 Agent 开始、消息开始、消息增量、消息结束和 Agent 结束。取消与失败通过最终 Assistant 消息的结束原因表达，不为它们建立额外 Run 状态机或终态通知。
+
+Tool、多个模型回合和权限事件在对应 Feature 出现时再扩展，不提前放置空事件。
+
+## 模型配置方向
+
+首个真实 Model Adapter 从本地环境读取以下配置：
+
+- ANTHIAS_MODEL_BASE_URL
+- ANTHIAS_MODEL_ID
+- ANTHIAS_MODEL_API_KEY
+
+三项只供模型 Adapter 使用。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
+
+## 设计约束
+
+- 优先形成深 Module：TUI、测试和未来 Desktop 使用同一个小 Interface，不穿透 Agent 内部步骤。
+- 只有真实变化才建立 seam；当前只保留生产 Model Adapter 与确定性测试 Adapter。
+- Agent 状态只有一份。交互层可以保存渲染数据，但不能成为生命周期权威。
+- 普通函数和判别联合足以表达的行为，不增加类层级、Registry、Manager 或通用框架。
+- 取消、进程信号、终端状态、模型流和后续 Tool 资源必须有明确持有者与释放时机。
+- 敏感值只进入被忽略的本地配置或环境变量；仓库只保存变量名、占位符和安全默认值。
+
+## 仍待后续 Feature 决定
+
+- Tool 合同、文件和命令副作用；
+- 权限确认与沙箱策略；
+- Session 持久化、恢复与 Compaction；
+- 多 Provider、模型切换、重试和 Provider 专属能力；
+- Desktop 框架、进程模型和传输协议；
+- 检查点、执行分支和候选结果的存储与隔离机制；
+- Coding Agent 的具体用户场景与系统提示词。
+
+这些未决项不得在 Feature 001 中以空接口、预留层或通用基础设施提前实现。

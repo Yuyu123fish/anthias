@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node", "vitest/globals"],
+    "paths": {
+      "@anthias/agent": ["./apps/agent/src/index.ts"]
+    }
+  },
+  "include": ["apps/**/*.test.ts", "apps/**/src/**/*.ts", "vitest.config.ts"]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "anthias",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24 <25",
+    "pnpm": "10.33.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "check": "biome check package.json biome.json tsconfig.json tsconfig.base.json tsconfig.test.json vitest.config.ts apps && tsc -p tsconfig.test.json --noEmit",
+    "start": "pnpm --filter @anthias/tui start",
+    "test": "pnpm build && vitest run",
+    "verify": "pnpm check && pnpm test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.11",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "files": [],
+  "references": [{ "path": "./apps/agent" }, { "path": "./apps/tui" }]
+}

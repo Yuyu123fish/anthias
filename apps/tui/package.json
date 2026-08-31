@@ -1,0 +1,32 @@
+{
+  "name": "@anthias/tui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "anthias": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node ./dist/main.js"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "3.0.41",
+    "@anthias/agent": "workspace:*",
+    "ai": "7.0.85"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  }
+}

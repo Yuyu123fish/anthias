@@ -7,3 +7,15 @@
 # IDE 配置
 .idea/
 .vscode/
+
+# Node 与构建产物
+node_modules/
+coverage/
+dist/
+release/
+out/
+.vite/
+*.tsbuildinfo
+
+# 本地运行日志
+*.log
