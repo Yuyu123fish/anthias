@@ -1,6 +1,13 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { Agent, AgentEvent, AgentListener, AgentState, PromptResult } from "@anthias/agent";
+import type {
+  Agent,
+  AgentEvent,
+  AgentListener,
+  AgentState,
+  Message,
+  PromptResult,
+} from "@anthias/agent";
 import { describe, expect, it, vi } from "vitest";
 import { runTui } from "../src/index.js";
 
@@ -15,6 +22,31 @@ type FakeAgentBehavior = Readonly<{
 }>;
 
 describe("runTui", () => {
+  it("renders Session identity, workspace, and reopened message history", async () => {
+    const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
+    const agent = createFakeAgent({ prompt: promptHandler }, [
+      { role: "user", content: "previous" },
+      { role: "assistant", content: "answer", status: "completed" },
+    ]);
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({ agent, input, output, signalSource });
+    input.write("/exit\n");
+
+    await expect(tuiExit).resolves.toBe(0);
+    expect(rendered).toContain("Session: 00000000-0000-4000-8000-000000000001\n");
+    expect(rendered).toContain("Workspace: C:\\workspace\n");
+    expect(rendered).toContain("You: previous\nAssistant: answer\n");
+    expect(promptHandler).not.toHaveBeenCalled();
+  });
+
   it("renders Agent events and submits multiple prompts", async () => {
     let promptCount = 0;
     const promptHandler = vi.fn(
@@ -76,7 +108,7 @@ describe("runTui", () => {
         type: "message_end",
         message: { role: "assistant", content: "partial", status: "aborted" },
       });
-      controls.publish({ type: "agent_end", result: { status: "aborted" } });
+      controls.publish({ type: "run_end", result: { status: "aborted" } });
       controls.setRunning(false);
       firstPromptCompletion.resolve({ status: "aborted" });
     });
@@ -150,7 +182,7 @@ describe("runTui", () => {
           message: { role: "assistant", content: "partial", status: "failed" },
         });
         controls.publish({
-          type: "agent_end",
+          type: "run_end",
           result: { status: "failed", error: "模型请求失败，请检查模型配置或稍后重试。" },
         });
         controls.setRunning(false);
@@ -178,7 +210,10 @@ describe("runTui", () => {
   });
 });
 
-function createFakeAgent({ prompt, abort }: FakeAgentBehavior): Agent {
+function createFakeAgent(
+  { prompt, abort }: FakeAgentBehavior,
+  messageHistory: readonly Message[] = [],
+): Agent {
   const listeners = new Set<AgentListener>();
   let running = false;
   const controls: FakeAgentControls = {
@@ -195,8 +230,16 @@ function createFakeAgent({ prompt, abort }: FakeAgentBehavior): Agent {
   return Object.freeze({
     get state(): AgentState {
       return Object.freeze({
-        messageHistory: Object.freeze([]),
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        workspaceRoot: "C:\\workspace",
+        messageHistory: Object.freeze([...messageHistory]),
         activeAssistantMessage: null,
+        activeRun: running
+          ? Object.freeze({
+              runId: "00000000-0000-4000-8000-000000000002",
+              phase: "requesting_model" as const,
+            })
+          : null,
         running,
         lastError: null,
       });
@@ -234,7 +277,7 @@ async function completePrompt(
     type: "message_end",
     message: { role: "assistant", content, status: "completed" },
   });
-  controls.publish({ type: "agent_end", result: { status: "completed" } });
+  controls.publish({ type: "run_end", result: { status: "completed" } });
   controls.setRunning(false);
   return { status: "completed" };
 }
@@ -253,7 +296,7 @@ function publishPartialResponse(
 }
 
 function publishPromptOpening(promptText: string, controls: FakeAgentControls): void {
-  controls.publish({ type: "agent_start" });
+  controls.publish({ type: "run_start" });
   controls.publish({
     type: "message_start",
     message: { role: "user", content: promptText },

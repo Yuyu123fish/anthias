@@ -1,9 +1,11 @@
+/** 保存生产 Model Adapter 所需的本地配置。 */
 export type ModelConfig = Readonly<{
   baseURL: string;
   modelId: string;
   apiKey: string;
 }>;
 
+/** 表示模型配置读取成功或返回安全校验错误。 */
 export type ModelConfigResult =
   | Readonly<{ ok: true; config: ModelConfig }>
   | Readonly<{ ok: false; error: string }>;
@@ -14,7 +16,10 @@ const MODEL_VARIABLES = [
   "ANTHIAS_MODEL_API_KEY",
 ] as const;
 
+/** 枚举 Anthias 读取的模型环境变量名。 */
 type ModelVariable = (typeof MODEL_VARIABLES)[number];
+
+/** 限定模型配置读取函数可观察的环境变量集合。 */
 type ModelEnvironment = Readonly<Partial<Record<ModelVariable, string | undefined>>>;
 
 /** 读取并本地校验模型环境变量，不验证远端凭据或模型可用性。 */

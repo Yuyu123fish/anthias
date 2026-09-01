@@ -22,7 +22,7 @@
 
 | Stage | Tasks | 当前状态 | 完成门 |
 | --- | --- | --- | --- |
-| Stage 01：线性 Session 存储 | T001–T003 | 未开始 | T003 完成并经开发者审查 |
+| Stage 01：线性 Session 存储 | T001–T003 | 进行中：T001 已完成，T002 待确认恢复计量语义 | T003 完成并经开发者审查 |
 | Stage 02：Tool 系统接入与 Agent Loop 改造 | T004–T009 | 未开始 | T009 完成并经开发者审查 |
 | Stage 03：整体集成与验收准备 | T010–T012 | 未开始 | T012 完成，等待开发者验收 |
 
@@ -30,7 +30,7 @@
 
 ### T001：交付可新建和重开的文本 Session 闭环
 
-状态：进行中
+状态：已完成
 
 Blocked by：无
 
@@ -45,13 +45,13 @@ Blocked by：无
 
 验收：
 
-- [ ] 新建 Session 的首行只有合法 SessionHeader，后续记录从 `seq = 1` 连续递增、每行 JSON 完整且以换行结束；
-- [ ] 一次文本 Run 的 UserMessage、最终 AssistantMessage 和 RunFinishedRecord 顺序与实际事件一致；
-- [ ] 重新打开后，历史状态、TUI 展示和下一次模型输入来自同一持久投影；
-- [ ] workspace 不匹配、无效 Session ID 和未知 CLI 参数安全失败并返回非零退出码；
-- [ ] completed、aborted、failed 的部分文本、唯一终态、busy 和继续对话语义没有回归；
-- [ ] 本任务没有 Tool 定义、Tool 执行、确认 UI 或多模型请求循环；
-- [ ] Session 定向测试及受影响的 Agent/TUI 测试通过，未访问真实 Provider、外部网络或真实凭据。
+- [x] 新建 Session 的首行只有合法 SessionHeader，后续记录从 `seq = 1` 连续递增、每行 JSON 完整且以换行结束；
+- [x] 一次文本 Run 的 UserMessage、最终 AssistantMessage 和 RunFinishedRecord 顺序与实际事件一致；
+- [x] 重新打开后，历史状态、TUI 展示和下一次模型输入来自同一持久投影；
+- [x] workspace 不匹配、无效 Session ID 和未知 CLI 参数安全失败并返回非零退出码；
+- [x] completed、aborted、failed 的部分文本、唯一终态、busy 和继续对话语义没有回归；
+- [x] 本任务没有 Tool 定义、Tool 执行、确认 UI 或多模型请求循环；
+- [x] Session 定向测试及受影响的 Agent/TUI 测试通过，未访问真实 Provider、外部网络或真实凭据。
 
 ### T002：补齐 Session 损坏恢复与独占写入保护
 
@@ -320,6 +320,6 @@ Blocked by：T010、T011
 ## 授权与下一步
 
 - 本 Tasks 已由开发者确认，当前仅授权 Stage 01（T001–T003）实施；
-- T001 已开始，T002 在 T001 完成后推进，T003 完成 Stage 01 门禁与检查点汇报；
+- T001 已完成；T002 在恢复计量语义确认后开始，T003 完成 Stage 01 门禁与检查点汇报；
 - T003 汇报后停止，Stage 02 仍需开发者单独授权；
 - 外部网络、真实 Provider 验证、后续提交、推送和创建 PR 继续分别取得授权。

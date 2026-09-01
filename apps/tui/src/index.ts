@@ -1,11 +1,13 @@
 import { createInterface } from "node:readline";
 import type { Agent, AgentEvent, PromptResult } from "@anthias/agent";
 
+/** 抽象 TUI 所需的最小 SIGINT 订阅行为。 */
 export type TuiSignalSource = Readonly<{
   on(event: "SIGINT", listener: () => void): void;
   off(event: "SIGINT", listener: () => void): void;
 }>;
 
+/** 配置 TUI 使用的 Agent、输入输出流与信号来源。 */
 export type RunTuiOptions = Readonly<{
   agent: Agent;
   input?: NodeJS.ReadableStream;
@@ -27,6 +29,7 @@ export function runTui({
   let pendingPromptResultPromise: Promise<PromptResult> | null = null;
   let exitStarted = false;
 
+  renderInitialState(agent.state, output);
   const unsubscribeFromAgentEvents = agent.subscribe((event) => renderEvent(event, output));
 
   /** 运行时 Ctrl+C 只停止当前生成；空闲时 Ctrl+C 退出 TUI。 */
@@ -107,7 +110,7 @@ export function runTui({
 /** 将 AgentEvent 顺序映射为终端输出，不维护第二份 Agent 状态。 */
 function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   switch (event.type) {
-    case "agent_start":
+    case "run_start":
       return;
     case "message_start":
       if (event.message.role === "user") {
@@ -124,7 +127,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
         output.write("\n");
       }
       return;
-    case "agent_end":
+    case "run_end":
       if (event.result.status === "failed") {
         output.write(`错误：${event.result.error}\n`);
       } else if (event.result.status === "aborted") {
@@ -133,6 +136,17 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
         output.write("已完成。\n");
       }
       return;
+  }
+}
+
+/** TUI 只从 AgentState 呈现重开投影，不直接读取 Session 文件。 */
+function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream): void {
+  output.write(`Session: ${state.sessionId}\n`);
+  output.write(`Workspace: ${state.workspaceRoot}\n`);
+  for (const message of state.messageHistory) {
+    output.write(
+      message.role === "user" ? `You: ${message.content}\n` : `Assistant: ${message.content}\n`,
+    );
   }
 }
 
