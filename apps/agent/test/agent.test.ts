@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -135,10 +135,14 @@ describe("Agent", () => {
     const agent = await createTestAgent(modelStream);
     const eventTypes: string[] = [];
     let reentrantPromptResult: ReturnType<typeof agent.prompt> | undefined;
+    let lockObservedDuringRunEnd: Promise<void> | undefined;
     agent.subscribe((event) => {
       eventTypes.push(event.type);
       if (event.type === "message_end" && event.message.role === "assistant") {
         reentrantPromptResult = agent.prompt("too early");
+      }
+      if (event.type === "run_end") {
+        lockObservedDuringRunEnd = access(getSessionLockPath(agent));
       }
     });
 
@@ -147,6 +151,8 @@ describe("Agent", () => {
       throw new Error("expected the terminal subscriber to attempt a prompt");
     }
     await expect(reentrantPromptResult).resolves.toEqual({ status: "rejected", reason: "busy" });
+    await expect(lockObservedDuringRunEnd).resolves.toBeUndefined();
+    await expect(access(getSessionLockPath(agent))).rejects.toThrow();
     expect(eventTypes).toEqual([
       "run_start",
       "message_start",
@@ -255,18 +261,29 @@ describe("Agent", () => {
 
   it("does not publish an assistant message when its persistence fails", async () => {
     let appendedRunFinishedCount = 0;
+    let releasedLeaseCount = 0;
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000001",
       workspaceRoot: "C:\\workspace",
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
-      async appendMessage(_runId, message) {
-        if (message.role === "assistant") {
-          throw new Error("disk failure with secret-value");
-        }
-      },
-      async appendRunFinished() {
-        appendedRunFinishedCount += 1;
+      async acquireRun() {
+        return Object.freeze({
+          status: "acquired",
+          lease: Object.freeze({
+            async appendMessage(message: Message) {
+              if (message.role === "assistant") {
+                throw new Error("disk failure with secret-value");
+              }
+            },
+            async appendRunFinished() {
+              appendedRunFinishedCount += 1;
+            },
+            async release() {
+              releasedLeaseCount += 1;
+            },
+          }),
+        });
       },
     });
     const agent = createAgentWithModelStream({
@@ -290,23 +307,89 @@ describe("Agent", () => {
     expect(agent.state.activeAssistantMessage).toBeNull();
     expect(assistantMessageEndEvents).toHaveLength(0);
     expect(appendedRunFinishedCount).toBe(0);
+    expect(releasedLeaseCount).toBe(1);
+  });
+
+  it("reports and seals a Session when User persistence and lease release both fail", async () => {
+    let acquisitionCount = 0;
+    let modelCallCount = 0;
+    const session: Session = Object.freeze({
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      workspaceRoot: "C:\\workspace",
+      shell: TEST_SHELL,
+      messageHistory: Object.freeze([]),
+      async acquireRun() {
+        acquisitionCount += 1;
+        return Object.freeze({
+          status: "acquired",
+          lease: Object.freeze({
+            async appendMessage() {
+              throw new Error("append secret-value");
+            },
+            async appendRunFinished() {
+              throw new Error("must not append RunFinished");
+            },
+            async release() {
+              throw new Error("release secret-value");
+            },
+          }),
+        });
+      },
+    });
+    const agent = createAgentWithModelStream({
+      session,
+      modelStream: async function* () {
+        modelCallCount += 1;
+        yield "must not run";
+      },
+    });
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
+
+    const firstPromptResult = await agent.prompt("persist me");
+    const secondPromptResult = await agent.prompt("must stay sealed");
+
+    expect(firstPromptResult).toEqual({
+      status: "failed",
+      error: "Session 资源释放失败，已停止继续写入；请重新打开 Session。",
+    });
+    if (firstPromptResult.status !== "failed") {
+      throw new Error("expected Session release failure");
+    }
+    expect(secondPromptResult).toEqual(firstPromptResult);
+    expect(agent.state.lastError).toBe(firstPromptResult.error);
+    expect(JSON.stringify({ firstPromptResult, state: agent.state })).not.toContain("secret-value");
+    expect(acquisitionCount).toBe(1);
+    expect(modelCallCount).toBe(0);
+    expect(events).toHaveLength(0);
   });
 
   it("seals the Agent after run completion persistence fails", async () => {
     let appendedMessageCount = 0;
     let appendedRunFinishedCount = 0;
     let modelCallCount = 0;
+    let releasedLeaseCount = 0;
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000002",
       workspaceRoot: "C:\\workspace",
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
-      async appendMessage() {
-        appendedMessageCount += 1;
-      },
-      async appendRunFinished() {
-        appendedRunFinishedCount += 1;
-        throw new Error("run completion persistence failed");
+      async acquireRun() {
+        return Object.freeze({
+          status: "acquired",
+          lease: Object.freeze({
+            async appendMessage() {
+              appendedMessageCount += 1;
+            },
+            async appendRunFinished() {
+              appendedRunFinishedCount += 1;
+              throw new Error("run completion persistence failed");
+            },
+            async release() {
+              releasedLeaseCount += 1;
+            },
+          }),
+        });
       },
     });
     const agent = createAgentWithModelStream({
@@ -326,9 +409,89 @@ describe("Agent", () => {
     expect(secondPromptResult).toEqual(firstPromptResult);
     expect(appendedMessageCount).toBe(2);
     expect(appendedRunFinishedCount).toBe(1);
+    expect(releasedLeaseCount).toBe(1);
     expect(modelCallCount).toBe(1);
     expect(eventTypes.filter((eventType) => eventType === "run_start")).toHaveLength(1);
   });
+
+  it.each(["session_busy", "session_changed"] as const)(
+    "rejects %s before events or model work and seals only a changed Session",
+    async (reason) => {
+      let acquisitionCount = 0;
+      let modelCallCount = 0;
+      const session: Session = Object.freeze({
+        sessionId: randomSessionId(),
+        workspaceRoot: "C:\\workspace",
+        shell: TEST_SHELL,
+        messageHistory: Object.freeze([]),
+        async acquireRun() {
+          acquisitionCount += 1;
+          return Object.freeze({ status: "rejected", reason });
+        },
+      });
+      const agent = createAgentWithModelStream({
+        session,
+        modelStream: async function* () {
+          modelCallCount += 1;
+          yield "must not run";
+        },
+      });
+      const events: AgentEvent[] = [];
+      agent.subscribe((event) => events.push(event));
+
+      await expect(agent.prompt("first")).resolves.toEqual({ status: "rejected", reason });
+      await expect(agent.prompt("second")).resolves.toEqual({ status: "rejected", reason });
+      expect(acquisitionCount).toBe(reason === "session_changed" ? 1 : 2);
+      expect(modelCallCount).toBe(0);
+      expect(events).toHaveLength(0);
+      expect(agent.state.messageHistory).toEqual([]);
+    },
+  );
+
+  it("rejects an externally appended Session and leaves the old projection untouched", async () => {
+    let modelCallCount = 0;
+    const agent = await createTestAgent(async function* () {
+      modelCallCount += 1;
+      yield "must not run";
+    });
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
+    await appendFile(getSessionFilePath(agent), " ");
+
+    await expect(agent.prompt("stale")).resolves.toEqual({
+      status: "rejected",
+      reason: "session_changed",
+    });
+    expect(modelCallCount).toBe(0);
+    expect(events).toHaveLength(0);
+    expect(agent.state.messageHistory).toEqual([]);
+  });
+
+  it.each(["completed", "aborted", "failed"] as const)(
+    "releases the Session Run lock after a %s terminal result",
+    async (terminalStatus) => {
+      const responseGate = Promise.withResolvers<void>();
+      const agent = await createTestAgent(async function* () {
+        if (terminalStatus === "failed") {
+          throw new Error("model failed");
+        }
+        yield "partial";
+        if (terminalStatus === "aborted") {
+          await responseGate.promise;
+        }
+      });
+      const promptResultPromise = agent.prompt("terminal");
+      if (terminalStatus === "aborted") {
+        await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
+        agent.abort();
+      }
+
+      const promptResult = await promptResultPromise;
+      expect(promptResult.status).toBe(terminalStatus);
+      await expect(access(getSessionLockPath(agent))).rejects.toThrow();
+      responseGate.resolve();
+    },
+  );
 
   it("does not await subscriber promises and unsubscribes idempotently", async () => {
     const neverSettles = new Promise<void>(() => undefined);
@@ -423,14 +586,27 @@ async function createTestAgent(modelStream: ModelStream): Promise<Agent> {
 }
 
 async function readSessionRecords(agent: Agent): Promise<Record<string, unknown>[]> {
-  const sessionFilePath = sessionFilePaths.get(agent);
-  if (!sessionFilePath) {
-    throw new Error("expected test Agent to have a Session file");
-  }
+  const sessionFilePath = getSessionFilePath(agent);
   const sessionText = await readFile(sessionFilePath, "utf8");
   return sessionText
     .trimEnd()
     .split("\n")
     .slice(1)
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function getSessionFilePath(agent: Agent): string {
+  const sessionFilePath = sessionFilePaths.get(agent);
+  if (!sessionFilePath) {
+    throw new Error("expected test Agent to have a Session file");
+  }
+  return sessionFilePath;
+}
+
+function getSessionLockPath(agent: Agent): string {
+  return getSessionFilePath(agent).replace(/\.jsonl$/u, ".lock");
+}
+
+function randomSessionId(): string {
+  return "00000000-0000-4000-8000-000000000003";
 }

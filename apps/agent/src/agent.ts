@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Session } from "./session.js";
+import type { Session, SessionRunLease } from "./session.js";
 
 /** 表示一条已经被 Agent 接受的用户文本消息。 */
 export type UserMessage = Readonly<{
@@ -42,7 +42,10 @@ export type FinishedPromptResult =
 
 /** 表示提示词被拒绝或完成一次 Run 后的结果。 */
 export type PromptResult =
-  | Readonly<{ status: "rejected"; reason: "empty" | "busy" }>
+  | Readonly<{
+      status: "rejected";
+      reason: "empty" | "busy" | "session_busy" | "session_changed";
+    }>
   | FinishedPromptResult;
 
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
@@ -98,6 +101,7 @@ type ActiveRunOwnership = {
   runId: string;
   phase: "requesting_model";
   startedAtMilliseconds: number;
+  sessionLease: SessionRunLease;
   abortController: AbortController;
   assistantMessage: MutableAssistantMessage;
   responseIterator: AsyncIterator<string> | null;
@@ -109,9 +113,14 @@ type ActiveRunOwnership = {
 const ABORT_SIGNAL_RECEIVED = Symbol("abort-signal-received");
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const SAFE_SESSION_ERROR = "Session 写入失败，请检查本地存储后重试。";
+const SAFE_SESSION_RELEASE_ERROR = "Session 资源释放失败，已停止继续写入；请重新打开 Session。";
 const SESSION_FAILED_RESULT = Object.freeze({
   status: "failed",
   error: SAFE_SESSION_ERROR,
+} as const);
+const SESSION_RELEASE_FAILED_RESULT = Object.freeze({
+  status: "failed",
+  error: SAFE_SESSION_RELEASE_ERROR,
 } as const);
 
 const EMPTY_PROMPT_RESULT = Object.freeze({
@@ -121,6 +130,14 @@ const EMPTY_PROMPT_RESULT = Object.freeze({
 const BUSY_PROMPT_RESULT = Object.freeze({
   status: "rejected",
   reason: "busy",
+} as const);
+const SESSION_BUSY_PROMPT_RESULT = Object.freeze({
+  status: "rejected",
+  reason: "session_busy",
+} as const);
+const SESSION_CHANGED_PROMPT_RESULT = Object.freeze({
+  status: "rejected",
+  reason: "session_changed",
 } as const);
 const COMPLETED_PROMPT_RESULT = Object.freeze({ status: "completed" } as const);
 const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
@@ -135,7 +152,9 @@ export function createAgentWithModelStream({
   let activeAssistantMessage: MutableAssistantMessage | null = null;
   let lastError: string | null = null;
   let activeRun: ActiveRunOwnership | null = null;
-  let sessionUnavailable = false;
+  let sessionUnavailableResult: FinishedPromptResult | null = null;
+  let sessionLeaseAcquisitionPending = false;
+  let sessionChanged = false;
 
   /** 生成只读状态快照，避免调用者通过保留引用修改 Agent 内部消息。 */
   function createStateSnapshot(): AgentState {
@@ -192,11 +211,37 @@ export function createAgentWithModelStream({
     if (activeRun !== null) {
       return BUSY_PROMPT_RESULT;
     }
-    if (sessionUnavailable) {
-      return SESSION_FAILED_RESULT;
+    if (sessionLeaseAcquisitionPending) {
+      return BUSY_PROMPT_RESULT;
+    }
+    if (sessionChanged) {
+      return SESSION_CHANGED_PROMPT_RESULT;
+    }
+    if (sessionUnavailableResult !== null) {
+      return sessionUnavailableResult;
     }
 
     lastError = null;
+    const runId = randomUUID();
+    sessionLeaseAcquisitionPending = true;
+    let sessionRunAcquisition: Awaited<ReturnType<Session["acquireRun"]>>;
+    try {
+      sessionRunAcquisition = await session.acquireRun(runId);
+    } catch {
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      lastError = SAFE_SESSION_ERROR;
+      return SESSION_FAILED_RESULT;
+    } finally {
+      sessionLeaseAcquisitionPending = false;
+    }
+    if (sessionRunAcquisition.status === "rejected") {
+      if (sessionRunAcquisition.reason === "session_changed") {
+        sessionChanged = true;
+        return SESSION_CHANGED_PROMPT_RESULT;
+      }
+      return SESSION_BUSY_PROMPT_RESULT;
+    }
+
     const abortController = new AbortController();
     const assistantMessage: MutableAssistantMessage = {
       role: "assistant",
@@ -204,9 +249,10 @@ export function createAgentWithModelStream({
       status: "streaming",
     };
     const currentRun: ActiveRunOwnership = {
-      runId: randomUUID(),
+      runId,
       phase: "requesting_model",
       startedAtMilliseconds: Date.now(),
+      sessionLease: sessionRunAcquisition.lease,
       abortController,
       assistantMessage,
       responseIterator: null,
@@ -219,12 +265,17 @@ export function createAgentWithModelStream({
     const userMessage: UserMessage = Object.freeze({ role: "user", content: promptText });
     try {
       // UserMessage 刷新成功后 Run 才算被接受，后续事件与副作用才能开始。
-      await session.appendMessage(currentRun.runId, userMessage);
+      await currentRun.sessionLease.appendMessage(userMessage);
     } catch {
-      const failedResult = SESSION_FAILED_RESULT;
+      let failedResult: FinishedPromptResult = SESSION_FAILED_RESULT;
+      try {
+        await currentRun.sessionLease.release();
+      } catch {
+        failedResult = SESSION_RELEASE_FAILED_RESULT;
+      }
       currentRun.terminalResult = failedResult;
       lastError = failedResult.error;
-      sessionUnavailable = true;
+      sessionUnavailableResult = failedResult;
       if (activeRun === currentRun) {
         activeRun = null;
       }
@@ -311,14 +362,14 @@ export function createAgentWithModelStream({
     let assistantMessagePersisted = false;
 
     try {
-      await session.appendMessage(currentRun.runId, finalAssistantMessage);
+      await currentRun.sessionLease.appendMessage(finalAssistantMessage);
       assistantMessagePersisted = true;
     } catch {
       finalResult = SESSION_FAILED_RESULT;
       currentRun.terminalResult = finalResult;
       currentRun.assistantMessage.status = "failed";
       finalAssistantMessage = snapshotAssistantMessage(currentRun.assistantMessage);
-      sessionUnavailable = true;
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
     }
 
     activeAssistantMessage = null;
@@ -333,7 +384,7 @@ export function createAgentWithModelStream({
       publishEvent({ type: "message_end", message: finalAssistantMessage });
 
       try {
-        await session.appendRunFinished(currentRun.runId, {
+        await currentRun.sessionLease.appendRunFinished({
           status: finalResult.status,
           modelRequestCount: currentRun.modelRequestCount,
           toolCallCount: 0,
@@ -343,18 +394,27 @@ export function createAgentWithModelStream({
         finalResult = SESSION_FAILED_RESULT;
         currentRun.terminalResult = finalResult;
         lastError = finalResult.error;
-        sessionUnavailable = true;
+        sessionUnavailableResult = SESSION_FAILED_RESULT;
       }
     }
 
     // activeRun 保留到 run_end 同步交付后，阻止终态订阅者重入 prompt。
     publishEvent({ type: "run_end", result: finalResult });
 
-    if (requestedResult.status !== "completed") {
-      closeResponseIterator(responseIterator);
-    }
-    if (activeRun === currentRun) {
-      activeRun = null;
+    try {
+      if (requestedResult.status !== "completed") {
+        closeResponseIterator(responseIterator);
+      }
+    } finally {
+      try {
+        await currentRun.sessionLease.release();
+      } catch {
+        sessionUnavailableResult = SESSION_RELEASE_FAILED_RESULT;
+        lastError = SAFE_SESSION_RELEASE_ERROR;
+      }
+      if (activeRun === currentRun) {
+        activeRun = null;
+      }
     }
     return finalResult;
   }

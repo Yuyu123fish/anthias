@@ -22,7 +22,7 @@
 
 | Stage | Tasks | 当前状态 | 完成门 |
 | --- | --- | --- | --- |
-| Stage 01：线性 Session 存储 | T001–T003 | 进行中：T001 已完成，T002 待开始 | T003 完成并经开发者审查 |
+| Stage 01：线性 Session 存储 | T001–T003 | 已完成：等待开发者审查 | T003 完成并经开发者审查 |
 | Stage 02：Tool 系统接入与 Agent Loop 改造 | T004–T009 | 未开始 | T009 完成并经开发者审查 |
 | Stage 03：整体集成与验收准备 | T010–T012 | 未开始 | T012 完成，等待开发者验收 |
 
@@ -55,7 +55,7 @@ Blocked by：无
 
 ### T002：补齐 Session 损坏恢复与独占写入保护
 
-状态：待开始
+状态：已完成
 
 Blocked by：T001
 
@@ -71,18 +71,18 @@ Blocked by：T001
 
 验收：
 
-- [ ] 重复 ID、错序 `seq`、跨 Run 错误引用、完整坏行和 workspace 不匹配均硬失败，不跳过后继续；
-- [ ] 唯一可恢复的残缺尾段被精确截断到上一条完整记录，旧记录字节保持不变；
-- [ ] requesting_model、awaiting_tool_approval 和副作用开始后中断的夹具分别恢复为 interrupted，并补出正确的 aborted / unknown ToolResult；
-- [ ] interrupted 的计量明确标记为 incomplete，未知值保持 `null`，正常终态仍保存完整非负整数计量；
-- [ ] 恢复不发起模型请求、不执行 Tool、不重试文件或命令，只向同一 JSONL 追加事实；
-- [ ] 活锁阻止第二写者，确定死亡的残留锁可回收，owner token 不匹配时不会误删锁；
-- [ ] 外部追加使旧 Agent 返回 session_changed，既有消息和文件尾部不被静默合并；
-- [ ] Session 损坏、恢复和锁定向测试通过，所有夹具只使用测试临时目录。
+- [x] 重复 ID、错序 `seq`、跨 Run 错误引用、完整坏行和 workspace 不匹配均硬失败，不跳过后继续；
+- [x] 唯一可恢复的残缺尾段被精确截断到上一条完整记录，旧记录字节保持不变；
+- [x] requesting_model、awaiting_tool_approval 和副作用开始后中断的夹具分别恢复为 interrupted，并补出正确的 aborted / unknown ToolResult；
+- [x] interrupted 的计量明确标记为 incomplete，未知值保持 `null`，正常终态仍保存完整非负整数计量；
+- [x] 恢复不发起模型请求、不执行 Tool、不重试文件或命令，只向同一 JSONL 追加事实；
+- [x] 活锁阻止第二写者，确定死亡的残留锁可回收，owner token 不匹配时不会误删锁；
+- [x] 外部追加使旧 Agent 返回 session_changed，既有消息和文件尾部不被静默合并；
+- [x] Session 损坏、恢复和锁定向测试通过，所有夹具只使用测试临时目录。
 
 ### T003：完成 Stage 01 门禁与检查点汇报
 
-状态：待开始
+状态：已完成
 
 Blocked by：T001、T002
 
@@ -95,12 +95,12 @@ Blocked by：T001、T002
 
 验收：
 
-- [ ] Plan 约定的 Stage 01 定向测试全部通过；
-- [ ] `pnpm verify` 通过 Biome、Strict TypeScript、测试和构建；
-- [ ] 实际 JSONL 证明新建、完成、重开、截尾和中断恢复的顺序与 Schema 1 一致；
-- [ ] 没有新增六个 Tool、确认 Interface、Tool Loop、`diff` 依赖或 Stage 02 行为；
-- [ ] 未在 Anthias 或开发者其他仓库写入运行 Session，未调用真实 Provider 或外部网络；
-- [ ] 汇报完成后按本次授权提交 Stage 01，没有自动开始 T004、推送或创建 PR。
+- [x] Plan 约定的 Stage 01 定向测试全部通过；
+- [x] `pnpm verify` 通过 Biome、Strict TypeScript、测试和构建；
+- [x] 实际 JSONL 证明新建、完成、重开、截尾和中断恢复的顺序与 Schema 1 一致；
+- [x] 没有新增六个 Tool、确认 Interface、Tool Loop、`diff` 依赖或 Stage 02 行为；
+- [x] 未在 Anthias 或开发者其他仓库写入运行 Session，未调用真实 Provider 或外部网络；
+- [x] 汇报完成后按本次授权提交 Stage 01，没有自动开始 T004、推送或创建 PR。
 
 ## Stage 02：Tool 系统接入与 Agent Loop 改造
 
@@ -326,7 +326,7 @@ Blocked by：T010、T011
 
 ## 授权与下一步
 
-- 本 Tasks 已由开发者确认，当前仅授权 Stage 01（T001–T003）实施；
-- T001 已完成；本 Feature 文档已经明确恢复计量语义和最终 Session 位置，T002 可以开始，T003 完成 Stage 01 门禁与检查点汇报；
-- T003 汇报后停止，Stage 02 仍需开发者单独授权；
-- 当前已授权本次文档提交与 Stage 01 完成提交；外部网络、真实 Provider 验证、Stage 02、推送和创建 PR 继续分别取得授权。
+- 本 Tasks 已由开发者确认，Stage 01（T001–T003）已经实施并完成门禁，当前等待开发者审查；
+- T001–T003 均已完成；最终 Session 位置的生产迁移仍按计划留在 Stage 02；
+- T003 汇报和本次授权提交后停止，Stage 02 仍需开发者单独授权；
+- 外部网络、真实 Provider 验证、Stage 02、推送和创建 PR 继续分别取得授权。
