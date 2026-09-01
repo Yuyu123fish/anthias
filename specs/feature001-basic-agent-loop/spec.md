@@ -34,8 +34,8 @@ Feature 001 不建设 Desktop、独立 Host 或传输协议。它只保证 Agent
 ## 4. 用户流程
 
 1. 开发者从终端启动 Anthias。
-2. Anthias 在接受提示词前校验本地模型配置是否完整，以及格式是否能在本地判定为有效。
-3. TUI 创建一个内存 Agent，订阅其事件，并显示输入区域或输入提示。
+2. Anthias 通过 Agent 的启动工厂校验本地模型配置；配置和生产 Model Adapter 不进入 TUI。
+3. TUI 接收已经创建好的内存 Agent，订阅其事件，并显示输入区域或输入提示。
 4. 开发者提交非空文本。
 5. Agent 记录用户消息，启动一次模型流，并依次发布生命周期事件和消息事件。
 6. TUI 随着消息增量事件到达，逐步显示 Assistant 文本。
@@ -103,18 +103,18 @@ Feature 001 不建设 Desktop、独立 Host 或传输协议。它只保证 Agent
 
 ### 5.4 模型行为
 
-- Agent 接收模型流依赖，不在内部构造 Provider。
-- 模型流接收当前模型消息和 AbortSignal，然后按顺序产出 Assistant 文本增量。
-- 生产适配器通过 AI SDK Core 使用一个 OpenAI-compatible Provider。
-- AI SDK、Provider 和传输相关类型只存在于模型适配器内部。
+- Model Stream 是 Agent Module 的内部 seam，不属于 TUI 或 Agent 的外部 Interface。
+- Agent Loop 通过内部 Model Stream 传入当前模型消息和 AbortSignal，并按顺序接收 Assistant 文本增量。
+- `apps/agent` 内的生产 Adapter 通过 AI SDK Core 使用一个 OpenAI-compatible Provider；Agent 内部测试使用确定性 Model Stream。
+- AI SDK、Provider、模型消息和 Model Stream 类型只存在于 Agent Module 实现内部，不向 TUI 暴露。
 - DeepSeek V4 Flash 是本地参考配置，不是专用代码路径。
 - 一个被接受的提示词只发起一次模型请求。
 - Feature 001 不执行重试、模型切换、Provider 路由或后续提示词排队。
 
 ### 5.5 配置、失败与资源行为
 
-- 生产 TUI 启动时从本地环境读取 ANTHIAS_MODEL_BASE_URL、ANTHIAS_MODEL_ID 和 ANTHIAS_MODEL_API_KEY。
-- 配置缺失或能在本地判断为格式错误时，TUI 在创建 Agent 或发起模型请求前显示可操作的终端提示，并以非零状态码退出。
+- Agent 启动工厂从本地环境读取 ANTHIAS_MODEL_BASE_URL、ANTHIAS_MODEL_ID 和 ANTHIAS_MODEL_API_KEY；TUI 不解析或持有模型配置。
+- 配置缺失或能在本地判断为格式错误时，Agent 启动工厂返回安全错误；TUI 在发起模型请求前显示该错误，并以非零状态码退出。
 - API Key、模型标识或服务地址被远端 Provider 拒绝属于模型请求期间的 failed 结果；Feature 001 不声称能在发出请求前验证远端凭据或模型可用性。
 - API Key、Authorization Header、完整请求体和未经处理的 Provider 响应不得进入 AgentEvent、终端输出、自动化测试快照或仓库文件。
 - 模型抛出异常时，当前 Assistant 消息以 failed 状态结束，保留已经生成的正文但不追加错误说明；安全错误单独进入 Agent 状态和 Agent 结束事件。
@@ -126,14 +126,14 @@ Feature 001 不建设 Desktop、独立 Host 或传输协议。它只保证 Agent
 ## 6. 已确认决定
 
 - Feature 001 采用 TUI 优先、Agent 为先的设计：TUI 是首个适配器，不拥有 Agent 行为。
-- TUI 单向依赖 Agent 的公开接口；Agent 不反向依赖 TUI、AI SDK 或具体 Provider。
+- TUI 单向依赖 Agent 的公开 Interface；Agent 不反向依赖 TUI。AI SDK 和具体 Provider 只允许存在于 `apps/agent` 的内部 Model Adapter，不进入 Agent Loop 类型或外部 Interface。
 - Agent 由普通工厂函数创建，并暴露一个小型对象接口；不建立 Agent 类继承层级。
 - 本 Feature 对外只需要 state、prompt、abort 和 subscribe 四类行为。
 - prompt 必须区分预期拒绝和已接受执行的终态，不用异常表示空提示词或 Agent 忙碌。
 - AgentEvent 是当前 TUI 和自动化验证共用的观察接缝。Feature 001 只证明 Agent 不依赖 TUI，不提前承诺未来 Desktop 的具体合同。
 - AgentEvent 采用有序的同步进程内通知，不暴露 Provider 事件，也不等待订阅者的异步工作。
 - TUI 与 Agent 运行在同一个 Node.js 进程中，通过直接函数调用协作。
-- 当前唯一注入的接缝是模型流，由一个生产 OpenAI-compatible 适配器和一个确定性测试适配器共同证明其必要性。
+- 当前唯一注入的 seam 是 Agent Module 内部的 Model Stream，由生产 OpenAI-compatible Adapter 和确定性测试 Adapter 共同证明其必要性；它不向交互 Adapter 暴露。
 - 状态转换全部留在 Agent 内部；TUI、模型适配器和测试都不能调用内部生命周期函数。
 - 具体文件布局、依赖版本、TUI 库和终端按键在本 Spec 确认后的 Plan 中确定。
 
@@ -219,8 +219,9 @@ Feature 001 不建设 Desktop、独立 Host 或传输协议。它只保证 Agent
 ### G. 接口独立性
 
 - Agent 模块不导入 TUI、Electron、React 或传输实现；
-- Agent 模块不导入 AI SDK 或具体 Provider，TUI 到 Agent 的依赖保持单向；
-- TUI 只通过 state、prompt、abort 和 subscribe 完成整个对话；
+- `apps/agent` 只在内部 Model Adapter 导入 AI SDK 或具体 Provider，相关类型不从 package 入口导出；
+- `apps/tui` 不导入 AI SDK、具体 Provider、模型消息或 Model Stream；TUI 到 Agent 的依赖保持单向；
+- TUI 除启动时调用 Agent 工厂外，只通过 state、prompt、abort 和 subscribe 完成整个对话；
 - 一个确定性的非 TUI 订阅者可以通过公开接口观察同样的有序事件；
 - 不需要协议包或重复的生命周期归约器。
 
@@ -235,7 +236,7 @@ Agent 空闲或正在生成时退出：
 
 ## 9. 验证边界
 
-自动化验证通过公开 Agent 接口和终端适配器接缝使用确定性模型流。验证必须覆盖提示词接纳、事件顺序、流式输出、多轮上下文、并发拒绝、停止、失败恢复和资源清理，并且不访问外部网络或真实凭据。
+自动化验证在 Agent Module 内部使用确定性 Model Stream 验证 Agent Interface；TUI 测试只使用 Agent 的外部 Interface，不构造模型消息或 Model Stream。验证必须覆盖提示词接纳、事件顺序、流式输出、多轮上下文、并发拒绝、停止、失败恢复和资源清理，并且不访问外部网络或真实凭据。
 
 后续可以通过真实 DeepSeek V4 Flash 冒烟测试证明参考 OpenAI-compatible 配置可用，但该验证需要单独授权和本地凭据。Mock 与构建结果不能表述为已经完成真实 Provider 验证。
 
@@ -247,7 +248,7 @@ Agent 空闲或正在生成时退出：
 2. TUI 接受非空提示词，Agent 记录用户消息并发起一次模型流；
 3. 模型增量持续更新同一条 Assistant 消息，结束后 Agent 回到空闲；
 4. 同一时间只处理一个提示词，失败或停止后保留部分文本并允许继续对话；
-5. TUI 和确定性自动化验证只通过 state、prompt、abort、subscribe 与有序 AgentEvent 使用 Agent，空白或忙碌是显式拒绝结果；
+5. TUI 只通过 Agent 启动工厂以及 state、prompt、abort、subscribe 与有序 AgentEvent 使用 Agent；确定性 Model Stream 只存在于 Agent Module 内部测试中，空白或忙碌是显式拒绝结果；
 6. 具体 TUI 库、布局、按键和依赖版本留给 Plan，不改变上述行为；
-7. TUI 单向依赖 Agent；AgentEvent 是同步的进程内通知，不暴露或等待 Provider 与订阅者的异步实现细节；
+7. TUI 单向依赖 Agent，且不持有模型配置、模型消息、Model Stream、AI SDK 或 Provider；AgentEvent 是同步的进程内通知，不暴露或等待 Provider 与订阅者的异步实现细节；
 8. 旧 Desktop、Host、Protocol 以及未来 Tool、Session 或执行分叉基础设施不进入本 Feature。

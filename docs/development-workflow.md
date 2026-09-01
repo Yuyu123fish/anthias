@@ -133,7 +133,7 @@ Plan 可以为低风险实现细节留出调整空间，但不能把产品语义
 
 Anthias 当前使用 Strict TypeScript、Node.js 24 LTS、ESM 和 pnpm workspace。package manifest、lockfile 和构建配置是具体版本、脚本与工具入口的事实源。
 
-Agent 通过小而稳定的 Interface 隐藏消息、模型流、取消和后续 Tool Loop。TUI 只调用 Agent 并订阅 AgentEvent；测试使用确定性 Model Stream；未来 Desktop 只在外部增加 Adapter。普通函数和判别联合足以表达的行为不建立类层级、通用协议或未来框架。
+Agent 通过小而稳定的 Interface 隐藏消息、模型流、取消和后续 Tool Loop。TUI 只调用 Agent 并订阅 AgentEvent；确定性 Model Stream 只用于 Agent Module 内部测试，不从 package 入口暴露；未来 Desktop 只在外部增加 Adapter。普通函数和判别联合足以表达的行为不建立类层级、通用协议或未来框架。
 
 测试使用英文行为名，优先覆盖公开行为、取消、资源释放、失败恢复和实际终端交互。只有测试名无法表达同步意图或非直观断言时才加入简洁中文注释。未来真正出现跨进程输入时，只在接收 Adapter 做运行时校验，不把传输要求扩散到 Agent Module。
 

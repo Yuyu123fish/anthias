@@ -23,10 +23,10 @@
 - 首个入口：TUI 与 Agent 在同一进程直接协作，不经过 RPC；
 - 可观察性：Agent 以类似 pi 的 emit / subscribe 方式发布有序 AgentEvent；
 - Desktop 兼容：未来 Desktop 适配器可以转发相同命令与事件，Agent 不依赖 Electron、React、MessagePort 或序列化协议；
-- 模型：AI SDK Core 只允许留在具体模型适配器内部，不把其类型传播到 Agent 接口；
+- 模型：AI SDK Core 只允许留在 `apps/agent` 的内部 Model Adapter，不把 Model Stream、模型消息、AI SDK 或 Provider 类型传播到 Agent 的外部 Interface；
 - 首个模型接入：单一 OpenAI-compatible Provider，不建设 Provider Registry；
 - 参考模型：DeepSeek V4 Flash，通过 OpenAI-compatible Chat Completions 使用；它只是一组配置，不产生专用实现；
-- 自动验证：通过注入的确定性 Model Stream 验证 Agent 行为，不默认访问真实模型、外部网络或付费 API。
+- 自动验证：在 Agent Module 内部通过注入的确定性 Model Stream 验证 Agent 行为；TUI 测试只使用 Agent Interface，不默认访问真实模型、外部网络或付费 API。
 
 Feature 001 已根据 Node.js 24 环境固定 TypeScript、Vitest、Biome 与 AI SDK 依赖版本，并生成 pnpm lockfile；package manifest 与 lockfile 是具体版本事实源。
 
@@ -36,20 +36,21 @@ Feature 001 已根据 Node.js 24 环境固定 TypeScript、Vitest、Biome 与 AI
 
 Agent 持有消息 transcript、当前流式消息、是否正在运行以及取消所需的资源。对调用者只提供以下行为：
 
+- 通过生产启动工厂从本地环境创建 Agent，并返回安全的配置结果；
 - 读取当前只读 state；
 - 提交一条 prompt；
 - 取消当前运行；
 - 订阅 AgentEvent，并能取消订阅。
 
-Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
+Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。生产启动工厂隐藏模型配置解析与 Adapter 构造；Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
 
 ### 模型适配器
 
-Model Adapter 把 Agent 的消息 transcript 和 AbortSignal 转换为一次模型流，并把模型输出转换为 Agent 可消费的增量。生产实现使用 OpenAI-compatible 接口；测试实现使用确定性本地流。两者形成当前唯一真实可替换 seam。
+Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 AbortSignal 转换为一次模型流，并把模型输出转换为 Agent 可消费的增量。生产实现使用 OpenAI-compatible 接口；Agent 内部测试使用确定性本地流。两者形成当前唯一真实可替换 seam，但该 seam 不向 TUI 或未来 Desktop 暴露。
 
 ### TUI 适配器
 
-TUI 负责终端输入、输出和用户停止操作。它直接调用 Agent，并订阅 AgentEvent；它不自行推进 Agent 生命周期，也不维护第二份业务状态。
+TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
 Feature 001 使用 Node.js `readline` 的普通行式 TUI；未来交互方式可以调整，但不能改变 Agent Interface。
 
@@ -67,18 +68,18 @@ Tool、多个模型回合和权限事件在对应 Feature 出现时再扩展，�
 
 ## 模型配置方向
 
-首个真实 Model Adapter 从本地环境读取以下配置：
+Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取以下配置：
 
 - ANTHIAS_MODEL_BASE_URL
 - ANTHIAS_MODEL_ID
 - ANTHIAS_MODEL_API_KEY
 
-三项只供模型 Adapter 使用。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
+三项只供 Agent Module 内部的模型 Adapter 使用，TUI 只接收启动成功后的 Agent 或安全错误文本。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
 
 ## 设计约束
 
 - 优先形成深 Module：TUI、测试和未来 Desktop 使用同一个小 Interface，不穿透 Agent 内部步骤。
-- 只有真实变化才建立 seam；当前只保留生产 Model Adapter 与确定性测试 Adapter。
+- 只有真实变化才建立 seam；当前只保留 Agent Module 内部的生产 Model Adapter 与确定性测试 Adapter。
 - Agent 状态只有一份。交互层可以保存渲染数据，但不能成为生命周期权威。
 - 普通函数和判别联合足以表达的行为，不增加类层级、Registry、Manager 或通用框架。
 - 取消、进程信号、终端状态、模型流和后续 Tool 资源必须有明确持有者与释放时机。

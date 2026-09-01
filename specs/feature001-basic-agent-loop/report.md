@@ -6,11 +6,11 @@
 - 对应 Spec：[spec.md](spec.md)
 - 对应 Plan：[plan.md](plan.md)
 - 对应 Tasks：[tasks.md](tasks.md)
-- 实现基线：`main` / `ae142b0`
+- 职责修正基线：`main` / `52726d9`
 
 ## 1. 已经成立的用户行为
 
-- 模型配置缺失或 Base URL 本地格式无效时，TUI 在创建模型请求前给出安全提示并以非零状态码退出。
+- 模型配置缺失或 Base URL 本地格式无效时，Agent 启动工厂在创建模型请求前返回安全错误，TUI 展示提示并以非零状态码退出。
 - 非空提示词会进入同一个内存 Agent，模型文本增量持续更新同一条 Assistant 消息；完成后明确展示完成状态并恢复输入。
 - 后续提示词会携带此前用户与 Assistant 正文，包含失败或停止后保留的部分 Assistant 文本。
 - 空白提示词与运行期间的第二个提示词分别返回 empty、busy 拒绝，不追加消息、不发布第二组事件，也不发起第二次模型请求。
@@ -23,17 +23,20 @@ Feature 001 没有加入 Tool、文件或命令执行、Session、Compaction、�
 
 ```text
 apps/tui/src/main.ts
-  ├─ readModelConfig()                         请求前配置校验
-  ├─ createOpenAICompatibleModelStream()       生产 Model Adapter
-  ├─ createAgent()                             唯一消息与运行状态持有者
-  └─ runTui()                                  输入、呈现、信号与退出清理
+  ├─ createAgentFromEnvironment()              取得已配置的 Agent 或安全错误
+  └─ runTui(agent)                             输入、呈现、信号与退出清理
 
-用户输入 → agent.prompt() → ModelStream → 文本增量
-                                  ↓
-TUI 呈现 ← AgentEvent ← Agent 状态更新与统一终结
+apps/agent/src/index.ts
+  ├─ readModelConfig()                         内部配置校验
+  ├─ createOpenAICompatibleModelStream()       内部生产 Model Adapter
+  └─ createAgentWithModelStream()              内部 Agent Loop 装配
+
+用户输入 → TUI → agent.prompt() → Agent 内部 ModelStream → Provider
+             ↑              ↓
+             └─ AgentEvent ─┘
 ```
 
-`apps/tui` 单向依赖 `apps/agent`。Agent 公共面只有 state、prompt、abort、subscribe 及其必要类型；公开消息收敛为 `UserMessage`、`AssistantMessage` 和 `Message`，state 使用 `messageHistory` 与 `activeAssistantMessage` 明确区分历史和活动消息。AI SDK 和 OpenAI-compatible Provider 类型只存在于 TUI 的生产 Adapter。
+`apps/tui` 单向依赖 `apps/agent`，其生产依赖只有 `@anthias/agent`。Agent package 入口暴露生产启动工厂、state、prompt、abort、subscribe 及必要公共类型；`ModelStream`、模型输入、AI SDK 和 OpenAI-compatible Provider 只存在于 Agent Module 内部。TUI 测试使用 Agent Interface fake，只有 Agent 内部测试能够注入确定性 Model Stream。
 
 ## 3. 并发、取消、失败与资源边界
 
@@ -51,10 +54,11 @@ TUI 呈现 ← AgentEvent ← Agent 状态更新与统一终结
 | --- | --- | --- |
 | 版本 | `node --version`、`pnpm --version` | 与 Plan 固定版本一致 |
 | 安装 | `pnpm install --frozen-lockfile --offline` | 通过；lockfile 已同步，未下载依赖 |
-| 审查修复回归 | `pnpm exec vitest run apps/agent/test/agent.test.ts apps/tui/test/tui.test.ts` | 2 个文件、12 个测试通过 |
-| 完整门禁 | `pnpm verify` | Biome 检查 20 个文件、Strict TypeScript、构建通过；5 个测试文件、20 个测试通过 |
+| Agent 定向验证 | `pnpm exec vitest run apps/agent/test/agent.test.ts apps/agent/test/startup.test.ts apps/agent/test/model-config.test.ts apps/agent/test/openai-compatible-model.test.ts` | 4 个文件、17 个测试通过 |
+| TUI 定向验证 | `pnpm exec vitest run apps/tui/test/tui.test.ts apps/tui/test/main.test.ts` | 2 个文件、5 个测试通过 |
+| 完整门禁 | `pnpm verify` | Biome 检查 22 个文件、Strict TypeScript、构建通过；6 个测试文件、22 个测试通过 |
 
-完整门禁覆盖 Agent 公共接口、事件顺序、只读快照、多轮上下文、empty / busy、终态重入、停止与晚到增量、失败恢复、订阅行为、TUI 流式呈现、SIGINT、EOF、配置预检、CLI 非零退出，以及本机 loopback OpenAI-compatible 流与禁用重试。loopback HTTP 只监听 `127.0.0.1`，没有访问外部网络。
+完整门禁覆盖 Agent 公共 Interface、事件顺序、只读快照、多轮上下文、empty / busy、终态重入、停止与晚到增量、失败恢复、订阅行为、Agent 启动配置、TUI 流式呈现、SIGINT、EOF、CLI 非零退出，以及 Agent 内部的本机 loopback OpenAI-compatible 流与禁用重试。loopback HTTP 只监听 `127.0.0.1`，没有访问外部网络。
 
 ## 5. 尚未验证与已知边界
 
@@ -65,7 +69,7 @@ TUI 呈现 ← AgentEvent ← Agent 状态更新与统一终结
 
 ## 6. Git 边界
 
-- 当前仍在 `main`，实现基线为 `ae142b0`。
-- `.gitignore`、AGENTS、README、稳定 `docs/`、Feature 文档、工程配置、源码和测试组成同一个本地提交增量；合并提交范围已由开发者单独确认。
-- 开始实施前已有的文档修改均被保留并按当前实现状态完成一致性收口，没有重置或覆盖。
-- 未推送，也未创建 PR；这些动作仍需开发者分别授权。
+- 当前仍在 `main`，职责修正开始于 `52726d9`；当前修正尚未提交。
+- 本次变更只涉及 Agent/TUI 职责文档、package 依赖、模型 Adapter 归属、Agent 启动工厂和对应测试，没有改变 Feature 001 的用户行为。
+- 修正前工作区干净，没有重置、覆盖或夹带开发者的其他修改。
+- 未调用真实 Provider，未提交、推送或创建 PR；这些动作仍需开发者分别授权。

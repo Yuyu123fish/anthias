@@ -27,7 +27,7 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 
 - 旧的 Desktop、Local Agent Host、JSON-RPC 和 Protocol 实现已经撤销。
 - Feature 001 的“TUI 优先、事件驱动的最小 Agent Loop”已完成本地实现和约定验证，当前等待开发者验收。
-- 仓库已有可构建、可启动的内存 Agent 与行式 TUI；真实 Provider 和人工 Windows 终端体验尚未验证。
+- 仓库已有可构建、可启动的内存 Agent 与行式 TUI；生产 OpenAI-compatible Model Adapter 由 Agent 内部持有，TUI 只负责终端交互；真实 Provider 和人工 Windows 终端体验尚未验证。
 - 已确认的基础方向是 Strict TypeScript、Node.js 24 LTS、ESM 和 pnpm workspace。
 - 首个模型接入继续使用通用 OpenAI-compatible 接口；DeepSeek V4 Flash 只是日常使用与联调的参考模型。
 - Electron 不再是产品前提；Desktop 的框架、进程模型和传输方式留给未来 Feature 决定。

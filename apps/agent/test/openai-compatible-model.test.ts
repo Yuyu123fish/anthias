@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOpenAICompatibleModelStream } from "../src/model-adapter.js";
+import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
 
 const servers = new Set<ReturnType<typeof createServer>>();
 

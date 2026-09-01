@@ -30,7 +30,7 @@ Anthias 是本地优先、交互形态无关的 Coding Agent。
       ├─ TUI 适配器
       └─ Desktop 适配器
 
-- Agent 持有消息、运行状态以及后续 Tool 和工作区副作用，是行为权威。
+- Agent 持有消息、模型运行、运行状态以及后续 Tool 和工作区副作用，是行为权威。
 - TUI 是首个交互入口，直接调用 Agent，并根据 AgentEvent 呈现运行过程。
 - Desktop 是未来可加入的交互适配器。它可以转发同一组 Agent 命令和事件，但不产生另一套 Agent 状态。
 - Agent 的公开接口不依赖终端库、Electron、React、MessagePort 或传输协议。
@@ -52,7 +52,7 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 
 ## 当前实现状态
 
-- 仓库已有可构建、可启动的内存 Agent 与行式 TUI。
+- 仓库已有可构建、可启动的内存 Agent 与行式 TUI；生产 OpenAI-compatible Model Adapter 位于 Agent 内部，TUI 不持有模型接入。
 - 旧的 Electron Desktop、Utility Process Host、JSON-RPC、Protocol DTO 和 Renderer 状态投影已经撤销。
 - Feature 001 已完成 Spec、Plan、Tasks、实现和 Report，当前状态为“已实现、等待验收”。
 - Tool、工作区操作、持久化、Compaction、Desktop 和执行分叉均未实现。
@@ -110,6 +110,6 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 ## 确认边界
 
 - 当前确认的是产品路线、Coding Harness 近期目标、交互形态无关原则和 TUI 优先顺序。
-- TypeScript、`apps/agent` 与 `apps/tui` 布局、Node 内置行式 TUI 和依赖版本已经由 Feature 001 Plan 与 lockfile 固定。
+- TypeScript、`apps/agent` 与 `apps/tui` 布局、Agent 内部 Model Adapter、Node 内置行式 TUI 和依赖版本已经由 Feature 001 Plan 与 lockfile 固定。
 - Feature 001 已完成最小 Agent Loop 的本地实现和约定验证，真实 Provider 与人工 Windows 终端体验仍是明确验证边界。
 - 归档 Research 和历史实现可以提供反例与证据，但不能自动恢复旧决定。

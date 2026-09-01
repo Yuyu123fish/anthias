@@ -1,21 +1,17 @@
 #!/usr/bin/env node
 
-import { createAgent } from "@anthias/agent";
-import { readModelConfig } from "./config.js";
+import { createAgentFromEnvironment } from "@anthias/agent";
 import { runTui } from "./index.js";
-import { createOpenAICompatibleModelStream } from "./model-adapter.js";
 
+/** 创建生产 Agent 并进入 TUI；启动配置无效时以非零状态退出。 */
 async function main(): Promise<number> {
-  const modelConfigResult = readModelConfig();
-  if (!modelConfigResult.ok) {
-    process.stderr.write(`${modelConfigResult.error}\n`);
+  const agentCreationResult = createAgentFromEnvironment();
+  if (!agentCreationResult.ok) {
+    process.stderr.write(`${agentCreationResult.error}\n`);
     return 1;
   }
 
-  const agent = createAgent({
-    modelStream: createOpenAICompatibleModelStream(modelConfigResult.config),
-  });
-  return runTui({ agent });
+  return runTui({ agent: agentCreationResult.agent });
 }
 
 try {

@@ -4,14 +4,13 @@
 
 - 文档类型：Plan
 - 对应 Spec：[spec.md](spec.md)
-- 授权状态：Feature 001 实施已获得；2026-08-31 后续单独授权一次本地提交；不含真实 Provider 验证、推送或 PR
+- 授权状态：Feature 001 实施已获得；2026-09-01 开发者授权完成 Model Adapter 职责修正；不含新的本地提交、真实 Provider 验证、推送或 PR
 
 ## 1. 当前基线
 
-- 当前分支为 `main`，检查点为 `ae142b0`。
-- 工作区已有未提交文档修改，全部属于开发者现有工作；实施时不得重置、清理或覆盖。
-- Feature 001 Spec 已进入“已定义”，范围仅为最小 Agent Loop 与首个 TUI 适配器。
-- 仓库当前没有 `package.json`、lockfile、TypeScript 源码或可运行实现。
+- 当前分支为 `main`，纠正前检查点为 `52726d9`，工作区干净。
+- Feature 001 已有可运行实现，但生产 Model Adapter、模型配置和 AI SDK 依赖错误地位于 `apps/tui`，Model Stream 也从 Agent package 入口暴露给了 TUI。
+- 本次只纠正模块职责和测试 seam，不改变消息、事件、取消、失败、配置错误或 TUI 用户行为。
 - 本机运行时为 Node.js `24.13.1`、pnpm `10.33.0`。
 - 默认验证不访问真实模型、外部网络或凭据。
 
@@ -37,15 +36,15 @@
 
 ```text
 apps/
-  agent/    # @anthias/agent，与界面无关的内存 Agent Module
-  tui/      # @anthias/tui，行式终端入口与应用组合
+  agent/    # @anthias/agent，Agent Loop、模型配置与内部 Model Adapter
+  tui/      # @anthias/tui，行式终端输入、呈现与退出
 ```
 
 根目录只保留私有 workspace 配置、统一脚本和工具配置，不再同时维护 `apps/` 与 `packages/` 两套顶层目录。
 
-`apps/tui` 依赖 `apps/agent`，负责终端交互、环境配置、生产 OpenAI-compatible Adapter 和应用组合；`apps/agent` 不得反向依赖 TUI 或 AI SDK。
+`apps/tui` 只依赖 `apps/agent`，负责终端输入、呈现、信号和退出；`apps/agent` 不得反向依赖 TUI，并在内部持有环境配置、生产 OpenAI-compatible Adapter 和 Agent Loop。
 
-Agent 通过 `apps/agent/src/index.ts` 向 TUI 和测试提供小 Interface；Model Stream 仍是生产 Adapter 与确定性测试 Adapter 共同使用的真实 seam。不创建 Desktop、Host、共享 DTO、Provider Registry、独立 Model package 或额外的 Coding Agent 组合 package。
+Agent 通过 `apps/agent/src/index.ts` 向 TUI 暴露启动工厂、Agent 实例 Interface 及必要事件和消息类型。Model Stream 是生产 Adapter 与确定性测试 Adapter 共同使用的内部 seam，不从 package 入口导出，也不进入 TUI 测试。不创建 Desktop、Host、共享 DTO、Provider Registry、独立 Model package 或额外的 Coding Agent 组合 package。
 
 ### 3.2 依赖版本
 
@@ -68,6 +67,7 @@ Agent 通过 `apps/agent/src/index.ts` 向 TUI 和测试提供小 Interface；Mo
 
 `apps/agent` 持有消息、当前 Assistant 消息、运行状态、`AbortController`、模型迭代器和订阅者，只公开：
 
+- 通过本地环境创建生产 Agent，并返回可安全展示的配置结果；
 - 读取只读 state；
 - `prompt(text)`；
 - `abort()`；
@@ -106,25 +106,25 @@ AgentEvent 按 Spec 的顺序同步发布。TUI 只根据事件呈现，不维�
 
 ### 3.4 Model Stream
 
-Agent 依赖项目自有的最小 Model Stream 合同：
+Agent Module 内部依赖项目自有的最小 Model Stream 合同：
 
 - 输入为按顺序排列的用户与 Assistant 正文，以及 `AbortSignal`；
 - 输出为异步文本增量；
-- AI SDK 与 Provider 类型不得进入 Agent Interface。
+- AI SDK、Provider、模型消息与 Model Stream 类型不得从 Agent package 入口导出。
 
-测试直接提供确定性异步流。生产 Adapter 使用 `createOpenAICompatible` 与 `streamText`，从 `fullStream` 只提取文本增量，并在 Adapter 内收敛 error part；同时传递 `abortSignal` 并设置 `maxRetries: 0`，保证一次提示词只发起一次模型请求。
+Agent 内部测试直接提供确定性异步流。`apps/agent` 内的生产 Adapter 使用 `createOpenAICompatible` 与 `streamText`，从 `fullStream` 只提取文本增量，并在 Adapter 内收敛 error part；同时传递 `abortSignal` 并设置 `maxRetries: 0`，保证一次提示词只发起一次模型请求。
 
 生产 Adapter 不包含 DeepSeek 专用类型、枚举或条件分支。
 
 ### 3.5 配置
 
-TUI 启动时读取：
+Agent 启动工厂读取：
 
 - `ANTHIAS_MODEL_BASE_URL`
 - `ANTHIAS_MODEL_ID`
 - `ANTHIAS_MODEL_API_KEY`
 
-请求前只校验非空值，以及 Base URL 能否解析为 `http` 或 `https`。API Key、模型和远端服务的真实有效性只能在请求时判断，统一作为可恢复的模型失败。
+请求前只校验非空值，以及 Base URL 能否解析为 `http` 或 `https`。失败时向 TUI 返回安全错误文本；TUI 不接收有效配置对象。API Key、模型和远端服务的真实有效性只能在请求时判断，统一作为可恢复的模型失败。
 
 终端、AgentEvent、测试快照和仓库文件不得包含 API Key、Authorization Header、完整请求体或原始 Provider 响应。
 
@@ -155,13 +155,13 @@ Feature 001 不创建子进程或后台进程。
 
 ### 4.3 生产 Model Adapter
 
-- 实现环境配置读取与本地校验。
+- 在 `apps/agent` 内实现环境配置读取与本地校验。
 - 接入通用 OpenAI-compatible Provider。
 - 禁用重试、传递取消信号并收敛敏感错误。
 
 ### 4.4 TUI
 
-- 建立生产组合入口。
+- 通过 Agent 启动工厂取得已配置的 Agent，不构造 Model Stream 或 Provider。
 - 实现输入、流式输出、停止、失败恢复和退出。
 - 验证 Windows 终端下 `Ctrl+C` 与 readline 的真实行为。
 
@@ -185,7 +185,7 @@ Feature 001 不创建子进程或后台进程。
 6. 失败后保留部分文本、错误不进入 Assistant 正文、错误已脱敏并允许继续；
 7. 完成、失败和中止只终结一次并释放运行资源；
 8. 同步订阅者按顺序收到事件，未完成的监听器 Promise 不阻塞 Agent，取消订阅后不再收到事件；
-9. TUI 流式输出、停止和恢复输入；
+9. TUI 通过 Agent 外部 Interface 完成流式输出、停止和恢复输入，不导入内部 Model Stream；
 10. `/exit`、EOF、`Ctrl+C` 与配置缺失时的进程退出行为。
 
 测试优先通过 Agent Interface 和完整 TUI 入口，不为内部步骤增加专用测试接口。
@@ -220,7 +220,7 @@ pnpm verify
 
 - 必须改变已确认的事件顺序、部分消息上下文或并发拒绝语义；
 - Node 内置行式终端无法满足停止与退出，需要引入完整 TUI 库；
-- AI SDK 类型无法被限制在生产 Adapter 内；
+- AI SDK、Provider、模型消息或 Model Stream 类型无法被限制在 Agent Module 内部；
 - 需要增加 Desktop、Host、协议、Tool、Session、重试、队列或 Registry；
 - 需要真实模型、外部网络或凭据才能继续默认验证；
 - 与开发者现有修改发生无法安全处理的重叠。

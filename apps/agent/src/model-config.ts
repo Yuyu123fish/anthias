@@ -15,9 +15,10 @@ const MODEL_VARIABLES = [
 ] as const;
 
 type ModelVariable = (typeof MODEL_VARIABLES)[number];
-type Environment = Readonly<Partial<Record<ModelVariable, string | undefined>>>;
+type ModelEnvironment = Readonly<Partial<Record<ModelVariable, string | undefined>>>;
 
-export function readModelConfig(environment: Environment = process.env): ModelConfigResult {
+/** 读取并本地校验模型环境变量，不验证远端凭据或模型可用性。 */
+export function readModelConfig(environment: ModelEnvironment = process.env): ModelConfigResult {
   const missingVariables = MODEL_VARIABLES.filter((name) => !environment[name]?.trim());
   if (missingVariables.length > 0) {
     return Object.freeze({
@@ -44,6 +45,7 @@ export function readModelConfig(environment: Environment = process.env): ModelCo
   });
 }
 
+/** 仅接受可用于模型请求的 HTTP(S) Base URL。 */
 function isHttpUrl(value: string): boolean {
   try {
     const url = new URL(value);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readModelConfig } from "../src/config.js";
+import { readModelConfig } from "../src/model-config.js";
 
 describe("readModelConfig", () => {
   it("reports missing variable names without exposing values", () => {

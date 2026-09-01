@@ -29,6 +29,7 @@ export function runTui({
 
   const unsubscribeFromAgentEvents = agent.subscribe((event) => renderEvent(event, output));
 
+  /** 运行时 Ctrl+C 只停止当前生成；空闲时 Ctrl+C 退出 TUI。 */
   const onSigint = () => {
     if (agent.state.running) {
       agent.abort();
@@ -37,6 +38,7 @@ export function runTui({
     void requestExit();
   };
 
+  /** 统一关闭输入、等待活动 prompt 结束并释放 TUI 持有的监听器。 */
   async function requestExit(): Promise<void> {
     if (exitStarted) {
       return;
@@ -54,6 +56,7 @@ export function runTui({
     }
   }
 
+  /** 将一行终端输入转换为退出命令或 Agent prompt。 */
   async function handleLine(line: string): Promise<void> {
     if (exitStarted) {
       return;
@@ -101,6 +104,7 @@ export function runTui({
   return exitCompletion.promise;
 }
 
+/** 将 AgentEvent 顺序映射为终端输出，不维护第二份 Agent 状态。 */
 function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   switch (event.type) {
     case "agent_start":
@@ -132,6 +136,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   }
 }
 
+/** 写出下一次终端输入提示。 */
 function writeInputPrompt(output: NodeJS.WritableStream): void {
   output.write(INPUT_PROMPT);
 }

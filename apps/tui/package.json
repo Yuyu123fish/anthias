@@ -22,9 +22,7 @@
     "start": "node ./dist/main.js"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "3.0.41",
-    "@anthias/agent": "workspace:*",
-    "ai": "7.0.85"
+    "@anthias/agent": "workspace:*"
   },
   "engines": {
     "node": ">=24 <25"

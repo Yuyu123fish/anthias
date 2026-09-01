@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { type AgentEvent, createAgent, type Message, type ModelStream } from "../src/index.js";
+import { createAgentWithModelStream, type ModelStream } from "../src/agent.js";
+import type { AgentEvent, Message } from "../src/index.js";
 
 describe("Agent", () => {
   it("streams one assistant message through the public interface", async () => {
@@ -9,7 +10,7 @@ describe("Agent", () => {
       yield "你";
       yield "好";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const events: string[] = [];
     const updateSnapshots: string[] = [];
     agent.subscribe((event) => {
@@ -53,7 +54,7 @@ describe("Agent", () => {
       modelMessageBatches.push(modelMessages);
       yield modelMessageBatches.length === 1 ? "first" : "second";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
@@ -84,7 +85,7 @@ describe("Agent", () => {
       await responseGate.promise;
       yield " done";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const firstPromptResult = agent.prompt("first");
     await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("working"));
 
@@ -103,7 +104,7 @@ describe("Agent", () => {
     const modelStream: ModelStream = async function* () {
       yield "done";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const eventTypes: string[] = [];
     let reentrantPromptResult: ReturnType<typeof agent.prompt> | undefined;
     agent.subscribe((event) => {
@@ -144,7 +145,7 @@ describe("Agent", () => {
       }
       yield "recovered";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const eventTypes: string[] = [];
     agent.subscribe((event) => eventTypes.push(event.type));
     const firstPromptResult = agent.prompt("stop this");
@@ -176,7 +177,7 @@ describe("Agent", () => {
       }
       yield "ok";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
 
     const failedPromptResult = await agent.prompt("fail");
 
@@ -201,7 +202,7 @@ describe("Agent", () => {
     const modelStream: ModelStream = async function* () {
       yield "ok";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     const events: AgentEvent[] = [];
     agent.subscribe(async () => {
       await neverSettles;
@@ -222,7 +223,7 @@ describe("Agent", () => {
     const modelStream: ModelStream = async function* () {
       yield "safe";
     };
-    const agent = createAgent({ modelStream });
+    const agent = createAgentWithModelStream({ modelStream });
     await agent.prompt("hello");
     const state = agent.state;
 

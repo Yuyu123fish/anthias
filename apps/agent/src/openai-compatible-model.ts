@@ -1,8 +1,9 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { ModelStream } from "@anthias/agent";
 import { streamText } from "ai";
-import type { ModelConfig } from "./config.js";
+import type { ModelStream } from "./agent.js";
+import type { ModelConfig } from "./model-config.js";
 
+/** 创建生产 OpenAI-compatible Model Stream，并将 Provider 细节封装在 Agent 内部。 */
 export function createOpenAICompatibleModelStream({
   baseURL,
   modelId,
@@ -29,6 +30,7 @@ export function createOpenAICompatibleModelStream({
   };
 }
 
+/** 只转发文本增量，并把 Provider error part 转换为内部失败。 */
 async function* streamTextDeltas(
   fullStream: AsyncIterable<
     Readonly<{ type: "text-delta"; text: string }> | Readonly<{ type: string }>

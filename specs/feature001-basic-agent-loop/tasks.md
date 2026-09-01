@@ -77,9 +77,9 @@ Blocked by：T003
 
 交付：
 
-- 在 `apps/tui` 中读取并校验三项 ANTHIAS 模型环境变量；
+- 在 `apps/agent` 中读取并校验三项 ANTHIAS 模型环境变量；
 - 通过 AI SDK Core 与 `@ai-sdk/openai-compatible` 实现生产 Model Adapter；
-- 显式关闭重试、传递 AbortSignal，并阻止 Provider 类型与敏感错误进入 Agent Interface；
+- 显式关闭重试、传递 AbortSignal，并阻止 Provider、模型消息和 Model Stream 类型与敏感错误进入 Agent 的外部 Interface；
 - 提供可构建、可启动的终端入口。
 
 验收：
@@ -108,3 +108,25 @@ Blocked by：T001、T002、T003、T004
 - [x] 没有 Tool、Session、Desktop、协议层或其他范围外实现；
 - [x] 未运行真实 DeepSeek V4 Flash 冒烟测试；
 - [x] 实施阶段未越权提交、推送或创建 PR；本地提交随后由开发者单独授权。
+
+## T006：修正 Model Adapter 归属与测试 seam
+
+状态：已完成
+
+Blocked by：T005
+
+交付：
+
+- 将模型配置、OpenAI-compatible Adapter 和 AI SDK 依赖从 `apps/tui` 迁入 `apps/agent`；
+- Agent package 入口只暴露生产启动工厂、Agent 实例 Interface 及必要公共类型，不暴露 Model Stream 或模型输入类型；
+- TUI 只接收已创建的 Agent，并通过 Agent Interface 输入、呈现、停止和退出；
+- Agent 内部测试使用确定性 Model Stream，TUI 测试使用 Agent Interface fake，不再构造模型请求。
+
+验收：
+
+- [x] `apps/tui` 不导入或依赖 AI SDK、Provider、模型配置、模型消息或 Model Stream；
+- [x] 删除 TUI 不会删除 Agent 的生产模型接入实现；
+- [x] 原有消息、事件、多轮、拒绝、取消、失败和退出行为保持兼容；
+- [x] 本地 loopback Adapter 验证仍证明单请求、流式增量与禁用重试；
+- [x] 完整门禁和最终差异审查通过，Report 与稳定文档同步当前事实；
+- [x] 未调用真实 Provider，未提交、推送或创建 PR。
