@@ -22,7 +22,7 @@
 
 | Stage | Tasks | 当前状态 | 完成门 |
 | --- | --- | --- | --- |
-| Stage 01：线性 Session 存储 | T001–T003 | 进行中：T001 已完成，T002 待确认恢复计量语义 | T003 完成并经开发者审查 |
+| Stage 01：线性 Session 存储 | T001–T003 | 进行中：T001 已完成，T002 待开始 | T003 完成并经开发者审查 |
 | Stage 02：Tool 系统接入与 Agent Loop 改造 | T004–T009 | 未开始 | T009 完成并经开发者审查 |
 | Stage 03：整体集成与验收准备 | T010–T012 | 未开始 | T012 完成，等待开发者验收 |
 
@@ -37,7 +37,7 @@ Blocked by：无
 交付：
 
 - 在 `apps/agent` 内建立不从 package 入口导出的 Session Module，实现 Schema 1 Header、MessageRecord、RunFinishedRecord、UUID、连续 `seq` 和 UTC 时间戳；
-- 按 Plan 解析 workspace root、本地 Session 目录和固定 Shell，新建 `<sessionId>.jsonl`，并能按 UUID `sessionId` 打开同一 workspace 的已有 Session；
+- 按 Plan 解析 workspace root、可配置 Session 目录和固定 Shell，新建 `<sessionId>.jsonl`，并能按 UUID `sessionId` 打开同一 workspace 的已有 Session；生产默认目录迁移与文件 Tool 隔离留在 T005 同步完成；
 - 将生产 Agent 工厂改为异步，`AgentState` 增加 `sessionId`，把现有纯文本 UserMessage、最终 AssistantMessage 和 completed / aborted / failed RunFinishedRecord 串行追加并刷新；
 - 将 `activeGeneration` 收敛为文本 Run 所有权，把 `agent_start` / `agent_end` 迁移为 `run_start` / `run_end`，保持 activeRun 到终态事件交付完成；
 - 让重开后的消息投影同时驱动 AgentState、TUI 历史展示和下一轮模型上下文；
@@ -64,6 +64,7 @@ Blocked by：T001
 - 对 Header、Schema、字段、UUID、`seq`、Run 顺序、ToolCall 引用和记录类型执行完整运行时校验；
 - 只截断“最后一段没有换行且 JSON 语法不完整”的尾部，完整坏尾行、中间坏行和断裂引用全部拒绝打开；
 - 对缺少 RunFinishedRecord 的最后一个 Run 追加恢复事实：未开始 ToolCall 为 aborted、已有 ToolExecutionStartedRecord 无结果为 unknown，最后写入 interrupted；
+- interrupted 记录使用不完整计量：无法精确还原的模型请求数和活动执行时长为 `null`，ToolCall 数按持久事实计算，不伪造精确值；
 - 用原子 `<sessionId>.lock` 目录、PID、owner token 和文件检查点阻止并发写者；只回收能够确认 PID 已不存在的残留锁；
 - 新 prompt 在取得锁后核对文件大小和最后 `seq`，分别以 `session_busy` 或 `session_changed` 拒绝竞争写入和外部尾部变化；
 - 确保打开恢复和每个 Run 的句柄、锁及临时状态在成功、失败和停止路径全部释放。
@@ -73,6 +74,7 @@ Blocked by：T001
 - [ ] 重复 ID、错序 `seq`、跨 Run 错误引用、完整坏行和 workspace 不匹配均硬失败，不跳过后继续；
 - [ ] 唯一可恢复的残缺尾段被精确截断到上一条完整记录，旧记录字节保持不变；
 - [ ] requesting_model、awaiting_tool_approval 和副作用开始后中断的夹具分别恢复为 interrupted，并补出正确的 aborted / unknown ToolResult；
+- [ ] interrupted 的计量明确标记为 incomplete，未知值保持 `null`，正常终态仍保存完整非负整数计量；
 - [ ] 恢复不发起模型请求、不执行 Tool、不重试文件或命令，只向同一 JSONL 追加事实；
 - [ ] 活锁阻止第二写者，确定死亡的残留锁可回收，owner token 不匹配时不会误删锁；
 - [ ] 外部追加使旧 Agent 返回 session_changed，既有消息和文件尾部不被静默合并；
@@ -98,7 +100,7 @@ Blocked by：T001、T002
 - [ ] 实际 JSONL 证明新建、完成、重开、截尾和中断恢复的顺序与 Schema 1 一致；
 - [ ] 没有新增六个 Tool、确认 Interface、Tool Loop、`diff` 依赖或 Stage 02 行为；
 - [ ] 未在 Anthias 或开发者其他仓库写入运行 Session，未调用真实 Provider 或外部网络；
-- [ ] 汇报完成后停止，没有自动开始 T004、提交、推送或创建 PR。
+- [ ] 汇报完成后按本次授权提交 Stage 01，没有自动开始 T004、推送或创建 PR。
 
 ## Stage 02：Tool 系统接入与 Agent Loop 改造
 
@@ -133,6 +135,7 @@ Blocked by：T004
 
 交付：
 
+- 将生产 Session 默认目录迁移为 `<workspaceRoot>/data/conversation`，创建目录内本地 `.gitignore` 且不修改项目根 `.gitignore`；把实际 Session 目录作为文件 Tool 的统一保留路径；
 - 以固定映射实现 `read_file`、`glob` 和 `grep` 的 Schema、运行时校验、工作区路径约束、严格 UTF-8 行为、稳定输出和统一 ToolResult 截断；
 - 在 Agent 中实现 UserMessage 只追加一次、AssistantMessage 完成持久化、ToolCall 串行处理、ToolResult 持久化并回到下一次模型请求的循环；
 - 将 Assistant text / ToolCall part 与 ToolResultMessage 纳入 AgentState、Session 投影和模型上下文，未知 Tool 或无效输入产生 failed ToolResult；
@@ -142,6 +145,8 @@ Blocked by：T004
 
 验收：
 
+- [ ] 默认 Session 只写入当前 workspace 的 `data/conversation/<sessionId>.jsonl`，运行目录不进入 Git，项目根 `.gitignore` 不被修改；
+- [ ] 三个只读文件 Tool 均不能读取或遍历实际 Session 目录，Glob 与 Grep 的默认结果也不包含该目录；统一保留路径判断可由后续文件修改 Tool 复用，命令 Tool 的无沙箱边界保持明确；
 - [ ] 确定性模型按 `glob → grep → read_file → final` 完成一个 Run，三个 Tool 无人工确认且顺序正确；
 - [ ] 每条 AssistantMessage 在 Tool 处理前刷新，每个 ToolCall 都有同 ID、同 Tool 名的 ToolResult 并进入下一次模型请求；
 - [ ] 二进制/非法 UTF-8、错误正则、越界路径、未知 Tool 和 Schema 错误不产生本地副作用，并允许模型修正；
@@ -161,6 +166,7 @@ Blocked by：T005
 - 在 `apps/agent` 增加唯一直接运行时依赖 `diff@9.0.0` 并同步 lockfile；若本地 pnpm store 不具备该包，停止并单独申请外部网络授权；
 - 在 Agent Interface 增加 `respondToToolApproval`，在 AgentState、AgentEvent 与 TUI 中表达唯一待确认请求和批准 / 拒绝输入；
 - 实现 `edit_file` 与 `write_file` 的固定 Schema、运行时校验、无副作用预检、统一 Diff 或完整内容预览、目标 SHA-256 / 不存在状态指纹和确认内容上限；
+- 复用 T005 的保留路径判断，拒绝对实际 Session 目录执行预检、预览、创建、覆盖或编辑；
 - `edit_file` 在同一原始快照中验证非空 `oldText` 唯一且替换范围不重叠；`write_file` 只创建或覆盖目标文件，父目录必须已存在；
 - 批准后再次验证目标状态，以同目录临时文件、刷新和原子 rename 生效；状态变化返回 stale target，不隐式建目录；
 - 在任何实际文件副作用前持久化并刷新 ToolExecutionStartedRecord；拒绝时只记录 denied ToolResult，不写开始记录。
@@ -168,6 +174,7 @@ Blocked by：T005
 验收：
 
 - [ ] 确认请求发出后、批准前，目标文件及其父目录没有变化；
+- [ ] `edit_file` 与 `write_file` 不能以任何规范化路径或真实路径命中实际 Session 目录；
 - [ ] 批准的精确编辑、新建文件和覆盖文件只产生确认内容对应的变化，JSONL 中开始记录先于实际副作用、结果记录晚于副作用；
 - [ ] 拒绝不会产生 ToolExecutionStartedRecord 或本地副作用，denied ToolResult 能进入下一次模型请求并允许模型继续；
 - [ ] 预览后目标变更会返回 stale target，旧预览不能覆盖外部变化；
@@ -320,6 +327,6 @@ Blocked by：T010、T011
 ## 授权与下一步
 
 - 本 Tasks 已由开发者确认，当前仅授权 Stage 01（T001–T003）实施；
-- T001 已完成；T002 在恢复计量语义确认后开始，T003 完成 Stage 01 门禁与检查点汇报；
+- T001 已完成；本 Feature 文档已经明确恢复计量语义和最终 Session 位置，T002 可以开始，T003 完成 Stage 01 门禁与检查点汇报；
 - T003 汇报后停止，Stage 02 仍需开发者单独授权；
-- 外部网络、真实 Provider 验证、后续提交、推送和创建 PR 继续分别取得授权。
+- 当前已授权本次文档提交与 Stage 01 完成提交；外部网络、真实 Provider 验证、Stage 02、推送和创建 PR 继续分别取得授权。

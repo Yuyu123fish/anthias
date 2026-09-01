@@ -34,7 +34,7 @@ Model Adapter 只把 OpenAI-compatible 流转换为 Agent 内部的文本增量�
 
 ### 3.1 Session
 
-Session 是绑定一个规范化工作区根目录的、可持久化的线性编码上下文。一个 Session 使用一个 JSONL 文件保存历史事实。Feature 002 可以创建新 Session，也可以重新打开同一工作区中已有的 Session；不支持从中间消息分叉。
+Session 是绑定一个规范化工作区根目录的、可持久化的线性编码上下文。一个 Session 使用一个 JSONL 文件保存历史事实，默认物理位置为 `<workspaceRoot>/data/conversation/<sessionId>.jsonl`。Feature 002 可以创建新 Session，也可以重新打开同一工作区中已有的 Session；不支持从中间消息分叉。
 
 ### 3.2 Run
 
@@ -224,6 +224,9 @@ Feature 002 只向模型提供以下六个 Tool：
 ### 6.6 JSONL Session
 
 - 一个 Session 对应一个追加写入的 JSONL 文件，并绑定一个规范化 workspace root。
+- 默认 Session 目录是 `<workspaceRoot>/data/conversation`。该目录由 Anthias 持有，并在目录内部使用内容为 `*` 的本地 `.gitignore` 隐藏全部运行数据；Anthias 不自动修改项目根 `.gitignore`。
+- `ANTHIAS_SESSION_DIR` 可以覆盖默认 Session 目录，主要供测试和特殊部署使用；无论目录来自默认值还是覆盖值，路径解析、创建和文件访问都由 Agent Module 负责。
+- Agent 内置文件 Tool 不得读取、修改或遍历活动 Session 目录，避免模型把自身持久上下文再次读入或破坏正在追加的 JSONL。未来的 `execute_command` 在本 Feature 中没有 OS 沙箱，不能承诺无法访问该目录；每次命令仍必须经过人工确认。
 - 第一行是 SessionHeader，至少包含 schemaVersion、sessionId、createdAt 和 workspaceRoot。
 - 后续每条记录都有稳定 entryId、单调递增 seq 和 timestamp；属于 Run 的记录还包含 runId。
 - 除首行 SessionHeader 外，Feature 002 的持久记录只有 MessageRecord、ToolExecutionStartedRecord 和 RunFinishedRecord，不保存流式 delta 或 AgentEvent。
@@ -231,7 +234,7 @@ Feature 002 只向模型提供以下六个 Tool：
 - AssistantMessage 必须在执行其 ToolCall 之前完成追加。
 - ToolExecutionStartedRecord 必须在对应本地副作用之前完成追加和刷新。
 - ToolResultMessage 只在结果已终结后追加；结果文本遵守统一输出预算。
-- RunFinishedRecord 保存 completed、aborted、failed、budget_exhausted 或 interrupted 终态，以及实际模型请求数、ToolCall 数和活动执行时长。
+- RunFinishedRecord 保存 completed、aborted、failed、budget_exhausted 或 interrupted 终态。正常终结使用 `metricsStatus: "complete"` 并保存完整模型请求数、ToolCall 数和活动执行时长；重启恢复生成的 interrupted 记录使用 `metricsStatus: "incomplete"`，无法从持久事实精确还原的模型请求数和活动执行时长保持 `null`，不伪造精确值，ToolCall 数仍由已持久化消息准确计算。
 - Session 写入在 Agent 内串行化。Feature 002 不支持两个 Agent 进程同时写同一个 Session；不得把并发写入静默合并。
 - 打开 Session 时，workspaceRoot 不匹配必须拒绝继续，不能把历史上下文绑定到另一个工作区执行 Tool。
 - 只允许丢弃或截断文件末尾一条“没有换行结尾且 JSON 语法不完整”的残缺记录。任何位于文件中间的非法记录，以及已经换行结束但无法验证的最后一条记录，都视为 Session 损坏并停止加载，不能跳过损坏后继续恢复。
@@ -281,6 +284,7 @@ Feature 002 只向模型提供以下六个 Tool：
 - 同一 AssistantMessage 中的 ToolCall 串行处理。
 - Agent Interface 只为确认增加一个必要的响应行为，不增加 Tool Manager、Registry、内部 Loop 控制或持久化入口。
 - Session 使用一个 JSONL 文件保存线性事实；最终消息与副作用开始事实持久化，流式 delta 不持久化。
+- Session 最终默认保存在所属 workspace 的 `data/conversation`，目录内部自行忽略运行文件且不改项目根 `.gitignore`；文件 Tool 把该位置作为 Agent 自有保留目录。
 - 进程重启只恢复已完成的线性上下文，不继续活动 Run，也不自动重试可能有副作用的 ToolCall。
 - 当前不实现对话分叉，但保留可由未来记录引用的稳定身份和 schemaVersion；不预建空 Branch 或 parent graph。
 - Run 资源限制按模型请求数、ToolCall 数、活动执行时长和单结果输出分别表达，不使用单一 step 概念。

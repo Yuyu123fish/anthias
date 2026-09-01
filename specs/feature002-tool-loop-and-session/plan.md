@@ -5,17 +5,17 @@
 - 文档类型：Plan
 - 对应 Spec：[spec.md](spec.md)
 - Plan 结构：一个文档、三个线性 Stage
-- 授权状态：Plan 与 Tasks 已由开发者确认；当前文档基线本地提交及 Stage 01 实施已获授权，Stage 02、外部网络、真实 Provider、推送和 PR 尚未授权
+- 授权状态：Plan 与 Tasks 已由开发者确认；本次文档提交、Stage 01 剩余实施及其完成提交已获授权，Stage 02、外部网络、真实 Provider、推送和 PR 尚未授权
 
 ## 1. 当前基线与范围
 
-- 当前分支为 `main`，文档编写前 HEAD 为 `0a5c24d`；工作区只有尚未提交的 `specs/feature002-tool-loop-and-session/`。
+- 当前分支为 `main`，T001 已在 `efdf711` 完成；本次工作从该干净检查点更新 Feature 文档并继续 T002–T003。
 - 当前环境为 Windows、Node.js `v24.13.1`、pnpm `10.33.0`、PowerShell `7.5.4`。
-- `apps/agent` 已实现内存消息、一次提示词一次模型请求、文本流、单活动生成、取消、失败恢复和安全错误；内部 Model Stream 目前只产出字符串增量。
-- `apps/tui` 只依赖 `@anthias/agent`，通过 `state`、`prompt`、`abort` 和 `subscribe` 输入与呈现；当前没有 Session 选择、Tool 确认或 Tool 输出界面。
+- `apps/agent` 已实现 Schema 1 的文本 Session 新建、追加、按 UUID 重开、持久投影、一次提示词一次模型请求、文本流、单 activeRun、取消和安全错误；内部 Model Stream 目前只产出字符串增量。
+- `apps/tui` 只依赖 `@anthias/agent`，通过 `state`、`prompt`、`abort` 和 `subscribe` 输入与呈现；已经支持无参数新建和 `--session <sessionId>` 重开，当前没有 Tool 确认或 Tool 输出界面。
 - 生产 OpenAI-compatible Adapter 位于 Agent Module 内部，使用 AI SDK `7.0.85`，当前只转发 `text-delta` 并丢弃 ToolCall、finish reason 和 usage。
-- Feature 001 Report 记录的最近一次完整门禁为 Biome、Strict TypeScript、构建和 22 个测试通过；本次只改 Feature 文档，不重复运行同一代码版本的门禁。
-- 当前没有持久 Session、Tool、子进程或后台资源，也不存在需要迁移的历史 Session 文件。
+- T001 完成检查点的 `pnpm verify` 已通过 Biome、Strict TypeScript、构建和 37 个测试；T002 修改代码前以该结果作为干净基线。
+- 当前已有持久 Session 基础能力，但尚无完整损坏恢复、独占锁、Tool、子进程或后台资源；没有需要迁移的已发布历史 Session 格式。
 
 本 Plan 只交付 Spec 已定义的线性 JSONL Session、六个固定 Tool、逐次副作用确认、多模型请求 Agent Loop、TUI 闭环和整体本地验收。不会加入沙箱、可复用授权、PTY、后台命令、动态 Tool Registry、Compaction、分叉、Desktop 或多 Agent。
 
@@ -57,9 +57,9 @@ apps/agent
 
 - workspace root 默认为启动 Anthias 时的 `process.cwd()`，由 Agent 启动工厂通过真实路径规范化；Windows 比较同时规范盘符大小写和分隔符。
 - 新建 Session 时生成 UUID `sessionId`，文件名固定为 `<sessionId>.jsonl`。
-- Session 默认保存在工作区外的 Anthias 本地状态目录，避免污染代码仓库，也避免文件 Tool 直接读写活动 Session：
-  - Windows：`%LOCALAPPDATA%\Anthias\sessions`；缺失时回退到用户目录下 `.anthias\sessions`；
-  - POSIX：`$XDG_STATE_HOME/anthias/sessions`；缺失时回退到 `~/.local/state/anthias/sessions`。
+- Feature 002 完成后的默认 Session 目录固定为 `<workspaceRoot>/data/conversation`。Stage 01 保留 T001 已完成的目录 seam 和过渡默认值；Stage 02 在接入文件 Tool 时同步迁移生产默认值，避免出现“Session 已进入 workspace、文件 Tool 尚未隔离”的中间状态。
+- Anthias 在 `data/conversation` 内创建内容为 `*` 的本地 `.gitignore`，使运行 JSONL 和该忽略文件自身都不进入 Git；运行时不修改项目根 `.gitignore`。
+- 默认 Session 目录是 Agent 自有保留路径。Stage 02 的 `read_file`、`glob`、`grep`、`edit_file` 和 `write_file` 必须拒绝读取、修改或遍历该目录；没有 OS 沙箱的 `execute_command` 不能提供同等隔离，因此仍逐次确认并明确保留这一安全边界。
 - `ANTHIAS_SESSION_DIR` 只覆盖 Session 目录，主要用于本地部署和测试；目录解析、创建和文件访问仍由 Agent Module 负责。
 - CLI 不带 Session 参数时创建新 Session；`--session <sessionId>` 只按 UUID 打开默认 Session 目录中的文件，不接受任意文件路径或路径片段。
 - TUI 启动后展示 `sessionId` 和规范化 workspace root；Feature 002 不增加 Session 列表、删除、重命名、复制或分叉命令。
@@ -74,7 +74,7 @@ apps/agent
 | `SessionHeader` | `type: "session_header"`、`schemaVersion: 1`、`sessionId`、`createdAt`、`workspaceRoot`、固定 Shell 描述 |
 | `MessageRecord` | `type: "message"`、`entryId`、`seq`、`timestamp`、`runId`、一个完整 UserMessage、AssistantMessage 或 ToolResultMessage |
 | `ToolExecutionStartedRecord` | `type: "tool_execution_started"`、`entryId`、`seq`、`timestamp`、`runId`、`toolCallId`、`toolName`、`toolApprovalRequestId` |
-| `RunFinishedRecord` | `type: "run_finished"`、`entryId`、`seq`、`timestamp`、`runId`、终态、模型请求数、ToolCall 数、活动执行毫秒数、可选预算种类和可用的累计模型 usage |
+| `RunFinishedRecord` | `type: "run_finished"`、`entryId`、`seq`、`timestamp`、`runId`、终态、计量完整性、模型请求数、ToolCall 数、活动执行毫秒数、可选预算种类和可用的累计模型 usage |
 
 消息持久形状固定为：
 
@@ -97,6 +97,7 @@ apps/agent
 - 加载时逐行校验 Header、Schema、字段、UUID、`seq`、引用顺序、ToolCall 唯一性和 Run 线性关系；未知记录类型、工作区不匹配、完整坏行、中间坏行或断裂引用直接拒绝打开。
 - 仅“文件末尾没有换行且 JSON 语法不完整”的最后一段可以截断到前一个完整换行；已经换行结束的无效尾行仍然是损坏。
 - 最后一个 Run 缺少 `RunFinishedRecord` 时，在同一独占锁内按 ToolCall 顺序追加恢复记录：已有开始记录但无结果者补 `unknown`，没有开始记录且无结果者补 `aborted`，最后追加 `interrupted` RunFinishedRecord。
+- 恢复生成的 `interrupted` RunFinishedRecord 使用 `metricsStatus: "incomplete"`；无法从持久记录精确还原的 `modelRequestCount` 与 `activeDurationMilliseconds` 为 `null`，`toolCallCount` 从已持久化 Assistant ToolCall 准确计算。正常终结使用 `metricsStatus: "complete"` 和非负整数计量。
 - 恢复只追加事实，不重写旧记录、不恢复模型流、不执行 Tool，也不自动重试文件或命令。
 
 ### 3.5 Agent Interface 与生命周期
@@ -189,6 +190,8 @@ Agent Module 在每次模型请求前重建 Coding Agent 系统提示词，至�
 Session 消息投影在 Model Adapter 边界内转换为 Provider 所需的 user、assistant 和 tool message；Assistant ToolCall 与 ToolResult 必须保留原 `toolCallId`。完成消息是唯一上下文来源，不把 AgentEvent、ToolExecutionStartedRecord、确认 UI 或安全错误发送给模型。
 
 ### 5.3 固定 Tool 合同
+
+Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<workspaceRoot>/data/conversation`，创建目录内本地 `.gitignore`，并把解析后的 Session 目录加入文件 Tool 的统一保留路径判断。路径比较必须覆盖规范化路径、真实路径和平台大小写语义；默认 Glob 与 Grep 也不能把保留目录纳入候选集合。
 
 | Tool | 输入 | 准备与执行 |
 | --- | --- | --- |
@@ -375,4 +378,4 @@ Stage 02 首次加入依赖时由实施 Agent 更新 manifest 与 lockfile；之
 
 - 本 Plan 已由开发者确认并标记为“已计划”。
 - 开发者已确认唯一 Tasks，并明确授权当前文档基线本地提交和 Stage 01 实施；Stage 01 完成汇报后停止。
-- Stage 02 实施、依赖联网、真实 Provider、真实凭据、后续本地提交、推送和 PR 继续分别取得授权。
+- 本次文档提交与 Stage 01 完成提交已经获得授权；Stage 02 实施、依赖联网、真实 Provider、真实凭据、推送和 PR 继续分别取得授权。
