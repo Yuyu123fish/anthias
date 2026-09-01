@@ -18,11 +18,11 @@ type ModelVariable = (typeof MODEL_VARIABLES)[number];
 type Environment = Readonly<Partial<Record<ModelVariable, string | undefined>>>;
 
 export function readModelConfig(environment: Environment = process.env): ModelConfigResult {
-  const missing = MODEL_VARIABLES.filter((name) => !environment[name]?.trim());
-  if (missing.length > 0) {
+  const missingVariables = MODEL_VARIABLES.filter((name) => !environment[name]?.trim());
+  if (missingVariables.length > 0) {
     return Object.freeze({
       ok: false,
-      error: `缺少模型配置：${missing.join("、")}。请通过本地环境变量提供。`,
+      error: `缺少模型配置：${missingVariables.join("、")}。请通过本地环境变量提供。`,
     });
   }
 

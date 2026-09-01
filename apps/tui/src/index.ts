@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import type { Agent, AgentEvent } from "@anthias/agent";
+import type { Agent, AgentEvent, PromptResult } from "@anthias/agent";
 
 export type TuiSignalSource = Readonly<{
   on(event: "SIGINT", listener: () => void): void;
@@ -10,7 +10,7 @@ export type RunTuiOptions = Readonly<{
   agent: Agent;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
-  signals?: TuiSignalSource;
+  signalSource?: TuiSignalSource;
 }>;
 
 const INPUT_PROMPT = "anthias> ";
@@ -20,14 +20,14 @@ export function runTui({
   agent,
   input = process.stdin,
   output = process.stdout,
-  signals = process,
+  signalSource = process,
 }: RunTuiOptions): Promise<number> {
-  const readline = createInterface({ input, output, terminal: false });
-  const done = Promise.withResolvers<number>();
-  let pendingPrompt: Promise<unknown> | null = null;
+  const readlineInterface = createInterface({ input, output, terminal: false });
+  const exitCompletion = Promise.withResolvers<number>();
+  let pendingPromptResultPromise: Promise<PromptResult> | null = null;
   let exitStarted = false;
 
-  const unsubscribe = agent.subscribe((event) => renderEvent(event, output));
+  const unsubscribeFromAgentEvents = agent.subscribe((event) => renderEvent(event, output));
 
   const onSigint = () => {
     if (agent.state.running) {
@@ -43,14 +43,14 @@ export function runTui({
     }
     exitStarted = true;
     agent.abort();
-    readline.close();
+    readlineInterface.close();
 
     try {
-      await pendingPrompt;
+      await pendingPromptResultPromise;
     } finally {
-      unsubscribe();
-      signals.off("SIGINT", onSigint);
-      done.resolve(0);
+      unsubscribeFromAgentEvents();
+      signalSource.off("SIGINT", onSigint);
+      exitCompletion.resolve(0);
     }
   }
 
@@ -64,7 +64,7 @@ export function runTui({
     }
     if (line.trim().length === 0) {
       output.write("请输入非空提示词。\n");
-      writePrompt(output);
+      writeInputPrompt(output);
       return;
     }
     if (agent.state.running) {
@@ -72,31 +72,33 @@ export function runTui({
       return;
     }
 
-    const execution = agent.prompt(line);
-    pendingPrompt = execution;
-    const result = await execution;
-    if (pendingPrompt === execution) {
-      pendingPrompt = null;
+    const promptResultPromise = agent.prompt(line);
+    pendingPromptResultPromise = promptResultPromise;
+    const promptResult = await promptResultPromise;
+    if (pendingPromptResultPromise === promptResultPromise) {
+      pendingPromptResultPromise = null;
     }
 
-    if (result.status === "rejected") {
-      output.write(result.reason === "empty" ? "请输入非空提示词。\n" : "当前响应仍在生成。\n");
+    if (promptResult.status === "rejected") {
+      output.write(
+        promptResult.reason === "empty" ? "请输入非空提示词。\n" : "当前响应仍在生成。\n",
+      );
     }
     if (!exitStarted) {
-      writePrompt(output);
+      writeInputPrompt(output);
     }
   }
 
-  signals.on("SIGINT", onSigint);
-  readline.on("line", (line) => {
+  signalSource.on("SIGINT", onSigint);
+  readlineInterface.on("line", (line) => {
     void handleLine(line);
   });
-  readline.on("close", () => {
+  readlineInterface.on("close", () => {
     void requestExit();
   });
 
-  writePrompt(output);
-  return done.promise;
+  writeInputPrompt(output);
+  return exitCompletion.promise;
 }
 
 function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
@@ -130,6 +132,6 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   }
 }
 
-function writePrompt(output: NodeJS.WritableStream): void {
+function writeInputPrompt(output: NodeJS.WritableStream): void {
   output.write(INPUT_PROMPT);
 }

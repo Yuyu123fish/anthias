@@ -30,6 +30,13 @@
 - 终端状态、AbortController、模型流以及后续线程、进程、文件句柄和网络请求必须有明确持有者、取消方式和关闭时机。
 - 敏感值只进入被忽略的本地配置或环境变量；仓库文件只保留变量名、占位符和安全默认值。
 
+## 命名
+
+- 名称必须说明值实际代表的对象，不能只写角色、状态或类型判别值；一条 Assistant 消息使用 `assistantMessage`，不能简写为 `assistant`。
+- 长生命周期或异步状态使用完整名词表达所有权、阶段和值类型，例如 `activeGeneration`、`responseIterator`、`pendingPromptResultPromise`；避免脱离小局部后含义不明的 `run`、`context`、`done`、`next`。
+- 不为了穷举生命周期而扩张一组近义公开类型。一个判别联合或状态字段足以表达时，优先保留少量领域类型，再用明确变量名说明当前阶段。
+- 方法、变量和类型名称首先服务于代码阅读；不能因为 TypeScript 能推断类型就省略 `Message`、`Result`、`Iterator` 等决定语义的名词。
+
 ## 代码注释
 
 - 注释和 JSDoc 统一使用中文，`Conversation`、`Turn`、`Run`、`Host`、`MessagePort`、`AbortSignal` 等正式术语保留英文。

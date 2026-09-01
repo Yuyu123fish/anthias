@@ -6,14 +6,14 @@ import { runTui } from "./index.js";
 import { createOpenAICompatibleModelStream } from "./model-adapter.js";
 
 async function main(): Promise<number> {
-  const config = readModelConfig();
-  if (!config.ok) {
-    process.stderr.write(`${config.error}\n`);
+  const modelConfigResult = readModelConfig();
+  if (!modelConfigResult.ok) {
+    process.stderr.write(`${modelConfigResult.error}\n`);
     return 1;
   }
 
   const agent = createAgent({
-    modelStream: createOpenAICompatibleModelStream(config.config),
+    modelStream: createOpenAICompatibleModelStream(modelConfigResult.config),
   });
   return runTui({ agent });
 }

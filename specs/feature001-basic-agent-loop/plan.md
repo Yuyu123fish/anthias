@@ -75,8 +75,8 @@ Agent 通过 `apps/agent/src/index.ts` 向 TUI 和测试提供小 Interface；Mo
 
 公开 Interface 的类型语义在本 Plan 固定如下：
 
-- state 是不可由调用者修改的快照，包含按顺序结束的消息、当前正在流式生成的 Assistant 消息或空值、`running` 和安全的 `lastError`；活动 Assistant 不同时重复出现在结束消息中；
-- 用户消息只包含 role 与正文；Assistant 消息另外包含 streaming、completed、aborted 或 failed 状态，不增加 MessageId、ConversationId、TurnId 或 RunId；
+- state 是不可由调用者修改的快照，`messageHistory` 保存按顺序结束的消息，`activeAssistantMessage` 保存当前正在流式生成的 Assistant 消息或空值，另外包含 `running` 和安全的 `lastError`；活动消息不同时重复出现在历史中；
+- 公开消息类型只保留 `UserMessage`、`AssistantMessage` 和二者组成的 `Message`；Assistant 消息通过 streaming、completed、aborted 或 failed 状态表达阶段，不为每个阶段建立近义类型，也不增加 MessageId、ConversationId、TurnId 或 RunId；
 - `prompt(text)` 返回以 `status` 判别的异步结果：拒绝为 `{ status: "rejected", reason: "empty" | "busy" }`，正常完成为 `{ status: "completed" }`，中止为 `{ status: "aborted" }`，失败为 `{ status: "failed", error: string }`；其中 error 必须是可安全展示的文本；
 - rejected 结果立即返回且没有事件；已接受执行的结果在最终 message_end、agent_end、资源释放和空闲状态恢复后返回；
 - `abort()` 返回 void，空闲或已经终结时调用均无副作用；

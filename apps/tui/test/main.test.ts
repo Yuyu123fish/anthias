@@ -10,14 +10,14 @@ describe("Anthias CLI", () => {
     delete env.ANTHIAS_MODEL_API_KEY;
     const mainPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
 
-    const result = spawnSync(process.execPath, [mainPath], {
+    const processResult = spawnSync(process.execPath, [mainPath], {
       env,
       encoding: "utf8",
       timeout: 5_000,
     });
 
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("缺少模型配置");
-    expect(result.stderr).toContain("ANTHIAS_MODEL_API_KEY");
+    expect(processResult.status).toBe(1);
+    expect(processResult.stderr).toContain("缺少模型配置");
+    expect(processResult.stderr).toContain("ANTHIAS_MODEL_API_KEY");
   });
 });

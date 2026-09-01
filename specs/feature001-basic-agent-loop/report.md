@@ -33,11 +33,11 @@ apps/tui/src/main.ts
 TUI 呈现 ← AgentEvent ← Agent 状态更新与统一终结
 ```
 
-`apps/tui` 单向依赖 `apps/agent`。Agent 公共面只有 state、prompt、abort、subscribe 及其必要类型；AI SDK 和 OpenAI-compatible Provider 类型只存在于 TUI 的生产 Adapter。
+`apps/tui` 单向依赖 `apps/agent`。Agent 公共面只有 state、prompt、abort、subscribe 及其必要类型；公开消息收敛为 `UserMessage`、`AssistantMessage` 和 `Message`，state 使用 `messageHistory` 与 `activeAssistantMessage` 明确区分历史和活动消息。AI SDK 和 OpenAI-compatible Provider 类型只存在于 TUI 的生产 Adapter。
 
 ## 3. 并发、取消、失败与资源边界
 
-- 一个 Agent 同时只有一个 active run；终态发布完成前仍保持 busy，避免同步订阅者重入 prompt 时把下一轮事件插入上一轮 `agent_end` 之前。
+- 一个 Agent 同时只有一个 `activeGeneration`；终态发布完成前仍保持 busy，避免同步订阅者重入 prompt 时把下一轮事件插入上一轮 `agent_end` 之前。
 - completed、aborted、failed 共用同一终结路径，第一次终态生效；晚到增量、异常或取消不会再次结束本轮。
 - abort 通过本轮 `AbortController` 取消底层请求，并与挂起的迭代器读取竞争；迭代器 `return()` 只做不阻塞终态的收尾。
 - 失败和停止都会保留已生成正文，清除活动引用并恢复空闲；新一轮接受时清除上一轮安全错误。

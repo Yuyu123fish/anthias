@@ -3,66 +3,56 @@ export type UserMessage = Readonly<{
   content: string;
 }>;
 
-export type StreamingAssistantMessage = Readonly<{
+export type AssistantMessage = Readonly<{
   role: "assistant";
   content: string;
-  status: "streaming";
+  status: "streaming" | "completed" | "aborted" | "failed";
 }>;
 
-export type TerminalAssistantMessage = Readonly<{
-  role: "assistant";
-  content: string;
-  status: "completed" | "aborted" | "failed";
-}>;
-
-export type AssistantMessage = StreamingAssistantMessage | TerminalAssistantMessage;
-export type AgentMessage = UserMessage | AssistantMessage;
-export type EndedMessage = UserMessage | TerminalAssistantMessage;
+export type Message = UserMessage | AssistantMessage;
 
 export type AgentState = Readonly<{
-  messages: readonly EndedMessage[];
-  currentAssistant: StreamingAssistantMessage | null;
+  messageHistory: readonly Message[];
+  activeAssistantMessage: AssistantMessage | null;
   running: boolean;
   lastError: string | null;
 }>;
 
-export type RejectedPromptResult = Readonly<{
-  status: "rejected";
-  reason: "empty" | "busy";
-}>;
+export type FinishedPromptResult =
+  | Readonly<{ status: "completed" }>
+  | Readonly<{ status: "aborted" }>
+  | Readonly<{ status: "failed"; error: string }>;
 
-export type CompletedPromptResult = Readonly<{ status: "completed" }>;
-export type AbortedPromptResult = Readonly<{ status: "aborted" }>;
-export type FailedPromptResult = Readonly<{ status: "failed"; error: string }>;
-export type TerminalPromptResult = CompletedPromptResult | AbortedPromptResult | FailedPromptResult;
-export type PromptResult = RejectedPromptResult | TerminalPromptResult;
+export type PromptResult =
+  | Readonly<{ status: "rejected"; reason: "empty" | "busy" }>
+  | FinishedPromptResult;
 
 export type AgentEvent =
   | Readonly<{ type: "agent_start" }>
-  | Readonly<{ type: "message_start"; message: AgentMessage }>
+  | Readonly<{ type: "message_start"; message: Message }>
   | Readonly<{
       type: "message_update";
-      message: StreamingAssistantMessage;
+      message: AssistantMessage;
       delta: string;
     }>
-  | Readonly<{ type: "message_end"; message: EndedMessage }>
-  | Readonly<{ type: "agent_end"; result: TerminalPromptResult }>;
+  | Readonly<{ type: "message_end"; message: Message }>
+  | Readonly<{ type: "agent_end"; result: FinishedPromptResult }>;
 
-export type ModelMessage = Readonly<{
+export type ModelInputMessage = Readonly<{
   role: "user" | "assistant";
   content: string;
 }>;
 
 export type ModelStream = (
-  messages: readonly ModelMessage[],
-  signal: AbortSignal,
+  modelMessages: readonly ModelInputMessage[],
+  abortSignal: AbortSignal,
 ) => AsyncIterable<string>;
 
 export type AgentListener = (event: AgentEvent) => void;
 
 export type Agent = Readonly<{
   readonly state: AgentState;
-  prompt(text: string): Promise<PromptResult>;
+  prompt(promptText: string): Promise<PromptResult>;
   abort(): void;
   subscribe(listener: AgentListener): () => void;
 }>;
@@ -71,201 +61,207 @@ export type CreateAgentOptions = Readonly<{
   modelStream: ModelStream;
 }>;
 
-type MutableUserMessage = {
-  role: "user";
-  content: string;
-};
-
 type MutableAssistantMessage = {
   role: "assistant";
   content: string;
   status: "streaming" | "completed" | "aborted" | "failed";
 };
 
-type MutableEndedMessage = MutableUserMessage | MutableAssistantMessage;
-
-type ActiveRun = {
-  controller: AbortController;
-  assistant: MutableAssistantMessage;
-  iterator: AsyncIterator<string> | null;
-  terminal: TerminalPromptResult | null;
+type ActiveGeneration = {
+  abortController: AbortController;
+  assistantMessage: MutableAssistantMessage;
+  responseIterator: AsyncIterator<string> | null;
+  promptResult: FinishedPromptResult | null;
 };
 
-const ABORTED = Symbol("aborted");
+const ABORT_SIGNAL_RECEIVED = Symbol("abort-signal-received");
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 
-const EMPTY_RESULT: RejectedPromptResult = Object.freeze({
+const EMPTY_PROMPT_RESULT = Object.freeze({
   status: "rejected",
   reason: "empty",
-});
-const BUSY_RESULT: RejectedPromptResult = Object.freeze({
+} as const);
+const BUSY_PROMPT_RESULT = Object.freeze({
   status: "rejected",
   reason: "busy",
-});
-const COMPLETED_RESULT: CompletedPromptResult = Object.freeze({ status: "completed" });
-const ABORTED_RESULT: AbortedPromptResult = Object.freeze({ status: "aborted" });
+} as const);
+const COMPLETED_PROMPT_RESULT = Object.freeze({ status: "completed" } as const);
+const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
 
 export function createAgent({ modelStream }: CreateAgentOptions): Agent {
-  const messages: MutableEndedMessage[] = [];
-  const listeners = new Set<AgentListener>();
-  let currentAssistant: MutableAssistantMessage | null = null;
+  const messageHistory: Message[] = [];
+  const eventListeners = new Set<AgentListener>();
+  let activeAssistantMessage: MutableAssistantMessage | null = null;
   let lastError: string | null = null;
-  let activeRun: ActiveRun | null = null;
+  let activeGeneration: ActiveGeneration | null = null;
 
-  function getState(): AgentState {
+  function createStateSnapshot(): AgentState {
     return Object.freeze({
-      messages: Object.freeze(messages.map(snapshotEndedMessage)),
-      currentAssistant: currentAssistant
-        ? (snapshotAssistant(currentAssistant) as StreamingAssistantMessage)
+      messageHistory: Object.freeze([...messageHistory]),
+      activeAssistantMessage: activeAssistantMessage
+        ? snapshotAssistantMessage(activeAssistantMessage)
         : null,
-      running: activeRun !== null,
+      running: activeGeneration !== null,
       lastError,
     });
   }
 
-  function emit(event: AgentEvent): void {
-    const frozenEvent = Object.freeze(event);
-    for (const listener of [...listeners]) {
+  function publishEvent(event: AgentEvent): void {
+    const eventSnapshot = Object.freeze(event);
+    for (const listener of [...eventListeners]) {
       // 订阅者只负责观察；渲染回调的同步异常不能破坏 Agent 的唯一终结路径。
       try {
-        void listener(frozenEvent);
+        void listener(eventSnapshot);
       } catch {
         // Feature 001 不增加第二条监听器错误通道。
       }
     }
   }
 
-  function subscribe(listener: AgentListener): () => void {
-    listeners.add(listener);
+  function subscribeToEvents(listener: AgentListener): () => void {
+    eventListeners.add(listener);
     let subscribed = true;
     return () => {
       if (!subscribed) {
         return;
       }
       subscribed = false;
-      listeners.delete(listener);
+      eventListeners.delete(listener);
     };
   }
 
-  function abort(): void {
-    activeRun?.controller.abort();
+  function abortActiveGeneration(): void {
+    activeGeneration?.abortController.abort();
   }
 
-  async function prompt(text: string): Promise<PromptResult> {
-    if (text.trim().length === 0) {
-      return EMPTY_RESULT;
+  async function submitPrompt(promptText: string): Promise<PromptResult> {
+    if (promptText.trim().length === 0) {
+      return EMPTY_PROMPT_RESULT;
     }
-    if (activeRun !== null) {
-      return BUSY_RESULT;
+    if (activeGeneration !== null) {
+      return BUSY_PROMPT_RESULT;
     }
 
     lastError = null;
-    const controller = new AbortController();
-    const assistant: MutableAssistantMessage = {
+    const abortController = new AbortController();
+    const assistantMessage: MutableAssistantMessage = {
       role: "assistant",
       content: "",
       status: "streaming",
     };
-    const run: ActiveRun = {
-      controller,
-      assistant,
-      iterator: null,
-      terminal: null,
+    const generation: ActiveGeneration = {
+      abortController,
+      assistantMessage,
+      responseIterator: null,
+      promptResult: null,
     };
-    activeRun = run;
+    activeGeneration = generation;
 
-    const userMessage: MutableUserMessage = { role: "user", content: text };
-    messages.push(userMessage);
-    emit({ type: "agent_start" });
-    emit({ type: "message_start", message: snapshotUser(userMessage) });
-    emit({ type: "message_end", message: snapshotUser(userMessage) });
-    currentAssistant = assistant;
-    emit({ type: "message_start", message: snapshotAssistant(assistant) });
+    const userMessage: UserMessage = Object.freeze({ role: "user", content: promptText });
+    messageHistory.push(userMessage);
+    publishEvent({ type: "agent_start" });
+    publishEvent({ type: "message_start", message: userMessage });
+    publishEvent({ type: "message_end", message: userMessage });
+    activeAssistantMessage = assistantMessage;
+    publishEvent({
+      type: "message_start",
+      message: snapshotAssistantMessage(assistantMessage),
+    });
 
-    if (controller.signal.aborted) {
-      return finishRun(run, ABORTED_RESULT);
+    if (abortController.signal.aborted) {
+      return finishGeneration(generation, ABORTED_PROMPT_RESULT);
     }
 
     try {
-      const context = Object.freeze(messages.map(toModelMessage));
-      const iterator = modelStream(context, controller.signal)[Symbol.asyncIterator]();
-      run.iterator = iterator;
+      const modelMessages = Object.freeze(messageHistory.map(toModelInputMessage));
+      const responseIterator = modelStream(modelMessages, abortController.signal)[
+        Symbol.asyncIterator
+      ]();
+      generation.responseIterator = responseIterator;
 
       while (true) {
-        const next = await nextWithAbort(iterator, controller.signal);
-        if (next === ABORTED || controller.signal.aborted) {
-          return finishRun(run, ABORTED_RESULT);
+        const nextChunkResult = await readNextChunkOrAbort(
+          responseIterator,
+          abortController.signal,
+        );
+        if (nextChunkResult === ABORT_SIGNAL_RECEIVED || abortController.signal.aborted) {
+          return finishGeneration(generation, ABORTED_PROMPT_RESULT);
         }
-        if (next.done) {
-          return finishRun(run, COMPLETED_RESULT);
+        if (nextChunkResult.done) {
+          return finishGeneration(generation, COMPLETED_PROMPT_RESULT);
         }
-        if (next.value.length === 0 || run.terminal !== null || activeRun !== run) {
+        if (
+          nextChunkResult.value.length === 0 ||
+          generation.promptResult !== null ||
+          activeGeneration !== generation
+        ) {
           continue;
         }
 
-        assistant.content += next.value;
-        emit({
+        assistantMessage.content += nextChunkResult.value;
+        publishEvent({
           type: "message_update",
-          message: snapshotAssistant(assistant) as StreamingAssistantMessage,
-          delta: next.value,
+          message: snapshotAssistantMessage(assistantMessage),
+          delta: nextChunkResult.value,
         });
       }
     } catch {
-      if (controller.signal.aborted) {
-        return finishRun(run, ABORTED_RESULT);
+      if (abortController.signal.aborted) {
+        return finishGeneration(generation, ABORTED_PROMPT_RESULT);
       }
-      return finishRun(run, Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR }));
+      return finishGeneration(
+        generation,
+        Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR }),
+      );
     }
   }
 
-  function finishRun(run: ActiveRun, requested: TerminalPromptResult): TerminalPromptResult {
+  function finishGeneration(
+    generation: ActiveGeneration,
+    promptResult: FinishedPromptResult,
+  ): FinishedPromptResult {
     // 完成、失败、取消可能相邻发生；第一次进入终态后，其余路径只能读取既有结果。
-    if (run.terminal !== null) {
-      return run.terminal;
+    if (generation.promptResult !== null) {
+      return generation.promptResult;
     }
-    run.terminal = requested;
+    generation.promptResult = promptResult;
 
-    const status = requested.status;
-    run.assistant.status = status;
-    const endedAssistant = snapshotAssistant(run.assistant) as TerminalAssistantMessage;
-    messages.push({ ...run.assistant });
-    currentAssistant = null;
-    if (status === "failed") {
-      lastError = requested.error;
+    generation.assistantMessage.status = promptResult.status;
+    const finalAssistantMessage = snapshotAssistantMessage(generation.assistantMessage);
+    messageHistory.push(finalAssistantMessage);
+    activeAssistantMessage = null;
+    if (promptResult.status === "failed") {
+      lastError = promptResult.error;
     }
 
-    const iterator = run.iterator;
-    run.iterator = null;
+    const responseIterator = generation.responseIterator;
+    generation.responseIterator = null;
 
-    // 保留 activeRun 直到 agent_end 已同步交付，避免订阅者重入 prompt 打断事件骨架。
-    emit({ type: "message_end", message: endedAssistant });
-    emit({ type: "agent_end", result: requested });
+    // 保留 activeGeneration 直到 agent_end 已同步交付，避免订阅者重入 prompt 打断事件骨架。
+    publishEvent({ type: "message_end", message: finalAssistantMessage });
+    publishEvent({ type: "agent_end", result: promptResult });
 
-    if (status === "aborted" && iterator?.return) {
+    if (promptResult.status === "aborted" && responseIterator?.return) {
       // AbortSignal 负责立即取消底层请求；return 只做不阻塞终态的迭代器收尾。
-      void iterator.return().catch(() => undefined);
+      void responseIterator.return().catch(() => undefined);
     }
-    if (activeRun === run) {
-      activeRun = null;
+    if (activeGeneration === generation) {
+      activeGeneration = null;
     }
-    return requested;
+    return promptResult;
   }
 
   return Object.freeze({
     get state() {
-      return getState();
+      return createStateSnapshot();
     },
-    prompt,
-    abort,
-    subscribe,
+    prompt: submitPrompt,
+    abort: abortActiveGeneration,
+    subscribe: subscribeToEvents,
   });
 }
 
-function snapshotUser(message: MutableUserMessage): UserMessage {
-  return Object.freeze({ role: "user", content: message.content });
-}
-
-function snapshotAssistant(message: MutableAssistantMessage): AssistantMessage {
+function snapshotAssistantMessage(message: MutableAssistantMessage): AssistantMessage {
   return Object.freeze({
     role: "assistant",
     content: message.content,
@@ -273,42 +269,36 @@ function snapshotAssistant(message: MutableAssistantMessage): AssistantMessage {
   });
 }
 
-function snapshotEndedMessage(message: MutableEndedMessage): EndedMessage {
-  return message.role === "user"
-    ? snapshotUser(message)
-    : (snapshotAssistant(message) as EndedMessage);
-}
-
-function toModelMessage(message: MutableEndedMessage): ModelMessage {
+function toModelInputMessage(message: Message): ModelInputMessage {
   return Object.freeze({ role: message.role, content: message.content });
 }
 
-function nextWithAbort(
-  iterator: AsyncIterator<string>,
-  signal: AbortSignal,
-): Promise<IteratorResult<string> | typeof ABORTED> {
-  if (signal.aborted) {
-    return Promise.resolve(ABORTED);
+function readNextChunkOrAbort(
+  responseIterator: AsyncIterator<string>,
+  abortSignal: AbortSignal,
+): Promise<IteratorResult<string> | typeof ABORT_SIGNAL_RECEIVED> {
+  if (abortSignal.aborted) {
+    return Promise.resolve(ABORT_SIGNAL_RECEIVED);
   }
 
   // 某些迭代器不会立即响应 AbortSignal；竞速可让 Agent 先进入唯一中止终态。
   return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      cleanup();
-      resolve(ABORTED);
+    const handleAbort = () => {
+      removeAbortListener();
+      resolve(ABORT_SIGNAL_RECEIVED);
     };
-    const cleanup = () => {
-      signal.removeEventListener("abort", onAbort);
+    const removeAbortListener = () => {
+      abortSignal.removeEventListener("abort", handleAbort);
     };
 
-    signal.addEventListener("abort", onAbort, { once: true });
-    Promise.resolve(iterator.next()).then(
-      (result) => {
-        cleanup();
-        resolve(result);
+    abortSignal.addEventListener("abort", handleAbort, { once: true });
+    Promise.resolve(responseIterator.next()).then(
+      (nextChunkResult) => {
+        removeAbortListener();
+        resolve(nextChunkResult);
       },
       (error: unknown) => {
-        cleanup();
+        removeAbortListener();
         reject(error);
       },
     );

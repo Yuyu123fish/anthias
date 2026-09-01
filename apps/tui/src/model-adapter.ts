@@ -14,30 +14,30 @@ export function createOpenAICompatibleModelStream({
     apiKey,
   });
 
-  return (messages, signal) => {
-    const result = streamText({
+  return (modelMessages, abortSignal) => {
+    const streamResult = streamText({
       model: provider.chatModel(modelId),
-      messages: messages.map(({ role, content }) => ({ role, content })),
-      abortSignal: signal,
+      messages: modelMessages.map(({ role, content }) => ({ role, content })),
+      abortSignal,
       maxRetries: 0,
       // 原始 Provider 错误不得由 AI SDK 写入终端；下方统一转换为 Adapter 内部异常。
       onError: () => undefined,
     });
 
     // fullStream 保留 error part，Adapter 才能在不暴露 Provider 细节时可靠地让本轮失败。
-    return streamTextDeltas(result.fullStream);
+    return streamTextDeltas(streamResult.fullStream);
   };
 }
 
 async function* streamTextDeltas(
-  stream: AsyncIterable<
+  fullStream: AsyncIterable<
     Readonly<{ type: "text-delta"; text: string }> | Readonly<{ type: string }>
   >,
 ): AsyncIterable<string> {
-  for await (const part of stream) {
-    if (part.type === "text-delta" && "text" in part) {
-      yield part.text;
-    } else if (part.type === "error") {
+  for await (const streamPart of fullStream) {
+    if (streamPart.type === "text-delta" && "text" in streamPart) {
+      yield streamPart.text;
+    } else if (streamPart.type === "error") {
       throw new Error("OpenAI-compatible 模型流失败。");
     }
   }

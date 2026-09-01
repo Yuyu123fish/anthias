@@ -12,10 +12,10 @@ afterEach(async () => {
 
 describe("createOpenAICompatibleModelStream", () => {
   it("streams text through one local OpenAI-compatible request", async () => {
-    let requests = 0;
+    let requestCount = 0;
     let requestBody: unknown;
     const server = await startServer(async (request, response) => {
-      requests += 1;
+      requestCount += 1;
       requestBody = JSON.parse(await readBody(request));
       expect(request.headers.authorization).toBe("Bearer test-key");
       response.writeHead(200, {
@@ -42,16 +42,16 @@ describe("createOpenAICompatibleModelStream", () => {
       apiKey: "test-key",
     });
 
-    const chunks: string[] = [];
+    const textChunks: string[] = [];
     for await (const chunk of modelStream(
       [{ role: "user", content: "hello" }],
       new AbortController().signal,
     )) {
-      chunks.push(chunk);
+      textChunks.push(chunk);
     }
 
-    expect(chunks).toEqual(["hello", " world"]);
-    expect(requests).toBe(1);
+    expect(textChunks).toEqual(["hello", " world"]);
+    expect(requestCount).toBe(1);
     expect(requestBody).toMatchObject({
       model: "test-model",
       messages: [{ role: "user", content: "hello" }],
@@ -60,9 +60,9 @@ describe("createOpenAICompatibleModelStream", () => {
   });
 
   it("does not retry a failed provider request", async () => {
-    let requests = 0;
+    let requestCount = 0;
     const server = await startServer((_request, response) => {
-      requests += 1;
+      requestCount += 1;
       response.writeHead(500, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { message: "temporary failure" } }));
     });
@@ -80,7 +80,7 @@ describe("createOpenAICompatibleModelStream", () => {
           modelStream([{ role: "user", content: "fail once" }], new AbortController().signal),
         ),
       ).rejects.toBeDefined();
-      expect(requests).toBe(1);
+      expect(requestCount).toBe(1);
       expect(consoleError).not.toHaveBeenCalled();
     } finally {
       consoleError.mockRestore();
@@ -113,9 +113,9 @@ function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
 
 function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    const bodyChunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
+    request.on("end", () => resolve(Buffer.concat(bodyChunks).toString("utf8")));
     request.on("error", reject);
   });
 }
@@ -132,9 +132,9 @@ function writeChunk(response: ServerResponse, content: string): void {
 }
 
 async function collect(stream: AsyncIterable<string>): Promise<string[]> {
-  const chunks: string[] = [];
+  const textChunks: string[] = [];
   for await (const chunk of stream) {
-    chunks.push(chunk);
+    textChunks.push(chunk);
   }
-  return chunks;
+  return textChunks;
 }
