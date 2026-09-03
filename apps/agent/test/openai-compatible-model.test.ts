@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
 import { createSession, resolveSessionDirectory, resolveSessionShell } from "../src/session.js";
-import { FIXED_TOOL_DEFINITIONS } from "../src/tools.js";
+import { FIXED_TOOL_DEFINITIONS } from "../src/tool/definitions.js";
 
 const servers = new Set<ReturnType<typeof createServer>>();
 const temporaryDirectories = new Set<string>();

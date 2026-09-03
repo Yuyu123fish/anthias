@@ -1,16 +1,22 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
-import type { AssistantToolCallPart } from "./agent.js";
-import type { SessionShell } from "./session.js";
+import type { AssistantToolCallPart } from "../agent.js";
+import type { SessionShell } from "../session.js";
+import {
+  hasOnlyKeys,
+  isNonEmptyString,
+  isOptionalIntegerInRange,
+  isOptionalNonEmptyString,
+  isRecord,
+} from "./input-validation.js";
 import {
   boundToolOutput,
-  resolveExistingWorkspacePath,
   TOOL_RESULT_BYTE_LIMIT,
   TOOL_RESULT_LINE_LIMIT,
   type ToolExecutionResult,
-  type ToolWorkspace,
-} from "./tools.js";
+} from "./tool-result.js";
+import { resolveExistingWorkspacePath, type ToolWorkspace } from "./workspace-path.js";
 
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
@@ -489,39 +495,4 @@ function toSafeCommandError(error: unknown): string {
   return typeof errorCode === "string"
     ? `execute_command 预检失败：${errorCode}`
     : "execute_command 预检失败。";
-}
-
-/** 判断未知值是否为普通 JSON 对象。 */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** 判断对象键集合是否没有 Schema 之外的字段。 */
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
-/** 判断未知值是否为非空字符串。 */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-/** 判断可选值是否为非空字符串。 */
-function isOptionalNonEmptyString(value: unknown): value is string | undefined {
-  return value === undefined || isNonEmptyString(value);
-}
-
-/** 判断可选值是否为闭区间内的安全整数。 */
-function isOptionalIntegerInRange(
-  value: unknown,
-  minimum: number,
-  maximum: number,
-): value is number | undefined {
-  return (
-    value === undefined ||
-    (Number.isSafeInteger(value) &&
-      typeof value === "number" &&
-      value >= minimum &&
-      value <= maximum)
-  );
 }

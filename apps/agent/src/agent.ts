@@ -1,23 +1,23 @@
 import { randomUUID } from "node:crypto";
+import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
+import type { Session, SessionRunLease } from "./session.js";
 import {
   executePreparedCommand,
   type PreparedCommandTool,
   prepareCommandTool,
-} from "./command-tool.js";
+} from "./tool/command-tool.js";
+import {
+  FIXED_TOOL_DEFINITIONS,
+  isReadOnlyToolName,
+  type ModelToolDefinition,
+} from "./tool/definitions.js";
 import {
   executePreparedFileTool,
   isFileToolName,
   type PreparedFileTool,
   prepareFileTool,
-} from "./file-tool.js";
-import type { Session, SessionRunLease } from "./session.js";
-import {
-  createCodingSystemPrompt,
-  executeReadOnlyTool,
-  FIXED_TOOL_DEFINITIONS,
-  isReadOnlyToolName,
-  type ModelToolDefinition,
-} from "./tools.js";
+} from "./tool/file-tool.js";
+import { executeReadOnlyTool } from "./tool/read-only-tool.js";
 
 /** 表示一条已经被 Agent 接受的用户文本消息。 */
 export type UserMessage = Readonly<{

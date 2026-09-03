@@ -43,6 +43,7 @@ apps/tui
 apps/agent
   ├─ Agent / Run 协调器       消息、循环、确认、预算、取消与事件
   ├─ Session Module           JSONL、锁、恢复、投影与追加
+  ├─ Prompt Module            每次模型请求使用的 Coding Agent 系统提示词
   ├─ Fixed Tool Module        六个 Tool 的定义、校验、预览与执行
   └─ Model Adapter            Provider 流与内部模型事件互转
 ```
@@ -339,7 +340,7 @@ pnpm exec vitest run apps/agent/test/session.test.ts apps/agent/test/agent.test.
 pnpm verify
 
 # Stage 02
-pnpm exec vitest run apps/agent/test/tools.test.ts apps/agent/test/tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts apps/tui/test/tui.test.ts
+pnpm exec vitest run apps/agent/test/read-only-tool.test.ts apps/agent/test/tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts apps/tui/test/tui.test.ts
 pnpm verify
 
 # Stage 03

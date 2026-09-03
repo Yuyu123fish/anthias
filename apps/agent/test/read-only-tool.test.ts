@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AssistantToolCallPart } from "../src/agent.js";
-import { executeReadOnlyTool } from "../src/tools.js";
+import { executeReadOnlyTool } from "../src/tool/read-only-tool.js";
 
 const temporaryDirectories = new Set<string>();
 

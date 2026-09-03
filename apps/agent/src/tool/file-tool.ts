@@ -1,9 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
-import type { AssistantToolCallPart } from "./agent.js";
-import { boundToolOutput, type ToolExecutionResult, type ToolWorkspace } from "./tools.js";
+import type { AssistantToolCallPart } from "../agent.js";
+import { hasOnlyKeys, isNonEmptyString, isRecord } from "./input-validation.js";
+import { boundToolOutput, type ToolExecutionResult } from "./tool-result.js";
+import {
+  isPathSameOrInside,
+  type ToolWorkspace,
+  validateWorkspaceRelativePath,
+} from "./workspace-path.js";
 
 /** 枚举 Feature 002 中两个文件副作用 Tool。 */
 export type FileToolName = "edit_file" | "write_file";
@@ -299,7 +305,7 @@ async function resolveFileTarget(
   requestedPath: string,
   workspace: ToolWorkspace,
 ): Promise<ResolvedFileTarget> {
-  validateRelativePath(requestedPath);
+  validateWorkspaceRelativePath(requestedPath, "文件 Tool path");
   const lexicalTargetPath = resolve(workspace.workspaceRoot, requestedPath);
   const lexicalParentPath = dirname(lexicalTargetPath);
   const parentRealPath = await realpath(lexicalParentPath);
@@ -376,32 +382,14 @@ async function matchesPreparedTarget(preparedTool: PreparedFileTool): Promise<bo
   return fingerprintBytes(currentBytes).sha256 === preparedTool.expectedFingerprint.sha256;
 }
 
-/** 拒绝绝对路径和任何显式父目录逃逸片段。 */
-function validateRelativePath(requestedPath: string): void {
-  if (
-    requestedPath.length === 0 ||
-    isAbsolute(requestedPath) ||
-    win32.isAbsolute(requestedPath) ||
-    requestedPath.replaceAll("\\", "/").split("/").includes("..")
-  ) {
-    throw new Error("文件 Tool path 必须是工作区相对路径。");
-  }
-}
-
 /** 校验真实路径仍在工作区内且没有进入 Agent 自有 Session 目录。 */
 function assertAllowedPath(targetPath: string, workspace: ToolWorkspace): void {
-  if (!isSameOrInside(workspace.workspaceRoot, targetPath)) {
+  if (!isPathSameOrInside(workspace.workspaceRoot, targetPath)) {
     throw new Error("文件 Tool path 越出工作区。");
   }
-  if (isSameOrInside(workspace.sessionDirectory, targetPath)) {
+  if (isPathSameOrInside(workspace.sessionDirectory, targetPath)) {
     throw new Error("文件 Tool path 命中 Session 保留目录。");
   }
-}
-
-/** 使用平台路径语义判断目标是否等于或位于父目录内。 */
-function isSameOrInside(parentPath: string, targetPath: string): boolean {
-  const relativePath = relative(parentPath, targetPath);
-  return relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..");
 }
 
 /** 将平台路径分隔符统一为模型与 Session 可稳定使用的斜杠。 */
@@ -455,19 +443,4 @@ function toSafeFileError(error: unknown): string {
     return `文件 Tool 操作失败：${errorCode}`;
   }
   return error instanceof Error ? error.message : "文件 Tool 操作失败。";
-}
-
-/** 判断未知值是否为普通 JSON 对象。 */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** 判断对象键集合是否没有 Schema 之外的字段。 */
-function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
-/** 判断未知值是否为非空字符串。 */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
 }

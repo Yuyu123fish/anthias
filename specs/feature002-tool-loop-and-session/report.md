@@ -14,6 +14,8 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Agent 统一持有循环、确认、取消、预算、Session 写入和资源回收，TUI 只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
 
+验收前的结构整理已把系统提示词归入 `src/prompts/`，把定义、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。原先根目录的 `tools.ts`、`file-tool.ts` 和 `command-tool.ts` 已移除；本次只调整 Agent Module 内部 locality，没有增加 Registry、Manager、公开导出或第二套生命周期。
+
 本 Feature 没有实现 OS 沙箱、通用权限策略、Session 分叉、Compaction、PTY、后台命令、持久 Shell、动态 Tool Registry、Desktop、跨进程协议或多 Agent。
 
 ## 2. 关键行为与边界
@@ -36,7 +38,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 | E 命令确认与失败 | PASS | `command-tool-loop.test.ts` 覆盖批准前无进程副作用、Shell/cwd/命令/超时预览、成功、非零退出、超时、输出截断后继续排空，以及模型 Key 隔离。 |
 | F 拒绝副作用 | PASS | `file-tool-loop.test.ts` 证明拒绝不写文件、不产生开始记录，denied 结果进入下一次模型请求，重复确认被拒绝；`tui.test.ts` 证明确认输入只映射到 Agent。 |
 | G 多 Tool 多模型循环 | PASS | `complete-tool-loop.test.ts` 用四次模型请求完成读取、编辑、真实本地命令验证、总结并接受后续提示；生产 Adapter 集成测试用两次 loopback HTTP 请求完成读—改—命令—总结。 |
-| H 参数错误与未知 Tool | PASS | `tools.test.ts`、`file-tool-loop.test.ts`、`agent-budget.test.ts` 和 `openai-compatible-model.test.ts` 覆盖越界/保留路径、二进制、非法 Schema、未知 Tool 与不可解析调用，均无副作用且形成对应失败结果。 |
+| H 参数错误与未知 Tool | PASS | `read-only-tool.test.ts`、`file-tool-loop.test.ts`、`agent-budget.test.ts` 和 `openai-compatible-model.test.ts` 覆盖越界/保留路径、二进制、非法 Schema、未知 Tool 与不可解析调用，均无副作用且形成对应失败结果。 |
 | I 分阶段停止 | PASS | `agent.test.ts`、`file-tool-loop.test.ts` 和 `command-tool-loop.test.ts` 分别覆盖模型流、等待确认、命令执行期间停止，均只有一个终态并回到 idle。 |
 | J 执行预算 | PASS | `agent-budget.test.ts` 证明第 13 次模型请求不发送、第 33 个 ToolCall 不处理、30 分钟活动时长终止及确认等待不计时；`command-tool-loop.test.ts` 证明输出达到限制后明确截断且管道继续排空。 |
 | K JSONL 保存与重载 | PASS | `session.test.ts`、`agent.test.ts` 与生产 Adapter 集成测试检查记录顺序、稳定引用、累计 usage、重开投影和沿线性上下文继续。 |
@@ -53,6 +55,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 - Stage 02：`pnpm verify` 通过，当时为 13 个测试文件、87 个测试；`pnpm install --frozen-lockfile --offline` 通过，manifest 和 lockfile 只增加直接运行时依赖 `diff@9.0.0`。
 - Stage 03 定向验证：`pnpm exec vitest run apps/agent/test/command-tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts` 通过，2 个测试文件、9 个测试。
 - Stage 03 最终门禁：`pnpm verify` 通过；Biome 检查 33 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
+- 验收前结构整理：`pnpm verify` 通过；Biome 检查当前 38 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
 
 Stage 3 的输出边界强化测试发现：同一输出流的连续小块会重复产生渲染标签，可能提前挤占最终 ToolResult 的 2,000 行预算并覆盖命令专用截断说明。实现已改为只合并相邻同源块，stdout / stderr 的观察顺序不变，截断后仍继续排空管道；对应定向测试和完整门禁均在修复后重新通过。
 
