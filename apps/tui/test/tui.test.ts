@@ -5,19 +5,36 @@ import type {
   AgentEvent,
   AgentListener,
   AgentState,
+  AssistantMessage,
   Message,
   PromptResult,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
 } from "@anthias/agent";
 import { describe, expect, it, vi } from "vitest";
 import { runTui } from "../src/index.js";
 
+const TEST_RUN_ID = "00000000-0000-4000-8000-000000000002";
+const TEST_RUN_METRICS = Object.freeze({
+  modelRequestCount: 1,
+  producedToolCallCount: 0,
+  processedToolCallCount: 0,
+  activeDurationMilliseconds: 1,
+});
+
 type FakeAgentControls = Readonly<{
   publish(event: AgentEvent): void;
   setRunning(running: boolean): void;
+  setPendingToolApproval(request: ToolApprovalRequest | null): void;
 }>;
 
 type FakeAgentBehavior = Readonly<{
   prompt(promptText: string, controls: FakeAgentControls): Promise<PromptResult>;
+  respondToToolApproval?(
+    toolApprovalRequestId: string,
+    decision: "approve" | "deny",
+    controls: FakeAgentControls,
+  ): ToolApprovalResponse;
   abort?(controls: FakeAgentControls): void;
 }>;
 
@@ -26,7 +43,7 @@ describe("runTui", () => {
     const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
     const agent = createFakeAgent({ prompt: promptHandler }, [
       { role: "user", content: "previous" },
-      { role: "assistant", content: "answer", status: "completed" },
+      assistantMessage("answer", "completed"),
     ]);
     const input = new PassThrough();
     const output = new PassThrough();
@@ -88,6 +105,150 @@ describe("runTui", () => {
     expect(signalSource.listenerCount("SIGINT")).toBe(0);
   });
 
+  it("renders Tool lifecycle only from Agent events", async () => {
+    const agent = createFakeAgent({
+      prompt: async (promptText, controls) => {
+        controls.setRunning(true);
+        publishPromptOpening(promptText, controls);
+        controls.publish({
+          type: "tool_execution_start",
+          toolCallId: "00000000-0000-4000-8000-000000000010",
+          toolName: "read_file",
+        });
+        const result = {
+          role: "tool" as const,
+          toolCallId: "00000000-0000-4000-8000-000000000010",
+          toolName: "read_file",
+          status: "completed" as const,
+          content: "path: README.md",
+          truncated: false,
+        };
+        controls.publish({
+          type: "message_end",
+          message: result,
+        });
+        controls.publish({
+          type: "tool_execution_end",
+          toolCallId: result.toolCallId,
+          toolName: result.toolName,
+          result,
+          cleanupUncertain: false,
+        });
+        controls.publish({
+          type: "message_end",
+          message: assistantMessage("done", "completed"),
+        });
+        controls.publish({
+          type: "run_end",
+          runId: TEST_RUN_ID,
+          result: { status: "completed" },
+          metrics: TEST_RUN_METRICS,
+        });
+        controls.setRunning(false);
+        return { status: "completed" };
+      },
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({ agent, input, output, signalSource });
+    input.write("inspect\n");
+    await vi.waitFor(() => {
+      expect(rendered).toContain("Tool: read_file");
+      expect(rendered).toContain("ToolResult: read_file completed\npath: README.md\n");
+    });
+    input.write("/exit\n");
+    await expect(tuiExit).resolves.toBe(0);
+  });
+
+  it.each([
+    {
+      inputDecision: "y",
+      expectedDecision: "approve" as const,
+      renderedDecision: "已批准本次调用。",
+    },
+    { inputDecision: "", expectedDecision: "deny" as const, renderedDecision: "已拒绝本次调用。" },
+  ])(
+    "maps '$inputDecision' to the current Tool approval",
+    async ({ inputDecision, expectedDecision, renderedDecision }) => {
+      const promptCompletion = Promise.withResolvers<PromptResult>();
+      const approvalRequest = Object.freeze({
+        toolApprovalRequestId: "00000000-0000-4000-8000-000000000030",
+        toolCallId: "00000000-0000-4000-8000-000000000031",
+        toolName: "edit_file" as const,
+        target: "src/example.ts",
+        preview: "--- old\n+++ new",
+      });
+      const approvalHandler = vi.fn(
+        (
+          toolApprovalRequestId: string,
+          decision: "approve" | "deny",
+          controls: FakeAgentControls,
+        ): ToolApprovalResponse => {
+          if (toolApprovalRequestId !== approvalRequest.toolApprovalRequestId) {
+            return { status: "rejected", reason: "request_mismatch" };
+          }
+          controls.setPendingToolApproval(null);
+          controls.publish({
+            type: "tool_approval_resolved",
+            request: approvalRequest,
+            decision,
+          });
+          controls.publish({
+            type: "run_end",
+            runId: TEST_RUN_ID,
+            result: { status: "completed" },
+            metrics: TEST_RUN_METRICS,
+          });
+          controls.setRunning(false);
+          promptCompletion.resolve({ status: "completed" });
+          return { status: "accepted" };
+        },
+      );
+      const agent = createFakeAgent({
+        prompt: async (promptText, controls) => {
+          controls.setRunning(true);
+          publishPromptOpening(promptText, controls);
+          controls.setPendingToolApproval(approvalRequest);
+          controls.publish({ type: "tool_approval_requested", request: approvalRequest });
+          return promptCompletion.promise;
+        },
+        respondToToolApproval: approvalHandler,
+      });
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const signalSource = new EventEmitter();
+      let rendered = "";
+      output.setEncoding("utf8");
+      output.on("data", (chunk: string) => {
+        rendered += chunk;
+      });
+
+      const tuiExit = runTui({ agent, input, output, signalSource });
+      input.write("change\n");
+      await vi.waitFor(() => expect(rendered).toContain("允许执行？[y/N]"));
+      input.write("maybe\n");
+      await vi.waitFor(() => expect(rendered).toContain("请输入 y/yes 批准"));
+      expect(approvalHandler).not.toHaveBeenCalled();
+      input.write(`${inputDecision}\n`);
+      await vi.waitFor(() => expect(rendered).toContain(renderedDecision));
+
+      expect(approvalHandler).toHaveBeenCalledWith(
+        approvalRequest.toolApprovalRequestId,
+        expectedDecision,
+        expect.anything(),
+      );
+      input.write("/exit\n");
+      await expect(tuiExit).resolves.toBe(0);
+    },
+  );
+
   it("maps active SIGINT to abort and accepts another prompt", async () => {
     const firstPromptCompletion = Promise.withResolvers<PromptResult>();
     let promptCount = 0;
@@ -106,9 +267,14 @@ describe("runTui", () => {
     const abortHandler = vi.fn((controls: FakeAgentControls) => {
       controls.publish({
         type: "message_end",
-        message: { role: "assistant", content: "partial", status: "aborted" },
+        message: assistantMessage("partial", "aborted"),
       });
-      controls.publish({ type: "run_end", result: { status: "aborted" } });
+      controls.publish({
+        type: "run_end",
+        runId: TEST_RUN_ID,
+        result: { status: "aborted" },
+        metrics: TEST_RUN_METRICS,
+      });
       controls.setRunning(false);
       firstPromptCompletion.resolve({ status: "aborted" });
     });
@@ -179,11 +345,13 @@ describe("runTui", () => {
         publishPartialResponse(promptText, "partial", controls);
         controls.publish({
           type: "message_end",
-          message: { role: "assistant", content: "partial", status: "failed" },
+          message: assistantMessage("partial", "failed"),
         });
         controls.publish({
           type: "run_end",
+          runId: TEST_RUN_ID,
           result: { status: "failed", error: "模型请求失败，请检查模型配置或稍后重试。" },
+          metrics: TEST_RUN_METRICS,
         });
         controls.setRunning(false);
         return { status: "failed", error: "模型请求失败，请检查模型配置或稍后重试。" };
@@ -211,11 +379,12 @@ describe("runTui", () => {
 });
 
 function createFakeAgent(
-  { prompt, abort }: FakeAgentBehavior,
+  { prompt, respondToToolApproval, abort }: FakeAgentBehavior,
   messageHistory: readonly Message[] = [],
 ): Agent {
   const listeners = new Set<AgentListener>();
   let running = false;
+  let pendingToolApproval: ToolApprovalRequest | null = null;
   const controls: FakeAgentControls = {
     publish(event) {
       for (const listener of [...listeners]) {
@@ -224,6 +393,9 @@ function createFakeAgent(
     },
     setRunning(nextRunning) {
       running = nextRunning;
+    },
+    setPendingToolApproval(request) {
+      pendingToolApproval = request;
     },
   };
 
@@ -237,14 +409,23 @@ function createFakeAgent(
         activeRun: running
           ? Object.freeze({
               runId: "00000000-0000-4000-8000-000000000002",
-              phase: "requesting_model" as const,
+              phase:
+                pendingToolApproval === null
+                  ? ("requesting_model" as const)
+                  : ("awaiting_tool_approval" as const),
+              modelRequestCount: 1,
+              toolCallCount: 0,
             })
           : null,
+        pendingToolApproval,
         running,
         lastError: null,
       });
     },
     prompt: (promptText) => prompt(promptText, controls),
+    respondToToolApproval: (toolApprovalRequestId, decision) =>
+      respondToToolApproval?.(toolApprovalRequestId, decision, controls) ??
+      Object.freeze({ status: "rejected", reason: "not_pending" }),
     abort: () => abort?.(controls),
     subscribe(listener) {
       listeners.add(listener);
@@ -268,16 +449,21 @@ async function completePrompt(
     content += chunk;
     controls.publish({
       type: "message_update",
-      message: { role: "assistant", content, status: "streaming" },
+      message: assistantMessage(content, "streaming"),
       delta: chunk,
     });
   }
 
   controls.publish({
     type: "message_end",
-    message: { role: "assistant", content, status: "completed" },
+    message: assistantMessage(content, "completed"),
   });
-  controls.publish({ type: "run_end", result: { status: "completed" } });
+  controls.publish({
+    type: "run_end",
+    runId: TEST_RUN_ID,
+    result: { status: "completed" },
+    metrics: TEST_RUN_METRICS,
+  });
   controls.setRunning(false);
   return { status: "completed" };
 }
@@ -290,13 +476,13 @@ function publishPartialResponse(
   publishPromptOpening(promptText, controls);
   controls.publish({
     type: "message_update",
-    message: { role: "assistant", content: assistantContent, status: "streaming" },
+    message: assistantMessage(assistantContent, "streaming"),
     delta: assistantContent,
   });
 }
 
 function publishPromptOpening(promptText: string, controls: FakeAgentControls): void {
-  controls.publish({ type: "run_start" });
+  controls.publish({ type: "run_start", runId: TEST_RUN_ID });
   controls.publish({
     type: "message_start",
     message: { role: "user", content: promptText },
@@ -307,6 +493,16 @@ function publishPromptOpening(promptText: string, controls: FakeAgentControls): 
   });
   controls.publish({
     type: "message_start",
-    message: { role: "assistant", content: "", status: "streaming" },
+    message: assistantMessage("", "streaming"),
+  });
+}
+
+/** 创建与公开结构化消息合同一致的 Assistant 测试消息。 */
+function assistantMessage(content: string, status: AssistantMessage["status"]): AssistantMessage {
+  return Object.freeze({
+    role: "assistant",
+    content,
+    parts: Object.freeze(content.length === 0 ? [] : [{ type: "text" as const, text: content }]),
+    status,
   });
 }

@@ -5,7 +5,7 @@
 - 文档类型：Tasks
 - 对应 Spec：[spec.md](spec.md)
 - 对应 Plan：[plan.md](plan.md)
-- 实施授权：已获得，仅限 Stage 01（T001–T003）
+- 实施授权：已获得，覆盖 Feature 002 全部 Stage、逐 Stage 提交和最终提交
 
 本文件是 Feature 002 实施进度的唯一任务事实源。任务按依赖 DAG 推进，每项都必须在一个独立 Agent 上下文内形成可验证增量，不增加 Spec 与 Plan 之外的行为。
 
@@ -15,15 +15,15 @@
 - 每个任务的交付与验收必须一起完成，不把测试、TUI、持久化或资源收口留给未声明的后续补丁。
 - 实施 Agent 只运行当前任务列出的定向验证；Stage 门禁任务负责运行该 Stage 的完整回归，避免在同一代码版本上重复执行相同命令。
 - 普通实现缺陷由当前任务内修复。需要改变产品语义、Agent 公开 Interface、JSONL Schema、模块职责、资源预算或 Stage 边界时立即停止并回到讨论。
-- T003、T009 和 T012 是 Stage 门禁。对应任务完成并汇报后必须停止，等待开发者审查和下一 Stage 的独立授权。
-- 真实 Provider、外部网络、真实凭据、开发者仓库副作用、提交、推送和 PR 均不在任何任务的默认授权内。
+- T003、T009 和 T012 是 Stage 门禁。本次由开发者明确授权：T009 完成并提交后继续 Stage 03，T012 完成后创建最终提交并等待开发者验收。
+- 真实 Provider、外部网络、真实凭据、开发者仓库副作用、推送和 PR 均不在任何任务的默认授权内；Feature 002 的逐 Stage 提交和最终提交已单独授权。
 
 ## 进度总览
 
 | Stage | Tasks | 当前状态 | 完成门 |
 | --- | --- | --- | --- |
-| Stage 01：线性 Session 存储 | T001–T003 | 已完成：等待开发者审查 | T003 完成并经开发者审查 |
-| Stage 02：Tool 系统接入与 Agent Loop 改造 | T004–T009 | 未开始 | T009 完成并经开发者审查 |
+| Stage 01：线性 Session 存储 | T001–T003 | 已完成并提交 | T003 完成并经开发者审查 |
+| Stage 02：Tool 系统接入与 Agent Loop 改造 | T004–T009 | 已完成并提交 | T009 完成并提交 |
 | Stage 03：整体集成与验收准备 | T010–T012 | 未开始 | T012 完成，等待开发者验收 |
 
 ## Stage 01：线性 Session 存储
@@ -106,7 +106,7 @@ Blocked by：T001、T002
 
 ### T004：Expand 为结构化 Model Adapter
 
-状态：待开始
+状态：已完成
 
 Blocked by：T003
 
@@ -120,16 +120,16 @@ Blocked by：T003
 
 验收：
 
-- [ ] 一次 Adapter 调用只建立一次 loopback HTTP 请求，`maxRetries` 仍为 0；
-- [ ] 文本、有效 ToolCall、无效/未知 ToolCall、finish reason、usage、error 和取消都被转换为 Agent 内部事件；
-- [ ] 已包含调用标识的无效 ToolCall 保留 `toolCallId`，原始 SDK 错误不进入公开消息、TUI 或 JSONL；
-- [ ] 系统提示词和 Tool Schema 不写入 Session，不由 TUI 拼装；
-- [ ] Provider、AI SDK Tool、ModelMessage、Model Adapter 和内部 usage 类型没有从 `@anthias/agent` 导出；
-- [ ] Adapter 定向测试与既有文本 Run 回归通过，本任务未执行任何 Tool。
+- [x] 一次 Adapter 调用只建立一次 loopback HTTP 请求，`maxRetries` 仍为 0；
+- [x] 文本、有效 ToolCall、无效/未知 ToolCall、finish reason、usage、error 和取消都被转换为 Agent 内部事件；
+- [x] 已包含调用标识的无效 ToolCall 保留 `toolCallId`，原始 SDK 错误不进入公开消息、TUI 或 JSONL；
+- [x] 系统提示词和 Tool Schema 不写入 Session，不由 TUI 拼装；
+- [x] Provider、AI SDK Tool、ModelMessage、Model Adapter 和内部 usage 类型没有从 `@anthias/agent` 导出；
+- [x] Adapter 定向测试与既有文本 Run 回归通过，本任务未执行任何 Tool。
 
 ### T005：交付只读 Tool Loop 垂直切片
 
-状态：待开始
+状态：已完成
 
 Blocked by：T004
 
@@ -145,19 +145,19 @@ Blocked by：T004
 
 验收：
 
-- [ ] 默认 Session 只写入当前 workspace 的 `data/conversation/<sessionId>.jsonl`，运行目录不进入 Git，项目根 `.gitignore` 不被修改；
-- [ ] 三个只读文件 Tool 均不能读取或遍历实际 Session 目录，Glob 与 Grep 的默认结果也不包含该目录；统一保留路径判断可由后续文件修改 Tool 复用，命令 Tool 的无沙箱边界保持明确；
-- [ ] 确定性模型按 `glob → grep → read_file → final` 完成一个 Run，三个 Tool 无人工确认且顺序正确；
-- [ ] 每条 AssistantMessage 在 Tool 处理前刷新，每个 ToolCall 都有同 ID、同 Tool 名的 ToolResult 并进入下一次模型请求；
-- [ ] 二进制/非法 UTF-8、错误正则、越界路径、未知 Tool 和 Schema 错误不产生本地副作用，并允许模型修正；
-- [ ] Glob 路径稳定排序，Grep 匹配包含相对路径和行号，所有截断都明确报告未穷尽；
-- [ ] 完整循环结束后 Run completed、预算用量正确、Agent 回到 idle 并能接受下一条提示词；
-- [ ] TUI 只从 AgentEvent 呈现 Tool，不导入 Tool Schema、执行函数或 Session Record；
-- [ ] 只读 Tool、Agent Loop、JSONL 和 TUI 定向测试通过，未加入副作用 Tool。
+- [x] 默认 Session 只写入当前 workspace 的 `data/conversation/<sessionId>.jsonl`，运行目录不进入 Git，项目根 `.gitignore` 不被修改；
+- [x] 三个只读文件 Tool 均不能读取或遍历实际 Session 目录，Glob 与 Grep 的默认结果也不包含该目录；统一保留路径判断可由后续文件修改 Tool 复用，命令 Tool 的无沙箱边界保持明确；
+- [x] 确定性模型按 `glob → grep → read_file → final` 完成一个 Run，三个 Tool 无人工确认且顺序正确；
+- [x] 每条 AssistantMessage 在 Tool 处理前刷新，每个 ToolCall 都有同 ID、同 Tool 名的 ToolResult 并进入下一次模型请求；
+- [x] 二进制/非法 UTF-8、错误正则、越界路径、未知 Tool 和 Schema 错误不产生本地副作用，并允许模型修正；
+- [x] Glob 路径稳定排序，Grep 匹配包含相对路径和行号，所有截断都明确报告未穷尽；
+- [x] 完整循环结束后 Run completed、预算用量正确、Agent 回到 idle 并能接受下一条提示词；
+- [x] TUI 只从 AgentEvent 呈现 Tool，不导入 Tool Schema、执行函数或 Session Record；
+- [x] 只读 Tool、Agent Loop、JSONL 和 TUI 定向测试通过，未加入副作用 Tool。
 
 ### T006：交付需确认的文件修改闭环
 
-状态：待开始
+状态：已完成
 
 Blocked by：T005
 
@@ -173,19 +173,19 @@ Blocked by：T005
 
 验收：
 
-- [ ] 确认请求发出后、批准前，目标文件及其父目录没有变化；
-- [ ] `edit_file` 与 `write_file` 不能以任何规范化路径或真实路径命中实际 Session 目录；
-- [ ] 批准的精确编辑、新建文件和覆盖文件只产生确认内容对应的变化，JSONL 中开始记录先于实际副作用、结果记录晚于副作用；
-- [ ] 拒绝不会产生 ToolExecutionStartedRecord 或本地副作用，denied ToolResult 能进入下一次模型请求并允许模型继续；
-- [ ] 预览后目标变更会返回 stale target，旧预览不能覆盖外部变化；
-- [ ] 超过 64 KiB 或 2,000 行的确认预览直接失败且不进入确认，不能用截断预览取得批准；
-- [ ] 过期、重复、ID 不匹配或当前 Run 不匹配的确认响应均被拒绝；
-- [ ] 等待确认时停止当前 Run 会产生 aborted ToolResult 和唯一 aborted Run 终态；
-- [ ] 文件 Tool、确认、原子写入、Session 顺序和 TUI 定向测试通过，除 `diff@9.0.0` 外未增加运行时依赖。
+- [x] 确认请求发出后、批准前，目标文件及其父目录没有变化；
+- [x] `edit_file` 与 `write_file` 不能以任何规范化路径或真实路径命中实际 Session 目录；
+- [x] 批准的精确编辑、新建文件和覆盖文件只产生确认内容对应的变化，JSONL 中开始记录先于实际副作用、结果记录晚于副作用；
+- [x] 拒绝不会产生 ToolExecutionStartedRecord 或本地副作用，denied ToolResult 能进入下一次模型请求并允许模型继续；
+- [x] 预览后目标变更会返回 stale target，旧预览不能覆盖外部变化；
+- [x] 超过 64 KiB 或 2,000 行的确认预览直接失败且不进入确认，不能用截断预览取得批准；
+- [x] 过期、重复、ID 不匹配或当前 Run 不匹配的确认响应均被拒绝；
+- [x] 等待确认时停止当前 Run 会产生 aborted ToolResult 和唯一 aborted Run 终态；
+- [x] 文件 Tool、确认、原子写入、Session 顺序和 TUI 定向测试通过，除 `diff@9.0.0` 外未增加运行时依赖。
 
 ### T007：交付需确认的一次性命令闭环
 
-状态：待开始
+状态：已完成
 
 Blocked by：T006
 
@@ -200,17 +200,17 @@ Blocked by：T006
 
 验收：
 
-- [ ] 包括看似只读的命令在内，每个 `execute_command` 都先进入人工确认；批准前没有创建子进程；
-- [ ] 批准后的成功命令和非零退出命令都产生包含退出码、stdout、stderr、时长及截断状态的正确 ToolResult；
-- [ ] 子进程环境、ToolResult、事件、JSONL、TUI 与测试快照中均不包含 `ANTHIAS_MODEL_API_KEY`；
-- [ ] 超时与用户停止都会终止整棵进程树并关闭相关资源；不能证明清理完成时结果明确标记 cleanup uncertain；
-- [ ] 拒绝命令不启动子进程，denied ToolResult 返回模型；
-- [ ] 前一命令改变 cwd、环境或 Shell 状态不会影响后一命令，Feature 002 不提供持久 Shell 和后台任务；
-- [ ] 命令确认、输出、超时、停止、进程树回收和 TUI 定向测试只在临时 workspace 中通过。
+- [x] 包括看似只读的命令在内，每个 `execute_command` 都先进入人工确认；批准前没有创建子进程；
+- [x] 批准后的成功命令和非零退出命令都产生包含退出码、stdout、stderr、时长及截断状态的正确 ToolResult；
+- [x] 子进程环境、ToolResult、事件、JSONL、TUI 与测试快照中均不包含 `ANTHIAS_MODEL_API_KEY`；
+- [x] 超时与用户停止都会终止整棵进程树并关闭相关资源；不能证明清理完成时结果明确标记 cleanup uncertain；
+- [x] 拒绝命令不启动子进程，denied ToolResult 返回模型；
+- [x] 前一命令改变 cwd、环境或 Shell 状态不会影响后一命令，Feature 002 不提供持久 Shell 和后台任务；
+- [x] 命令确认、输出、超时、停止、进程树回收和 TUI 定向测试只在临时 workspace 中通过。
 
 ### T008：收口多 Tool、预算、取消与终态竞争
 
-状态：待开始
+状态：已完成
 
 Blocked by：T007
 
@@ -225,18 +225,18 @@ Blocked by：T007
 
 验收：
 
-- [ ] 多 Tool、多模型请求循环中 ToolCall 严格串行，每个调用恰有一个同 ID、同 Tool 名的 ToolResult，下一次模型输入完整；
-- [ ] 未知、无效、拒绝和失败的 ToolCall 均占用 ToolCall 预算，并按合同允许模型继续；
-- [ ] 第 13 次模型请求不会发出，第 33 个 ToolCall 不会执行或请求确认，Run 以对应 budget_exhausted 事实结束；
-- [ ] 可控时钟证明 30 分钟只累计模型请求与 Tool 执行时间，等待人工确认不消耗活动预算；
-- [ ] 模型停止、确认等待停止、Tool 执行停止、预算耗尽和失败竞态均只有一个终态，迟到确认、输出和模型事件被忽略；
-- [ ] JSONL 中 AssistantMessage、ToolExecutionStartedRecord、ToolResultMessage 和 RunFinishedRecord 的顺序符合实际事实；
-- [ ] 每条终止路径都回到 idle，释放锁、文件句柄、计时器、模型迭代器和子进程资源；
-- [ ] 多 Tool、预算、取消、终态竞争、Session 恢复和 TUI 退出定向测试通过。
+- [x] 多 Tool、多模型请求循环中 ToolCall 严格串行，每个调用恰有一个同 ID、同 Tool 名的 ToolResult，下一次模型输入完整；
+- [x] 未知、无效、拒绝和失败的 ToolCall 均占用 ToolCall 预算，并按合同允许模型继续；
+- [x] 第 13 次模型请求不会发出，第 33 个 ToolCall 不会执行或请求确认，Run 以对应 budget_exhausted 事实结束；
+- [x] 可控时钟证明 30 分钟只累计模型请求与 Tool 执行时间，等待人工确认不消耗活动预算；
+- [x] 模型停止、确认等待停止、Tool 执行停止、预算耗尽和失败竞态均只有一个终态，迟到确认、输出和模型事件被忽略；
+- [x] JSONL 中 AssistantMessage、ToolExecutionStartedRecord、ToolResultMessage 和 RunFinishedRecord 的顺序符合实际事实；
+- [x] 每条终止路径都回到 idle，释放锁、文件句柄、计时器、模型迭代器和子进程资源；
+- [x] 多 Tool、预算、取消、终态竞争、Session 恢复和 TUI 退出定向测试通过。
 
 ### T009：完成 Stage 02 门禁与检查点汇报
 
-状态：待开始
+状态：已完成
 
 Blocked by：T004、T005、T006、T007、T008
 
@@ -249,13 +249,13 @@ Blocked by：T004、T005、T006、T007、T008
 
 验收：
 
-- [ ] Stage 01 回归、Stage 02 定向测试和 `pnpm verify` 全部通过；
-- [ ] 现有 lockfile 可执行离线 frozen-lockfile 安装，manifest 只增加已批准的 `diff@9.0.0` 运行时依赖；
-- [ ] 实际证据覆盖三个只读 Tool、两个文件 Tool 和一个命令 Tool，确认前无副作用且预算、取消和持久化顺序准确；
-- [ ] 真实凭据未进入子进程、ToolResult、AgentEvent、JSONL、TUI、测试快照或报告；
-- [ ] 未增加 OS 沙箱、权限策略、会话分叉、多 Agent、后台任务、持久 Shell、自动重试或第二 Model Adapter；
-- [ ] 未调用真实 Provider、外部网络或开发者真实仓库副作用；
-- [ ] 汇报完成后停止，没有自动开始 T010、提交、推送或创建 PR。
+- [x] Stage 01 回归、Stage 02 定向测试和 `pnpm verify` 全部通过；
+- [x] 现有 lockfile 可执行离线 frozen-lockfile 安装，manifest 只增加已批准的 `diff@9.0.0` 运行时依赖；
+- [x] 实际证据覆盖三个只读 Tool、两个文件 Tool 和一个命令 Tool，确认前无副作用且预算、取消和持久化顺序准确；
+- [x] 真实凭据未进入子进程、ToolResult、AgentEvent、JSONL、TUI、测试快照或报告；
+- [x] 未增加 OS 沙箱、权限策略、会话分叉、多 Agent、后台任务、持久 Shell、自动重试或第二 Model Adapter；
+- [x] 除已授权安装 `diff@9.0.0` 外，未调用真实 Provider、其他外部网络或开发者真实仓库副作用；
+- [x] Stage 02 提交后按整项授权继续 T010；没有推送或创建 PR。
 
 ## Stage 03：整体集成与验收准备
 
@@ -326,7 +326,7 @@ Blocked by：T010、T011
 
 ## 授权与下一步
 
-- 本 Tasks 已由开发者确认，Stage 01（T001–T003）已经实施并完成门禁，当前等待开发者审查；
-- T001–T003 均已完成；最终 Session 位置的生产迁移仍按计划留在 Stage 02；
-- T003 汇报和本次授权提交后停止，Stage 02 仍需开发者单独授权；
-- 外部网络、真实 Provider 验证、Stage 02、推送和创建 PR 继续分别取得授权。
+- 本 Tasks 已由开发者确认，Stage 01（T001–T003）已经实施、完成门禁并提交；
+- Feature 002 全部 Stage 的本地实施、Stage 02 完成提交与 Stage 03 最终提交已经获得授权；
+- Stage 02 完成门通过并提交后直接进入 Stage 03，Stage 03 完成后提交并等待开发者验收；
+- 外部网络、真实 Provider 验证、真实凭据、推送和创建 PR 继续分别取得授权。

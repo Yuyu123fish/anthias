@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { type Agent, createAgentWithModelStream } from "./agent.js";
 import { readModelConfig } from "./model-config.js";
 import { createOpenAICompatibleModelStream } from "./openai-compatible-model.js";
@@ -15,10 +16,17 @@ export type {
   AgentEvent,
   AgentListener,
   AgentState,
+  AssistantContentPart,
   AssistantMessage,
+  AssistantTextPart,
+  AssistantToolCallPart,
   FinishedPromptResult,
   Message,
   PromptResult,
+  RunMetrics,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
+  ToolResultMessage,
   UserMessage,
 } from "./agent.js";
 
@@ -49,12 +57,18 @@ export async function createAgentFromEnvironment({
   }
 
   try {
-    const sessionDirectory = resolveSessionDirectory(environment);
+    const normalizedWorkspaceRoot = await realpath(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(normalizedWorkspaceRoot, environment);
     const shell = await resolveSessionShell(environment);
     const session =
       sessionId === undefined
-        ? await createSession({ workspaceRoot, sessionDirectory, shell })
-        : await openSession({ sessionId, workspaceRoot, sessionDirectory, shell });
+        ? await createSession({ workspaceRoot: normalizedWorkspaceRoot, sessionDirectory, shell })
+        : await openSession({
+            sessionId,
+            workspaceRoot: normalizedWorkspaceRoot,
+            sessionDirectory,
+            shell,
+          });
 
     return Object.freeze({
       ok: true,

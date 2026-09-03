@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -53,13 +53,35 @@ describe("createAgentFromEnvironment", () => {
         messageHistory: [],
         activeAssistantMessage: null,
         activeRun: null,
+        pendingToolApproval: null,
         running: false,
         lastError: null,
       });
       expect(await readdir(sessionDirectory)).toEqual([
+        ".gitignore",
         `${creationResult.agent.state.sessionId}.jsonl`,
       ]);
+      await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
     }
+  });
+
+  it("stores a default Session under workspace data/conversation", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-startup-default-session-");
+    const environment = await createValidEnvironment(join(workspaceRoot, "unused-sessions"));
+    delete environment.ANTHIAS_SESSION_DIR;
+
+    const creationResult = await createAgentFromEnvironment({ environment, workspaceRoot });
+
+    expect(creationResult.ok).toBe(true);
+    if (!creationResult.ok) {
+      return;
+    }
+    const sessionDirectory = join(workspaceRoot, "data", "conversation");
+    expect(await readdir(sessionDirectory)).toEqual([
+      ".gitignore",
+      `${creationResult.agent.state.sessionId}.jsonl`,
+    ]);
+    await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
   });
 
   it("reopens a requested Session in the same workspace", async () => {

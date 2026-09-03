@@ -5,17 +5,17 @@
 - 文档类型：Plan
 - 对应 Spec：[spec.md](spec.md)
 - Plan 结构：一个文档、三个线性 Stage
-- 授权状态：Plan 与 Tasks 已由开发者确认；本次文档提交、Stage 01 剩余实施及其完成提交已获授权，Stage 02、外部网络、真实 Provider、推送和 PR 尚未授权
+- 授权状态：Plan 与 Tasks 已由开发者确认；Feature 002 全部 Stage 的本地实施、逐 Stage 提交和最终提交已获授权；仅 `diff@9.0.0` 下载已取得并使用网络授权，真实 Provider、其他外部网络、推送和 PR 尚未授权
 
 ## 1. 当前基线与范围
 
-- 当前分支为 `main`，T001 已在 `efdf711` 完成；本次工作从该干净检查点更新 Feature 文档并继续 T002–T003。
+- 当前分支为 `main`，Stage 01 已在 `8c34b78` 完成；Stage 02 在本提交中完成门禁，随后按整项授权继续 Stage 03。
 - 当前环境为 Windows、Node.js `v24.13.1`、pnpm `10.33.0`、PowerShell `7.5.4`。
 - `apps/agent` 已实现 Schema 1 的文本 Session 新建、追加、按 UUID 重开、持久投影、一次提示词一次模型请求、文本流、单 activeRun、取消和安全错误；内部 Model Stream 目前只产出字符串增量。
-- `apps/tui` 只依赖 `@anthias/agent`，通过 `state`、`prompt`、`abort` 和 `subscribe` 输入与呈现；已经支持无参数新建和 `--session <sessionId>` 重开，当前没有 Tool 确认或 Tool 输出界面。
-- 生产 OpenAI-compatible Adapter 位于 Agent Module 内部，使用 AI SDK `7.0.85`，当前只转发 `text-delta` 并丢弃 ToolCall、finish reason 和 usage。
-- T001 完成检查点的 `pnpm verify` 已通过 Biome、Strict TypeScript、构建和 37 个测试；T002 修改代码前以该结果作为干净基线。
-- 当前已有持久 Session 基础能力，但尚无完整损坏恢复、独占锁、Tool、子进程或后台资源；没有需要迁移的已发布历史 Session 格式。
+- `apps/tui` 仍只依赖 `@anthias/agent`，现已通过同一公开 Interface 呈现 Tool、处理逐次确认、停止当前 Run 并报告实际预算用量。
+- 生产 OpenAI-compatible Adapter 仍位于 Agent Module 内部，使用 AI SDK `7.0.85`，现已转换文本、ToolCall、finish reason 和 usage，但不执行 Tool 或拥有循环。
+- Stage 02 完成门的 `pnpm verify` 已通过 Biome、Strict TypeScript、构建和 87 个测试；`pnpm install --frozen-lockfile --offline` 同时通过。
+- 当前已具备线性 Session 恢复与独占写入、六个固定 Tool、逐次副作用确认、Model → Tool → Model 循环和资源预算；Stage 1 产生的 Schema 1 终态记录仍可重开。
 
 本 Plan 只交付 Spec 已定义的线性 JSONL Session、六个固定 Tool、逐次副作用确认、多模型请求 Agent Loop、TUI 闭环和整体本地验收。不会加入沙箱、可复用授权、PTY、后台命令、动态 Tool Registry、Compaction、分叉、Desktop 或多 Agent。
 
@@ -27,7 +27,7 @@
 | Stage 02：Tool 系统与 Agent Loop | 六个 Tool、逐次确认、Model → Tool → Model、预算、取消和 TUI 呈现形成完整 Coding Harness | 沙箱、PTY、动态插件、分叉及其他 Spec 排除项 |
 | Stage 03：整体集成与验收准备 | 在临时工作区中逐项验证 Spec A–N，完成唯一 Report 并形成可供开发者验收的证据 | 新能力、真实 Provider、真实凭据和开发者仓库副作用 |
 
-三个 Stage 必须线性推进。每个 Stage 实施、验证并汇报后停止，等待开发者审查；上一 Stage 未通过或边界发生变化时，不得提前实现下一 Stage。Stage 03 的“验收”表示完成验收准备和证据矩阵，只有开发者可以把 Feature 标记为“已验收”。
+三个 Stage 必须线性推进。根据开发者本次明确授权，每个 Stage 实施、验证并提交后直接继续下一 Stage；上一 Stage 未通过或边界发生变化时，不得提前实现下一 Stage。Stage 03 的“验收”表示完成验收准备和证据矩阵，只有开发者可以把 Feature 标记为“已验收”。
 
 ## 3. 固定技术方案
 
@@ -165,7 +165,7 @@ Stage 01 只增加高价值边界测试：
 - 通过 Session 定向测试、现有 Agent/TUI 回归和 `pnpm verify`；
 - 在测试临时目录中检查实际 JSONL 文本，不在 Anthias 仓库或开发者其他仓库创建 Session；
 - 汇报 Schema、恢复结果、锁行为、命令与结果、未验证项和 Git 状态；
-- 不创建 Tool 实现，不调用真实 Provider，不进入 Stage 02；汇报后停止等待开发者审查。
+- 不创建 Tool 实现，不调用真实 Provider；Stage 01 已完成、汇报并提交，后续按本次整项授权进入 Stage 02。
 
 ## 5. Stage 02：Tool 系统接入与 Agent Loop 改造
 
@@ -284,7 +284,7 @@ Stage 02 的自动化验证以 Agent 公共 Interface 为主，使用确定性 M
 - 六个 Tool 和完整 Tool Loop 的定向验证、TUI 验证及 `pnpm verify` 通过；
 - 依赖只有必要的 `diff@9.0.0` 增量，lockfile 与 manifest 一致；若本地 pnpm store 没有该包，安装前单独取得外部网络授权；
 - 不调用真实 Provider、不读取真实凭据、不在开发者仓库执行 Tool；
-- 汇报事件顺序、确认边界、持久化先后、取消与进程回收证据后停止，不自动进入 Stage 03。
+- 汇报事件顺序、确认边界、持久化先后、取消与进程回收证据并提交 Stage 02 后，按本次整项授权进入 Stage 03。
 
 ## 6. Stage 03：整体集成与验收准备
 
@@ -326,7 +326,7 @@ Stage 03 不再增加产品能力。它冻结 Stage 02 的公开合同，在全�
 - Spec A–N 没有未解释的 FAIL；任何 BLOCKED 或 WAIVED 都有明确证据和开发者决定；
 - `pnpm verify` 与定向进程/恢复测试通过，临时资源检查通过；
 - 未调用真实 Provider、外部网络或付费 API，未触碰开发者真实项目文件；
-- 完成 Report 和变更范围汇报后停止，等待开发者验收、提交或后续动作的独立授权。
+- 完成 Report、变更范围汇报和最终提交后停止，等待开发者验收；推送和 PR 仍需独立授权。
 
 ## 7. 验证命令
 
@@ -377,5 +377,5 @@ Stage 02 首次加入依赖时由实施 Agent 更新 manifest 与 lockfile；之
 每个 Stage 的实施报告必须说明：完成的用户行为、主要调用链、JSONL 与副作用顺序、确认/取消/资源释放边界、实际验证命令和结果、未验证项以及 Git 状态。相同代码版本和环境已有可信结果时不重复验证，只补当前 Stage 新增的证据缺口。
 
 - 本 Plan 已由开发者确认并标记为“已计划”。
-- 开发者已确认唯一 Tasks，并明确授权当前文档基线本地提交和 Stage 01 实施；Stage 01 完成汇报后停止。
-- 本次文档提交与 Stage 01 完成提交已经获得授权；Stage 02 实施、依赖联网、真实 Provider、真实凭据、推送和 PR 继续分别取得授权。
+- 开发者已确认唯一 Tasks，并明确授权 Feature 002 全部 Stage 的本地实施、逐 Stage 提交和最终提交。
+- Stage 01 已完成并提交；Stage 02 门禁通过后提交并继续 Stage 03，Stage 03 完成后创建最终提交。依赖联网、真实 Provider、真实凭据、推送和 PR 继续分别取得授权。

@@ -11,9 +11,14 @@ import {
   stat,
   unlink,
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import type { AssistantMessage, Message, UserMessage } from "./agent.js";
+import type {
+  AssistantContentPart,
+  AssistantMessage,
+  Message,
+  ToolResultMessage,
+  UserMessage,
+} from "./agent.js";
 
 /** 描述 Session 创建时固定、重开时必须一致的 Shell。 */
 export type SessionShell = Readonly<{
@@ -22,12 +27,36 @@ export type SessionShell = Readonly<{
   arguments: readonly string[];
 }>;
 
-/** 描述当前 Run 写入终态记录所需的已知计量。 */
-export type RunFinishedDetails = Readonly<{
-  status: "completed" | "aborted" | "failed";
+/** 保存 Provider 能够准确报告的累计模型 token 用量。 */
+export type RunModelUsageDetails = Readonly<{
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+}>;
+
+/** 描述正常终结 Run 能够在进程内准确计算的计量。 */
+type CompleteRunMetricsDetails = Readonly<{
   modelRequestCount: number;
   toolCallCount: number;
+  processedToolCallCount?: number;
   activeDurationMilliseconds: number;
+  modelUsage?: RunModelUsageDetails;
+}>;
+
+/** 描述当前 Run 写入终态记录所需的终态与完整计量。 */
+export type RunFinishedDetails =
+  | (Readonly<{ status: "completed" | "aborted" | "failed" }> & CompleteRunMetricsDetails)
+  | (Readonly<{
+      status: "budget_exhausted";
+      budgetKind: "model_requests" | "tool_calls" | "active_duration";
+    }> &
+      CompleteRunMetricsDetails);
+
+/** 描述一个已经批准、即将在本地发生副作用的 ToolCall。 */
+export type ToolExecutionStartedDetails = Readonly<{
+  toolCallId: string;
+  toolName: "edit_file" | "write_file" | "execute_command";
+  toolApprovalRequestId: string;
 }>;
 
 /** 隔离锁实现中唯一需要替换的进程、身份与时钟系统边界。 */
@@ -41,6 +70,7 @@ export type SessionLockSystem = Readonly<{
 /** 持有单个已接受 Run 的 Session 锁与串行追加能力。 */
 export type SessionRunLease = Readonly<{
   appendMessage(message: Message): Promise<void>;
+  appendToolExecutionStarted(details: ToolExecutionStartedDetails): Promise<void>;
   appendRunFinished(details: RunFinishedDetails): Promise<void>;
   release(): Promise<void>;
 }>;
@@ -54,6 +84,7 @@ export type SessionRunAcquisition =
 export type Session = Readonly<{
   sessionId: string;
   workspaceRoot: string;
+  sessionDirectory: string;
   shell: SessionShell;
   readonly messageHistory: readonly Message[];
   acquireRun(runId: string): Promise<SessionRunAcquisition>;
@@ -158,7 +189,24 @@ type RunFinishedRecord =
       metricsStatus: "complete";
       modelRequestCount: number;
       toolCallCount: number;
+      processedToolCallCount: number;
       activeDurationMilliseconds: number;
+      modelUsage: RunModelUsageDetails;
+    }>
+  | Readonly<{
+      type: "run_finished";
+      entryId: string;
+      seq: number;
+      timestamp: string;
+      runId: string;
+      status: "budget_exhausted";
+      metricsStatus: "complete";
+      modelRequestCount: number;
+      toolCallCount: number;
+      processedToolCallCount: number;
+      activeDurationMilliseconds: number;
+      modelUsage: RunModelUsageDetails;
+      budgetKind: "model_requests" | "tool_calls" | "active_duration";
     }>
   | Readonly<{
       type: "run_finished";
@@ -173,7 +221,7 @@ type RunFinishedRecord =
       activeDurationMilliseconds: null;
     }>;
 
-/** 枚举 Stage 01 允许出现在 Header 之后的记录。 */
+/** 枚举 Schema 1 允许出现在 Header 之后的持久记录。 */
 type SessionRecord = MessageRecord | ToolExecutionStartedRecord | RunFinishedRecord;
 
 /** 汇总最后一个未终结 Run 中可由持久事实判定的 Tool 状态。 */
@@ -207,6 +255,11 @@ type SessionLockOwner = Readonly<{
 }>;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UNKNOWN_MODEL_USAGE = Object.freeze({
+  inputTokens: null,
+  outputTokens: null,
+  totalTokens: null,
+} satisfies RunModelUsageDetails);
 
 /** 提供生产环境真实进程探测、UUID 与 UTC 时间。 */
 const DEFAULT_SESSION_LOCK_SYSTEM: SessionLockSystem = Object.freeze({
@@ -228,23 +281,14 @@ class SessionBusyError extends Error {}
 
 /** 按平台约定解析 Agent Module 自有的 Session 目录。 */
 export function resolveSessionDirectory(
+  workspaceRoot: string,
   environment: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform,
 ): string {
   const overrideDirectory = environment.ANTHIAS_SESSION_DIR?.trim();
   if (overrideDirectory) {
     return resolve(overrideDirectory);
   }
-  if (platform === "win32") {
-    const localApplicationDataDirectory = environment.LOCALAPPDATA?.trim();
-    return localApplicationDataDirectory
-      ? join(localApplicationDataDirectory, "Anthias", "sessions")
-      : join(homedir(), ".anthias", "sessions");
-  }
-  const xdgStateHome = environment.XDG_STATE_HOME?.trim();
-  return xdgStateHome
-    ? join(xdgStateHome, "anthias", "sessions")
-    : join(homedir(), ".local", "state", "anthias", "sessions");
+  return join(resolve(workspaceRoot), "data", "conversation");
 }
 
 /** 固定当前平台可复用的非交互 Shell；重开时必须与 Header 完全一致。 */
@@ -333,19 +377,46 @@ export async function createSession({
   });
 
   await mkdir(sessionDirectory, { recursive: true });
-  const sessionFilePath = join(sessionDirectory, `${sessionId}.jsonl`);
+  await ensureSessionGitignore(sessionDirectory);
+  const normalizedSessionDirectory = await realpath(sessionDirectory);
+  const sessionFilePath = join(normalizedSessionDirectory, `${sessionId}.jsonl`);
   await writeNewSessionHeader(sessionFilePath, sessionHeader);
   const checkpoint = await readSessionCheckpoint(sessionFilePath);
   return createSessionRuntime(
     sessionFilePath,
     sessionId,
     normalizedWorkspaceRoot,
+    normalizedSessionDirectory,
     sessionShell,
     [],
     checkpoint,
-    join(sessionDirectory, `${sessionId}.lock`),
+    join(normalizedSessionDirectory, `${sessionId}.lock`),
     lockSystem,
   );
+}
+
+/** 创建 Agent 自有目录的本地忽略规则，并拒绝覆盖不一致的已有文件。 */
+async function ensureSessionGitignore(sessionDirectory: string): Promise<void> {
+  const gitignorePath = join(sessionDirectory, ".gitignore");
+  let gitignoreHandle: Awaited<ReturnType<typeof open>>;
+  try {
+    gitignoreHandle = await open(gitignorePath, "wx");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+    const existingContent = await readFile(gitignorePath, "utf8");
+    if (existingContent !== "*" && existingContent !== "*\n") {
+      throw new Error("Session 目录 .gitignore 内容不符合 Anthias 约定。");
+    }
+    return;
+  }
+  try {
+    await gitignoreHandle.writeFile("*\n", "utf8");
+    await gitignoreHandle.sync();
+  } finally {
+    await gitignoreHandle.close();
+  }
 }
 
 /** 打开一个完整的 Schema 1 文件，并从持久消息重建只读投影。 */
@@ -360,8 +431,9 @@ export async function openSession({
     throw new Error("Session ID 无效。");
   }
   const normalizedWorkspaceRoot = await realpath(workspaceRoot);
-  const sessionFilePath = join(sessionDirectory, `${sessionId}.jsonl`);
-  const lockDirectory = join(sessionDirectory, `${sessionId}.lock`);
+  const normalizedSessionDirectory = await realpath(sessionDirectory);
+  const sessionFilePath = join(normalizedSessionDirectory, `${sessionId}.jsonl`);
+  const lockDirectory = join(normalizedSessionDirectory, `${sessionId}.lock`);
   const startupLock = await acquireSessionLock(lockDirectory, lockSystem);
   let sessionText: string;
   let sessionHeader: SessionHeader;
@@ -393,18 +465,14 @@ export async function openSession({
   }
 
   const messageHistory = records
-    .filter(
-      (
-        record,
-      ): record is MessageRecord & { message: Exclude<DurableMessage, { type: "tool_result" }> } =>
-        record.type === "message" && record.message.type !== "tool_result",
-    )
+    .filter((record): record is MessageRecord => record.type === "message")
     .map((record) => fromDurableMessage(record.message));
 
   return createSessionRuntime(
     sessionFilePath,
     sessionHeader.sessionId,
     normalizedWorkspaceRoot,
+    normalizedSessionDirectory,
     sessionHeader.shell,
     messageHistory,
     checkpoint,
@@ -418,6 +486,7 @@ function createSessionRuntime(
   sessionFilePath: string,
   sessionId: string,
   workspaceRoot: string,
+  sessionDirectory: string,
   shell: SessionShell,
   initialMessageHistory: readonly Message[],
   initialCheckpoint: SessionFileCheckpoint,
@@ -431,6 +500,7 @@ function createSessionRuntime(
   return Object.freeze({
     sessionId,
     workspaceRoot,
+    sessionDirectory,
     shell,
     get messageHistory() {
       return Object.freeze([...messageHistory]);
@@ -500,18 +570,45 @@ function createSessionRuntime(
             () => messageHistory.push(messageSnapshot),
           );
         },
-        appendRunFinished(details) {
+        appendToolExecutionStarted(details) {
           if (
-            !isRunTerminalStatus(details.status) ||
+            !isUuid(details.toolCallId) ||
+            !isSideEffectToolName(details.toolName) ||
+            !isUuid(details.toolApprovalRequestId)
+          ) {
+            return Promise.reject(new Error("ToolExecutionStarted 身份无效。"));
+          }
+          return enqueueRecord((sequence) =>
+            Object.freeze({
+              type: "tool_execution_started",
+              entryId: randomUUID(),
+              seq: sequence,
+              timestamp: new Date().toISOString(),
+              runId,
+              toolCallId: details.toolCallId,
+              toolName: details.toolName,
+              toolApprovalRequestId: details.toolApprovalRequestId,
+            }),
+          );
+        },
+        appendRunFinished(details) {
+          const processedToolCallCount = details.processedToolCallCount ?? details.toolCallCount;
+          const modelUsage = details.modelUsage ?? UNKNOWN_MODEL_USAGE;
+          if (
+            !isRunFinishedTerminalStatus(details.status) ||
             !isNonNegativeInteger(details.modelRequestCount) ||
             !isNonNegativeInteger(details.toolCallCount) ||
-            !isNonNegativeInteger(details.activeDurationMilliseconds)
+            !isNonNegativeInteger(processedToolCallCount) ||
+            processedToolCallCount > details.toolCallCount ||
+            !isNonNegativeInteger(details.activeDurationMilliseconds) ||
+            !isRunModelUsage(modelUsage) ||
+            (details.status === "budget_exhausted" && !isBudgetKind(details.budgetKind))
           ) {
             return Promise.reject(new Error("RunFinished 计量无效。"));
           }
           return enqueueRecord(
-            (sequence) =>
-              Object.freeze({
+            (sequence) => {
+              const baseRecord = {
                 type: "run_finished",
                 entryId: randomUUID(),
                 seq: sequence,
@@ -521,8 +618,16 @@ function createSessionRuntime(
                 metricsStatus: "complete",
                 modelRequestCount: details.modelRequestCount,
                 toolCallCount: details.toolCallCount,
+                processedToolCallCount,
                 activeDurationMilliseconds: details.activeDurationMilliseconds,
-              }),
+                modelUsage: Object.freeze({ ...modelUsage }),
+              } as const;
+              return Object.freeze(
+                details.status === "budget_exhausted"
+                  ? { ...baseRecord, budgetKind: details.budgetKind }
+                  : baseRecord,
+              ) as RunFinishedRecord;
+            },
             () => {
               runFinished = true;
             },
@@ -1152,22 +1257,48 @@ function parseSessionRecord(line: string, expectedSequence: number): SessionReco
     return value as ToolExecutionStartedRecord;
   }
   if (value.type === "run_finished") {
+    const legacyExpectedKeys =
+      value.status === "budget_exhausted"
+        ? [
+            "type",
+            "entryId",
+            "seq",
+            "timestamp",
+            "runId",
+            "status",
+            "metricsStatus",
+            "modelRequestCount",
+            "toolCallCount",
+            "activeDurationMilliseconds",
+            "budgetKind",
+          ]
+        : [
+            "type",
+            "entryId",
+            "seq",
+            "timestamp",
+            "runId",
+            "status",
+            "metricsStatus",
+            "modelRequestCount",
+            "toolCallCount",
+            "activeDurationMilliseconds",
+          ];
+    const currentExpectedKeys = [...legacyExpectedKeys, "processedToolCallCount", "modelUsage"];
+    const usesLegacyMetrics = hasExactKeys(value, legacyExpectedKeys);
+    const usesCurrentMetrics = hasExactKeys(value, currentExpectedKeys);
     if (
-      !hasExactKeys(value, [
-        "type",
-        "entryId",
-        "seq",
-        "timestamp",
-        "runId",
-        "status",
-        "metricsStatus",
-        "modelRequestCount",
-        "toolCallCount",
-        "activeDurationMilliseconds",
-      ]) ||
-      !isRunFinishedMetrics(value)
+      (!usesLegacyMetrics && !usesCurrentMetrics) ||
+      !isRunFinishedMetrics(value, usesCurrentMetrics)
     ) {
       throw new Error("Session RunFinishedRecord 无效。");
+    }
+    if (usesLegacyMetrics && value.metricsStatus === "complete") {
+      return Object.freeze({
+        ...value,
+        processedToolCallCount: value.toolCallCount,
+        modelUsage: UNKNOWN_MODEL_USAGE,
+      }) as RunFinishedRecord;
     }
     return value as RunFinishedRecord;
   }
@@ -1290,8 +1421,23 @@ function validateSessionRecords(records: readonly SessionRecord[]): UnfinishedRu
     ) {
       throw new Error("Session completed Run 缺少不含 ToolCall 的最终 AssistantMessage。");
     }
-    if (record.status !== "interrupted" && record.status !== lastAssistantStatus) {
+    const runCanEndAfterCompletedToolCalls =
+      lastAssistantStatus === "completed" &&
+      lastAssistantHasToolCall &&
+      (record.status === "aborted" || record.status === "failed");
+    if (
+      record.status !== "interrupted" &&
+      record.status !== "budget_exhausted" &&
+      record.status !== lastAssistantStatus &&
+      !runCanEndAfterCompletedToolCalls
+    ) {
       throw new Error("Session RunFinished 与最终 AssistantMessage 状态不匹配。");
+    }
+    if (
+      record.metricsStatus === "complete" &&
+      record.processedToolCallCount > record.toolCallCount
+    ) {
+      throw new Error("Session RunFinished 的 ToolCall 处理计量无效。");
     }
     activeRunId = null;
   }
@@ -1325,20 +1471,46 @@ function parseJsonObject(line: string | undefined): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** 将公开文本消息转换为不包含流式状态的持久形状。 */
+/** 将公开消息转换为不包含流式状态的 Schema 1 持久形状。 */
 function toDurableMessage(message: Message): DurableMessage {
-  const content = Object.freeze([Object.freeze({ type: "text" as const, text: message.content })]);
   if (message.role === "user") {
-    return Object.freeze({ type: "user", content });
+    return Object.freeze({
+      type: "user",
+      content: Object.freeze([Object.freeze({ type: "text" as const, text: message.content })]),
+    });
+  }
+  if (message.role === "tool") {
+    return Object.freeze({
+      type: "tool_result",
+      toolCallId: message.toolCallId,
+      toolName: message.toolName,
+      status: message.status,
+      content: message.content,
+      truncated: message.truncated,
+    });
   }
   if (message.status === "streaming") {
     throw new Error("Session 只能持久化最终 AssistantMessage。");
   }
-  return Object.freeze({ type: "assistant", content, status: message.status });
+  return Object.freeze({
+    type: "assistant",
+    content: Object.freeze(message.parts.map(toDurableAssistantPart)),
+    status: message.status,
+  });
 }
 
 /** 将持久消息恢复为 Agent 与 TUI 共用的消息投影。 */
-function fromDurableMessage(message: Exclude<DurableMessage, { type: "tool_result" }>): Message {
+function fromDurableMessage(message: DurableMessage): Message {
+  if (message.type === "tool_result") {
+    return Object.freeze({
+      role: "tool",
+      toolCallId: message.toolCallId,
+      toolName: message.toolName,
+      status: message.status,
+      content: message.content,
+      truncated: message.truncated,
+    } satisfies ToolResultMessage);
+  }
   const content = message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
   if (message.type === "user") {
     return Object.freeze({ role: "user", content } satisfies UserMessage);
@@ -1346,6 +1518,7 @@ function fromDurableMessage(message: Exclude<DurableMessage, { type: "tool_resul
   return Object.freeze({
     role: "assistant",
     content,
+    parts: Object.freeze(message.content.map(fromDurableAssistantPart)),
     status: message.status,
   } satisfies AssistantMessage);
 }
@@ -1355,11 +1528,75 @@ function snapshotMessage(message: Message): Message {
   if (message.role === "user") {
     return Object.freeze({ role: "user", content: message.content });
   }
+  if (message.role === "tool") {
+    return Object.freeze({ ...message });
+  }
   return Object.freeze({
     role: "assistant",
     content: message.content,
+    parts: Object.freeze(message.parts.map(snapshotAssistantPart)),
     status: message.status,
   });
+}
+
+/** 将公开 Assistant part 转换为可持久化的 Schema 1 part。 */
+function toDurableAssistantPart(part: AssistantContentPart): DurableTextPart | DurableToolCallPart {
+  if (part.type === "text") {
+    return Object.freeze({ type: "text", text: part.text });
+  }
+  if (!isJsonValue(part.input)) {
+    throw new Error("ToolCall 输入不是可持久化 JSON 值。");
+  }
+  return Object.freeze({
+    type: "tool_call",
+    toolCallId: part.toolCallId,
+    toolName: part.toolName,
+    input: snapshotJsonValue(part.input),
+    invalid: part.invalid,
+  });
+}
+
+/** 将持久 Assistant part 恢复为 Agent 消息 part。 */
+function fromDurableAssistantPart(
+  part: DurableTextPart | DurableToolCallPart,
+): AssistantContentPart {
+  return part.type === "text"
+    ? Object.freeze({ type: "text", text: part.text })
+    : Object.freeze({
+        type: "tool_call",
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        input: snapshotJsonValue(part.input),
+        invalid: part.invalid,
+      });
+}
+
+/** 复制并冻结一个公开 Assistant part。 */
+function snapshotAssistantPart(part: AssistantContentPart): AssistantContentPart {
+  return part.type === "text"
+    ? Object.freeze({ type: "text", text: part.text })
+    : Object.freeze({
+        type: "tool_call",
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        input: isJsonValue(part.input) ? snapshotJsonValue(part.input) : part.input,
+        invalid: part.invalid,
+      });
+}
+
+/** 深复制并冻结一个已经验证的 JSON 值。 */
+function snapshotJsonValue(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(snapshotJsonValue));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.freeze(
+      Object.fromEntries(
+        Object.entries(value).map(([key, item]) => [key, snapshotJsonValue(item)]),
+      ),
+    );
+  }
+  return value;
 }
 
 /** 复制并冻结 Shell 描述及其参数列表。 */
@@ -1386,7 +1623,7 @@ function isSessionShell(value: unknown): value is SessionShell {
   );
 }
 
-/** 判断未知值是否为 Stage 01 支持的完整持久消息。 */
+/** 判断未知值是否为 Schema 1 支持的完整持久消息。 */
 function isDurableMessage(value: unknown): value is DurableMessage {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -1404,7 +1641,7 @@ function isDurableMessage(value: unknown): value is DurableMessage {
       hasExactKeys(message, ["type", "content", "status"]) &&
       Array.isArray(message.content) &&
       message.content.every((part) => isTextPart(part) || isToolCallPart(part)) &&
-      isRunTerminalStatus(message.status)
+      isAssistantTerminalStatus(message.status)
     );
   }
   return (
@@ -1445,13 +1682,21 @@ function isToolCallPart(value: unknown): value is DurableToolCallPart {
   );
 }
 
-/** 判断 RunFinishedRecord 的终态与计量完整性是否一致。 */
-function isRunFinishedMetrics(value: Record<string, unknown>): boolean {
-  if (isRunTerminalStatus(value.status) && value.metricsStatus === "complete") {
+/** 判断 RunFinishedRecord 的终态与新旧计量形状是否一致。 */
+function isRunFinishedMetrics(
+  value: Record<string, unknown>,
+  usesCurrentMetrics: boolean,
+): boolean {
+  if (isRunFinishedTerminalStatus(value.status) && value.metricsStatus === "complete") {
     return (
       isNonNegativeInteger(value.modelRequestCount) &&
       isNonNegativeInteger(value.toolCallCount) &&
-      isNonNegativeInteger(value.activeDurationMilliseconds)
+      isNonNegativeInteger(value.activeDurationMilliseconds) &&
+      (!usesCurrentMetrics ||
+        (isNonNegativeInteger(value.processedToolCallCount) &&
+          value.processedToolCallCount <= value.toolCallCount &&
+          isRunModelUsage(value.modelUsage))) &&
+      (value.status !== "budget_exhausted" || isBudgetKind(value.budgetKind))
     );
   }
   return (
@@ -1463,6 +1708,27 @@ function isRunFinishedMetrics(value: Record<string, unknown>): boolean {
   );
 }
 
+/** 判断未知值是否为可持久化的标准化累计模型 usage。 */
+function isRunModelUsage(value: unknown): value is RunModelUsageDetails {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const usage = value as Record<string, unknown>;
+  if (!hasExactKeys(usage, ["inputTokens", "outputTokens", "totalTokens"])) {
+    return false;
+  }
+  return (
+    isNullableNonNegativeInteger(usage.inputTokens) &&
+    isNullableNonNegativeInteger(usage.outputTokens) &&
+    isNullableNonNegativeInteger(usage.totalTokens)
+  );
+}
+
+/** 判断 token 计量是否未知或为非负整数。 */
+function isNullableNonNegativeInteger(value: unknown): boolean {
+  return value === null || isNonNegativeInteger(value);
+}
+
 /** 判断 ToolResult 是否使用 Schema 1 已确认的五种结果状态。 */
 function isToolResultStatus(value: unknown): boolean {
   return (
@@ -1472,6 +1738,11 @@ function isToolResultStatus(value: unknown): boolean {
     value === "aborted" ||
     value === "unknown"
   );
+}
+
+/** 判断名称是否属于必须记录开始事实的副作用 Tool。 */
+function isSideEffectToolName(value: unknown): value is ToolExecutionStartedDetails["toolName"] {
+  return value === "edit_file" || value === "write_file" || value === "execute_command";
 }
 
 /** 判断未知值能否由 JSON 无损表示。 */
@@ -1502,9 +1773,19 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-/** 判断未知值是否为 Stage 01 可产生的 Run 终态。 */
-function isRunTerminalStatus(value: unknown): value is RunFinishedDetails["status"] {
+/** 判断未知值是否为 AssistantMessage 的三个可持久终态。 */
+function isAssistantTerminalStatus(value: unknown): boolean {
   return value === "completed" || value === "aborted" || value === "failed";
+}
+
+/** 判断未知值是否为当前 Run 可以写入的终态。 */
+function isRunFinishedTerminalStatus(value: unknown): value is RunFinishedDetails["status"] {
+  return isAssistantTerminalStatus(value) || value === "budget_exhausted";
+}
+
+/** 判断未知值是否为三类固定 Run 预算。 */
+function isBudgetKind(value: unknown): boolean {
+  return value === "model_requests" || value === "tool_calls" || value === "active_duration";
 }
 
 /** 判断未知值是否为 Anthias 当前生成的 UUID v4。 */

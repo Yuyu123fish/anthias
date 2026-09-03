@@ -2,7 +2,12 @@ import { access, appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type Agent, createAgentWithModelStream, type ModelStream } from "../src/agent.js";
+import {
+  type Agent,
+  createAgentWithModelStream,
+  type ModelStream,
+  type ModelStreamEvent,
+} from "../src/agent.js";
 import type { AgentEvent, Message } from "../src/index.js";
 import { createSession, openSession, type Session, type SessionShell } from "../src/session.js";
 
@@ -25,11 +30,12 @@ afterEach(async () => {
 
 describe("Agent", () => {
   it("streams one assistant message through the public interface", async () => {
-    const modelStream: ModelStream = async function* (modelMessages, abortSignal) {
-      expect(modelMessages).toEqual([{ role: "user", content: "你好" }]);
+    const modelStream: ModelStream = async function* (modelRequest, abortSignal) {
+      expect(modelRequest.messages).toEqual([{ role: "user", content: "你好" }]);
       expect(abortSignal.aborted).toBe(false);
-      yield "你";
-      yield "好";
+      yield textDelta("你");
+      yield textDelta("好");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const events: string[] = [];
@@ -47,10 +53,16 @@ describe("Agent", () => {
     expect(agent.state).toEqual({
       messageHistory: [
         { role: "user", content: "你好" },
-        { role: "assistant", content: "你好", status: "completed" },
+        {
+          role: "assistant",
+          content: "你好",
+          parts: [{ type: "text", text: "你好" }],
+          status: "completed",
+        },
       ],
       activeAssistantMessage: null,
       activeRun: null,
+      pendingToolApproval: null,
       running: false,
       lastError: null,
       sessionId: expect.any(String),
@@ -78,9 +90,10 @@ describe("Agent", () => {
 
   it("keeps ordered context and rejects empty prompts without events", async () => {
     const modelMessageBatches: unknown[] = [];
-    const modelStream: ModelStream = async function* (modelMessages) {
-      modelMessageBatches.push(modelMessages);
-      yield modelMessageBatches.length === 1 ? "first" : "second";
+    const modelStream: ModelStream = async function* (modelRequest) {
+      modelMessageBatches.push(modelRequest.messages);
+      yield textDelta(modelMessageBatches.length === 1 ? "first" : "second");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const events: AgentEvent[] = [];
@@ -98,7 +111,7 @@ describe("Agent", () => {
       [{ role: "user", content: "one" }],
       [
         { role: "user", content: "one" },
-        { role: "assistant", content: "first" },
+        { role: "assistant", content: [{ type: "text", text: "first" }] },
         { role: "user", content: "two" },
       ],
     ]);
@@ -109,9 +122,10 @@ describe("Agent", () => {
     let modelCallCount = 0;
     const modelStream: ModelStream = async function* () {
       modelCallCount += 1;
-      yield "working";
+      yield textDelta("working");
       await responseGate.promise;
-      yield " done";
+      yield textDelta(" done");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const firstPromptResult = agent.prompt("first");
@@ -130,7 +144,8 @@ describe("Agent", () => {
 
   it("stays busy until run_end has been delivered", async () => {
     const modelStream: ModelStream = async function* () {
-      yield "done";
+      yield textDelta("done");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const eventTypes: string[] = [];
@@ -168,16 +183,38 @@ describe("Agent", () => {
 
   it("aborts immediately, ignores late deltas, and can continue", async () => {
     const lateChunkGate = Promise.withResolvers<void>();
+    const iteratorCleanupStarted = Promise.withResolvers<void>();
+    const iteratorCleanupGate = Promise.withResolvers<void>();
     let modelCallCount = 0;
-    const modelStream: ModelStream = async function* () {
+    const modelStream: ModelStream = () => {
       modelCallCount += 1;
       if (modelCallCount === 1) {
-        yield "partial";
-        await lateChunkGate.promise;
-        yield " late";
-        return;
+        let nextEventCount = 0;
+        const responseIterator: AsyncIterableIterator<ModelStreamEvent> = {
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+          next() {
+            nextEventCount += 1;
+            return nextEventCount === 1
+              ? Promise.resolve({ done: false as const, value: textDelta("partial") })
+              : lateChunkGate.promise.then(() => ({
+                  done: false as const,
+                  value: textDelta(" late"),
+                }));
+          },
+          async return() {
+            iteratorCleanupStarted.resolve();
+            await iteratorCleanupGate.promise;
+            return { done: true as const, value: undefined };
+          },
+        };
+        return responseIterator;
       }
-      yield "recovered";
+      return (async function* () {
+        yield textDelta("recovered");
+        yield stopFinish();
+      })();
     };
     const agent = await createTestAgent(modelStream);
     const eventTypes: string[] = [];
@@ -186,11 +223,15 @@ describe("Agent", () => {
     await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
 
     agent.abort();
+    await iteratorCleanupStarted.promise;
+    expect(eventTypes.filter((type) => type === "run_end")).toHaveLength(0);
+    iteratorCleanupGate.resolve();
     await expect(firstPromptResult).resolves.toEqual({ status: "aborted" });
     const finalAssistantMessage = agent.state.messageHistory.at(-1);
     expect(finalAssistantMessage).toEqual({
       role: "assistant",
       content: "partial",
+      parts: [{ type: "text", text: "partial" }],
       status: "aborted",
     });
     expect(eventTypes.filter((type) => type === "run_end")).toHaveLength(1);
@@ -212,18 +253,18 @@ describe("Agent", () => {
       modelCallCount += 1;
       if (modelCallCount === 1) {
         let nextChunkCount = 0;
-        const failedResponseIterator: AsyncIterableIterator<string> = {
+        const failedResponseIterator: AsyncIterableIterator<ModelStreamEvent> = {
           [Symbol.asyncIterator]() {
             return this;
           },
-          async next(): Promise<IteratorResult<string>> {
+          async next(): Promise<IteratorResult<ModelStreamEvent>> {
             nextChunkCount += 1;
             if (nextChunkCount === 1) {
-              return { done: false, value: "partial" };
+              return { done: false, value: textDelta("partial") };
             }
             throw new Error("Authorization: Bearer secret-value");
           },
-          return(): Promise<IteratorResult<string>> {
+          return(): Promise<IteratorResult<ModelStreamEvent>> {
             failedResponseIteratorReturnCount += 1;
             throw new Error("iterator cleanup failed");
           },
@@ -231,7 +272,8 @@ describe("Agent", () => {
         return failedResponseIterator;
       }
       return (async function* () {
-        yield "ok";
+        yield textDelta("ok");
+        yield stopFinish();
       })();
     };
     const agent = await createTestAgent(modelStream);
@@ -246,6 +288,7 @@ describe("Agent", () => {
     expect(agent.state.messageHistory.at(-1)).toEqual({
       role: "assistant",
       content: "partial",
+      parts: [{ type: "text", text: "partial" }],
       status: "failed",
     });
     expect(JSON.stringify(agent.state)).not.toContain("secret-value");
@@ -265,6 +308,7 @@ describe("Agent", () => {
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000001",
       workspaceRoot: "C:\\workspace",
+      sessionDirectory: "C:\\workspace\\data\\conversation",
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -276,6 +320,7 @@ describe("Agent", () => {
                 throw new Error("disk failure with secret-value");
               }
             },
+            async appendToolExecutionStarted() {},
             async appendRunFinished() {
               appendedRunFinishedCount += 1;
             },
@@ -289,7 +334,8 @@ describe("Agent", () => {
     const agent = createAgentWithModelStream({
       session,
       modelStream: async function* () {
-        yield "not durable";
+        yield textDelta("not durable");
+        yield stopFinish();
       },
     });
     const assistantMessageEndEvents: AgentEvent[] = [];
@@ -316,6 +362,7 @@ describe("Agent", () => {
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000011",
       workspaceRoot: "C:\\workspace",
+      sessionDirectory: "C:\\workspace\\data\\conversation",
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -325,6 +372,9 @@ describe("Agent", () => {
           lease: Object.freeze({
             async appendMessage() {
               throw new Error("append secret-value");
+            },
+            async appendToolExecutionStarted() {
+              throw new Error("must not append ToolExecutionStarted");
             },
             async appendRunFinished() {
               throw new Error("must not append RunFinished");
@@ -340,7 +390,7 @@ describe("Agent", () => {
       session,
       modelStream: async function* () {
         modelCallCount += 1;
-        yield "must not run";
+        yield textDelta("must not run");
       },
     });
     const events: AgentEvent[] = [];
@@ -372,6 +422,7 @@ describe("Agent", () => {
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000002",
       workspaceRoot: "C:\\workspace",
+      sessionDirectory: "C:\\workspace\\data\\conversation",
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -381,6 +432,7 @@ describe("Agent", () => {
             async appendMessage() {
               appendedMessageCount += 1;
             },
+            async appendToolExecutionStarted() {},
             async appendRunFinished() {
               appendedRunFinishedCount += 1;
               throw new Error("run completion persistence failed");
@@ -396,7 +448,8 @@ describe("Agent", () => {
       session,
       modelStream: async function* () {
         modelCallCount += 1;
-        yield "durable assistant";
+        yield textDelta("durable assistant");
+        yield stopFinish();
       },
     });
     const eventTypes: string[] = [];
@@ -422,6 +475,7 @@ describe("Agent", () => {
       const session: Session = Object.freeze({
         sessionId: randomSessionId(),
         workspaceRoot: "C:\\workspace",
+        sessionDirectory: "C:\\workspace\\data\\conversation",
         shell: TEST_SHELL,
         messageHistory: Object.freeze([]),
         async acquireRun() {
@@ -433,7 +487,7 @@ describe("Agent", () => {
         session,
         modelStream: async function* () {
           modelCallCount += 1;
-          yield "must not run";
+          yield textDelta("must not run");
         },
       });
       const events: AgentEvent[] = [];
@@ -452,7 +506,7 @@ describe("Agent", () => {
     let modelCallCount = 0;
     const agent = await createTestAgent(async function* () {
       modelCallCount += 1;
-      yield "must not run";
+      yield textDelta("must not run");
     });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
@@ -475,28 +529,31 @@ describe("Agent", () => {
         if (terminalStatus === "failed") {
           throw new Error("model failed");
         }
-        yield "partial";
+        yield textDelta("partial");
         if (terminalStatus === "aborted") {
           await responseGate.promise;
+        } else {
+          yield stopFinish();
         }
       });
       const promptResultPromise = agent.prompt("terminal");
       if (terminalStatus === "aborted") {
         await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
         agent.abort();
+        responseGate.resolve();
       }
 
       const promptResult = await promptResultPromise;
       expect(promptResult.status).toBe(terminalStatus);
       await expect(access(getSessionLockPath(agent))).rejects.toThrow();
-      responseGate.resolve();
     },
   );
 
   it("does not await subscriber promises and unsubscribes idempotently", async () => {
     const neverSettles = new Promise<void>(() => undefined);
     const modelStream: ModelStream = async function* () {
-      yield "ok";
+      yield textDelta("ok");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const events: AgentEvent[] = [];
@@ -517,7 +574,8 @@ describe("Agent", () => {
 
   it("does not expose mutable references to internal messages", async () => {
     const modelStream: ModelStream = async function* () {
-      yield "safe";
+      yield textDelta("safe");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     await agent.prompt("hello");
@@ -537,7 +595,8 @@ describe("Agent", () => {
     const firstAgent = createAgentWithModelStream({
       session,
       modelStream: async function* () {
-        yield "first answer";
+        yield textDelta("first answer");
+        yield stopFinish();
       },
     });
     await firstAgent.prompt("first question");
@@ -551,21 +610,27 @@ describe("Agent", () => {
     const modelMessageBatches: unknown[] = [];
     const reopenedAgent = createAgentWithModelStream({
       session: reopenedSession,
-      modelStream: async function* (modelMessages) {
-        modelMessageBatches.push(modelMessages);
-        yield "second answer";
+      modelStream: async function* (modelRequest) {
+        modelMessageBatches.push(modelRequest.messages);
+        yield textDelta("second answer");
+        yield stopFinish();
       },
     });
 
     expect(reopenedAgent.state.messageHistory).toEqual([
       { role: "user", content: "first question" },
-      { role: "assistant", content: "first answer", status: "completed" },
+      {
+        role: "assistant",
+        content: "first answer",
+        parts: [{ type: "text", text: "first answer" }],
+        status: "completed",
+      },
     ]);
     await reopenedAgent.prompt("second question");
     expect(modelMessageBatches).toEqual([
       [
         { role: "user", content: "first question" },
-        { role: "assistant", content: "first answer" },
+        { role: "assistant", content: [{ type: "text", text: "first answer" }] },
         { role: "user", content: "second question" },
       ],
     ]);
@@ -609,4 +674,18 @@ function getSessionLockPath(agent: Agent): string {
 
 function randomSessionId(): string {
   return "00000000-0000-4000-8000-000000000003";
+}
+
+/** 创建一个确定性文本增量事件。 */
+function textDelta(delta: string): ModelStreamEvent {
+  return Object.freeze({ type: "text_delta", delta });
+}
+
+/** 创建一个无计量的正常停止事件。 */
+function stopFinish(): ModelStreamEvent {
+  return Object.freeze({
+    type: "finish",
+    finishReason: "stop",
+    usage: Object.freeze({ inputTokens: null, outputTokens: null, totalTokens: null }),
+  });
 }

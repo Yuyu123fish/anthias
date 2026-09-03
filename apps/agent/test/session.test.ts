@@ -107,6 +107,7 @@ describe("Session", () => {
     const assistantMessage: Message = Object.freeze({
       role: "assistant",
       content: "world",
+      parts: Object.freeze([{ type: "text" as const, text: "world" }]),
       status: "completed",
     });
 
@@ -151,6 +152,20 @@ describe("Session", () => {
       activeDurationMilliseconds: 25,
     });
 
+    // Stage 1 已落盘记录没有新增计量字段，重开必须继续兼容而不重写历史。
+    const legacySessionLines = completedSessionText.trimEnd().split("\n").map(parseRecord);
+    const legacyRunFinishedRecord = legacySessionLines.at(-1);
+    if (legacyRunFinishedRecord === undefined) {
+      throw new Error("expected a RunFinishedRecord");
+    }
+    delete legacyRunFinishedRecord.processedToolCallCount;
+    delete legacyRunFinishedRecord.modelUsage;
+    await writeFile(
+      sessionFilePath,
+      `${legacySessionLines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+      "utf8",
+    );
+
     const reopenedSession = await openSession({
       sessionId: session.sessionId,
       workspaceRoot: existingWorkspaceRoot,
@@ -185,7 +200,12 @@ describe("Session", () => {
     ] as const) {
       const runLease = await acquireSessionRun(session, reusedRunId);
       await runLease.appendMessage({ role: "user", content: question });
-      await runLease.appendMessage({ role: "assistant", content: answer, status: "completed" });
+      await runLease.appendMessage({
+        role: "assistant",
+        content: answer,
+        parts: [{ type: "text", text: answer }],
+        status: "completed",
+      });
       await runLease.appendRunFinished({
         status: "completed",
         modelRequestCount: 1,
@@ -435,6 +455,7 @@ describe("Session", () => {
     await runLease.appendMessage({
       role: "assistant",
       content: "answer",
+      parts: [{ type: "text", text: "answer" }],
       status: "completed",
     });
     await runLease.appendRunFinished({

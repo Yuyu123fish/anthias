@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.41",
-    "ai": "7.0.85"
+    "ai": "7.0.85",
+    "diff": "9.0.0"
   },
   "engines": {
     "node": ">=24 <25"

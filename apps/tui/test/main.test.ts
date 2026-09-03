@@ -42,7 +42,7 @@ describe("Anthias CLI", () => {
       throw new Error("expected CLI to print the created Session UUID");
     }
     expect(firstProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
-    expect(await readdir(sessionDirectory)).toEqual([`${sessionId}.jsonl`]);
+    expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
     const sessionHeader = JSON.parse(
       (await readFile(join(sessionDirectory, `${sessionId}.jsonl`), "utf8")).trimEnd(),
     ) as Record<string, unknown>;
@@ -64,7 +64,7 @@ describe("Anthias CLI", () => {
     expect(reopenedProcessResult.stderr).toBe("");
     expect(reopenedProcessResult.stdout).toContain(`Session: ${sessionId}\n`);
     expect(reopenedProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
-    expect(await readdir(sessionDirectory)).toEqual([`${sessionId}.jsonl`]);
+    expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
   });
 
   it("exits before Session creation when model configuration is missing", async () => {

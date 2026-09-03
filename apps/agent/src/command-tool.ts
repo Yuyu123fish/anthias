@@ -1,0 +1,518 @@
+import { spawn } from "node:child_process";
+import { stat } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
+import type { AssistantToolCallPart } from "./agent.js";
+import type { SessionShell } from "./session.js";
+import {
+  boundToolOutput,
+  resolveExistingWorkspacePath,
+  TOOL_RESULT_BYTE_LIMIT,
+  TOOL_RESULT_LINE_LIMIT,
+  type ToolExecutionResult,
+  type ToolWorkspace,
+} from "./tools.js";
+
+/** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
+export type PreparedCommandTool = Readonly<{
+  toolName: "execute_command";
+  target: string;
+  preview: string;
+  command: string;
+  cwd: string;
+  timeoutMilliseconds: number;
+  shell: SessionShell;
+}>;
+
+/** 表示命令预检成功，或无需确认即可返回模型的安全失败。 */
+export type PreparedCommandResult =
+  | Readonly<{ ok: true; preparedTool: PreparedCommandTool }>
+  | Readonly<{ ok: false; result: ToolExecutionResult }>;
+
+/** 描述一次命令执行期间可公开的有界输出增量。 */
+export type CommandExecutionUpdate = Readonly<{
+  stream: "stdout" | "stderr";
+  delta: string;
+}>;
+
+/** 保存命令终结结果以及进程树清理是否能够确认。 */
+export type CommandExecutionResult = ToolExecutionResult &
+  Readonly<{
+    cleanupUncertain: boolean;
+  }>;
+
+/** 保存命令输出中一个按 Node 观察顺序接受的有界片段。 */
+type CommandOutputEntry = Readonly<{
+  stream: "stdout" | "stderr";
+  text: string;
+}>;
+
+/** 聚合命令输出并在达到展示预算后继续排空但停止保存。 */
+type CommandOutputCollector = Readonly<{
+  append(stream: "stdout" | "stderr", text: string): string;
+  entries(): readonly CommandOutputEntry[];
+  readonly truncated: boolean;
+}>;
+
+/** 枚举一次命令可以进入的明确终止原因。 */
+type CommandTerminationReason =
+  | "completed"
+  | "non_zero_exit"
+  | "spawn_failed"
+  | "timeout"
+  | "aborted";
+
+const DEFAULT_COMMAND_TIMEOUT_MILLISECONDS = 120_000;
+const MINIMUM_COMMAND_TIMEOUT_MILLISECONDS = 1_000;
+const MAXIMUM_COMMAND_TIMEOUT_MILLISECONDS = 1_800_000;
+const PROCESS_TREE_SHUTDOWN_GRACE_MILLISECONDS = 2_000;
+const PROCESS_TREE_SIGNAL_GRACE_MILLISECONDS = 750;
+const PROCESS_TREE_POLL_MILLISECONDS = 25;
+
+/** 无副作用地校验并形成每次 execute_command 确认所需的完整预览。 */
+export async function prepareCommandTool(
+  toolCall: AssistantToolCallPart,
+  workspace: ToolWorkspace,
+  shell: SessionShell,
+  remainingActiveDurationMilliseconds: number,
+): Promise<PreparedCommandResult> {
+  const inputResult = parseCommandInput(toolCall);
+  if (!inputResult.ok) {
+    return failedPreparation(inputResult.error);
+  }
+
+  try {
+    const resolvedCwd = await resolveExistingWorkspacePath(inputResult.input.cwd, workspace, true);
+    if (!(await stat(resolvedCwd.absolutePath)).isDirectory()) {
+      return failedPreparation("execute_command cwd 不是目录。");
+    }
+    const timeoutMilliseconds = Math.max(
+      1,
+      Math.min(
+        inputResult.input.timeoutMilliseconds,
+        Math.floor(remainingActiveDurationMilliseconds),
+      ),
+    );
+    const target = resolvedCwd.relativePath.length === 0 ? "." : resolvedCwd.relativePath;
+    const previewResult = boundToolOutput([
+      "operation: execute command",
+      `shell: ${renderShell(shell)}`,
+      `cwd: ${target}`,
+      `timeoutMs: ${timeoutMilliseconds}`,
+      "command:",
+      ...splitLines(inputResult.input.command),
+    ]);
+    if (previewResult.truncated) {
+      return failedPreparation("execute_command 确认内容超过 64 KiB 或 2,000 行，请缩短命令。");
+    }
+    return Object.freeze({
+      ok: true,
+      preparedTool: Object.freeze({
+        toolName: "execute_command",
+        target,
+        preview: previewResult.content,
+        command: inputResult.input.command,
+        cwd: resolvedCwd.absolutePath,
+        timeoutMilliseconds,
+        shell,
+      }),
+    });
+  } catch (error) {
+    return failedPreparation(toSafeCommandError(error));
+  }
+}
+
+/** 启动一次已经展示并批准的固定 Shell 命令，并收口输出、超时与取消。 */
+export async function executePreparedCommand(
+  preparedTool: PreparedCommandTool,
+  abortSignal: AbortSignal,
+  publishUpdate: (update: CommandExecutionUpdate) => void,
+): Promise<CommandExecutionResult> {
+  if (abortSignal.aborted) {
+    return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
+  }
+
+  const startedAtMilliseconds = Date.now();
+  const outputCollector = createCommandOutputCollector();
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
+  let childProcess: ReturnType<typeof spawn>;
+  try {
+    childProcess = spawn(
+      preparedTool.shell.executable,
+      [...preparedTool.shell.arguments, preparedTool.command],
+      {
+        cwd: preparedTool.cwd,
+        env: createSanitizedEnvironment(process.env),
+        shell: false,
+        windowsHide: true,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch {
+    return createCommandResult(
+      "spawn_failed",
+      null,
+      Date.now() - startedAtMilliseconds,
+      outputCollector,
+      false,
+    );
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let terminationReason: "timeout" | "aborted" | null = null;
+    let terminationPromise: Promise<boolean> | null = null;
+    let cleanupUncertain = false;
+    let shutdownFallbackTimer: NodeJS.Timeout | null = null;
+
+    /** 只交付一次命令终态，并移除所有由本次执行持有的资源。 */
+    const settle = (exitCode: number | null, spawnFailed = false) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(commandTimeout);
+      if (shutdownFallbackTimer !== null) {
+        clearTimeout(shutdownFallbackTimer);
+      }
+      abortSignal.removeEventListener("abort", handleAbort);
+      const finalStdout = stdoutDecoder.end();
+      const finalStderr = stderrDecoder.end();
+      publishAcceptedOutput("stdout", finalStdout);
+      publishAcceptedOutput("stderr", finalStderr);
+      childProcess.stdout?.removeAllListeners();
+      childProcess.stderr?.removeAllListeners();
+      childProcess.removeAllListeners();
+      childProcess.stdout?.destroy();
+      childProcess.stderr?.destroy();
+      const reason: CommandTerminationReason = spawnFailed
+        ? "spawn_failed"
+        : (terminationReason ?? (exitCode === 0 ? "completed" : "non_zero_exit"));
+      resolve(
+        createCommandResult(
+          reason,
+          exitCode,
+          Date.now() - startedAtMilliseconds,
+          outputCollector,
+          cleanupUncertain,
+        ),
+      );
+    };
+
+    /** 保存并发布仍落在统一预算内的输出，订阅者异常不能破坏子进程收口。 */
+    const publishAcceptedOutput = (stream: "stdout" | "stderr", text: string) => {
+      const acceptedText = outputCollector.append(stream, text);
+      if (acceptedText.length === 0 || settled) {
+        return;
+      }
+      try {
+        publishUpdate(Object.freeze({ stream, delta: acceptedText }));
+      } catch {
+        // 呈现失败不影响命令结果、进程回收或 JSONL 事实。
+      }
+    };
+
+    /** 在中止或超时时仅请求一次进程树终止，并为无法确认的情况设置收口上限。 */
+    const requestTermination = (reason: "timeout" | "aborted") => {
+      if (terminationReason !== null || settled) {
+        return;
+      }
+      terminationReason = reason;
+      terminationPromise = terminateProcessTree(childProcess).then((uncertain) => {
+        cleanupUncertain ||= uncertain;
+        return uncertain;
+      });
+      shutdownFallbackTimer = setTimeout(() => {
+        cleanupUncertain = true;
+        forceTerminateProcessTree(childProcess);
+        settle(null);
+      }, PROCESS_TREE_SHUTDOWN_GRACE_MILLISECONDS);
+    };
+
+    /** 根 AbortSignal 只请求进程回收，Run 终态由 Agent 统一决定。 */
+    const handleAbort = () => requestTermination("aborted");
+
+    childProcess.stdout?.on("data", (chunk: Buffer) => {
+      publishAcceptedOutput("stdout", stdoutDecoder.write(chunk));
+    });
+    childProcess.stderr?.on("data", (chunk: Buffer) => {
+      publishAcceptedOutput("stderr", stderrDecoder.write(chunk));
+    });
+    childProcess.once("error", () => settle(null, true));
+    childProcess.once("close", (exitCode) => {
+      if (terminationPromise === null) {
+        settle(exitCode);
+        return;
+      }
+      void terminationPromise.finally(() => settle(exitCode));
+    });
+    const commandTimeout = setTimeout(
+      () => requestTermination("timeout"),
+      preparedTool.timeoutMilliseconds,
+    );
+    abortSignal.addEventListener("abort", handleAbort, { once: true });
+    if (abortSignal.aborted) {
+      handleAbort();
+    }
+  });
+}
+
+/** 精确解析 execute_command 输入并拒绝未知字段或错误类型。 */
+function parseCommandInput(toolCall: AssistantToolCallPart):
+  | Readonly<{
+      ok: true;
+      input: Readonly<{ command: string; cwd: string; timeoutMilliseconds: number }>;
+    }>
+  | Readonly<{ ok: false; error: string }> {
+  if (toolCall.invalid || toolCall.toolName !== "execute_command" || !isRecord(toolCall.input)) {
+    return Object.freeze({ ok: false, error: "execute_command 输入无法解析或不符合 Schema。" });
+  }
+  const input = toolCall.input;
+  if (
+    !hasOnlyKeys(input, ["command", "cwd", "timeoutMs"]) ||
+    !isNonEmptyString(input.command) ||
+    !isOptionalNonEmptyString(input.cwd) ||
+    !isOptionalIntegerInRange(
+      input.timeoutMs,
+      MINIMUM_COMMAND_TIMEOUT_MILLISECONDS,
+      MAXIMUM_COMMAND_TIMEOUT_MILLISECONDS,
+    )
+  ) {
+    return Object.freeze({ ok: false, error: "execute_command 输入不符合 Schema。" });
+  }
+  return Object.freeze({
+    ok: true,
+    input: Object.freeze({
+      command: input.command,
+      cwd: input.cwd ?? ".",
+      timeoutMilliseconds: input.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MILLISECONDS,
+    }),
+  });
+}
+
+/** 创建一个只保存有界 UTF-8 文本和行数的命令输出收集器。 */
+function createCommandOutputCollector(): CommandOutputCollector {
+  const entries: CommandOutputEntry[] = [];
+  let byteCount = 0;
+  let lineCount = 0;
+  let outputStarted = false;
+  let truncated = false;
+
+  return Object.freeze({
+    append(stream, text) {
+      if (truncated || text.length === 0) {
+        return "";
+      }
+      let acceptedText = "";
+      for (const character of text) {
+        const characterBytes = Buffer.byteLength(character, "utf8");
+        const nextLineCount = lineCount + (!outputStarted || character === "\n" ? 1 : 0);
+        if (
+          byteCount + characterBytes > TOOL_RESULT_BYTE_LIMIT - 1024 ||
+          nextLineCount > TOOL_RESULT_LINE_LIMIT - 16
+        ) {
+          truncated = true;
+          break;
+        }
+        acceptedText += character;
+        byteCount += characterBytes;
+        lineCount = nextLineCount;
+        outputStarted = true;
+      }
+      if (acceptedText.length > 0) {
+        entries.push(Object.freeze({ stream, text: acceptedText }));
+      }
+      return acceptedText;
+    },
+    entries: () => Object.freeze([...entries]),
+    get truncated() {
+      return truncated;
+    },
+  });
+}
+
+/** 将命令终止事实与按观察顺序保存的输出收敛为一个有界 ToolResult。 */
+function createCommandResult(
+  reason: CommandTerminationReason,
+  exitCode: number | null,
+  durationMilliseconds: number,
+  outputCollector: CommandOutputCollector,
+  cleanupUncertain: boolean,
+): CommandExecutionResult {
+  const resultLines = [
+    `termination: ${reason}`,
+    `exitCode: ${exitCode ?? "none"}`,
+    `durationMs: ${Math.max(0, Math.round(durationMilliseconds))}`,
+    `cleanupUncertain: ${cleanupUncertain}`,
+    "output:",
+  ];
+  for (const entry of outputCollector.entries()) {
+    resultLines.push(`[${entry.stream}]`, ...splitLines(entry.text));
+  }
+  if (outputCollector.truncated) {
+    resultLines.push("...[命令输出已截断，管道已继续排空]");
+  }
+  const rendered = boundToolOutput(resultLines);
+  return Object.freeze({
+    status: reason === "completed" ? "completed" : "failed",
+    content: rendered.content,
+    truncated: outputCollector.truncated || rendered.truncated,
+    cleanupUncertain,
+  });
+}
+
+/** 终止本次命令拥有的进程树，并在无法确认时返回 true。 */
+async function terminateProcessTree(childProcess: ReturnType<typeof spawn>): Promise<boolean> {
+  const processId = childProcess.pid;
+  if (processId === undefined) {
+    return true;
+  }
+  if (process.platform === "win32") {
+    return new Promise((resolve) => {
+      let taskkillProcess: ReturnType<typeof spawn>;
+      try {
+        taskkillProcess = spawn("taskkill.exe", ["/PID", String(processId), "/T", "/F"], {
+          shell: false,
+          windowsHide: true,
+          stdio: "ignore",
+        });
+      } catch {
+        resolve(true);
+        return;
+      }
+      taskkillProcess.once("error", () => resolve(true));
+      taskkillProcess.once("close", (exitCode) => resolve(exitCode !== 0));
+    });
+  }
+  if (!signalPosixProcessGroup(processId, "SIGTERM")) {
+    return false;
+  }
+  if (await waitForPosixProcessGroupExit(processId, PROCESS_TREE_SIGNAL_GRACE_MILLISECONDS)) {
+    return false;
+  }
+  if (!signalPosixProcessGroup(processId, "SIGKILL")) {
+    return false;
+  }
+  return !(await waitForPosixProcessGroupExit(processId, PROCESS_TREE_SIGNAL_GRACE_MILLISECONDS));
+}
+
+/** 向 POSIX 进程组发送信号；组已经消失时返回 false。 */
+function signalPosixProcessGroup(processId: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-processId, signal);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/** 在短宽限内确认 POSIX 进程组已经消失，避免把仅发送信号当作清理完成。 */
+async function waitForPosixProcessGroupExit(
+  processId: number,
+  graceMilliseconds: number,
+): Promise<boolean> {
+  const deadlineMilliseconds = Date.now() + graceMilliseconds;
+  while (Date.now() < deadlineMilliseconds) {
+    try {
+      process.kill(-processId, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return true;
+      }
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, PROCESS_TREE_POLL_MILLISECONDS));
+  }
+  try {
+    process.kill(-processId, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+/** 在宽限结束后升级终止请求；失败事实由调用方的 cleanupUncertain 暴露。 */
+function forceTerminateProcessTree(childProcess: ReturnType<typeof spawn>): void {
+  const processId = childProcess.pid;
+  try {
+    if (process.platform !== "win32" && processId !== undefined) {
+      process.kill(-processId, "SIGKILL");
+      return;
+    }
+    childProcess.kill("SIGKILL");
+  } catch {
+    // 调用方已经把结果标记为 cleanupUncertain，不能继续无限等待。
+  }
+}
+
+/** 从子进程环境中大小写不敏感地移除 Anthias 模型凭据。 */
+function createSanitizedEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([name]) => name.toLowerCase() !== "anthias_model_api_key"),
+  );
+}
+
+/** 用不会混淆 executable 与参数边界的形式展示固定 Session Shell。 */
+function renderShell(shell: SessionShell): string {
+  return [shell.executable, ...shell.arguments].map((part) => JSON.stringify(part)).join(" ");
+}
+
+/** 把多行确认或结果文本拆成稳定行，不虚构额外尾行。 */
+function splitLines(text: string): string[] {
+  const lines = text.split(/\r?\n/u);
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  return lines.length === 0 ? [""] : lines;
+}
+
+/** 创建一个无需确认即可返回模型的命令预检失败。 */
+function failedPreparation(error: string): PreparedCommandResult {
+  return Object.freeze({
+    ok: false,
+    result: Object.freeze({ status: "failed", content: error, truncated: false }),
+  });
+}
+
+/** 收敛路径和系统错误，避免绝对路径或堆栈进入消息。 */
+function toSafeCommandError(error: unknown): string {
+  const errorCode = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof errorCode === "string"
+    ? `execute_command 预检失败：${errorCode}`
+    : "execute_command 预检失败。";
+}
+
+/** 判断未知值是否为普通 JSON 对象。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** 判断对象键集合是否没有 Schema 之外的字段。 */
+function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+/** 判断未知值是否为非空字符串。 */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** 判断可选值是否为非空字符串。 */
+function isOptionalNonEmptyString(value: unknown): value is string | undefined {
+  return value === undefined || isNonEmptyString(value);
+}
+
+/** 判断可选值是否为闭区间内的安全整数。 */
+function isOptionalIntegerInRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number | undefined {
+  return (
+    value === undefined ||
+    (Number.isSafeInteger(value) &&
+      typeof value === "number" &&
+      value >= minimum &&
+      value <= maximum)
+  );
+}

@@ -68,6 +68,22 @@ export function runTui({
       await requestExit();
       return;
     }
+    const pendingApproval = agent.state.pendingToolApproval;
+    if (pendingApproval !== null) {
+      const normalizedDecision = line.trim().toLocaleLowerCase("en-US");
+      if (normalizedDecision === "y" || normalizedDecision === "yes") {
+        agent.respondToToolApproval(pendingApproval.toolApprovalRequestId, "approve");
+      } else if (
+        normalizedDecision === "" ||
+        normalizedDecision === "n" ||
+        normalizedDecision === "no"
+      ) {
+        agent.respondToToolApproval(pendingApproval.toolApprovalRequestId, "deny");
+      } else {
+        output.write("请输入 y/yes 批准，或 n/no/空行拒绝。\n");
+      }
+      return;
+    }
     if (line.trim().length === 0) {
       output.write("请输入非空提示词。\n");
       writeInputPrompt(output);
@@ -86,9 +102,7 @@ export function runTui({
     }
 
     if (promptResult.status === "rejected") {
-      output.write(
-        promptResult.reason === "empty" ? "请输入非空提示词。\n" : "当前响应仍在生成。\n",
-      );
+      output.write(renderPromptRejection(promptResult.reason));
     }
     if (!exitStarted) {
       writeInputPrompt(output);
@@ -115,7 +129,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
     case "message_start":
       if (event.message.role === "user") {
         output.write(`You: ${event.message.content}\n`);
-      } else {
+      } else if (event.message.role === "assistant") {
         output.write("Assistant: ");
       }
       return;
@@ -125,6 +139,33 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
     case "message_end":
       if (event.message.role === "assistant") {
         output.write("\n");
+      } else if (event.message.role === "tool") {
+        output.write(
+          `ToolResult: ${event.message.toolName} ${event.message.status}${event.message.truncated ? "（已截断）" : ""}\n${event.message.content}\n`,
+        );
+      }
+      return;
+    case "tool_execution_start":
+      output.write(`Tool: ${event.toolName} (${event.toolCallId})\n`);
+      return;
+    case "tool_execution_update":
+      output.write(`[${event.stream}] ${event.delta}`);
+      return;
+    case "tool_execution_end":
+      if (event.cleanupUncertain) {
+        output.write("警告：Tool 资源清理结果不确定。\n");
+      }
+      return;
+    case "tool_approval_requested":
+      output.write(
+        `需要确认：${event.request.toolName}\n目标：${event.request.target}\n${event.request.preview}\n允许执行？[y/N] `,
+      );
+      return;
+    case "tool_approval_resolved":
+      if (event.decision === "aborted") {
+        output.write("确认等待已停止。\n");
+      } else {
+        output.write(event.decision === "approve" ? "已批准本次调用。\n" : "已拒绝本次调用。\n");
       }
       return;
     case "run_end":
@@ -132,9 +173,14 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
         output.write(`错误：${event.result.error}\n`);
       } else if (event.result.status === "aborted") {
         output.write("已停止当前响应。\n");
+      } else if (event.result.status === "budget_exhausted") {
+        output.write(`已达到 Run 预算：${event.result.budget}。\n`);
       } else {
         output.write("已完成。\n");
       }
+      output.write(
+        `Run 用量：模型请求 ${event.metrics.modelRequestCount}，ToolCall ${event.metrics.processedToolCallCount}/${event.metrics.producedToolCallCount}，活动 ${event.metrics.activeDurationMilliseconds} ms。\n`,
+      );
       return;
   }
 }
@@ -144,13 +190,33 @@ function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream
   output.write(`Session: ${state.sessionId}\n`);
   output.write(`Workspace: ${state.workspaceRoot}\n`);
   for (const message of state.messageHistory) {
-    output.write(
-      message.role === "user" ? `You: ${message.content}\n` : `Assistant: ${message.content}\n`,
-    );
+    if (message.role === "user") {
+      output.write(`You: ${message.content}\n`);
+    } else if (message.role === "assistant") {
+      output.write(`Assistant: ${message.content}\n`);
+    } else {
+      output.write(`ToolResult: ${message.toolName} ${message.status}\n${message.content}\n`);
+    }
   }
 }
 
 /** 写出下一次终端输入提示。 */
 function writeInputPrompt(output: NodeJS.WritableStream): void {
   output.write(INPUT_PROMPT);
+}
+
+/** 将不同 prompt 拒绝原因映射为可操作且不混淆的终端文案。 */
+function renderPromptRejection(
+  reason: Extract<PromptResult, { status: "rejected" }>["reason"],
+): string {
+  switch (reason) {
+    case "empty":
+      return "请输入非空提示词。\n";
+    case "busy":
+      return "当前响应仍在生成。\n";
+    case "session_busy":
+      return "Session 正被其他进程使用，请稍后重试。\n";
+    case "session_changed":
+      return "Session 文件已发生变化，请重新打开 Session。\n";
+  }
 }
