@@ -50,7 +50,10 @@ export type ModelStreamEvent =
       usage: ModelUsage;
     }>;
 
-/** 定义可被生产 Adapter 与确定性测试实现替换的结构化模型流。 */
+/**
+ * 定义可被生产 Adapter 与确定性测试实现替换的结构化模型流。
+ * Adapter 必须在 AbortSignal 触发后结束迭代或抛出，不能留下挂起的读取。
+ */
 export type ModelStream = (
   modelRequest: ModelRequest,
   abortSignal: AbortSignal,

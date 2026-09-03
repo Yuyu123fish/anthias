@@ -42,7 +42,7 @@ apps/agent/src/index.ts
 
 - 一个 Agent 同时只有一个 `activeGeneration`；终态发布完成前仍保持 busy，避免同步订阅者重入 prompt 时把下一轮事件插入上一轮 `agent_end` 之前。
 - completed、aborted、failed 共用同一终结路径，第一次终态生效；晚到增量、异常或取消不会再次结束本轮。
-- abort 通过本轮 `AbortController` 取消底层请求，并与挂起的迭代器读取竞争；迭代器 `return()` 只做不阻塞终态的收尾。
+- abort 通过本轮 `AbortController` 取消底层请求；Model Adapter 必须结束或拒绝流读取，Agent Loop 使用标准异步迭代结束本轮并忽略取消后事件。
 - 失败和停止都会保留已生成正文，清除活动引用并恢复空闲；新一轮接受时清除上一轮安全错误。
 - TUI 退出会先中止活动请求，等待当前 prompt 结束，再取消 Agent 订阅、移除 `SIGINT` 监听器并关闭 readline。输入读取不会在生成期间暂停，因此 EOF 和 `/exit` 可以及时触发退出。
 

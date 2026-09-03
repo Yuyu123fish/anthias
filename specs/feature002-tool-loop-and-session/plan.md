@@ -186,7 +186,7 @@ Stage 01 只增加高价值边界测试：
 - `tool_call`：完整 `toolCallId`、`toolName`、最终输入和 `invalid` 标记；
 - `finish`：规范化 finish reason 与本次 usage。
 
-生产 Adapter 继续使用 `streamText`，但 Tool 定义不提供 `execute`，不使用 AI SDK ToolLoopAgent、多步循环或 Tool approval。Adapter 从 `fullStream` 转换 `text-delta`、完整 `tool-call`、`finish` 和 `error`，并保持 `maxRetries: 0`。AI SDK 的无效或未知 ToolCall 只要已经包含调用标识，就转换成 `invalid` ToolCall 交给 Agent 生成 failed ToolResult；原始 SDK 异常不得进入公开消息或终端。
+生产 Adapter 继续使用 `streamText`，但 Tool 定义不提供 `execute`，不使用 AI SDK ToolLoopAgent、多步循环或 Tool approval。Adapter 从 `fullStream` 转换 `text-delta`、完整 `tool-call`、`finish` 和 `error`，并保持 `maxRetries: 0`。Model Stream 必须响应根 AbortSignal，在取消后结束迭代或抛出；Agent Loop 只使用 `for await...of` 消费，不手动管理迭代器或与单次 `next()` 竞速。AI SDK 的无效或未知 ToolCall 只要已经包含调用标识，就转换成 `invalid` ToolCall 交给 Agent 生成 failed ToolResult；原始 SDK 异常不得进入公开消息或终端。
 
 工具说明使用现有 AI SDK 的 JSON Schema 能力提供给模型；Agent 仍用项目自己的运行时解析器验证最终 `unknown` 输入。Provider、AI SDK Tool、ModelMessage、LanguageModelUsage 和流 part 类型不从 package 入口导出。
 
@@ -232,6 +232,8 @@ Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<wo
 ### 5.5 Agent Loop 顺序
 
 一次已接受 Run 使用以下唯一循环：
+
+`runAgentLoop()` 使用 `while (true)` 控制 Model → Tool → Model；每轮由 `streamAssistantResponse()` 使用 `for await...of` 消费一次 Model Stream，并通过同一个 `emit` 交付消息事件。模型流的结束与取消由 Model Adapter seam 保证，Loop 不建立第二套流运行时。
 
 1. 取得 Session 锁、核对文件检查点、创建 `runId`，追加 UserMessage，发布 `run_start` 和 User 消息事件；
 2. 检查模型请求与活动时长预算，进入 `requesting_model`，累计一次模型请求；

@@ -178,39 +178,36 @@ describe("Agent", () => {
   });
 
   it("aborts immediately, ignores late deltas, and can continue", async () => {
-    const lateChunkGate = Promise.withResolvers<void>();
-    const iteratorCleanupStarted = Promise.withResolvers<void>();
-    const iteratorCleanupGate = Promise.withResolvers<void>();
+    const abortObserved = Promise.withResolvers<void>();
+    const streamCleanupFinished = Promise.withResolvers<void>();
     let modelCallCount = 0;
-    const modelStream: ModelStream = () => {
+    const modelStream: ModelStream = async function* (_modelRequest, abortSignal) {
       modelCallCount += 1;
       if (modelCallCount === 1) {
-        let nextEventCount = 0;
-        const responseIterator: AsyncIterableIterator<ModelStreamEvent> = {
-          [Symbol.asyncIterator]() {
-            return this;
-          },
-          next() {
-            nextEventCount += 1;
-            return nextEventCount === 1
-              ? Promise.resolve({ done: false as const, value: textDelta("partial") })
-              : lateChunkGate.promise.then(() => ({
-                  done: false as const,
-                  value: textDelta(" late"),
-                }));
-          },
-          async return() {
-            iteratorCleanupStarted.resolve();
-            await iteratorCleanupGate.promise;
-            return { done: true as const, value: undefined };
-          },
-        };
-        return responseIterator;
+        try {
+          yield textDelta("partial");
+          if (abortSignal.aborted) {
+            abortObserved.resolve();
+          } else {
+            await new Promise<void>((resolve) => {
+              abortSignal.addEventListener(
+                "abort",
+                () => {
+                  abortObserved.resolve();
+                  resolve();
+                },
+                { once: true },
+              );
+            });
+          }
+          yield textDelta(" late");
+        } finally {
+          streamCleanupFinished.resolve();
+        }
+        return;
       }
-      return (async function* () {
-        yield textDelta("recovered");
-        yield stopFinish();
-      })();
+      yield textDelta("recovered");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
     const eventTypes: string[] = [];
@@ -219,10 +216,9 @@ describe("Agent", () => {
     await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
 
     agent.abort();
-    await iteratorCleanupStarted.promise;
-    expect(eventTypes.filter((type) => type === "run_end")).toHaveLength(0);
-    iteratorCleanupGate.resolve();
+    await abortObserved.promise;
     await expect(firstPromptResult).resolves.toEqual({ status: "aborted" });
+    await streamCleanupFinished.promise;
     const finalAssistantMessage = agent.state.messageHistory.at(-1);
     expect(finalAssistantMessage).toEqual({
       role: "assistant",
@@ -235,42 +231,20 @@ describe("Agent", () => {
       type: "run_finished",
       status: "aborted",
     });
-
-    lateChunkGate.resolve();
-    await Promise.resolve();
     expect(agent.state.messageHistory.at(-1)).toEqual(finalAssistantMessage);
     await expect(agent.prompt("continue")).resolves.toEqual({ status: "completed" });
   });
 
   it("keeps provider errors out of assistant text and recovers", async () => {
     let modelCallCount = 0;
-    let failedResponseIteratorReturnCount = 0;
-    const modelStream: ModelStream = () => {
+    const modelStream: ModelStream = async function* () {
       modelCallCount += 1;
       if (modelCallCount === 1) {
-        let nextChunkCount = 0;
-        const failedResponseIterator: AsyncIterableIterator<ModelStreamEvent> = {
-          [Symbol.asyncIterator]() {
-            return this;
-          },
-          async next(): Promise<IteratorResult<ModelStreamEvent>> {
-            nextChunkCount += 1;
-            if (nextChunkCount === 1) {
-              return { done: false, value: textDelta("partial") };
-            }
-            throw new Error("Authorization: Bearer secret-value");
-          },
-          return(): Promise<IteratorResult<ModelStreamEvent>> {
-            failedResponseIteratorReturnCount += 1;
-            throw new Error("iterator cleanup failed");
-          },
-        };
-        return failedResponseIterator;
+        yield textDelta("partial");
+        throw new Error("Authorization: Bearer secret-value");
       }
-      return (async function* () {
-        yield textDelta("ok");
-        yield stopFinish();
-      })();
+      yield textDelta("ok");
+      yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
 
@@ -292,8 +266,6 @@ describe("Agent", () => {
       type: "run_finished",
       status: "failed",
     });
-    expect(failedResponseIteratorReturnCount).toBe(1);
-
     await expect(agent.prompt("recover")).resolves.toEqual({ status: "completed" });
     expect(agent.state.lastError).toBeNull();
   });

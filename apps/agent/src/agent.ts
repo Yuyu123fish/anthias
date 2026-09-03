@@ -14,7 +14,6 @@ import {
   type ModelFinishReason,
   type ModelRequest,
   type ModelStream,
-  type ModelStreamEvent,
   type ModelUsage,
   toModelInputMessage,
 } from "./model-stream.js";
@@ -138,7 +137,6 @@ type AssistantRequestResult = Readonly<{
   finishReason: ModelFinishReason | null;
 }>;
 
-const ABORT_SIGNAL_RECEIVED = Symbol("abort-signal-received");
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const MODEL_REQUEST_LIMIT = 12;
 const TOOL_CALL_LIMIT = 32;
@@ -199,7 +197,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
       loopState.modelRequestCount += 1;
       updateLoopProgress(loopState, options);
-      const assistantRequest = await requestAssistantMessage(loopState, messageHistory, options);
+      const assistantRequest = await streamAssistantResponse(loopState, messageHistory, options);
       if (assistantRequest.message.status === "aborted") {
         await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
         return getAbortLoopResult(loopState);
@@ -264,8 +262,8 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
   }
 }
 
-/** 请求并形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
-async function requestAssistantMessage(
+/** 流式形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
+async function streamAssistantResponse(
   loopState: AgentLoopState,
   messageHistory: Message[],
   options: RunAgentLoopOptions,
@@ -278,7 +276,6 @@ async function requestAssistantMessage(
   };
   let finishReason: ModelFinishReason | null = null;
   let finishUsageObserved = false;
-  let responseIterator: AsyncIterator<ModelStreamEvent> | null = null;
 
   try {
     await options.emit({
@@ -292,75 +289,60 @@ async function requestAssistantMessage(
     });
 
     try {
-      responseIterator = options
-        .modelStream(modelRequest, options.abortController.signal)
-        [Symbol.asyncIterator]();
+      for await (const modelEvent of options.modelStream(
+        modelRequest,
+        options.abortController.signal,
+      )) {
+        if (options.abortController.signal.aborted) {
+          mutableMessage.status = "aborted";
+          break;
+        }
+        if (modelEvent.type === "text_delta") {
+          if (modelEvent.delta.length > 0) {
+            mutableMessage.content += modelEvent.delta;
+            appendTextPart(mutableMessage.parts, modelEvent.delta);
+            await options.emit({
+              type: "assistant_message_update",
+              message: snapshotAssistantMessage(mutableMessage),
+              delta: modelEvent.delta,
+            });
+          }
+          continue;
+        }
+        if (modelEvent.type === "tool_call") {
+          const toolCallIds = new Set(
+            mutableMessage.parts.filter(isToolCallPart).map((part) => part.toolCallId),
+          );
+          mutableMessage.parts.push(normalizeToolCall(modelEvent, toolCallIds));
+          continue;
+        }
+
+        finishReason = modelEvent.finishReason;
+        finishUsageObserved = true;
+        loopState.cumulativeModelUsage = addModelUsage(
+          loopState.cumulativeModelUsage,
+          modelEvent.usage,
+        );
+        updateLoopProgress(loopState, options);
+        mutableMessage.status = isSuccessfulAssistantFinish(
+          finishReason,
+          mutableMessage.parts.some(isToolCallPart),
+        )
+          ? "completed"
+          : "failed";
+        break;
+      }
     } catch {
       mutableMessage.status = options.abortController.signal.aborted ? "aborted" : "failed";
     }
-
-    while (responseIterator !== null && finishReason === null) {
-      let nextEventResult: IteratorResult<ModelStreamEvent> | typeof ABORT_SIGNAL_RECEIVED;
-      try {
-        nextEventResult = await readNextModelEventOrAbort(
-          responseIterator,
-          options.abortController.signal,
-        );
-      } catch {
-        mutableMessage.status = options.abortController.signal.aborted ? "aborted" : "failed";
-        break;
-      }
-
-      if (nextEventResult === ABORT_SIGNAL_RECEIVED || options.abortController.signal.aborted) {
-        mutableMessage.status = "aborted";
-        break;
-      }
-      if (nextEventResult.done) {
-        mutableMessage.status = "failed";
-        break;
-      }
-
-      const modelEvent = nextEventResult.value;
-      if (modelEvent.type === "text_delta") {
-        if (modelEvent.delta.length > 0) {
-          mutableMessage.content += modelEvent.delta;
-          appendTextPart(mutableMessage.parts, modelEvent.delta);
-          await options.emit({
-            type: "assistant_message_update",
-            message: snapshotAssistantMessage(mutableMessage),
-            delta: modelEvent.delta,
-          });
-        }
-        continue;
-      }
-      if (modelEvent.type === "tool_call") {
-        const toolCallIds = new Set(
-          mutableMessage.parts.filter(isToolCallPart).map((part) => part.toolCallId),
-        );
-        mutableMessage.parts.push(normalizeToolCall(modelEvent, toolCallIds));
-        continue;
-      }
-
-      finishReason = modelEvent.finishReason;
-      finishUsageObserved = true;
-      loopState.cumulativeModelUsage = addModelUsage(
-        loopState.cumulativeModelUsage,
-        modelEvent.usage,
-      );
-      updateLoopProgress(loopState, options);
-      mutableMessage.status = isSuccessfulAssistantFinish(
-        finishReason,
-        mutableMessage.parts.some(isToolCallPart),
-      )
-        ? "completed"
-        : "failed";
+    if (mutableMessage.status === "streaming") {
+      mutableMessage.status = options.abortController.signal.aborted ? "aborted" : "failed";
     }
   } finally {
     if (!finishUsageObserved) {
       loopState.cumulativeModelUsage = UNKNOWN_MODEL_USAGE;
       updateLoopProgress(loopState, options);
     }
-    await closeResponseIterator(responseIterator);
     pauseActivePhase(loopState, options);
   }
 
@@ -675,52 +657,6 @@ function updateLoopProgress(loopState: AgentLoopState, options: RunAgentLoopOpti
       activeDurationExhausted: loopState.activeDurationExhausted,
     }),
   );
-}
-
-/** 等待模型迭代器释放，并隔离同步或异步清理失败。 */
-async function closeResponseIterator(
-  responseIterator: AsyncIterator<ModelStreamEvent> | null,
-): Promise<void> {
-  if (!responseIterator?.return) {
-    return;
-  }
-  try {
-    await responseIterator.return();
-  } catch {
-    // 模型流清理失败不能覆盖 Agent Loop 已经确定的停止原因。
-  }
-}
-
-/** 在下一条模型事件与根 AbortSignal 之间竞速。 */
-function readNextModelEventOrAbort(
-  responseIterator: AsyncIterator<ModelStreamEvent>,
-  abortSignal: AbortSignal,
-): Promise<IteratorResult<ModelStreamEvent> | typeof ABORT_SIGNAL_RECEIVED> {
-  if (abortSignal.aborted) {
-    return Promise.resolve(ABORT_SIGNAL_RECEIVED);
-  }
-  return new Promise((resolve, reject) => {
-    /** AbortSignal 触发时解除监听并让取消赢得竞速。 */
-    const handleAbort = () => {
-      removeAbortListener();
-      resolve(ABORT_SIGNAL_RECEIVED);
-    };
-    /** 移除当前读取操作注册的 AbortSignal 监听器。 */
-    const removeAbortListener = () => {
-      abortSignal.removeEventListener("abort", handleAbort);
-    };
-    abortSignal.addEventListener("abort", handleAbort, { once: true });
-    Promise.resolve(responseIterator.next()).then(
-      (nextEventResult) => {
-        removeAbortListener();
-        resolve(nextEventResult);
-      },
-      (error: unknown) => {
-        removeAbortListener();
-        reject(error);
-      },
-    );
-  });
 }
 
 /** 判断 finish reason 与 ToolCall 组合是否形成完整 AssistantMessage。 */
