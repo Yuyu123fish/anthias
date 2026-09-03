@@ -18,13 +18,8 @@ import {
   type ModelUsage,
   toModelInputMessage,
 } from "./model-stream.js";
-import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import { FIXED_TOOL_DEFINITIONS } from "./tool/definitions.js";
-import {
-  createToolCallPlan,
-  type PreparedToolExecution,
-  type ToolRunnerContext,
-} from "./tool/tool-runner.js";
+import type { PreparedToolExecution, ToolApprovalPlan, ToolRunner } from "./tool/tool-runner.js";
 
 /** 枚举 Agent Loop 当前正在推进的活动阶段。 */
 export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
@@ -47,21 +42,9 @@ export type AgentLoopResult =
       budget: "model_requests" | "tool_calls" | "active_duration";
     }>;
 
-/** 描述当前副作用 ToolCall 请求用户确认时展示的完整信息。 */
-export type ToolApprovalRequest = Readonly<{
-  toolApprovalRequestId: string;
-  toolCallId: string;
-  toolName: "edit_file" | "write_file" | "execute_command";
-  target: string;
-  preview: string;
-}>;
-
-/** 提取 Tool Module 已完成预检的副作用确认计划。 */
-export type AgentLoopApprovalPlan = NonNullable<PreparedToolExecution["approval"]>;
-
-/** 表示 Agent Loop 等到的一次确认请求及最终决定。 */
+/** 表示 Agent Loop 等到的一次确认标识及最终决定。 */
 export type AgentLoopToolApproval = Readonly<{
-  request: ToolApprovalRequest;
+  toolApprovalRequestId: string;
   decision: "approve" | "deny" | "aborted";
 }>;
 
@@ -75,18 +58,27 @@ export type AgentLoopProgress = AgentLoopMetrics &
 
 /** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
 export type AgentLoopEvent =
-  | Readonly<{ type: "assistant_message_start"; message: AssistantMessage }>
+  | Readonly<{
+      type: "assistant_message_start";
+      message: AssistantMessage;
+    }>
   | Readonly<{
       type: "assistant_message_update";
       message: AssistantMessage;
       delta: string;
     }>
-  | Readonly<{ type: "assistant_message_end"; message: AssistantMessage }>
-  | Readonly<{ type: "tool_result"; message: ToolResultMessage }>
+  | Readonly<{
+      type: "assistant_message_end";
+      message: AssistantMessage;
+    }>
+  | Readonly<{
+      type: "tool_result";
+      message: ToolResultMessage;
+    }>
   | Readonly<{
       type: "tool_execution_start";
       toolCall: AssistantToolCallPart;
-      approvalRequest: ToolApprovalRequest | null;
+      toolApprovalRequestId: string | null;
     }>
   | Readonly<{
       type: "tool_execution_update";
@@ -107,26 +99,36 @@ export type AgentLoopEvent =
 export type RunAgentLoopOptions = Readonly<{
   messages: readonly Message[];
   modelStream: ModelStream;
-  toolRunnerContext: ToolRunnerContext;
+  systemPrompt: string;
+  toolRunner: ToolRunner;
   abortController: AbortController;
   emit(event: AgentLoopEvent): Promise<void>;
   updateProgress(progress: AgentLoopProgress): void;
   requestToolApproval(
     toolCall: AssistantToolCallPart,
-    approvalPlan: AgentLoopApprovalPlan,
+    approvalPlan: ToolApprovalPlan,
   ): Promise<AgentLoopToolApproval>;
 }>;
 
 /** 保存一次 Agent Loop 内部的预算、阶段与计量状态。 */
 type AgentLoopState = {
+  /** 当前 Agent Loop 的阶段 */
   phase: AgentLoopPhase;
+  /** 已经进行的模型请求次数 */
   modelRequestCount: number;
+  /** 产生的 Tool Call 次数 */
   producedToolCallCount: number;
+  /** 已处理完成的 Tool Call 次数 */
   processedToolCallCount: number;
+  /** 累计的模型使用量 */
   cumulativeModelUsage: ModelUsage;
+  /** agent 活动阶段累计毫秒数 */
   activeDurationMilliseconds: number;
+  /** 当前活跃阶段的开始时间，单位为毫秒，若无则为 null */
   activePhaseStartedAtMilliseconds: number | null;
+  /** 控制定时器，在活动期间计时，若无则为 null */
   activeDurationTimer: NodeJS.Timeout | null;
+  /** 活动时长是否已耗尽 */
   activeDurationExhausted: boolean;
 };
 
@@ -165,6 +167,7 @@ const ACTIVE_DURATION_BUDGET_RESULT = Object.freeze({
 /** 推进 Model → Tool → Model，直到完成、失败、停止或预算耗尽。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = options.messages.map(snapshotMessage);
+  // 初始化 Agent Loop 状态
   const loopState: AgentLoopState = {
     phase: "requesting_model",
     modelRequestCount: 0,
@@ -283,10 +286,7 @@ async function requestAssistantMessage(
       message: snapshotAssistantMessage(mutableMessage),
     });
     const modelRequest: ModelRequest = Object.freeze({
-      systemPrompt: createCodingSystemPrompt(
-        options.toolRunnerContext.workspace.workspaceRoot,
-        options.toolRunnerContext.shell,
-      ),
+      systemPrompt: options.systemPrompt,
       messages: Object.freeze(messageHistory.map(toModelInputMessage)),
       tools: FIXED_TOOL_DEFINITIONS,
     });
@@ -377,7 +377,7 @@ async function processToolCall(
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<void> {
-  const toolCallPlan = createToolCallPlan(toolCall, options.toolRunnerContext);
+  const toolCallPlan = options.toolRunner.createPlan(toolCall);
   let preparation: Awaited<ReturnType<typeof toolCallPlan.prepare>>;
 
   if (toolCallPlan.preparationConsumesActiveDuration) {
@@ -437,12 +437,12 @@ async function executePreparedToolCall(
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<void> {
-  let approvalRequest: ToolApprovalRequest | null = null;
+  let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
     setLoopPhase(loopState, "awaiting_tool_approval", options);
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
-    approvalRequest = approval.request;
+    toolApprovalRequestId = approval.toolApprovalRequestId;
     if (approval.decision !== "approve" || options.abortController.signal.aborted) {
       await appendToolResult(
         toolCall,
@@ -475,7 +475,7 @@ async function executePreparedToolCall(
     return;
   }
 
-  await options.emit({ type: "tool_execution_start", toolCall, approvalRequest });
+  await options.emit({ type: "tool_execution_start", toolCall, toolApprovalRequestId });
   let executionResult: Awaited<ReturnType<PreparedToolExecution["execute"]>>;
   try {
     executionResult = await preparedExecution.execute(options.abortController.signal, (update) => {
@@ -654,7 +654,7 @@ function getAbortLoopResult(loopState: AgentLoopState): AgentLoopResult {
   return loopState.activeDurationExhausted ? ACTIVE_DURATION_BUDGET_RESULT : ABORTED_LOOP_RESULT;
 }
 
-/** 将 Loop 的可变计量复制为 Run 可以安全投影的快照。 */
+/** 把当前 Loop 状态里的可变计量字段做一份快照，方便 Run 过程安全地读取和展示进度。 */
 function updateLoopProgress(loopState: AgentLoopState, options: RunAgentLoopOptions): void {
   options.updateProgress(
     Object.freeze({

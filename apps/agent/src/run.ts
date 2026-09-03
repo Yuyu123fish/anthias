@@ -1,14 +1,10 @@
 import { randomUUID } from "node:crypto";
 import {
-  type AgentLoopApprovalPlan,
   type AgentLoopEvent,
-  type AgentLoopMetrics,
-  type AgentLoopPhase,
   type AgentLoopProgress,
   type AgentLoopResult,
   type AgentLoopToolApproval,
   runAgentLoop,
-  type ToolApprovalRequest,
 } from "./agent.js";
 import {
   type AssistantMessage,
@@ -19,22 +15,37 @@ import {
   type UserMessage,
 } from "./message.js";
 import type { ModelStream, ModelUsage } from "./model-stream.js";
+import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import type { Session, SessionRunLease } from "./session.js";
-import type { ToolRunnerContext } from "./tool/tool-runner.js";
+import { createToolRunner, type ToolApprovalPlan } from "./tool/tool-runner.js";
 
-/** 重新导出交互 Adapter 需要呈现的确认请求。 */
-export type { ToolApprovalRequest } from "./agent.js";
+/** 枚举 Run 对外交付的活动阶段。 */
+type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
 
 /** 描述公开状态中当前 Run 的身份、阶段和实际预算用量。 */
 export type ActiveRun = Readonly<{
   runId: string;
-  phase: AgentLoopPhase;
+  phase: RunPhase;
   modelRequestCount: number;
   toolCallCount: number;
 }>;
 
 /** 报告一个 Run 对三类执行预算的最终实际用量。 */
-export type RunMetrics = AgentLoopMetrics;
+export type RunMetrics = Readonly<{
+  modelRequestCount: number;
+  producedToolCallCount: number;
+  processedToolCallCount: number;
+  activeDurationMilliseconds: number;
+}>;
+
+/** 描述交互 Adapter 需要呈现的一次副作用 Tool 确认请求。 */
+export type ToolApprovalRequest = Readonly<{
+  toolApprovalRequestId: string;
+  toolCallId: string;
+  toolName: "edit_file" | "write_file" | "execute_command";
+  target: string;
+  preview: string;
+}>;
 
 /** 表示 TUI 对当前 Tool 确认响应的同步接纳结果。 */
 export type ToolApprovalResponse =
@@ -54,7 +65,14 @@ export type AgentState = Readonly<{
 }>;
 
 /** 枚举一个已接受 Run 的公开终态。 */
-export type FinishedPromptResult = AgentLoopResult;
+export type FinishedPromptResult =
+  | Readonly<{ status: "completed" }>
+  | Readonly<{ status: "aborted" }>
+  | Readonly<{ status: "failed"; error: string }>
+  | Readonly<{
+      status: "budget_exhausted";
+      budget: "model_requests" | "tool_calls" | "active_duration";
+    }>;
 
 /** 表示提示词被拒绝或完成一次 Run 后的结果。 */
 export type PromptResult =
@@ -122,7 +140,7 @@ export type CreateAgentWithModelStreamOptions = Readonly<{
 /** 集中持有一个活动 Run 的取消、Session lease、Loop 投影与唯一终态。 */
 type ActiveRunOwnership = {
   runId: string;
-  phase: AgentLoopPhase;
+  phase: RunPhase;
   sessionLease: SessionRunLease;
   abortController: AbortController;
   modelRequestCount: number;
@@ -176,13 +194,14 @@ export function createAgentWithModelStream({
   session,
 }: CreateAgentWithModelStreamOptions): Agent {
   const messageHistory: Message[] = session.messageHistory.map(snapshotMessage);
-  const toolRunnerContext: ToolRunnerContext = Object.freeze({
+  const toolRunner = createToolRunner({
     workspace: Object.freeze({
       workspaceRoot: session.workspaceRoot,
       sessionDirectory: session.sessionDirectory,
     }),
     shell: session.shell,
   });
+  const systemPrompt = createCodingSystemPrompt(session.workspaceRoot, session.shell);
   const eventListeners = new Set<AgentListener>();
   let activeAssistantMessage: AssistantMessage | null = null;
   let lastError: string | null = null;
@@ -298,7 +317,7 @@ export function createAgentWithModelStream({
   function waitForToolApproval(
     currentRun: ActiveRunOwnership,
     toolCall: AssistantToolCallPart,
-    approvalPlan: AgentLoopApprovalPlan,
+    approvalPlan: ToolApprovalPlan,
   ): Promise<AgentLoopToolApproval> {
     const request: ToolApprovalRequest = Object.freeze({
       toolApprovalRequestId: randomUUID(),
@@ -311,7 +330,13 @@ export function createAgentWithModelStream({
       pendingToolApproval = Object.freeze({
         runId: currentRun.runId,
         request,
-        resolve: (decision) => resolve(Object.freeze({ request, decision })),
+        resolve: (decision) =>
+          resolve(
+            Object.freeze({
+              toolApprovalRequestId: request.toolApprovalRequestId,
+              decision,
+            }),
+          ),
       });
       publishEvent({ type: "tool_approval_requested", request });
       if (currentRun.abortController.signal.aborted) {
@@ -393,14 +418,15 @@ export function createAgentWithModelStream({
       const loopResult = await runAgentLoop({
         messages: messageHistory,
         modelStream,
-        toolRunnerContext,
+        systemPrompt,
+        toolRunner,
         abortController: currentRun.abortController,
         emit: (event) => processAgentLoopEvent(currentRun, event),
         updateProgress: (progress) => updateRunProgress(currentRun, progress),
         requestToolApproval: (toolCall, approvalPlan) =>
           waitForToolApproval(currentRun, toolCall, approvalPlan),
       });
-      return finishRun(currentRun, loopResult);
+      return finishRun(currentRun, toFinishedPromptResult(loopResult));
     } catch {
       const requestedResult = currentRun.sessionWriteFailed
         ? SESSION_FAILED_RESULT
@@ -466,8 +492,8 @@ export function createAgentWithModelStream({
         await appendCompletedMessage(currentRun, event.message, false);
         return;
       case "tool_execution_start":
-        if (event.approvalRequest !== null) {
-          await appendToolExecutionStarted(currentRun, event.toolCall, event.approvalRequest);
+        if (event.toolApprovalRequestId !== null) {
+          await appendToolExecutionStarted(currentRun, event.toolCall, event.toolApprovalRequestId);
         }
         publishEvent({
           type: "tool_execution_start",
@@ -488,7 +514,7 @@ export function createAgentWithModelStream({
   async function appendToolExecutionStarted(
     currentRun: ActiveRunOwnership,
     toolCall: AssistantToolCallPart,
-    approvalRequest: ToolApprovalRequest,
+    toolApprovalRequestId: string,
   ): Promise<void> {
     if (
       toolCall.toolName !== "edit_file" &&
@@ -501,7 +527,7 @@ export function createAgentWithModelStream({
       await currentRun.sessionLease.appendToolExecutionStarted({
         toolCallId: toolCall.toolCallId,
         toolName: toolCall.toolName,
-        toolApprovalRequestId: approvalRequest.toolApprovalRequestId,
+        toolApprovalRequestId,
       });
     } catch {
       currentRun.sessionWriteFailed = true;
@@ -626,4 +652,21 @@ function createRunMetrics(currentRun: ActiveRunOwnership): RunMetrics {
     processedToolCallCount: currentRun.processedToolCallCount,
     activeDurationMilliseconds: Math.max(0, Math.round(currentRun.activeDurationMilliseconds)),
   });
+}
+
+/** 把内部 Loop 终态复制为由 Run Module 拥有的公开结果。 */
+function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResult {
+  switch (loopResult.status) {
+    case "completed":
+      return Object.freeze({ status: "completed" });
+    case "aborted":
+      return Object.freeze({ status: "aborted" });
+    case "failed":
+      return Object.freeze({ status: "failed", error: loopResult.error });
+    case "budget_exhausted":
+      return Object.freeze({
+        status: "budget_exhausted",
+        budget: loopResult.budget,
+      });
+  }
 }

@@ -12,12 +12,13 @@ import {
   unlink,
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type {
-  AssistantContentPart,
-  AssistantMessage,
-  Message,
-  ToolResultMessage,
-  UserMessage,
+import {
+  type AssistantContentPart,
+  type AssistantMessage,
+  type Message,
+  snapshotMessage,
+  type ToolResultMessage,
+  type UserMessage,
 } from "./message.js";
 
 /** 描述 Session 创建时固定、重开时必须一致的 Shell。 */
@@ -1523,22 +1524,6 @@ function fromDurableMessage(message: DurableMessage): Message {
   } satisfies AssistantMessage);
 }
 
-/** 复制并冻结消息，避免调用者修改 Session 内部投影。 */
-function snapshotMessage(message: Message): Message {
-  if (message.role === "user") {
-    return Object.freeze({ role: "user", content: message.content });
-  }
-  if (message.role === "tool") {
-    return Object.freeze({ ...message });
-  }
-  return Object.freeze({
-    role: "assistant",
-    content: message.content,
-    parts: Object.freeze(message.parts.map(snapshotAssistantPart)),
-    status: message.status,
-  });
-}
-
 /** 将公开 Assistant part 转换为可持久化的 Schema 1 part。 */
 function toDurableAssistantPart(part: AssistantContentPart): DurableTextPart | DurableToolCallPart {
   if (part.type === "text") {
@@ -1567,19 +1552,6 @@ function fromDurableAssistantPart(
         toolCallId: part.toolCallId,
         toolName: part.toolName,
         input: snapshotJsonValue(part.input),
-        invalid: part.invalid,
-      });
-}
-
-/** 复制并冻结一个公开 Assistant part。 */
-function snapshotAssistantPart(part: AssistantContentPart): AssistantContentPart {
-  return part.type === "text"
-    ? Object.freeze({ type: "text", text: part.text })
-    : Object.freeze({
-        type: "tool_call",
-        toolCallId: part.toolCallId,
-        toolName: part.toolName,
-        input: isJsonValue(part.input) ? snapshotJsonValue(part.input) : part.input,
         invalid: part.invalid,
       });
 }

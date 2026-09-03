@@ -33,7 +33,10 @@ export type ModelFinishReason =
 
 /** 枚举生产 Adapter 和确定性测试 Adapter 产生的结构化事件。 */
 export type ModelStreamEvent =
-  | Readonly<{ type: "text_delta"; delta: string }>
+  | Readonly<{
+      type: "text_delta";
+      delta: string;
+    }>
   | Readonly<{
       type: "tool_call";
       toolCallId: string;
@@ -41,7 +44,11 @@ export type ModelStreamEvent =
       input: unknown;
       invalid: boolean;
     }>
-  | Readonly<{ type: "finish"; finishReason: ModelFinishReason; usage: ModelUsage }>;
+  | Readonly<{
+      type: "finish";
+      finishReason: ModelFinishReason;
+      usage: ModelUsage;
+    }>;
 
 /** 定义可被生产 Adapter 与确定性测试实现替换的结构化模型流。 */
 export type ModelStream = (

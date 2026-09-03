@@ -14,7 +14,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Run 宿主持有 prompt 接纳、Session lease、根取消、确认状态、事件投影和唯一终态；Agent Loop 只推进模型与 Tool 的迭代。TUI 仍只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
 
-验收前的结构整理已把系统提示词归入 `src/prompts/`，把消息形状与快照归入 `src/message.ts`，把 Provider 无关模型事件 seam 归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只保留 Model → Tool → Model 循环、模型流消费、ToolCall 串行推进和预算判断；`src/run.ts` 实现公开 Agent Interface，持有 Session 与运行生命周期并调用 `runAgentLoop`。Session、Tool 和 Model Adapter 不反向依赖二者，package 公开面保持不变。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
+验收前的结构整理已把系统提示词归入 `src/prompts/`，把消息形状与唯一快照实现归入 `src/message.ts`，把 Provider 无关模型事件 seam 归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只定义并实现 Model → Tool → Model 循环及其内部协作协议；`src/run.ts` 自行定义并实现公开 Agent Interface，持有 Session 与运行生命周期，调用 `runAgentLoop` 后显式映射公开结果；Tool Module 通过已绑定 workspace 与 Shell 的 ToolRunner 向循环隐藏分派上下文。Session、Tool 和 Model Adapter 不反向依赖二者，package 公开面保持不变。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
 
 本 Feature 没有实现 OS 沙箱、通用权限策略、Session 分叉、Compaction、PTY、后台命令、持久 Shell、动态 Tool Registry、Desktop、跨进程协议或多 Agent。
 

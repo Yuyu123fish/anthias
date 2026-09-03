@@ -1,27 +1,31 @@
 import type { AssistantToolCallPart } from "../message.js";
 import type { SessionShell } from "../session.js";
-import {
-  type CommandExecutionUpdate,
-  executePreparedCommand,
-  prepareCommandTool,
-} from "./command-tool.js";
+import { executePreparedCommand, prepareCommandTool } from "./command-tool.js";
 import { isReadOnlyToolName } from "./definitions.js";
 import { executePreparedFileTool, isFileToolName, prepareFileTool } from "./file-tool.js";
 import { executeReadOnlyTool } from "./read-only-tool.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
 
-/** 提供固定 Tool 分派与执行所需的工作区和 Shell。 */
-export type ToolRunnerContext = Readonly<{
+/** 配置一个绑定固定工作区与 Shell 的 ToolRunner。 */
+export type CreateToolRunnerOptions = Readonly<{
   workspace: ToolWorkspace;
   shell: SessionShell;
 }>;
 
+/** 隐藏 Tool 分派细节，只向 Agent Loop 提供统一计划入口。 */
+export type ToolRunner = Readonly<{
+  createPlan(toolCall: AssistantToolCallPart): ToolCallPlan;
+}>;
+
 /** 描述 Tool 执行期间可以按发生顺序发布的输出。 */
-export type ToolExecutionUpdate = CommandExecutionUpdate;
+type ToolExecutionUpdate = Readonly<{
+  stream: "stdout" | "stderr";
+  delta: string;
+}>;
 
 /** 描述副作用 Tool 在执行前必须展示的一次性确认。 */
-type ToolApprovalPlan = Readonly<{
+export type ToolApprovalPlan = Readonly<{
   toolName: "edit_file" | "write_file" | "execute_command";
   target: string;
   preview: string;
@@ -56,19 +60,30 @@ export type ToolCallPlan = Readonly<{
   prepare(remainingActiveDurationMilliseconds: number): Promise<ToolCallPreparation>;
 }>;
 
+/** 创建已经绑定运行环境、可以被 Agent Loop 直接调用的 ToolRunner。 */
+export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
+  const runnerOptions = Object.freeze({
+    workspace: options.workspace,
+    shell: options.shell,
+  });
+  return Object.freeze({
+    createPlan: (toolCall) => createToolCallPlan(toolCall, runnerOptions),
+  });
+}
+
 /** 将任意 ToolCall 解析为统一的预检与执行计划。 */
-export function createToolCallPlan(
+function createToolCallPlan(
   toolCall: AssistantToolCallPart,
-  context: ToolRunnerContext,
+  options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   if (isReadOnlyToolName(toolCall.toolName)) {
-    return createReadOnlyToolCallPlan(toolCall, context.workspace);
+    return createReadOnlyToolCallPlan(toolCall, options.workspace);
   }
   if (toolCall.toolName === "execute_command") {
-    return createCommandToolCallPlan(toolCall, context);
+    return createCommandToolCallPlan(toolCall, options);
   }
   if (isFileToolName(toolCall.toolName)) {
-    return createFileToolCallPlan(toolCall, context.workspace);
+    return createFileToolCallPlan(toolCall, options.workspace);
   }
   return createRejectedToolCallPlan(toolCall);
 }
@@ -145,7 +160,7 @@ function createFileToolCallPlan(
 /** 创建需要活动时间预检和人工确认的命令 Tool 计划。 */
 function createCommandToolCallPlan(
   toolCall: AssistantToolCallPart,
-  context: ToolRunnerContext,
+  options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   return Object.freeze({
     preparationConsumesActiveDuration: true,
@@ -154,8 +169,8 @@ function createCommandToolCallPlan(
     async prepare(remainingActiveDurationMilliseconds) {
       const preparedResult = await prepareCommandTool(
         toolCall,
-        context.workspace,
-        context.shell,
+        options.workspace,
+        options.shell,
         remainingActiveDurationMilliseconds,
       );
       if (!preparedResult.ok) {
