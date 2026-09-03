@@ -12,9 +12,9 @@
 
 Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久恢复的基础 Coding Harness。一次 Run 现在可以连续请求模型，串行执行 `read_file`、`glob`、`grep`、`edit_file`、`write_file` 和 `execute_command`，把每个 ToolResult 返回模型，最后由没有 ToolCall 的模型响应正常收口。
 
-对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Agent 统一持有循环、确认、取消、预算、Session 写入和资源回收，TUI 只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
+对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Run 宿主持有 prompt 接纳、Session lease、根取消、确认状态、事件投影和唯一终态；Agent Loop 只推进模型与 Tool 的迭代。TUI 仍只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
 
-验收前的结构整理已把系统提示词归入 `src/prompts/`，把定义、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。原先根目录的 `tools.ts`、`file-tool.ts` 和 `command-tool.ts` 已移除；本次只调整 Agent Module 内部 locality，没有增加 Registry、Manager、公开导出或第二套生命周期。
+验收前的结构整理已把系统提示词归入 `src/prompts/`，把消息形状与快照归入 `src/message.ts`，把 Provider 无关模型事件 seam 归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只保留 Model → Tool → Model 循环、模型流消费、ToolCall 串行推进和预算判断；`src/run.ts` 实现公开 Agent Interface，持有 Session 与运行生命周期并调用 `runAgentLoop`。Session、Tool 和 Model Adapter 不反向依赖二者，package 公开面保持不变。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
 
 本 Feature 没有实现 OS 沙箱、通用权限策略、Session 分叉、Compaction、PTY、后台命令、持久 Shell、动态 Tool Registry、Desktop、跨进程协议或多 Agent。
 
@@ -56,6 +56,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 - Stage 03 定向验证：`pnpm exec vitest run apps/agent/test/command-tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts` 通过，2 个测试文件、9 个测试。
 - Stage 03 最终门禁：`pnpm verify` 通过；Biome 检查 33 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
 - 验收前结构整理：`pnpm verify` 通过；Biome 检查当前 38 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
+- Agent Loop 职责收敛：定向回归 8 个测试文件、61 个测试通过；随后 `pnpm verify` 通过，Biome 检查 41 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
 
 Stage 3 的输出边界强化测试发现：同一输出流的连续小块会重复产生渲染标签，可能提前挤占最终 ToolResult 的 2,000 行预算并覆盖命令专用截断说明。实现已改为只合并相邻同源块，stdout / stderr 的观察顺序不变，截断后仍继续排空管道；对应定向测试和完整门禁均在修复后重新通过。
 

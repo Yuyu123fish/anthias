@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
-import type { AssistantToolCallPart } from "../agent.js";
+import type { AssistantToolCallPart } from "../message.js";
 import type { SessionShell } from "../session.js";
 import {
   hasOnlyKeys,

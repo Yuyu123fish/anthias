@@ -4,8 +4,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
+import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
 import { createSession, resolveSessionDirectory, resolveSessionShell } from "../src/session.js";
 import { FIXED_TOOL_DEFINITIONS } from "../src/tool/definitions.js";
 

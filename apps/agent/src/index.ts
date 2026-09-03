@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
-import { type Agent, createAgentWithModelStream } from "./agent.js";
 import { readModelConfig } from "./model-config.js";
 import { createOpenAICompatibleModelStream } from "./openai-compatible-model.js";
+import { type Agent, createAgentWithModelStream } from "./run.js";
 import {
   createSession,
   openSession,
@@ -9,6 +9,16 @@ import {
   resolveSessionShell,
 } from "./session.js";
 
+/** 重新导出交互 Adapter 需要呈现的公开 Message 类型。 */
+export type {
+  AssistantContentPart,
+  AssistantMessage,
+  AssistantTextPart,
+  AssistantToolCallPart,
+  Message,
+  ToolResultMessage,
+  UserMessage,
+} from "./message.js";
 /** 重新导出交互 Adapter 所需的公开 Agent 类型。 */
 export type {
   ActiveRun,
@@ -16,19 +26,12 @@ export type {
   AgentEvent,
   AgentListener,
   AgentState,
-  AssistantContentPart,
-  AssistantMessage,
-  AssistantTextPart,
-  AssistantToolCallPart,
   FinishedPromptResult,
-  Message,
   PromptResult,
   RunMetrics,
   ToolApprovalRequest,
   ToolApprovalResponse,
-  ToolResultMessage,
-  UserMessage,
-} from "./agent.js";
+} from "./run.js";
 
 /** 表示生产 Agent 已成功装配或以安全文本启动失败。 */
 export type AgentCreationResult =

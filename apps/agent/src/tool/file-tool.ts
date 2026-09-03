@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
-import type { AssistantToolCallPart } from "../agent.js";
+import type { AssistantToolCallPart } from "../message.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "./input-validation.js";
 import { boundToolOutput, type ToolExecutionResult } from "./tool-result.js";
 import {
@@ -11,7 +11,7 @@ import {
   validateWorkspaceRelativePath,
 } from "./workspace-path.js";
 
-/** 枚举 Feature 002 中两个文件副作用 Tool。 */
+/** 枚举两个需要人工确认的文件副作用 Tool。 */
 export type FileToolName = "edit_file" | "write_file";
 
 /** 保存一个已经展示、仍未写入磁盘的准确文件变更。 */

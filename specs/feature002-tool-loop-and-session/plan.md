@@ -41,16 +41,19 @@ apps/tui
   └─ 只使用 @anthias/agent 的公开 Interface
 
 apps/agent
-  ├─ Agent / Run 协调器       消息、循环、确认、预算、取消与事件
+  ├─ Run Module               Prompt 接纳、Session lease、根取消、确认状态、事件投影与唯一终态
+  ├─ Agent Loop Module        Model → Tool → Model、流消费、调用顺序与执行预算
+  ├─ Message Module           线性消息形状、不可变快照与 ToolCall 规范化
   ├─ Session Module           JSONL、锁、恢复、投影与追加
   ├─ Prompt Module            每次模型请求使用的 Coding Agent 系统提示词
-  ├─ Fixed Tool Module        六个 Tool 的定义、校验、预览与执行
-  └─ Model Adapter            Provider 流与内部模型事件互转
+  ├─ Fixed Tool Module        六个 Tool 的定义、分派、校验、预览与执行
+  └─ Model Stream / Adapter   Provider 无关事件 seam 与生产转换
 ```
 
-- Agent 是 Run 行为和资源所有权的唯一权威；Session、Tool 和 Model Adapter 都是 Agent Module 内部 seam。
+- Run Module 是一次公开运行的宿主：持有 active Run、根 AbortController、Session lease 和待确认请求，接纳 prompt 后调用 Agent Loop，并按 Loop 事实完成持久化、公开事件与唯一终态。
+- Agent Loop 只负责循环算法：在本地消息上下文中消费 Model Stream、串行处理 ToolCall、调用 Prompt 与 Tool Module、执行三类预算判断并返回循环结果；它不接纳 prompt，不持有 Session、监听器或公开 Agent 状态，也不写 Run 终态。
 - TUI 不读取 JSONL、模型配置或 Tool 定义，不计算 Diff、不启动命令，也不维护第二个 Run 状态机。
-- Session Module 不知道 TUI 和 Provider；Tool Module 不写 Session；Model Adapter 不执行 Tool、不等待确认、不控制循环。
+- Message Module 不依赖 Agent Loop；Session Module 不知道 Agent Loop、TUI 和 Provider；Tool Module 不写 Session；Model Adapter 不执行 Tool、不等待确认、不控制循环。
 - package 入口只导出生产启动工厂、Agent Interface 以及 TUI 必需的 state、message、result 和 event 类型；Model Adapter、Tool Schema、Session Record、Writer 和锁类型均不导出。
 - 不建立 Tool Registry、Manager、通用插件协议或类层级。六个 Tool 使用一个固定、穷尽的内部映射和判别联合。
 - Stage 02 允许在 `apps/agent` 增加唯一一个直接运行时依赖 `diff@9.0.0`，用于不启动 Git 或 Shell 的统一 Diff；该版本自带 TypeScript 类型，不增加 `@types/diff`。其他能力优先使用 Node.js 24 标准库和现有 AI SDK。

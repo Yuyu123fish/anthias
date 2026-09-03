@@ -2,13 +2,9 @@ import { access, appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  type Agent,
-  createAgentWithModelStream,
-  type ModelStream,
-  type ModelStreamEvent,
-} from "../src/agent.js";
 import type { AgentEvent, Message } from "../src/index.js";
+import type { ModelStream, ModelStreamEvent } from "../src/model-stream.js";
+import { type Agent, createAgentWithModelStream } from "../src/run.js";
 import { createSession, openSession, type Session, type SessionShell } from "../src/session.js";
 
 const temporaryDirectories = new Set<string>();

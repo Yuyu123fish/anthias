@@ -1,13 +1,13 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { jsonSchema, type ModelMessage, streamText, type ToolSet, tool } from "ai";
+import type { ModelConfig } from "./model-config.js";
 import type {
   ModelFinishReason,
   ModelInputMessage,
   ModelStream,
   ModelStreamEvent,
   ModelUsage,
-} from "./agent.js";
-import type { ModelConfig } from "./model-config.js";
+} from "./model-stream.js";
 
 /** 创建生产 OpenAI-compatible Model Stream，并将 Provider 细节封装在 Agent 内部。 */
 export function createOpenAICompatibleModelStream({

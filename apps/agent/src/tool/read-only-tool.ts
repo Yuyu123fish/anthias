@@ -1,6 +1,6 @@
 import { glob as nodeGlob, readFile, stat } from "node:fs/promises";
 import { relative, resolve } from "node:path";
-import type { AssistantToolCallPart } from "../agent.js";
+import type { AssistantToolCallPart } from "../message.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,

@@ -18,7 +18,7 @@ import type {
   Message,
   ToolResultMessage,
   UserMessage,
-} from "./agent.js";
+} from "./message.js";
 
 /** 描述 Session 创建时固定、重开时必须一致的 Shell。 */
 export type SessionShell = Readonly<{

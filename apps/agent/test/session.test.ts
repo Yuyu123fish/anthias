@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Message } from "../src/agent.js";
+import type { Message } from "../src/message.js";
 import {
   createSession,
   openSession,
