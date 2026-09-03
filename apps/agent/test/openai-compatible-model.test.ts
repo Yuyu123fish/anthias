@@ -1,14 +1,25 @@
+import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
+import { createSession, resolveSessionDirectory, resolveSessionShell } from "../src/session.js";
 import { FIXED_TOOL_DEFINITIONS } from "../src/tools.js";
 
 const servers = new Set<ReturnType<typeof createServer>>();
+const temporaryDirectories = new Set<string>();
 
 afterEach(async () => {
   await Promise.all([...servers].map((server) => closeServer(server)));
   servers.clear();
+  vi.unstubAllEnvs();
+  await Promise.all(
+    [...temporaryDirectories].map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+  temporaryDirectories.clear();
 });
 
 describe("createOpenAICompatibleModelStream", () => {
@@ -226,8 +237,145 @@ describe("createOpenAICompatibleModelStream", () => {
     await vi.waitFor(() => expect(connectionClosed).toBe(true));
     expect(requestCount).toBe(1);
   });
+
+  it("drives a complete read-edit-command loop through the production adapter", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-production-loop-"));
+    temporaryDirectories.add(workspaceRoot);
+    await writeFile(join(workspaceRoot, "target.txt"), "old\n", "utf8");
+    vi.stubEnv("ANTHIAS_MODEL_API_KEY", "stage3-fake-process-key");
+    const shell = await resolveSessionShell(process.env);
+    const command =
+      shell.kind === "powershell"
+        ? "$present=[bool]$env:ANTHIAS_MODEL_API_KEY; Write-Output \"key=$present\"; if ((Get-Content -Raw -LiteralPath 'target.txt') -notmatch '^new') { exit 7 }; Write-Output 'verified'"
+        : `present=\${ANTHIAS_MODEL_API_KEY:+true}; printf 'key=%s\\n' "\${present:-false}"; grep '^new' target.txt >/dev/null && printf 'verified\\n'`;
+    const requestBodies: Record<string, unknown>[] = [];
+    const server = await startServer(async (request, response) => {
+      expect(request.headers.authorization).toBe("Bearer stage3-provider-key");
+      requestBodies.push(JSON.parse(await readBody(request)) as Record<string, unknown>);
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        connection: "keep-alive",
+      });
+      if (requestBodies.length === 1) {
+        writeToolCalls(response, [
+          {
+            toolCallId: "00000000-0000-4000-8000-000000000101",
+            toolName: "read_file",
+            input: '{"path":"target.txt"}',
+          },
+          {
+            toolCallId: "00000000-0000-4000-8000-000000000102",
+            toolName: "edit_file",
+            input: '{"path":"target.txt","replacements":[{"oldText":"old","newText":"new"}]}',
+          },
+          {
+            toolCallId: "00000000-0000-4000-8000-000000000103",
+            toolName: "execute_command",
+            input: JSON.stringify({ command, timeoutMs: 10_000 }),
+          },
+        ]);
+        writeFinish(response, "tool_calls", { prompt_tokens: 6, completion_tokens: 3 });
+      } else {
+        writeChunk(response, "读取、修改和验证完成。");
+        writeFinish(response, "stop", { prompt_tokens: 8, completion_tokens: 4 });
+      }
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+    const address = server.address() as AddressInfo;
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    const agent = createAgentWithModelStream({
+      session,
+      modelStream: createOpenAICompatibleModelStream({
+        baseURL: `http://127.0.0.1:${address.port}/v1`,
+        modelId: "stage3-test-model",
+        apiKey: "stage3-provider-key",
+      }),
+    });
+    const events: AgentEvent[] = [];
+    const approvalTargets: string[] = [];
+    agent.subscribe((event) => {
+      events.push(event);
+      if (event.type === "tool_approval_requested") {
+        approvalTargets.push(event.request.target);
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+      }
+    });
+
+    try {
+      await expect(agent.prompt("把 target.txt 更新为 new 并验证")).resolves.toEqual({
+        status: "completed",
+      });
+    } finally {
+      await closeServer(server);
+      servers.delete(server);
+    }
+
+    expect(server.listening).toBe(false);
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]).toMatchObject({
+      messages: [
+        { role: "system" },
+        { role: "user", content: "把 target.txt 更新为 new 并验证" },
+        {
+          role: "assistant",
+          tool_calls: [
+            { id: "00000000-0000-4000-8000-000000000101" },
+            { id: "00000000-0000-4000-8000-000000000102" },
+            { id: "00000000-0000-4000-8000-000000000103" },
+          ],
+        },
+        { role: "tool", tool_call_id: "00000000-0000-4000-8000-000000000101" },
+        { role: "tool", tool_call_id: "00000000-0000-4000-8000-000000000102" },
+        { role: "tool", tool_call_id: "00000000-0000-4000-8000-000000000103" },
+      ],
+    });
+    expect(approvalTargets).toEqual(["target.txt", "."]);
+    expect(await readFile(join(workspaceRoot, "target.txt"), "utf8")).toBe("new\n");
+    expect(
+      agent.state.messageHistory
+        .filter((message) => message.role === "tool")
+        .map((message) => [message.toolName, message.status]),
+    ).toEqual([
+      ["read_file", "completed"],
+      ["edit_file", "completed"],
+      ["execute_command", "completed"],
+    ]);
+    expect(JSON.stringify({ events, state: agent.state, requestBodies })).not.toContain(
+      "stage3-fake-process-key",
+    );
+    expect(JSON.stringify(agent.state)).toMatch(/key=(False|false)/u);
+    expect(events.at(-1)).toMatchObject({
+      type: "run_end",
+      result: { status: "completed" },
+      metrics: {
+        modelRequestCount: 2,
+        producedToolCallCount: 3,
+        processedToolCallCount: 3,
+      },
+    });
+    const sessionRecords = (
+      await readFile(join(sessionDirectory, `${session.sessionId}.jsonl`), "utf8")
+    )
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(sessionRecords.at(-1)).toMatchObject({
+      type: "run_finished",
+      status: "completed",
+      modelRequestCount: 2,
+      toolCallCount: 3,
+      processedToolCallCount: 3,
+      modelUsage: { inputTokens: 14, outputTokens: 7, totalTokens: 21 },
+    });
+    expect(JSON.stringify(sessionRecords)).not.toContain("stage3-fake-process-key");
+    await expect(access(join(sessionDirectory, `${session.sessionId}.lock`))).rejects.toThrow();
+    expect((await readdir(workspaceRoot)).some((name) => name.startsWith(".anthias-"))).toBe(false);
+  });
 });
 
+/** 启动只监听 loopback 随机端口的测试服务。 */
 async function startServer(
   handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
 ): Promise<ReturnType<typeof createServer>> {
@@ -245,12 +393,14 @@ async function startServer(
   return server;
 }
 
+/** 等待测试 HTTP 服务关闭及其连接完成收口。 */
 function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
 }
 
+/** 读取一条测试 HTTP 请求的完整 UTF-8 body。 */
 function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const bodyChunks: Buffer[] = [];
@@ -260,6 +410,7 @@ function readBody(request: IncomingMessage): Promise<string> {
   });
 }
 
+/** 写入一个 OpenAI-compatible 文本增量。 */
 function writeChunk(response: ServerResponse, content: string): void {
   response.write(
     `data: ${JSON.stringify({
@@ -267,6 +418,23 @@ function writeChunk(response: ServerResponse, content: string): void {
       created: 0,
       model: "test-model",
       choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })}\n\n`,
+  );
+}
+
+/** 写入一个包含 finish reason 与标准 token usage 的终止增量。 */
+function writeFinish(
+  response: ServerResponse,
+  finishReason: "stop" | "tool_calls",
+  usage: Readonly<{ prompt_tokens: number; completion_tokens: number }>,
+): void {
+  response.write(
+    `data: ${JSON.stringify({
+      id: "chatcmpl-finish",
+      created: 0,
+      model: "stage3-test-model",
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      usage: { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens },
     })}\n\n`,
   );
 }
@@ -303,6 +471,7 @@ function writeToolCalls(
   );
 }
 
+/** 收集有限测试流中的全部事件。 */
 async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const chunks: T[] = [];
   for await (const chunk of stream) {

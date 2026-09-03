@@ -1,6 +1,6 @@
 # Feature 002：基础 Tool Loop 与线性 Session
 
-状态：已定义
+状态：已实现
 
 - 文档类型：Spec
 - Feature 目录：feature002-tool-loop-and-session

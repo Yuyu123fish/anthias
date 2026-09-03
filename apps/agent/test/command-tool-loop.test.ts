@@ -66,7 +66,14 @@ describe("execute_command Agent Tool Loop", () => {
     }
     await expect(access(join(workspaceRoot, "command-ran.txt"))).rejects.toThrow();
     expect(approvalRequest.preview).toContain("operation: execute command");
+    expect(approvalRequest.preview).toContain(
+      `shell: ${[shell.executable, ...shell.arguments]
+        .map((part) => JSON.stringify(part))
+        .join(" ")}`,
+    );
+    expect(approvalRequest.preview).toContain("cwd: .");
     expect(approvalRequest.preview).toContain("timeoutMs: 10000");
+    expect(approvalRequest.preview).toContain(`command:\n${command}`);
 
     expect(agent.respondToToolApproval(approvalRequest.toolApprovalRequestId, "approve")).toEqual({
       status: "accepted",
@@ -165,16 +172,73 @@ describe("execute_command Agent Tool Loop", () => {
     expect(agent.state.running).toBe(false);
   });
 
+  it("drains byte- and line-bounded command output after truncation", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-truncation-"));
+    temporaryDirectories.add(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const shell = await resolveSessionShell(process.env);
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    const commands =
+      shell.kind === "powershell"
+        ? [
+            "$text='x' * 70000; [Console]::Out.Write($text); Set-Content -LiteralPath 'bytes-drained.txt' -Value 'yes'",
+            "1..2100 | ForEach-Object { Write-Output 'x' }; Set-Content -LiteralPath 'lines-drained.txt' -Value 'yes'",
+          ]
+        : [
+            "head -c 70000 /dev/zero | tr '\\0' x; printf 'yes\\n' > bytes-drained.txt",
+            "i=0; while [ \"$i\" -lt 2100 ]; do printf 'x\\n'; i=$((i+1)); done; printf 'yes\\n' > lines-drained.txt",
+          ];
+    let modelRequestCount = 0;
+    const modelStream: ModelStream = async function* () {
+      modelRequestCount += 1;
+      if (modelRequestCount <= commands.length) {
+        yield {
+          type: "tool_call",
+          toolCallId: `00000000-0000-4000-8000-${modelRequestCount.toString().padStart(12, "0")}`,
+          toolName: "execute_command",
+          input: { command: commands[modelRequestCount - 1], timeoutMs: 10_000 },
+          invalid: false,
+        } as const;
+        yield finishEvent("tool_calls");
+        return;
+      }
+      yield { type: "text_delta", delta: "截断验证完成。" } as const;
+      yield finishEvent("stop");
+    };
+    const agent = createAgentWithModelStream({ modelStream, session });
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+      }
+    });
+
+    await expect(agent.prompt("验证命令输出截断")).resolves.toEqual({ status: "completed" });
+
+    const toolResults = agent.state.messageHistory.filter((message) => message.role === "tool");
+    expect(toolResults).toHaveLength(2);
+    for (const toolResult of toolResults) {
+      expect(toolResult).toMatchObject({ status: "completed", truncated: true });
+      expect(toolResult.content).toContain("...[命令输出已截断，管道已继续排空]");
+      expect(Buffer.byteLength(toolResult.content, "utf8")).toBeLessThanOrEqual(64 * 1024);
+      expect(toolResult.content.split("\n").length).toBeLessThanOrEqual(2_000);
+    }
+    expect(await readFile(join(workspaceRoot, "bytes-drained.txt"), "utf8")).toContain("yes");
+    expect(await readFile(join(workspaceRoot, "lines-drained.txt"), "utf8")).toContain("yes");
+    expect(modelRequestCount).toBe(3);
+    expect(agent.state.running).toBe(false);
+  });
+
   it("aborts a running command once and returns to idle after process-tree cleanup", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-abort-"));
     temporaryDirectories.add(workspaceRoot);
     const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
     const shell = await resolveSessionShell(process.env);
     const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    const escapedNodeExecutable = process.execPath.replaceAll("'", "''");
     const command =
       shell.kind === "powershell"
-        ? "Write-Output 'started'; Start-Sleep -Seconds 30"
-        : "printf 'started\\n'; sleep 30";
+        ? `$child=Start-Process -FilePath '${escapedNodeExecutable}' -ArgumentList @('-e','setTimeout(()=>{},10000)') -WindowStyle Hidden -PassThru; Set-Content -LiteralPath 'child.pid' -Value $child.Id; Write-Output 'started'; Wait-Process -Id $child.Id`
+        : "sleep 10 & child=$!; printf '%s' \"$child\" > child.pid; printf 'started\\n'; wait \"$child\"";
     const modelStream: ModelStream = async function* () {
       yield {
         type: "tool_call",
@@ -207,13 +271,21 @@ describe("execute_command Agent Tool Loop", () => {
 
     expect(abortRequested).toBe(true);
     expect(events.filter((event) => event.type === "run_end")).toHaveLength(1);
-    expect(events.filter((event) => event.type === "tool_execution_end")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "tool_execution_end")).toEqual([
+      expect.objectContaining({ cleanupUncertain: false }),
+    ]);
     expect(
       agent.state.messageHistory.filter((message) => message.role === "tool").at(-1),
     ).toMatchObject({
       status: "aborted",
       content: expect.stringContaining("termination: aborted"),
     });
+    const childProcessId = Number.parseInt(
+      (await readFile(join(workspaceRoot, "child.pid"), "utf8")).trim(),
+      10,
+    );
+    expect(Number.isSafeInteger(childProcessId)).toBe(true);
+    await vi.waitFor(() => expect(isProcessAlive(childProcessId)).toBe(false), { timeout: 5_000 });
     expect(agent.state.running).toBe(false);
   });
 });
@@ -225,4 +297,14 @@ function finishEvent(finishReason: "stop" | "tool_calls") {
     finishReason,
     usage: Object.freeze({ inputTokens: null, outputTokens: null, totalTokens: null }),
   });
+}
+
+/** 判断测试命令创建的后代进程是否仍然存在。 */
+function isProcessAlive(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }

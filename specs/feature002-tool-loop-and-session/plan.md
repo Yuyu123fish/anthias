@@ -1,6 +1,6 @@
 # Feature 002：基础 Tool Loop 与线性 Session 实施方案
 
-状态：已计划
+状态：已实现
 
 - 文档类型：Plan
 - 对应 Spec：[spec.md](spec.md)
@@ -9,12 +9,13 @@
 
 ## 1. 当前基线与范围
 
-- 当前分支为 `main`，Stage 01 已在 `8c34b78` 完成；Stage 02 在本提交中完成门禁，随后按整项授权继续 Stage 03。
+- 当前分支为 `main`，Stage 01 已在 `8c34b78` 完成，Stage 02 已在 `996556e` 完成，Stage 03 已完成整体集成与验收准备。
 - 当前环境为 Windows、Node.js `v24.13.1`、pnpm `10.33.0`、PowerShell `7.5.4`。
-- `apps/agent` 已实现 Schema 1 的文本 Session 新建、追加、按 UUID 重开、持久投影、一次提示词一次模型请求、文本流、单 activeRun、取消和安全错误；内部 Model Stream 目前只产出字符串增量。
+- `apps/agent` 已实现 Schema 1 Session 的新建、追加、按 UUID 重开与持久投影；一次提示词可以在单 activeRun 内发起多次结构化模型请求，串行处理 ToolCall，并统一支持取消、预算和安全失败。
 - `apps/tui` 仍只依赖 `@anthias/agent`，现已通过同一公开 Interface 呈现 Tool、处理逐次确认、停止当前 Run 并报告实际预算用量。
 - 生产 OpenAI-compatible Adapter 仍位于 Agent Module 内部，使用 AI SDK `7.0.85`，现已转换文本、ToolCall、finish reason 和 usage，但不执行 Tool 或拥有循环。
 - Stage 02 完成门的 `pnpm verify` 已通过 Biome、Strict TypeScript、构建和 87 个测试；`pnpm install --frozen-lockfile --offline` 同时通过。
+- Stage 03 最终 `pnpm verify` 已通过 Biome 对 33 个文件的检查、Strict TypeScript、构建和 13 个测试文件中的 89 个测试。
 - 当前已具备线性 Session 恢复与独占写入、六个固定 Tool、逐次副作用确认、Model → Tool → Model 循环和资源预算；Stage 1 产生的 Schema 1 终态记录仍可重开。
 
 本 Plan 只交付 Spec 已定义的线性 JSONL Session、六个固定 Tool、逐次副作用确认、多模型请求 Agent Loop、TUI 闭环和整体本地验收。不会加入沙箱、可复用授权、PTY、后台命令、动态 Tool Registry、Compaction、分叉、Desktop 或多 Agent。
@@ -358,7 +359,7 @@ Stage 02 首次加入依赖时由实施 Agent 更新 manifest 与 lockfile；之
 - AI SDK 或 Provider 可能以不同 finish reason 表达 ToolCall；本地 Adapter 测试只能证明已锁定 SDK 与测试 Provider 的转换，不代表所有真实 Provider；
 - TUI 行输入与待确认 Promise 可能发生退出、Ctrl+C 和批准竞争，必须保持 Agent 唯一终态；
 - Diff 计算和大输出可能消耗过多内存；确认预览超限失败，ToolResult 统一截断，不引入 Blob 存储；
-- 新依赖安装可能需要外部网络，而当前 Plan 不授权联网。
+- `diff@9.0.0` 已在开发者单独授权后完成下载和锁定；任何其他新依赖或外部网络访问仍需重新授权。
 
 出现以下情况时当前 Stage 立即停止：
 
@@ -376,6 +377,6 @@ Stage 02 首次加入依赖时由实施 Agent 更新 manifest 与 lockfile；之
 
 每个 Stage 的实施报告必须说明：完成的用户行为、主要调用链、JSONL 与副作用顺序、确认/取消/资源释放边界、实际验证命令和结果、未验证项以及 Git 状态。相同代码版本和环境已有可信结果时不重复验证，只补当前 Stage 新增的证据缺口。
 
-- 本 Plan 已由开发者确认并标记为“已计划”。
+- 本 Plan 已由开发者确认；实现与 A–N 本地门禁完成后状态已更新为“已实现”，继续等待开发者验收。
 - 开发者已确认唯一 Tasks，并明确授权 Feature 002 全部 Stage 的本地实施、逐 Stage 提交和最终提交。
-- Stage 01 已完成并提交；Stage 02 门禁通过后提交并继续 Stage 03，Stage 03 完成后创建最终提交。依赖联网、真实 Provider、真实凭据、推送和 PR 继续分别取得授权。
+- Stage 01 与 Stage 02 已完成并分别提交；Stage 03 完成后创建最终提交。除已授权的 `diff@9.0.0` 下载外，其他外部网络、真实 Provider、真实凭据、推送和 PR 继续分别取得授权。

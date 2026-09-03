@@ -321,7 +321,16 @@ function createCommandOutputCollector(): CommandOutputCollector {
         outputStarted = true;
       }
       if (acceptedText.length > 0) {
-        entries.push(Object.freeze({ stream, text: acceptedText }));
+        const previousEntry = entries.at(-1);
+        // 相邻同源块合并后只占一个渲染标签，预留的行预算才能覆盖最终 ToolResult 元数据。
+        if (previousEntry?.stream === stream) {
+          entries[entries.length - 1] = Object.freeze({
+            stream,
+            text: previousEntry.text + acceptedText,
+          });
+        } else {
+          entries.push(Object.freeze({ stream, text: acceptedText }));
+        }
       }
       return acceptedText;
     },
