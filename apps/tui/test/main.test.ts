@@ -1,9 +1,21 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveStartupPaths } from "../src/startup.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -17,6 +29,91 @@ afterEach(async () => {
 });
 
 describe("Anthias CLI", () => {
+  it("derives one Anthias Data Root independently from different invocation workspaces", async () => {
+    const firstWorkspace = await createTemporaryDirectory("anthias-cli-first-workspace-");
+    const secondWorkspace = await createTemporaryDirectory("anthias-cli-second-workspace-");
+
+    const firstPaths = await resolveStartupPaths({
+      invocationWorkingDirectory: firstWorkspace,
+      environment: {},
+    });
+    const secondPaths = await resolveStartupPaths({
+      invocationWorkingDirectory: secondWorkspace,
+      environment: {},
+    });
+
+    expect(firstPaths.workspaceRoot).toBe(await realpath(firstWorkspace));
+    expect(secondPaths.workspaceRoot).toBe(await realpath(secondWorkspace));
+    expect(firstPaths.anthiasProjectRoot).toBe(secondPaths.anthiasProjectRoot);
+    expect(firstPaths.sessionDirectory).toBe(
+      join(firstPaths.anthiasProjectRoot, "data", "conversation"),
+    );
+    expect(secondPaths.sessionDirectory).toBe(firstPaths.sessionDirectory);
+
+    const selectedWorkspace = join(firstWorkspace, "selected");
+    await mkdir(selectedWorkspace);
+    const relativeSelection = await resolveStartupPaths({
+      invocationWorkingDirectory: firstWorkspace,
+      requestedWorkspace: "selected",
+      environment: {},
+    });
+    const absoluteSelection = await resolveStartupPaths({
+      invocationWorkingDirectory: secondWorkspace,
+      requestedWorkspace: selectedWorkspace,
+      environment: {},
+    });
+    expect(relativeSelection.workspaceRoot).toBe(absoluteSelection.workspaceRoot);
+  });
+
+  it("starts the compiled CLI in two selected workspaces without writing Session data there", async () => {
+    const anthiasProjectRoot = await createIsolatedAnthiasProject();
+    const firstWorkspace = await createTemporaryDirectory("anthias-cli-first-selected-");
+    const secondWorkspace = await createTemporaryDirectory("anthias-cli-second-selected-");
+    const sessionDirectory = join(anthiasProjectRoot, "data", "conversation");
+    const isolatedMainPath = join(anthiasProjectRoot, "apps", "tui", "dist", "main.js");
+    const environment = createModelEnvironment();
+
+    const firstProcessResult = spawnCli(
+      [],
+      environment,
+      firstWorkspace,
+      "/exit\n",
+      isolatedMainPath,
+    );
+    const secondProcessResult = spawnCli(
+      [],
+      environment,
+      secondWorkspace,
+      "/exit\n",
+      isolatedMainPath,
+    );
+
+    expect(firstProcessResult.status).toBe(0);
+    expect(secondProcessResult.status).toBe(0);
+    expect(firstProcessResult.stderr).toBe("");
+    expect(secondProcessResult.stderr).toBe("");
+    const sessionFiles = (await readdir(sessionDirectory)).filter((name) =>
+      name.endsWith(".jsonl"),
+    );
+    expect(sessionFiles).toHaveLength(2);
+    const recordedWorkspaces = await Promise.all(
+      sessionFiles.map(async (sessionFile) => {
+        const headerLine = (await readFile(join(sessionDirectory, sessionFile), "utf8")).split(
+          "\n",
+        )[0];
+        return (JSON.parse(headerLine ?? "") as { workspaceRoot: string }).workspaceRoot;
+      }),
+    );
+    expect(new Set(recordedWorkspaces)).toEqual(
+      new Set([await realpath(firstWorkspace), await realpath(secondWorkspace)]),
+    );
+    await expect(stat(join(firstWorkspace, "data"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(secondWorkspace, "data"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(anthiasProjectRoot, "apps", "tui", "data"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("creates a Session without arguments and reopens the same UUID", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-reopen-");
     const normalizedWorkspaceRoot = await realpath(workspaceRoot);
@@ -96,6 +193,33 @@ describe("Anthias CLI", () => {
     expect(processResult.stderr).toContain("命令行参数无效");
   });
 
+  it("rejects relative Session overrides and invalid workspaces before Session creation", async () => {
+    const invocationDirectory = await createTemporaryDirectory("anthias-cli-invalid-paths-");
+    const workspaceFile = join(invocationDirectory, "not-a-directory.txt");
+    await writeFile(workspaceFile, "not a workspace", "utf8");
+    const absoluteSessionDirectory = join(invocationDirectory, "sessions");
+
+    const relativeOverrideResult = spawnCli(
+      [],
+      createModelEnvironment("relative/sessions"),
+      invocationDirectory,
+    );
+    expect(relativeOverrideResult.status).toBe(1);
+    expect(relativeOverrideResult.stderr).toContain("ANTHIAS_SESSION_DIR 必须是绝对路径");
+    await expect(stat(join(invocationDirectory, "relative"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const invalidWorkspaceResult = spawnCli(
+      ["--workspace", workspaceFile],
+      createModelEnvironment(absoluteSessionDirectory),
+      invocationDirectory,
+    );
+    expect(invalidWorkspaceResult.status).toBe(1);
+    expect(invalidWorkspaceResult.stderr).toContain("Workspace 必须是存在的目录");
+    await expect(stat(absoluteSessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("accepts Plan mode and rejects an unknown mode before startup", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
     const sessionDirectory = join(workspaceRoot, "sessions");
@@ -130,7 +254,7 @@ describe("Anthias CLI", () => {
     });
 
     expect(processResult.status).toBe(1);
-    expect(processResult.stderr).toContain("Session 启动失败");
+    expect(processResult.stderr).toContain("Session ID 或 Session 文件无效");
   });
 });
 
@@ -139,8 +263,8 @@ function spawnCli(
   environment: NodeJS.ProcessEnv,
   cwd?: string,
   input?: string,
+  mainPath = fileURLToPath(new URL("../dist/main.js", import.meta.url)),
 ) {
-  const mainPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
   return spawnSync(process.execPath, [mainPath, ...arguments_], {
     cwd,
     env: environment,
@@ -150,8 +274,40 @@ function spawnCli(
   });
 }
 
+async function createIsolatedAnthiasProject(): Promise<string> {
+  const anthiasProjectRoot = await createTemporaryDirectory("anthias-cli-project-");
+  const isolatedTuiRoot = join(anthiasProjectRoot, "apps", "tui");
+  await mkdir(isolatedTuiRoot, { recursive: true });
+  await cp(fileURLToPath(new URL("../dist", import.meta.url)), join(isolatedTuiRoot, "dist"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(anthiasProjectRoot, "package.json"),
+    `${JSON.stringify({ name: "anthias", private: true, type: "module" })}\n`,
+    "utf8",
+  );
+  const isolatedPackageScope = join(isolatedTuiRoot, "node_modules", "@anthias");
+  await mkdir(isolatedPackageScope, { recursive: true });
+  await symlink(
+    fileURLToPath(new URL("../../agent", import.meta.url)),
+    join(isolatedPackageScope, "agent"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  return anthiasProjectRoot;
+}
+
 async function createTemporaryDirectory(prefix: string): Promise<string> {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), prefix));
   temporaryDirectories.add(temporaryDirectory);
   return temporaryDirectory;
+}
+
+function createModelEnvironment(sessionDirectory?: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
+    ANTHIAS_MODEL_ID: "model-id",
+    ANTHIAS_MODEL_API_KEY: "local-key",
+    ...(sessionDirectory === undefined ? {} : { ANTHIAS_SESSION_DIR: sessionDirectory }),
+  };
 }

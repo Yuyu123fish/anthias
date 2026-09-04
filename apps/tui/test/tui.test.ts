@@ -55,6 +55,9 @@ describe("runTui", () => {
     expect(rendered).toContain("Session: 00000000-0000-4000-8000-000000000001\n");
     expect(rendered).toContain("Workspace: C:\\workspace\n");
     expect(rendered).toContain("Mode: Agent\n");
+    expect(rendered).toContain(
+      "cwd: C:\\workspace | mode: Agent | session: 00000000 | status: idle\nanthias> ",
+    );
     expect(rendered).toContain("You: previous\nAssistant: answer\n");
     expect(promptHandler).not.toHaveBeenCalled();
   });
@@ -95,9 +98,37 @@ describe("runTui", () => {
       ]);
     });
 
+    await vi.waitFor(() => {
+      expect(
+        rendered.match(/cwd: C:\\workspace \| mode: Agent \| session: 00000000 \| status: idle/g),
+      ).toHaveLength(3);
+    });
     input.write("/exit\n");
     await expect(tuiExit).resolves.toBe(0);
     expect(signalSource.listenerCount("SIGINT")).toBe(0);
+  });
+
+  it("keeps the full workspace visible after rejecting empty input", async () => {
+    const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
+    const agent = createFakeAgent({ prompt: promptHandler });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({ agent, input, output, signalSource });
+    input.write("\n");
+    await vi.waitFor(() => {
+      expect(rendered).toContain("请输入非空提示词。\n");
+      expect(rendered.match(/cwd: C:\\workspace/g)).toHaveLength(2);
+    });
+    expect(promptHandler).not.toHaveBeenCalled();
+    input.write("/exit\n");
+    await expect(tuiExit).resolves.toBe(0);
   });
 
   it("renders Tool lifecycle only from Agent events", async () => {

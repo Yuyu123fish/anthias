@@ -32,7 +32,7 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 - 已确认的基础方向是 Strict TypeScript、Node.js 24 LTS、ESM 和 pnpm workspace。
 - 首个模型接入继续使用通用 OpenAI-compatible 接口；DeepSeek V4 Flash 只是日常使用与联调的参考模型。
 - Electron 不再是产品前提；Desktop 的框架、进程模型和传输方式留给未来 Feature 决定。
-- [Feature 004 已计划 Spec](specs/feature004-tui-workspace-experience/spec.md) 与四个 Plan 已确认 TUI 视觉与完整对话周期、工作路径常驻呈现、任意工作目录启动、Workspace Root 与 Anthias Data Root 分离，以及 TUI 内使用 Shiki 高亮代码；相关行为尚未实现。
+- [Feature 004](specs/feature004-tui-workspace-experience/spec.md) 正在实施。Plan 01 已完成任意工作目录启动、`--workspace`、Workspace Root 与 Anthias Data Root 分离，以及输入旁完整工作路径呈现，并通过本地约定验证、等待开发者审查；新的视觉层级、Reasoning、Tool 活动、文件标识和 Shiki 高亮仍在后续 Plan。
 - Compaction、执行分叉、候选比较和 Desktop 尚未实现。
 
 ## 文档入口

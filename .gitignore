@@ -19,3 +19,6 @@ out/
 
 # 本地运行日志
 *.log
+
+# Anthias 本地 Session 数据
+/data/

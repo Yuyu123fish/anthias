@@ -1,6 +1,6 @@
 # Feature 004：TUI 交互与工作区启动体验任务
 
-状态：已计划
+状态：实施中
 
 ## 开发者速览
 
@@ -8,7 +8,7 @@
 > **核心做法**：每项任务形成可验证 tracer，按依赖顺序推进，每个 Plan 完成后停止。<br>
 > **边界**：不改变 Session Schema、Tool Policy 或 Agent 核心 Interface，不自动跨 Plan。<br>
 > **风险 / 未验证**：路径、Reasoning 顺序、Shiki、终端重绘与真实 Provider 仍待实施证明。<br>
-> **当前 / 请审阅**：已计划；文档提交后从 T001 开始，Plan 01 完成即停止。
+> **当前 / 请审阅**：实施中；T001–T003 已完成，Plan 01 已停止并等待开发者审查。
 
 - 对应 Spec：[spec.md](spec.md)
 - 实施计划：[Plan 01](plan-01-workspace-and-data-root.md)、[Plan 02](plan-02-agent-observability.md)、[Plan 03](plan-03-terminal-content-rendering.md)、[Plan 04](plan-04-interactive-tui-and-closeout.md)
@@ -19,39 +19,39 @@
 
 ### T001：任意 Workspace 启动 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：无
 
-- [ ] 编译后 CLI 支持省略或传入 `--workspace <path>`，相对路径以调用时 `cwd` 为基准。
-- [ ] 启动 Module 从自身位置确定并校验 Anthias Project Root，不扫描用户 Workspace。
-- [ ] 生产装配把规范化 Workspace Root 与默认 Anthias Session Directory 分别交给 Agent。
-- [ ] 新 Session Header 记录目标 Workspace；输入旁上下文行显示完整路径、模式和 Session。
-- [ ] 两个临时 Workspace 的 CLI happy path 测试证明 Session 集中进入同一 Anthias Data Root。
+- [x] 编译后 CLI 支持省略或传入 `--workspace <path>`，相对路径以调用时 `cwd` 为基准。
+- [x] 启动 Module 从自身位置确定并校验 Anthias Project Root，不扫描用户 Workspace。
+- [x] 生产装配把规范化 Workspace Root 与默认 Anthias Session Directory 分别交给 Agent。
+- [x] 新 Session Header 记录目标 Workspace；输入旁上下文行显示完整路径、模式和 Session。
+- [x] 两个临时 Workspace 的 CLI happy path 测试证明 Session 集中进入同一 Anthias Data Root。
 
 ### T002：Session 兼容与启动失败 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T001
 
-- [ ] 绝对 `ANTHIAS_SESSION_DIR` 保持可用，相对值在 Session 创建前拒绝。
-- [ ] 同 Workspace 能重开；Workspace mismatch 显示当前和记录路径且不自动切换。
-- [ ] Session busy、changed、invalid、mismatch 与 Shell / 存储失败保持可区分的安全 reason。
-- [ ] 无效 Workspace、文件路径、未知参数和 mismatch 不产生模型请求或 Tool 副作用。
-- [ ] 旧 Session 目录不扫描、不迁移、不复制、不删除。
+- [x] 绝对 `ANTHIAS_SESSION_DIR` 保持可用，相对值在 Session 创建前拒绝。
+- [x] 同 Workspace 能重开；Workspace mismatch 显示当前和记录路径且不自动切换。
+- [x] Session busy、changed、invalid、mismatch 与 Shell / 存储失败保持可区分的安全 reason。
+- [x] 无效 Workspace、文件路径、未知参数和 mismatch 不产生模型请求或 Tool 副作用。
+- [x] 旧 Session 目录不扫描、不迁移、不复制、不删除。
 
 ### T003：Plan 01 门禁与阶段报告
 
-状态：待开始
+状态：已完成
 
 Blocked by：T001、T002
 
-- [ ] 启动、Session、CLI 与 TUI 定向测试通过。
-- [ ] `pnpm check` 通过，Session Schema 1 和现有输入 / approval / 停止语义无回归。
-- [ ] 根 `.gitignore` 明确排除 Anthias `data`，目标 Workspace 与 `apps/tui` 无默认 Session 污染。
-- [ ] 创建唯一 `report.md`，只记录 Plan 01 已成立能力与后续未完成范围。
-- [ ] 更新本任务状态并汇报；停止，不进入 Plan 02。
+- [x] 启动、Session、CLI 与 TUI 定向测试通过。
+- [x] `pnpm check` 通过，Session Schema 1 和现有输入 / approval / 停止语义无回归。
+- [x] 根 `.gitignore` 明确排除 Anthias `data`，目标 Workspace 与 `apps/tui` 无默认 Session 污染。
+- [x] 创建唯一 `report.md`，只记录 Plan 01 已成立能力与后续未完成范围。
+- [x] 更新本任务状态并汇报；停止，不进入 Plan 02。
 
 ## Plan 02：Agent 可观察生命周期
 

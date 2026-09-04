@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003 已验收；当前 TypeScript Coding Harness 已具备线性 Session、基础 Tool、权限策略和只读有界并发。
+状态：Feature 003 已验收；Feature 004 Plan 01 已实现独立 Workspace / Data Root 启动装配并等待审查。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -54,7 +54,7 @@ Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 Ab
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
-当前 TUI 仍使用 Node.js `readline` 的普通行式界面，已经能够呈现模式、Tool 归属、approval 风险边界和 Run 终态。[Feature 004 已计划 Spec](../specs/feature004-tui-workspace-experience/spec.md) 与四个 Plan 已确认重新设计视觉、输入区和完整对话周期、常驻呈现工作路径，并把 Shiki 限定为 TUI 内容 renderer 后的代码高亮依赖；这些能力尚未实现，Shiki 也不能把 Agent 生命周期或第二份业务状态带入 TUI。
+当前 TUI 仍使用 Node.js `readline` 的普通行式界面，已经能够呈现模式、Tool 归属、approval 风险边界、Run 终态，并在普通输入前显示完整 Workspace、模式、Session 短 ID 与运行状态。Feature 004 Plan 01 已让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。后续 Plan 才会重新设计视觉、输入区和完整对话周期，并把 Shiki 限定为 TUI Content Renderer 的代码高亮依赖。
 
 ### 未来 Desktop 适配器
 
@@ -88,7 +88,7 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 ## 仍待后续 Feature 决定
 
 - 新 TUI 的渲染框架、输入行为、视觉系统和终端降级策略；
-- 从任意工作目录启动的 CLI 入口，以及 Workspace Root 与 Anthias Data Root 的分离、重开和迁移语义；
+- 旧 Workspace 内 Session 的可选迁移能力；当前实现明确不自动扫描或迁移；
 - Session Compaction、检索和后续分叉所需的持久化扩展；
 - 可复用授权、OS 沙箱、低权限执行和网络隔离；
 - 多 Provider、模型切换、重试和 Provider 专属能力；

@@ -77,7 +77,7 @@ export function runTui({
     }
     if (trimmedLine === "/mode" || trimmedLine.startsWith("/mode ")) {
       handleModeCommand(trimmedLine, agent, output);
-      writeInputPrompt(output);
+      writeInputPrompt(agent.state, output);
       return;
     }
     const pendingApproval = agent.state.pendingToolApproval;
@@ -98,11 +98,12 @@ export function runTui({
     }
     if (trimmedLine.length === 0) {
       output.write("请输入非空提示词。\n");
-      writeInputPrompt(output);
+      writeInputPrompt(agent.state, output);
       return;
     }
     if (agent.state.running) {
       output.write("当前响应仍在生成，请先停止。\n");
+      writeInputPrompt(agent.state, output);
       return;
     }
 
@@ -117,7 +118,7 @@ export function runTui({
       output.write(renderPromptRejection(promptResult.reason));
     }
     if (!exitStarted) {
-      writeInputPrompt(output);
+      writeInputPrompt(agent.state, output);
     }
   }
 
@@ -129,7 +130,7 @@ export function runTui({
     void requestExit();
   });
 
-  writeInputPrompt(output);
+  writeInputPrompt(agent.state, output);
   return exitCompletion.promise;
 }
 
@@ -203,7 +204,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
 /** TUI 只从 AgentState 呈现重开投影，不直接读取 Session 文件。 */
 function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream): void {
   output.write(`Session: ${state.sessionId}\n`);
-  output.write(`Workspace: ${state.workspaceRoot}\n`);
+  output.write(`Workspace: ${renderSafePath(state.workspaceRoot)}\n`);
   output.write(`Mode: ${renderPermissionMode(state.permissionMode)}\n`);
   for (const message of state.messageHistory) {
     if (message.role === "user") {
@@ -256,8 +257,21 @@ function getAssistantText(message: AssistantMessage): string {
 }
 
 /** 写出下一次终端输入提示。 */
-function writeInputPrompt(output: NodeJS.WritableStream): void {
+function writeInputPrompt(state: Agent["state"], output: NodeJS.WritableStream): void {
+  output.write(
+    `cwd: ${renderSafePath(state.workspaceRoot)} | mode: ${renderPermissionMode(state.permissionMode)} | session: ${state.sessionId.slice(0, 8)} | status: ${state.running ? "active" : "idle"}\n`,
+  );
   output.write(INPUT_PROMPT);
+}
+
+/** 当前行式界面先阻断路径控制字符，完整 ANSI / OSC 策略由 Content Renderer 统一接管。 */
+function renderSafePath(path: string): string {
+  return [...path]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ? "�" : character;
+    })
+    .join("");
 }
 
 /** 将不同 prompt 拒绝原因映射为可操作且不混淆的终端文案。 */

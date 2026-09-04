@@ -3,31 +3,65 @@
 import { parseArgs } from "node:util";
 import { createAgentFromEnvironment, type PermissionMode } from "@anthias/agent";
 import { runTui } from "./index.js";
+import { resolveStartupPaths, StartupPathError, type StartupPaths } from "./startup.js";
 
 /** 创建生产 Agent 并进入 TUI；启动配置无效时以非零状态退出。 */
 async function main(): Promise<number> {
   let sessionId: string | undefined;
+  let requestedWorkspace: string | undefined;
   let permissionMode: PermissionMode = "agent";
   try {
     const parsedArguments = parseArgs({
       args: process.argv.slice(2),
-      options: { session: { type: "string" }, mode: { type: "string" } },
+      options: {
+        session: { type: "string" },
+        mode: { type: "string" },
+        workspace: { type: "string" },
+      },
       allowPositionals: false,
       strict: true,
     });
     sessionId = parsedArguments.values.session;
+    requestedWorkspace = parsedArguments.values.workspace;
     const requestedMode = parsedArguments.values.mode;
     if (requestedMode !== undefined && requestedMode !== "agent" && requestedMode !== "plan") {
       throw new Error("invalid mode");
     }
     permissionMode = requestedMode ?? "agent";
   } catch {
-    process.stderr.write("命令行参数无效；支持 --session <UUID> 与 --mode <agent|plan>。\n");
+    process.stderr.write(
+      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan>。\n",
+    );
+    return 1;
+  }
+
+  let startupPaths: StartupPaths;
+  try {
+    startupPaths = await resolveStartupPaths({
+      invocationWorkingDirectory: process.cwd(),
+      environment: process.env,
+      ...(requestedWorkspace === undefined ? {} : { requestedWorkspace }),
+    });
+  } catch (error) {
+    process.stderr.write(
+      `${error instanceof StartupPathError ? error.message : "Anthias 启动路径解析失败。"}\n`,
+    );
     return 1;
   }
 
   const agentCreationResult = await createAgentFromEnvironment(
-    sessionId === undefined ? { permissionMode } : { sessionId, permissionMode },
+    sessionId === undefined
+      ? {
+          workspaceRoot: startupPaths.workspaceRoot,
+          sessionDirectory: startupPaths.sessionDirectory,
+          permissionMode,
+        }
+      : {
+          workspaceRoot: startupPaths.workspaceRoot,
+          sessionDirectory: startupPaths.sessionDirectory,
+          sessionId,
+          permissionMode,
+        },
   );
   if (!agentCreationResult.ok) {
     process.stderr.write(`${agentCreationResult.error}\n`);

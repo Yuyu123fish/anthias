@@ -1,6 +1,6 @@
 # Feature 004：TUI 交互与工作区启动体验
 
-状态：已计划
+状态：实施中
 
 ## 开发者速览
 
@@ -8,7 +8,7 @@
 > **核心做法**：Session 归 Anthias `data`；TUI 常驻路径，Shiki 高亮代码并收起思考。<br>
 > **边界**：只显示 Provider 给出的 Reasoning；不含完整 Markdown、Session 管理器或 OS 沙箱。<br>
 > **风险 / 未验证**：终端能力、Shiki 性能、Provider 差异和 Windows 清理待验证。<br>
-> **当前 / 请审阅**：已计划；Shiki 已定，已授权文档提交后实施 Plan 01。
+> **当前 / 请审阅**：实施中；Plan 01 已实现并停止，等待开发者审查。
 
 - 文档类型：Spec
 - Feature 目录：`feature004-tui-workspace-experience`

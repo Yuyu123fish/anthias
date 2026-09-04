@@ -23,16 +23,49 @@ describe("createAgentFromEnvironment", () => {
     const creationResult = await createAgentFromEnvironment({
       environment: {
         ANTHIAS_MODEL_API_KEY: "secret-value",
-        ANTHIAS_SESSION_DIR: sessionDirectory,
       },
       workspaceRoot,
+      sessionDirectory,
     });
 
     expect(creationResult).toEqual({
       ok: false,
+      reason: "model_configuration",
       error: "缺少模型配置：ANTHIAS_MODEL_BASE_URL、ANTHIAS_MODEL_ID。请通过本地环境变量提供。",
     });
     expect(JSON.stringify(creationResult)).not.toContain("secret-value");
+    await expect(stat(sessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects invalid Workspace and relative Session paths before Session side effects", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-startup-invalid-paths-");
+    const workspaceFile = join(fixtureRoot, "workspace.txt");
+    const sessionDirectory = join(fixtureRoot, "must-not-exist");
+    await writeFile(workspaceFile, "not a directory", "utf8");
+    const environment = await createValidEnvironment(sessionDirectory);
+
+    await expect(
+      createAgentFromEnvironment({
+        environment,
+        workspaceRoot: workspaceFile,
+        sessionDirectory,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "workspace_unavailable",
+      error: "Workspace 必须是存在且可访问的目录。",
+    });
+    await expect(
+      createAgentFromEnvironment({
+        environment,
+        workspaceRoot: fixtureRoot,
+        sessionDirectory: "relative/sessions",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      reason: "storage_unavailable",
+      error: "Session Directory 必须是绝对路径。",
+    });
     await expect(stat(sessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -43,6 +76,7 @@ describe("createAgentFromEnvironment", () => {
     const creationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
     });
 
     expect(creationResult.ok).toBe(true);
@@ -66,23 +100,48 @@ describe("createAgentFromEnvironment", () => {
     }
   });
 
-  it("stores a default Session under workspace data/conversation", async () => {
-    const workspaceRoot = await createTemporaryDirectory("anthias-startup-default-session-");
-    const environment = await createValidEnvironment(join(workspaceRoot, "unused-sessions"));
-    delete environment.ANTHIAS_SESSION_DIR;
+  it("stores a Session only in the explicitly assembled directory", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-startup-explicit-session-");
+    const anthiasDataRoot = await createTemporaryDirectory("anthias-data-root-");
+    const sessionDirectory = join(anthiasDataRoot, "data", "conversation");
+    const environment = await createValidEnvironment(sessionDirectory);
 
-    const creationResult = await createAgentFromEnvironment({ environment, workspaceRoot });
+    const creationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot,
+      sessionDirectory,
+    });
 
     expect(creationResult.ok).toBe(true);
     if (!creationResult.ok) {
       return;
     }
-    const sessionDirectory = join(workspaceRoot, "data", "conversation");
     expect(await readdir(sessionDirectory)).toEqual([
       ".gitignore",
       `${creationResult.agent.state.sessionId}.jsonl`,
     ]);
     await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
+  });
+
+  it("returns a storage reason without exposing a filesystem error", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-startup-storage-");
+    const blockedParent = join(workspaceRoot, "not-a-directory");
+    const sessionDirectory = join(blockedParent, "conversation");
+    await writeFile(blockedParent, "file", "utf8");
+    const environment = await createValidEnvironment(join(workspaceRoot, "shell-fixture"));
+
+    const creationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot,
+      sessionDirectory,
+    });
+
+    expect(creationResult).toEqual({
+      ok: false,
+      reason: "storage_unavailable",
+      error: "Session 存储不可用，请检查 Anthias data 目录权限与磁盘状态。",
+    });
+    expect(JSON.stringify(creationResult)).not.toContain("ENOTDIR");
   });
 
   it("creates a Plan-mode Agent without persisting the runtime mode", async () => {
@@ -93,6 +152,7 @@ describe("createAgentFromEnvironment", () => {
     const creationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
       permissionMode: "plan",
     });
 
@@ -115,6 +175,7 @@ describe("createAgentFromEnvironment", () => {
     const firstCreationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
     });
     if (!firstCreationResult.ok) {
       throw new Error("expected initial Agent creation to succeed");
@@ -123,6 +184,7 @@ describe("createAgentFromEnvironment", () => {
     const reopenedCreationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
       sessionId: firstCreationResult.agent.state.sessionId,
     });
 
@@ -138,7 +200,11 @@ describe("createAgentFromEnvironment", () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-startup-busy-");
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = await createValidEnvironment(sessionDirectory);
-    const firstCreationResult = await createAgentFromEnvironment({ environment, workspaceRoot });
+    const firstCreationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot,
+      sessionDirectory,
+    });
     if (!firstCreationResult.ok) {
       throw new Error("expected initial Agent creation to succeed");
     }
@@ -160,12 +226,14 @@ describe("createAgentFromEnvironment", () => {
     const busyCreationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
       sessionId: firstCreationResult.agent.state.sessionId,
     });
 
     expect(busyCreationResult).toEqual({
       ok: false,
-      error: "Session 启动失败，请检查 Session ID、工作区与本地 Session 文件。",
+      reason: "session_busy",
+      error: "Session 正被其他进程使用，请稍后重试。",
     });
     await expect(stat(lockDirectory)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
   });
@@ -178,12 +246,14 @@ describe("createAgentFromEnvironment", () => {
     const creationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
+      sessionDirectory,
       sessionId: "",
     });
 
     expect(creationResult).toEqual({
       ok: false,
-      error: "Session 启动失败，请检查 Session ID、工作区与本地 Session 文件。",
+      reason: "invalid_session",
+      error: "Session ID 或 Session 文件无效，请检查后重试。",
     });
     await expect(stat(sessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -192,7 +262,11 @@ describe("createAgentFromEnvironment", () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-startup-shell-missing-");
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = await createValidEnvironment(sessionDirectory);
-    const firstCreationResult = await createAgentFromEnvironment({ environment, workspaceRoot });
+    const firstCreationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot,
+      sessionDirectory,
+    });
     if (!firstCreationResult.ok) {
       throw new Error("expected initial Agent creation to succeed");
     }
@@ -207,12 +281,46 @@ describe("createAgentFromEnvironment", () => {
       createAgentFromEnvironment({
         environment,
         workspaceRoot,
+        sessionDirectory,
         sessionId: firstCreationResult.agent.state.sessionId,
       }),
     ).resolves.toEqual({
       ok: false,
-      error: "Session 启动失败，请检查 Session ID、工作区与本地 Session 文件。",
+      reason: "shell_unavailable",
+      error: "Session Shell 不可用或与记录不一致，请检查本机 Shell。",
     });
+  });
+
+  it("reports both workspaces when reopening a Session from the wrong workspace", async () => {
+    const recordedWorkspaceRoot = await createTemporaryDirectory("anthias-startup-recorded-");
+    const requestedWorkspaceRoot = await createTemporaryDirectory("anthias-startup-requested-");
+    const sessionDirectory = join(recordedWorkspaceRoot, "sessions");
+    const environment = await createValidEnvironment(sessionDirectory);
+    const firstCreationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot: recordedWorkspaceRoot,
+      sessionDirectory,
+    });
+    if (!firstCreationResult.ok) {
+      throw new Error("expected initial Agent creation to succeed");
+    }
+
+    const mismatchResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot: requestedWorkspaceRoot,
+      sessionDirectory,
+      sessionId: firstCreationResult.agent.state.sessionId,
+    });
+
+    expect(mismatchResult).toEqual({
+      ok: false,
+      reason: "workspace_mismatch",
+      error: `Session 属于工作区 ${recordedWorkspaceRoot}，当前工作区是 ${requestedWorkspaceRoot}。请回到原工作区或创建新 Session。`,
+    });
+    expect(await readdir(sessionDirectory)).toEqual([
+      ".gitignore",
+      `${firstCreationResult.agent.state.sessionId}.jsonl`,
+    ]);
   });
 });
 
@@ -231,7 +339,6 @@ async function createValidEnvironment(sessionDirectory: string): Promise<NodeJS.
     ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
     ANTHIAS_MODEL_ID: "model-id",
     ANTHIAS_MODEL_API_KEY: "local-key",
-    ANTHIAS_SESSION_DIR: sessionDirectory,
     ...(process.platform === "win32"
       ? { Path: shellDirectory }
       : { PATH: shellDirectory, SHELL: shellExecutable }),

@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 已计划但尚未实施。
+状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 实施中，Plan 01 已实现并等待审查。
 
 2026-08-30，开发者撤销了此前围绕 Java/JVM 形成的产品与技术决定，并确认 Anthias 的长期路线是做一个可分叉的 Coding Agent。
 
@@ -56,7 +56,7 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 - 旧的 Electron Desktop、Utility Process Host、JSON-RPC、Protocol DTO 和 Renderer 状态投影已经撤销。
 - Feature 001–003 已累计实现多轮模型与 Tool 循环、六个固定 Tool、线性 JSONL Session、工作区文件和命令能力、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策与只读 Tool 四并发；Feature 003 已由开发者验收。
 - 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider、外部网络和长期人工终端体验尚未验证。
-- 当前 TUI 仍是追加文本的行式界面，Workspace Root 与 Session 默认数据目录仍然耦合。[Feature 004 已计划 Spec](../specs/feature004-tui-workspace-experience/spec.md) 与四个 Plan 已确认新的 TUI、完整对话周期、常驻工作路径、任意工作目录启动、Anthias Data Root 与 TUI 内 Shiki 代码高亮；相关行为尚未实现。
+- 当前 TUI 仍是追加文本的行式界面。[Feature 004](../specs/feature004-tui-workspace-experience/spec.md) 正在实施：Plan 01 已实现任意工作目录启动、显式 Workspace 选择、Workspace Root 与默认 Anthias `data/conversation` 分离，以及输入旁完整工作路径呈现，等待开发者审查。新的视觉层级、Reasoning、Tool 活动、文件标识和 Shiki 高亮仍未实现。
 - Compaction、Desktop、检查点、执行分支和候选比较尚未实现。
 
 ## 核心产品术语
@@ -102,7 +102,7 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 
 - Anthias 首先聚焦哪一种具体编码任务和用户工作流；
 - 新 TUI 的具体交互方式、终端渲染技术、输入能力与降级策略；
-- Workspace Root、Anthias Data Root、Session 重开和旧数据迁移的完整合同；
+- 是否为旧 Workspace 内 Session 提供单独迁移能力；当前合同是不扫描、不迁移、不删除；
 - 何时需要 Desktop，以及 Desktop 是否需要独立本地进程；
 - 哪个场景最能证明分叉比线性执行更有价值；
 - 检查点与执行分支需要继承哪些任务状态；
@@ -114,5 +114,5 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 - 当前确认的是产品路线、Coding Harness 近期目标、交互形态无关原则和 TUI 优先顺序。
 - TypeScript、`apps/agent` 与 `apps/tui` 布局、Agent 内部 Model Adapter、线性 Session、固定 Tool、Permission Mode 与安全策略已经由 Feature 001–003 和 lockfile 形成当前基线。
 - Feature 003 已于 2026-09-04 由开发者验收；没有 OS 沙箱、未调用真实 Provider，以及未进行长期人工终端体验仍是明确边界。
-- Feature 004 的 Spec、四个 Plan 与 Tasks 已由开发者确认并进入“已计划”，Shiki 已确定为 TUI 代码高亮方案；在对应 Plan 实施与验证完成前，新 TUI、任意工作目录启动和 Anthias Data Root 不能写成已实现能力。
+- Feature 004 的 Spec、四个 Plan 与 Tasks 已由开发者确认。Plan 01 已完成实现与约定验证、等待审查；Shiki 已确定为后续 TUI 代码高亮方案，但新的视觉、Reasoning、Tool 活动和内容渲染在对应 Plan 完成前不能写成已实现能力。
 - 归档 Research 和历史实现可以提供反例与证据，但不能自动恢复旧决定。

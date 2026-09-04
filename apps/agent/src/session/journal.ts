@@ -17,6 +17,9 @@ export type SessionFileCheckpoint = Readonly<{
   lastSequence: number;
 }>;
 
+/** 表示读取期间 Session 文件已变化，调用方不能继续使用旧投影。 */
+export class SessionChangedError extends Error {}
+
 /** 创建 Agent 自有目录的本地忽略规则，并拒绝覆盖不一致的已有文件。 */
 export async function ensureSessionGitignore(sessionDirectory: string): Promise<void> {
   const gitignorePath = join(sessionDirectory, ".gitignore");
@@ -52,7 +55,7 @@ export async function readSessionCheckpoint(
     fileStatsBeforeRead.size !== fileStatsAfterRead.size ||
     sessionBytes.byteLength !== fileStatsAfterRead.size
   ) {
-    throw new Error("Session checkpoint 读取期间发生变化。");
+    throw new SessionChangedError("Session checkpoint 读取期间发生变化。");
   }
   if (sessionBytes.at(-1) !== 0x0a) {
     throw new Error("Session checkpoint 尾部不完整。");

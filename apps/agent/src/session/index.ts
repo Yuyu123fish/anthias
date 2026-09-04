@@ -10,6 +10,7 @@ import {
   ensureSessionGitignore,
   readCompleteSessionText,
   readSessionCheckpoint,
+  SessionChangedError,
   type SessionFileCheckpoint,
   writeNewSessionHeader,
 } from "./journal.js";
@@ -46,6 +47,27 @@ export type {
   SessionShell,
   ToolExecutionStartedDetails,
 } from "./schema.js";
+
+export { SessionBusyError, SessionChangedError };
+
+/** 表示请求的 Session 身份或持久文件不能安全打开。 */
+export class InvalidSessionError extends Error {}
+
+/** 保留 Workspace mismatch 的两端规范化路径，供组合根生成安全提示。 */
+export class SessionWorkspaceMismatchError extends Error {
+  readonly recordedWorkspaceRoot: string;
+  readonly requestedWorkspaceRoot: string;
+
+  constructor(recordedWorkspaceRoot: string, requestedWorkspaceRoot: string) {
+    super("Session workspace root 不匹配。");
+    this.name = "SessionWorkspaceMismatchError";
+    this.recordedWorkspaceRoot = recordedWorkspaceRoot;
+    this.requestedWorkspaceRoot = requestedWorkspaceRoot;
+  }
+}
+
+/** 表示当前固定 Shell 不可用或与 Session Header 不一致。 */
+export class SessionShellUnavailableError extends Error {}
 
 /** 持有单个已接受 Run 的 Session 锁与串行追加能力。 */
 export type SessionRunLease = Readonly<{
@@ -84,16 +106,19 @@ export type OpenSessionOptions = CreateSessionOptions &
     sessionId: string;
   }>;
 
-/** 按环境覆盖或工作区默认值解析 Session 数据目录。 */
+/** 按环境覆盖或给定 Anthias Project Root 解析 Session 数据目录。 */
 export function resolveSessionDirectory(
-  workspaceRoot: string,
+  anthiasProjectRoot: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
   const overrideDirectory = environment.ANTHIAS_SESSION_DIR?.trim();
   if (overrideDirectory) {
+    if (!isAbsolute(overrideDirectory)) {
+      throw new Error("ANTHIAS_SESSION_DIR 必须是绝对路径。");
+    }
     return resolve(overrideDirectory);
   }
-  return join(resolve(workspaceRoot), "data", "conversation");
+  return join(resolve(anthiasProjectRoot), "data", "conversation");
 }
 
 /** 固定当前平台可复用的非交互 Shell；重开时必须与 Header 完全一致。 */
@@ -104,7 +129,7 @@ export async function resolveSessionShell(
   if (platform === "win32") {
     const powerShellExecutable = await resolveExecutableFromPath("pwsh.exe", environment, ";");
     if (powerShellExecutable === null) {
-      throw new Error("当前平台没有可用的 pwsh executable。");
+      throw new SessionShellUnavailableError("当前平台没有可用的 pwsh executable。");
     }
     return snapshotSessionShell({
       kind: "powershell",
@@ -126,12 +151,16 @@ export async function resolveSessionShell(
       // 不可执行的 SHELL 不是稳定运行时，统一回退到 Schema 1 的 POSIX 默认值。
     }
   }
-  await access("/bin/sh", constants.X_OK);
-  return snapshotSessionShell({
-    kind: "posix",
-    executable: await realpath("/bin/sh"),
-    arguments: ["-lc"],
-  });
+  try {
+    await access("/bin/sh", constants.X_OK);
+    return snapshotSessionShell({
+      kind: "posix",
+      executable: await realpath("/bin/sh"),
+      arguments: ["-lc"],
+    });
+  } catch {
+    throw new SessionShellUnavailableError("当前平台没有可用的 /bin/sh executable。");
+  }
 }
 
 /** 在显式环境 PATH 中解析一个真实存在的可执行文件。 */
@@ -209,7 +238,7 @@ export async function openSession({
   lockSystem = DEFAULT_SESSION_LOCK_SYSTEM,
 }: OpenSessionOptions): Promise<Session> {
   if (!isUuid(sessionId)) {
-    throw new Error("Session ID 无效。");
+    throw new InvalidSessionError("Session ID 无效。");
   }
   const normalizedWorkspaceRoot = await realpath(workspaceRoot);
   const normalizedSessionDirectory = await realpath(sessionDirectory);
@@ -229,11 +258,11 @@ export async function openSession({
       throw new Error("Session Header 与请求的 Session ID 不匹配。");
     }
     if (!areSameWorkspace(sessionHeader.workspaceRoot, normalizedWorkspaceRoot)) {
-      throw new Error("Session workspace root 不匹配。");
+      throw new SessionWorkspaceMismatchError(sessionHeader.workspaceRoot, normalizedWorkspaceRoot);
     }
     const requestedShell = snapshotSessionShell(shell);
     if (!areSameShell(sessionHeader.shell, requestedShell)) {
-      throw new Error("Session Shell 与当前固定 Shell 不匹配。");
+      throw new SessionShellUnavailableError("Session Shell 与当前固定 Shell 不匹配。");
     }
     records = lines.slice(1).map((line, recordIndex) => parseSessionRecord(line, recordIndex + 1));
     const unfinishedRun = validateSessionRecords(records);
