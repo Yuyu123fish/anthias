@@ -28,7 +28,7 @@ Agent 继续作为唯一行为权威，负责：
 - 将完整事实追加到 Session JSONL；
 - 从已有 JSONL 重建线性上下文并处理未完成 Run。
 
-Model Adapter 只把 OpenAI-compatible 流转换为 Agent 内部的文本增量、完整 ToolCall、结束原因和用量，不执行 Tool，也不持有循环。TUI 继续只使用 Agent Interface：提交提示词、响应待确认 ToolCall、停止 Run、读取状态和订阅事件；它不直接调用 Tool、不写 JSONL，也不维护第二套生命周期。
+Model Adapter 只把 OpenAI-compatible 流转换为 Agent 内部的文本增量、完整 ToolCall 和结束原因，不执行 Tool，也不持有循环。TUI 继续只使用 Agent Interface：提交提示词、响应待确认 ToolCall、停止 Run、读取状态和订阅事件；它不直接调用 Tool、不写 JSONL，也不维护第二套生命周期。
 
 ## 3. 术语与生命周期
 
@@ -38,7 +38,7 @@ Session 是绑定一个规范化工作区根目录的、可持久化的线性编
 
 ### 3.2 Run
 
-Run 从 Agent 接受一条 UserMessage 开始，到 completed、aborted、failed、budget_exhausted 或 interrupted 之一结束。一个 Run 可以包含多次模型请求，不等同于单个 AssistantMessage 或单次 ToolExecution。
+Run 从 Agent 接受一条 UserMessage 开始，到 completed、aborted 或 failed 之一结束。进程重启发现未终结的旧 Run 时，Session 恢复会把它记录为 interrupted；interrupted 不是当前 `prompt()` 的返回值。一个 Run 可以包含多次模型请求，不等同于单个 AssistantMessage 或单次 ToolExecution。
 
 活动 Run 只处于以下阶段之一：
 
@@ -55,7 +55,7 @@ Run 从 Agent 接受一条 UserMessage 开始，到 completed、aborted、failed
       ├─ ToolResultMessage → requesting_model
       └─ 停止 → aborted
 
-任一活动阶段都可能因模型故障、内部不变量破坏或预算耗尽进入对应终态。
+任一活动阶段都可能因模型故障、内部不变量破坏或内部安全保险丝触发而 failed。
 
 ### 3.3 Message、ToolCall 与 ToolExecution
 
@@ -83,7 +83,7 @@ Run 从 Agent 接受一条 UserMessage 开始，到 completed、aborted、failed
 11. 作为 Anthias 用户，我希望 Tool 参数错误、文件变化、命令失败或未知 Tool 不会直接破坏整个 Session，从而让模型有机会读取失败结果并修正。
 12. 作为 Anthias 用户，我希望对话和 Tool 事实自动保存为本地 JSONL，从而在进程退出后保留已经完成的编码上下文。
 13. 作为 Anthias 用户，我希望重新打开 Session 时不会自动重放中断的副作用，从而避免重复修改文件或重复运行命令。
-14. 作为 Anthias 用户，我希望 Agent 达到明确资源预算时安全停止并说明原因，从而避免无界的模型与 Tool 循环。
+14. 作为 Anthias 用户，我希望 Agent 在异常连续请求模型或一次产生过多 ToolCall 时安全失败，从而避免失控循环和过大调用批次。
 15. 作为 Anthias 用户，我希望退出 TUI 时当前模型流、确认等待、命令进程和文件句柄都被收口，从而不遗留后台资源。
 16. 作为 Anthias 交互适配器开发者，我希望通过同一个 Agent Interface 观察消息、Tool、确认和 Run 事件，从而无需在 TUI 或未来 Desktop 中复制 Agent Loop。
 
@@ -138,12 +138,12 @@ Run 从 Agent 接受一条 UserMessage 开始，到 completed、aborted、failed
 
 - 一条被接受的 UserMessage 只追加一次，但可以触发多次模型请求。
 - Agent 每次模型请求都传入当前消息投影和同一组 Tool 说明。
-- Model Adapter 只转换文本增量、完整 ToolCall、结束原因和模型用量；它不提供 Tool 的 execute 回调，不使用 Provider 或 AI SDK 的自动多步循环。
+- Model Adapter 只转换文本增量、完整 ToolCall 和结束原因；它不提供 Tool 的 execute 回调，不使用 Provider 或 AI SDK 的自动多步循环。
 - 一条 AssistantMessage 可以同时包含文本和多个 ToolCall。
 - 多个 ToolCall 按 AssistantMessage 中的出现顺序串行处理，不在本 Feature 中并行执行。
 - 单个 Tool 失败或被拒绝通常不终止 Run。Agent 补齐对应 ToolResultMessage后继续处理同一 AssistantMessage 中尚未处理的 ToolCall，再发起下一次模型请求。
 - 未知 Tool、无法解析的输入或 Schema 校验失败生成 failed ToolResultMessage，使模型可以修正调用。
-- Agent 不通过异常表示预期的 Tool 失败、拒绝、非零命令退出或预算终结；只有内部不变量破坏和无法安全收口的基础设施故障使 Run 直接 failed。
+- Agent 不通过异常表示预期的 Tool 失败、拒绝或非零命令退出；内部安全保险丝也返回普通 failed 结果。只有内部不变量破坏和无法安全收口的基础设施故障通过异常进入安全失败路径。
 
 ### 6.3 首批 Tool
 
@@ -159,13 +159,13 @@ Feature 002 只向模型提供以下六个 Tool：
 
 - 在工作区内按 Glob 模式发现文件。
 - 结果使用规范化的工作区相对路径并稳定排序。
-- 结果达到预算时明确标记截断，模型必须缩小目录或模式后继续查找。
+- 结果达到输出边界时明确标记截断，模型必须缩小目录或模式后继续查找。
 
 #### `grep`
 
 - 在工作区内按正则搜索文本内容，可限定目录和文件模式。
 - 每个匹配至少返回工作区相对路径、行号和匹配文本。
-- 结果达到预算时明确标记截断，不能据此宣称整个工作区不存在其他匹配。
+- 结果达到输出边界时明确标记截断，不能据此宣称整个工作区不存在其他匹配。
 
 #### `edit_file`
 
@@ -203,7 +203,7 @@ Feature 002 只向模型提供以下六个 Tool：
 - 过期、重复、错误标识或当前阶段不匹配的确认响应作为预期拒绝返回，不执行 Tool，也不改变 Run。
 - 用户批准后，Agent 必须在副作用发生前追加并刷新 ToolExecutionStartedRecord；该记录表明此 ToolCall 已经人工批准并开始执行。
 - 用户拒绝后不创建 ToolExecutionStartedRecord，直接追加 denied ToolResultMessage。
-- 用户等待确认的时间不计入 Run 的活动执行时长预算。
+- 用户等待确认直到响应或当前 Run 被停止；确认层不维护独立时钟。
 - 本 Feature 只有 approve once 和 deny，不提供永久允许、Session 允许、模式匹配、命令前缀授权或自动批准。
 
 ### 6.5 AgentState、AgentEvent 与 TUI
@@ -233,8 +233,8 @@ Feature 002 只向模型提供以下六个 Tool：
 - 第一条 UserMessage 隐式表示 Run 开始，不额外写入只重复同一事实的 RunStartedRecord。
 - AssistantMessage 必须在执行其 ToolCall 之前完成追加。
 - ToolExecutionStartedRecord 必须在对应本地副作用之前完成追加和刷新。
-- ToolResultMessage 只在结果已终结后追加；结果文本遵守统一输出预算。
-- RunFinishedRecord 保存 completed、aborted、failed、budget_exhausted 或 interrupted 终态。正常终结使用 `metricsStatus: "complete"` 并保存完整模型请求数、ToolCall 数和活动执行时长；重启恢复生成的 interrupted 记录使用 `metricsStatus: "incomplete"`，无法从持久事实精确还原的模型请求数和活动执行时长保持 `null`，不伪造精确值，ToolCall 数仍由已持久化消息准确计算。
+- ToolResultMessage 只在结果已终结后追加；结果文本遵守统一输出边界。
+- RunFinishedRecord 只保存 completed、aborted、failed 或 interrupted 终态以及记录身份，不保存请求次数、ToolCall 数、活动时长或 token usage。
 - Session 写入在 Agent 内串行化。Feature 002 不支持两个 Agent 进程同时写同一个 Session；不得把并发写入静默合并。
 - 打开 Session 时，workspaceRoot 不匹配必须拒绝继续，不能把历史上下文绑定到另一个工作区执行 Tool。
 - 只允许丢弃或截断文件末尾一条“没有换行结尾且 JSON 语法不完整”的残缺记录。任何位于文件中间的非法记录，以及已经换行结束但无法验证的最后一条记录，都视为 Session 损坏并停止加载，不能跳过损坏后继续恢复。
@@ -245,24 +245,22 @@ Feature 002 只向模型提供以下六个 Tool：
 - 恢复产生的补充记录继续追加到同一 JSONL，不重写或删除既有历史。
 - Feature 002 不增加 parentId、Branch、Checkpoint 或 Active Path。schemaVersion、sessionId、entryId、runId、toolCallId、seq 和 workspaceRoot 为未来引用历史位置保留稳定身份。
 
-### 6.7 取消、终态与资源预算
+### 6.7 取消、终态与安全边界
 
 - 一个 Run 使用同一个根 AbortSignal 传播到当前 Model Adapter 或 ToolExecution。
 - 模型请求中止时，保留已经形成的 Assistant 文本并以 aborted 结束；不持久化未完成的 ToolCall 参数。
 - 等待确认时中止，当前及尚未处理的 ToolCall 形成 aborted ToolResultMessage，不执行副作用。
 - Tool 执行中止时，当前 ToolResultMessage 记录 aborted；尚未处理的 ToolCall 也补齐 aborted 结果。
 - `execute_command` 中止或超时时必须尽力终止整个进程树、停止接收输出并关闭相关句柄。无法确认全部后代进程已经结束时，结果必须明确标记资源清理不确定。
-- 正常、失败、拒绝、预算耗尽和中止最终都必须释放模型迭代器、AbortController、确认等待、计时器、文件句柄和子进程所有权。
+- 正常完成、失败、拒绝和中止最终都必须释放模型迭代器、AbortController、确认等待、命令计时器、文件句柄和子进程所有权。
 - activeRun 保持到 run_end 已同步发布后再清除，避免订阅者重入 prompt 打断事件顺序。
 
-每个 Run 使用以下独立预算，不使用含糊的统一“步数上限”：
+Agent Loop 只保留两个内部安全保险丝：
 
-- 最多 12 次模型请求；
-- 最多处理 32 个 ToolCall，未知、无效、失败和拒绝的 ToolCall 同样计数；
-- 最多 30 分钟活动执行时长，不计算等待人工确认的时间；
-- 单个模型可见 ToolResult 最多 64 KiB 或 2,000 行，以先达到者为准。
+- 同一个 Run 发起 12 次模型请求后仍未结束时，不再发起第 13 次请求，Run 以普通 failed 结束；
+- 单条 AssistantMessage 包含超过 32 个 ToolCall 时，整批调用都不执行、不请求确认，逐个形成 failed ToolResultMessage 后让 Run failed。
 
-预算在接受 UserMessage 时建立。达到模型请求或 ToolCall 预算后，不再发起新的对应操作；已有但尚未执行的 ToolCall 必须获得 failed ToolResultMessage。达到活动时长预算时，中止当前活动操作并以 budget_exhausted 收口。RunFinishedRecord 和 run_end 必须明确报告触发的预算种类和实际用量。
+这两个值不形成公开 Run 预算，不进入 `AgentState`、`run_end`、RunFinishedRecord 或 TUI，也不累计跨消息 ToolCall 数。Anthias 不设置 Run 活动时长；`execute_command.timeoutMs` 仍是单次命令自身的超时合同。单个模型可见 ToolResult 仍最多 64 KiB 或 2,000 行，以先达到者为准，达到边界只截断该结果，不终止 Run。
 
 ### 6.8 系统提示词、安全与敏感信息
 
@@ -386,7 +384,6 @@ Feature 002 只向模型提供以下六个 Tool：
 
 - 不请求人工确认，不产生本地副作用；
 - 生成与原 toolCallId 对应的 failed ToolResultMessage；
-- 失败计入 ToolCall 预算；
 - 模型可以在后续请求中修正调用。
 
 ### I. 分阶段停止
@@ -400,15 +397,14 @@ Feature 002 只向模型提供以下六个 Tool：
 - 命令执行时停止会尽力终止进程树并报告清理是否确定；
 - run_end 发布后 Agent 回到 idle，能够继续使用。
 
-### J. 执行预算
+### J. 安全保险丝与结果边界
 
-分别达到模型请求、ToolCall、活动时长和 ToolResult 输出预算：
+分别触发连续模型请求保险丝、过大 ToolCall 批次、命令自身超时和 ToolResult 输出边界：
 
-- 触发的预算种类和实际用量明确可见；
-- 不发起超出预算的新模型请求或 ToolExecution；
-- 已形成 ToolCall 在 Run 结束前获得 ToolResultMessage；
-- Run 以 budget_exhausted 收口，不使用含糊的“超过步数”文本；
-- 等待用户确认的时间不消耗活动时长预算。
+- 第 13 次模型请求不发出，Run 以带安全错误文本的 failed 收口；
+- 单条 AssistantMessage 超过 32 个 ToolCall 时不执行或确认其中任何一个，并为全部调用形成 failed ToolResultMessage；
+- 命令只遵守该次 ToolCall 的 `timeoutMs`，不存在额外 Run 活动时长计时器；
+- ToolResult 达到输出边界时明确截断，命令输出管道仍被排空并完成资源清理。
 
 ### K. JSONL 保存与重载
 
@@ -445,13 +441,13 @@ Feature 002 只向模型提供以下六个 Tool：
 Agent 分别在 idle、requesting_model、awaiting_tool_approval 和 executing_tool 阶段退出：
 
 - 当前 Run 按合同中止或恢复标记；
-- 释放模型迭代器、确认等待、JSONL 文件句柄、计时器和子进程；
+- 释放模型迭代器、确认等待、JSONL 文件句柄、命令计时器和子进程；
 - TUI 取消订阅并移除信号监听器；
 - 不遗留由 Anthias 持有的活动后台资源。
 
 ## 10. 验证边界
 
-自动化验证优先通过 Agent 的公开 Interface 覆盖完整 Model → Tool → Model 行为。Agent Module 使用确定性 Model Adapter、受控 Tool 实现和临时 Session 存储验证事件顺序、确认暂停与恢复、消息上下文、JSONL 记录、预算、取消和中断恢复；不通过调用内部 Loop 步骤验证行为。
+自动化验证优先通过 Agent 的公开 Interface 覆盖完整 Model → Tool → Model 行为。Agent Module 使用确定性 Model Adapter、受控 Tool 实现和临时 Session 存储验证事件顺序、确认暂停与恢复、消息上下文、JSONL 记录、内部保险丝、结果边界、取消和中断恢复；不通过调用内部 Loop 步骤验证行为。
 
 内置文件 Tool 只在测试创建的临时工作区中验证路径、精确编辑、原子写入、陈旧预览和截断。命令 Tool 只运行确定、短时、无外部网络的本地子进程，验证输出、非零退出、超时、取消和进程回收。TUI 测试通过公开 Agent Interface 模拟批准、拒绝、停止和退出，不构造 Model Stream、ToolExecution 或 JSONL Record。
 

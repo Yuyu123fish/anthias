@@ -173,14 +173,9 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
         output.write(`错误：${event.result.error}\n`);
       } else if (event.result.status === "aborted") {
         output.write("已停止当前响应。\n");
-      } else if (event.result.status === "budget_exhausted") {
-        output.write(`已达到 Run 预算：${event.result.budget}。\n`);
       } else {
         output.write("已完成。\n");
       }
-      output.write(
-        `Run 用量：模型请求 ${event.metrics.modelRequestCount}，ToolCall ${event.metrics.processedToolCallCount}/${event.metrics.producedToolCallCount}，活动 ${event.metrics.activeDurationMilliseconds} ms。\n`,
-      );
       return;
   }
 }

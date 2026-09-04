@@ -6,7 +6,6 @@ import type {
   ModelInputMessage,
   ModelStream,
   ModelStreamEvent,
-  ModelUsage,
 } from "./model-stream.js";
 
 /** 创建生产 OpenAI-compatible Model Stream，并将 Provider 细节封装在 Agent 内部。 */
@@ -74,7 +73,6 @@ async function* streamModelEvents(
       yield Object.freeze({
         type: "finish",
         finishReason: normalizeFinishReason(streamPart.finishReason),
-        usage: normalizeUsage(streamPart.totalUsage),
       });
       continue;
     }
@@ -132,24 +130,4 @@ function normalizeFinishReason(value: unknown): ModelFinishReason {
     default:
       return "other";
   }
-}
-
-/** 只保留标准 token 计量，缺失值使用 null 而不是猜测。 */
-function normalizeUsage(value: unknown): ModelUsage {
-  const usage = isRecord(value) ? value : {};
-  return Object.freeze({
-    inputTokens: toNonNegativeIntegerOrNull(usage.inputTokens),
-    outputTokens: toNonNegativeIntegerOrNull(usage.outputTokens),
-    totalTokens: toNonNegativeIntegerOrNull(usage.totalTokens),
-  });
-}
-
-/** 判断未知值是否为普通对象。 */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/** 将未知计量收窄为非负整数或 null。 */
-function toNonNegativeIntegerOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }

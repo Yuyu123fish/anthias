@@ -9,7 +9,6 @@ import {
   type ModelFinishReason,
   type ModelRequest,
   type ModelStream,
-  type ModelUsage,
   streamAssistantMessage,
   toModelInputMessage,
 } from "./model-stream.js";
@@ -19,37 +18,17 @@ import type { PreparedToolExecution, ToolApprovalPlan, ToolRunner } from "./tool
 /** 枚举 Agent Loop 当前正在推进的活动阶段。 */
 export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
 
-/** 报告 Agent Loop 对三类执行预算的实际用量。 */
-export type AgentLoopMetrics = Readonly<{
-  modelRequestCount: number;
-  producedToolCallCount: number;
-  processedToolCallCount: number;
-  activeDurationMilliseconds: number;
-}>;
-
 /** 枚举 Agent Loop 停止迭代时可以交给 Run 的结果。 */
 export type AgentLoopResult =
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "aborted" }>
-  | Readonly<{ status: "failed"; error: string }>
-  | Readonly<{
-      status: "budget_exhausted";
-      budget: "model_requests" | "tool_calls" | "active_duration";
-    }>;
+  | Readonly<{ status: "failed"; error: string }>;
 
 /** 表示 Agent Loop 等到的一次确认标识及最终决定。 */
 export type AgentLoopToolApproval = Readonly<{
   toolApprovalRequestId: string;
   decision: "approve" | "deny" | "aborted";
 }>;
-
-/** 提供 Run 投影 Agent Loop 状态所需的完整进度快照。 */
-export type AgentLoopProgress = AgentLoopMetrics &
-  Readonly<{
-    phase: AgentLoopPhase;
-    modelUsage: ModelUsage;
-    activeDurationExhausted: boolean;
-  }>;
 
 /** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
 export type AgentLoopEvent =
@@ -98,34 +77,12 @@ export type RunAgentLoopOptions = Readonly<{
   toolRunner: ToolRunner;
   abortController: AbortController;
   emit(event: AgentLoopEvent): Promise<void>;
-  updateProgress(progress: AgentLoopProgress): void;
+  updatePhase(phase: AgentLoopPhase): void;
   requestToolApproval(
     toolCall: AssistantToolCallPart,
     approvalPlan: ToolApprovalPlan,
   ): Promise<AgentLoopToolApproval>;
 }>;
-
-/** 保存一次 Agent Loop 内部的预算、阶段与计量状态。 */
-type AgentLoopState = {
-  /** 当前 Agent Loop 的阶段 */
-  phase: AgentLoopPhase;
-  /** 已经进行的模型请求次数 */
-  modelRequestCount: number;
-  /** 产生的 Tool Call 次数 */
-  producedToolCallCount: number;
-  /** 已处理完成的 Tool Call 次数 */
-  processedToolCallCount: number;
-  /** 累计的模型使用量 */
-  cumulativeModelUsage: ModelUsage;
-  /** agent 活动阶段累计毫秒数 */
-  activeDurationMilliseconds: number;
-  /** 当前活跃阶段的开始时间，单位为毫秒，若无则为 null */
-  activePhaseStartedAtMilliseconds: number | null;
-  /** 控制定时器，在活动期间计时，若无则为 null */
-  activeDurationTimer: NodeJS.Timeout | null;
-  /** 活动时长是否已耗尽 */
-  activeDurationExhausted: boolean;
-};
 
 /** 表示一次模型请求形成的 AssistantMessage 与完成原因。 */
 type AssistantRequestResult = Readonly<{
@@ -135,177 +92,129 @@ type AssistantRequestResult = Readonly<{
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const MODEL_REQUEST_LIMIT = 12;
-const TOOL_CALL_LIMIT = 32;
-const ACTIVE_DURATION_LIMIT_MILLISECONDS = 30 * 60 * 1000;
-const UNKNOWN_MODEL_USAGE = Object.freeze({
-  inputTokens: null,
-  outputTokens: null,
-  totalTokens: null,
-} satisfies ModelUsage);
+const TOOL_CALL_BATCH_LIMIT = 32;
 const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
 const ABORTED_LOOP_RESULT = Object.freeze({ status: "aborted" } as const);
 const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
-const MODEL_BUDGET_RESULT = Object.freeze({
-  status: "budget_exhausted",
-  budget: "model_requests",
+const MODEL_REQUEST_LIMIT_RESULT = Object.freeze({
+  status: "failed",
+  error: "模型连续请求次数超过安全上限，Run 已停止。",
 } as const);
-const TOOL_BUDGET_RESULT = Object.freeze({
-  status: "budget_exhausted",
-  budget: "tool_calls",
-} as const);
-const ACTIVE_DURATION_BUDGET_RESULT = Object.freeze({
-  status: "budget_exhausted",
-  budget: "active_duration",
+const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
+  status: "failed",
+  error: "单次模型响应包含过多 ToolCall，Run 已停止。",
 } as const);
 
-/** 推进 Model → Tool → Model，直到完成、失败、停止或预算耗尽。 */
+/** 推进 Model → Tool → Model，并用内部上限阻止异常循环和过大调用批次。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = [...options.messages];
-  // 初始化 Agent Loop 状态
-  const loopState: AgentLoopState = {
-    phase: "requesting_model",
-    modelRequestCount: 0,
-    producedToolCallCount: 0,
-    processedToolCallCount: 0,
-    cumulativeModelUsage: Object.freeze({
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-    }),
-    activeDurationMilliseconds: 0,
-    activePhaseStartedAtMilliseconds: null,
-    activeDurationTimer: null,
-    activeDurationExhausted: false,
-  };
-  updateLoopProgress(loopState, options);
+  let modelRequestCount = 0;
 
-  try {
-    while (true) {
+  while (true) {
+    if (options.abortController.signal.aborted) {
+      return ABORTED_LOOP_RESULT;
+    }
+    if (modelRequestCount >= MODEL_REQUEST_LIMIT) {
+      return MODEL_REQUEST_LIMIT_RESULT;
+    }
+
+    options.updatePhase("requesting_model");
+    modelRequestCount += 1;
+    const assistantRequest = await streamAssistantResponse(messageHistory, options);
+    if (assistantRequest.message.status === "aborted") {
+      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
+      return ABORTED_LOOP_RESULT;
+    }
+    if (assistantRequest.message.status === "failed") {
+      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
+      return FAILED_LOOP_RESULT;
+    }
+
+    // 获取 ToolCall 列表
+    const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
+    if (toolCalls.length === 0) {
+      return assistantRequest.finishReason === "stop" ? COMPLETED_LOOP_RESULT : FAILED_LOOP_RESULT;
+    }
+    if (assistantRequest.finishReason !== "tool_calls") {
+      await appendToolResults(
+        toolCalls,
+        "aborted",
+        "模型未正常结束 ToolCall。",
+        messageHistory,
+        options,
+      );
+      return FAILED_LOOP_RESULT;
+    }
+    if (toolCalls.length > TOOL_CALL_BATCH_LIMIT) {
+      await appendToolResults(
+        toolCalls,
+        "failed",
+        "单次模型响应包含过多 ToolCall，调用未执行。",
+        messageHistory,
+        options,
+      );
+      return TOOL_CALL_BATCH_LIMIT_RESULT;
+    }
+
+    // 执行工具调用
+    for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
+      const toolCall = toolCalls[toolIndex];
+      if (toolCall === undefined) {
+        throw new Error("ToolCall 顺序状态缺失。");
+      }
+      await processToolCall(toolCall, messageHistory, options);
       if (options.abortController.signal.aborted) {
-        return getAbortLoopResult(loopState);
-      }
-      if (loopState.modelRequestCount >= MODEL_REQUEST_LIMIT) {
-        return MODEL_BUDGET_RESULT;
-      }
-      if (!beginActivePhase(loopState, "requesting_model", options)) {
-        return getAbortLoopResult(loopState);
-      }
-
-      loopState.modelRequestCount += 1;
-      updateLoopProgress(loopState, options);
-      const assistantRequest = await streamAssistantResponse(loopState, messageHistory, options);
-      if (assistantRequest.message.status === "aborted") {
-        await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-        return getAbortLoopResult(loopState);
-      }
-      if (assistantRequest.message.status === "failed") {
-        await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-        return FAILED_LOOP_RESULT;
-      }
-
-      const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
-      loopState.producedToolCallCount += toolCalls.length;
-      updateLoopProgress(loopState, options);
-      if (toolCalls.length === 0) {
-        return assistantRequest.finishReason === "stop"
-          ? COMPLETED_LOOP_RESULT
-          : FAILED_LOOP_RESULT;
-      }
-      if (assistantRequest.finishReason !== "tool_calls") {
         await appendToolResults(
-          toolCalls,
+          toolCalls.slice(toolIndex + 1),
           "aborted",
-          "模型未正常结束 ToolCall。",
+          "Run 已停止，调用未执行。",
           messageHistory,
           options,
         );
-        return FAILED_LOOP_RESULT;
-      }
-
-      for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
-        const toolCall = toolCalls[toolIndex];
-        if (toolCall === undefined) {
-          throw new Error("ToolCall 顺序状态缺失。");
-        }
-        if (loopState.processedToolCallCount >= TOOL_CALL_LIMIT) {
-          await appendToolResults(
-            toolCalls.slice(toolIndex),
-            "failed",
-            "Run ToolCall 预算已耗尽，调用未执行。",
-            messageHistory,
-            options,
-          );
-          return TOOL_BUDGET_RESULT;
-        }
-
-        loopState.processedToolCallCount += 1;
-        updateLoopProgress(loopState, options);
-        await processToolCall(loopState, toolCall, messageHistory, options);
-        if (options.abortController.signal.aborted) {
-          await appendToolResults(
-            toolCalls.slice(toolIndex + 1),
-            "aborted",
-            "Run 已停止，调用未执行。",
-            messageHistory,
-            options,
-          );
-          return getAbortLoopResult(loopState);
-        }
+        return ABORTED_LOOP_RESULT;
       }
     }
-  } finally {
-    pauseActivePhase(loopState, options);
   }
 }
 
 /** 流式形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
 async function streamAssistantResponse(
-  loopState: AgentLoopState,
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<AssistantRequestResult> {
   let finalMessage: AssistantMessage | null = null;
   let finishReason: ModelFinishReason | null = null;
 
-  try {
-    const modelRequest: ModelRequest = Object.freeze({
-      systemPrompt: options.systemPrompt,
-      messages: Object.freeze(messageHistory.map(toModelInputMessage)),
-      tools: FIXED_TOOL_DEFINITIONS,
-    });
+  const modelRequest: ModelRequest = Object.freeze({
+    systemPrompt: options.systemPrompt,
+    messages: Object.freeze(messageHistory.map(toModelInputMessage)),
+    tools: FIXED_TOOL_DEFINITIONS,
+  });
 
-    // 异步遍历可迭代模型响应
-    for await (const messageEvent of streamAssistantMessage(
-      options.modelStream,
-      modelRequest,
-      options.abortController.signal,
-    )) {
-      if (messageEvent.type === "start") {
-        await options.emit({
-          type: "assistant_message_start",
-          message: messageEvent.partialAssistantMessage,
-        });
-        continue;
-      }
-      if (messageEvent.type === "update") {
-        await options.emit({
-          type: "assistant_message_update",
-          message: messageEvent.partialAssistantMessage,
-          delta: messageEvent.delta,
-        });
-        continue;
-      }
-
-      finalMessage = messageEvent.message;
-      finishReason = messageEvent.finishReason;
-      loopState.cumulativeModelUsage =
-        messageEvent.usage === null
-          ? UNKNOWN_MODEL_USAGE
-          : addModelUsage(loopState.cumulativeModelUsage, messageEvent.usage);
-      updateLoopProgress(loopState, options);
+  // 异步遍历可迭代模型响应
+  for await (const messageEvent of streamAssistantMessage(
+    options.modelStream,
+    modelRequest,
+    options.abortController.signal,
+  )) {
+    if (messageEvent.type === "start") {
+      await options.emit({
+        type: "assistant_message_start",
+        message: messageEvent.partialAssistantMessage,
+      });
+      continue;
     }
-  } finally {
-    pauseActivePhase(loopState, options);
+    if (messageEvent.type === "update") {
+      await options.emit({
+        type: "assistant_message_update",
+        message: messageEvent.partialAssistantMessage,
+        delta: messageEvent.delta,
+      });
+      continue;
+    }
+
+    finalMessage = messageEvent.message;
+    finishReason = messageEvent.finishReason;
   }
 
   if (finalMessage === null) {
@@ -318,66 +227,36 @@ async function streamAssistantResponse(
 
 /** 通过统一 Tool Module 预检并处理一个 ToolCall。 */
 async function processToolCall(
-  loopState: AgentLoopState,
   toolCall: AssistantToolCallPart,
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<void> {
   const toolCallPlan = options.toolRunner.createPlan(toolCall);
-  let preparation: Awaited<ReturnType<typeof toolCallPlan.prepare>>;
-
-  if (toolCallPlan.preparationConsumesActiveDuration) {
-    if (!beginActivePhase(loopState, "executing_tool", options)) {
-      await appendToolResult(
-        toolCall,
-        {
-          status: "aborted",
-          content: toolCallPlan.preparationUnavailableContent,
-          truncated: false,
-        },
-        messageHistory,
-        options,
-      );
-      return;
-    }
-    try {
-      preparation = await toolCallPlan.prepare(remainingActiveDurationMilliseconds(loopState));
-    } finally {
-      pauseActivePhase(loopState, options);
-    }
-    if (options.abortController.signal.aborted) {
-      await appendToolResult(
-        toolCall,
-        {
-          status: "aborted",
-          content: toolCallPlan.abortedPreparationContent,
-          truncated: false,
-        },
-        messageHistory,
-        options,
-      );
-      return;
-    }
-  } else {
-    preparation = await toolCallPlan.prepare(remainingActiveDurationMilliseconds(loopState));
+  options.updatePhase("executing_tool");
+  const preparation = await toolCallPlan.prepare();
+  if (options.abortController.signal.aborted) {
+    await appendToolResult(
+      toolCall,
+      {
+        status: "aborted",
+        content: toolCallPlan.abortedPreparationContent,
+        truncated: false,
+      },
+      messageHistory,
+      options,
+    );
+    return;
   }
 
   if (!preparation.ok) {
     await appendToolResult(toolCall, preparation.result, messageHistory, options);
     return;
   }
-  await executePreparedToolCall(
-    loopState,
-    toolCall,
-    preparation.preparedExecution,
-    messageHistory,
-    options,
-  );
+  await executePreparedToolCall(toolCall, preparation.preparedExecution, messageHistory, options);
 }
 
 /** 协调一个已预检 Tool 的确认、执行、输出与结果顺序。 */
 async function executePreparedToolCall(
-  loopState: AgentLoopState,
   toolCall: AssistantToolCallPart,
   preparedExecution: PreparedToolExecution,
   messageHistory: Message[],
@@ -386,10 +265,12 @@ async function executePreparedToolCall(
   let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
-    setLoopPhase(loopState, "awaiting_tool_approval", options);
+    // 需要人工确认的 ToolCall，切换到等待人工确认阶段
+    options.updatePhase("awaiting_tool_approval");
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
     toolApprovalRequestId = approval.toolApprovalRequestId;
     if (approval.decision !== "approve" || options.abortController.signal.aborted) {
+      // 如果人工确认被拒绝或被 abort，则写入 aborted 的 ToolResult
       await appendToolResult(
         toolCall,
         {
@@ -407,7 +288,7 @@ async function executePreparedToolCall(
     }
   }
 
-  if (!beginActivePhase(loopState, "executing_tool", options)) {
+  if (options.abortController.signal.aborted) {
     await appendToolResult(
       toolCall,
       {
@@ -421,10 +302,12 @@ async function executePreparedToolCall(
     return;
   }
 
+  options.updatePhase("executing_tool");
+  // 开始执行 ToolCall
   await options.emit({ type: "tool_execution_start", toolCall, toolApprovalRequestId });
-  let executionResult: Awaited<ReturnType<PreparedToolExecution["execute"]>>;
-  try {
-    executionResult = await preparedExecution.execute(options.abortController.signal, (update) => {
+  const executionResult = await preparedExecution.execute(
+    options.abortController.signal,
+    (update) => {
       if (!options.abortController.signal.aborted) {
         void options.emit({
           type: "tool_execution_update",
@@ -434,10 +317,8 @@ async function executePreparedToolCall(
           delta: update.delta,
         });
       }
-    });
-  } finally {
-    pauseActivePhase(loopState, options);
-  }
+    },
+  );
 
   const resultMessage = await appendToolResult(
     toolCall,
@@ -513,126 +394,4 @@ async function appendUnresolvedToolResults(
     messageHistory,
     options,
   );
-}
-
-/** 开始累计模型请求或 Tool 执行的活动时间。 */
-function beginActivePhase(
-  loopState: AgentLoopState,
-  phase: Exclude<AgentLoopPhase, "awaiting_tool_approval">,
-  options: RunAgentLoopOptions,
-): boolean {
-  pauseActivePhase(loopState, options);
-  if (options.abortController.signal.aborted) {
-    return false;
-  }
-  const remainingMilliseconds = remainingActiveDurationMilliseconds(loopState);
-  if (remainingMilliseconds <= 0) {
-    exhaustActiveDuration(loopState, options);
-    return false;
-  }
-
-  loopState.phase = phase;
-  loopState.activePhaseStartedAtMilliseconds = Date.now();
-  loopState.activeDurationTimer = setTimeout(
-    () => exhaustActiveDuration(loopState, options),
-    remainingMilliseconds,
-  );
-  updateLoopProgress(loopState, options);
-  return true;
-}
-
-/** 暂停活动时间累计，使人工确认和持久化耗时不进入预算。 */
-function pauseActivePhase(loopState: AgentLoopState, options: RunAgentLoopOptions): void {
-  const phaseStartedAtMilliseconds = loopState.activePhaseStartedAtMilliseconds;
-  if (phaseStartedAtMilliseconds !== null) {
-    loopState.activeDurationMilliseconds = Math.min(
-      ACTIVE_DURATION_LIMIT_MILLISECONDS,
-      loopState.activeDurationMilliseconds + Math.max(0, Date.now() - phaseStartedAtMilliseconds),
-    );
-    loopState.activePhaseStartedAtMilliseconds = null;
-  }
-  if (loopState.activeDurationTimer !== null) {
-    clearTimeout(loopState.activeDurationTimer);
-    loopState.activeDurationTimer = null;
-  }
-  updateLoopProgress(loopState, options);
-}
-
-/** 切换到不计入活动预算的 Agent Loop 阶段。 */
-function setLoopPhase(
-  loopState: AgentLoopState,
-  phase: Extract<AgentLoopPhase, "awaiting_tool_approval">,
-  options: RunAgentLoopOptions,
-): void {
-  pauseActivePhase(loopState, options);
-  loopState.phase = phase;
-  updateLoopProgress(loopState, options);
-}
-
-/** 计算模型请求或 Tool 执行仍可使用的活动毫秒数。 */
-function remainingActiveDurationMilliseconds(loopState: AgentLoopState): number {
-  const activeElapsedMilliseconds =
-    loopState.activePhaseStartedAtMilliseconds === null
-      ? 0
-      : Math.max(0, Date.now() - loopState.activePhaseStartedAtMilliseconds);
-  return Math.max(
-    0,
-    ACTIVE_DURATION_LIMIT_MILLISECONDS -
-      loopState.activeDurationMilliseconds -
-      activeElapsedMilliseconds,
-  );
-}
-
-/** 让活动时长预算耗尽成为根 AbortSignal 的首个原因。 */
-function exhaustActiveDuration(loopState: AgentLoopState, options: RunAgentLoopOptions): void {
-  if (options.abortController.signal.aborted) {
-    return;
-  }
-  pauseActivePhase(loopState, options);
-  loopState.activeDurationMilliseconds = ACTIVE_DURATION_LIMIT_MILLISECONDS;
-  loopState.activeDurationExhausted = true;
-  updateLoopProgress(loopState, options);
-  options.abortController.abort();
-}
-
-/** 将当前根取消映射为用户停止或活动时长预算结果。 */
-function getAbortLoopResult(loopState: AgentLoopState): AgentLoopResult {
-  return loopState.activeDurationExhausted ? ACTIVE_DURATION_BUDGET_RESULT : ABORTED_LOOP_RESULT;
-}
-
-/** 把当前 Loop 状态里的可变计量字段做一份快照，方便 Run 过程安全地读取和展示进度。 */
-function updateLoopProgress(loopState: AgentLoopState, options: RunAgentLoopOptions): void {
-  options.updateProgress(
-    Object.freeze({
-      phase: loopState.phase,
-      modelRequestCount: loopState.modelRequestCount,
-      producedToolCallCount: loopState.producedToolCallCount,
-      processedToolCallCount: loopState.processedToolCallCount,
-      activeDurationMilliseconds: Math.max(
-        0,
-        Math.round(
-          loopState.activeDurationMilliseconds +
-            (loopState.activePhaseStartedAtMilliseconds === null
-              ? 0
-              : Math.max(0, Date.now() - loopState.activePhaseStartedAtMilliseconds)),
-        ),
-      ),
-      modelUsage: Object.freeze({ ...loopState.cumulativeModelUsage }),
-      activeDurationExhausted: loopState.activeDurationExhausted,
-    }),
-  );
-}
-
-/** 累加 Provider 报告的标准化 usage，任一未知维度继续保持未知。 */
-function addModelUsage(currentUsage: ModelUsage, requestUsage: ModelUsage): ModelUsage {
-  return Object.freeze({
-    inputTokens: addKnownTokenCounts(currentUsage.inputTokens, requestUsage.inputTokens),
-    outputTokens: addKnownTokenCounts(currentUsage.outputTokens, requestUsage.outputTokens),
-    totalTokens: addKnownTokenCounts(currentUsage.totalTokens, requestUsage.totalTokens),
-  });
-}
-
-/** 只在两侧都可知时返回准确 token 合计。 */
-function addKnownTokenCounts(left: number | null, right: number | null): number | null {
-  return left === null || right === null ? null : left + right;
 }

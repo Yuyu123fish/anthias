@@ -35,7 +35,7 @@ type ReadOnlyToolInput =
       contextLines: number;
     }>;
 
-/** 保存 Glob 的稳定文件集合以及是否因候选预算未穷尽。 */
+/** 保存 Glob 的稳定文件集合以及是否因候选上限未穷尽。 */
 type DiscoveredFiles = Readonly<{
   paths: readonly ResolvedWorkspacePath[];
   truncated: boolean;

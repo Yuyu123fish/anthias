@@ -21,7 +21,7 @@ import {
   type Session,
   type SessionRunLease,
   type SessionShell,
-} from "../src/session.js";
+} from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
 const TEST_SHELL: SessionShell = Object.freeze({
@@ -113,12 +113,7 @@ describe("Session", () => {
     const runLease = await acquireSessionRun(session, runId);
     await runLease.appendMessage(userMessage);
     await runLease.appendMessage(assistantMessage);
-    await runLease.appendRunFinished({
-      status: "completed",
-      modelRequestCount: 1,
-      toolCallCount: 0,
-      activeDurationMilliseconds: 25,
-    });
+    await runLease.appendRunFinished({ status: "completed" });
     await runLease.release();
 
     const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
@@ -145,25 +140,7 @@ describe("Session", () => {
       type: "run_finished",
       runId,
       status: "completed",
-      metricsStatus: "complete",
-      modelRequestCount: 1,
-      toolCallCount: 0,
-      activeDurationMilliseconds: 25,
     });
-
-    // Stage 1 已落盘记录没有新增计量字段，重开必须继续兼容而不重写历史。
-    const legacySessionLines = completedSessionText.trimEnd().split("\n").map(parseRecord);
-    const legacyRunFinishedRecord = legacySessionLines.at(-1);
-    if (legacyRunFinishedRecord === undefined) {
-      throw new Error("expected a RunFinishedRecord");
-    }
-    delete legacyRunFinishedRecord.processedToolCallCount;
-    delete legacyRunFinishedRecord.modelUsage;
-    await writeFile(
-      sessionFilePath,
-      `${legacySessionLines.map((line) => JSON.stringify(line)).join("\n")}\n`,
-      "utf8",
-    );
 
     const reopenedSession = await openSession({
       sessionId: session.sessionId,
@@ -204,12 +181,7 @@ describe("Session", () => {
         content: [{ type: "text", text: answer }],
         status: "completed",
       });
-      await runLease.appendRunFinished({
-        status: "completed",
-        modelRequestCount: 1,
-        toolCallCount: 0,
-        activeDurationMilliseconds: 1,
-      });
+      await runLease.appendRunFinished({ status: "completed" });
       await runLease.release();
     }
 
@@ -271,10 +243,6 @@ describe("Session", () => {
         ...createRecordIdentity(4, runId),
         type: "run_finished",
         status: "completed",
-        metricsStatus: "complete",
-        modelRequestCount: 1,
-        toolCallCount: 1,
-        activeDurationMilliseconds: 1,
       },
     ];
     await appendFile(
@@ -398,12 +366,6 @@ describe("Session", () => {
       },
     },
     {
-      name: "a fractional normal metric",
-      mutate(lines: Record<string, unknown>[]) {
-        lines[3] = { ...lines[3], activeDurationMilliseconds: 0.5 };
-      },
-    },
-    {
       name: "a ToolResult referencing an unknown ToolCall",
       mutate(lines: Record<string, unknown>[]) {
         const runId = String(lines[1]?.runId);
@@ -436,7 +398,7 @@ describe("Session", () => {
             truncated: false,
           },
         });
-        lines[4] = { ...lines[4], seq: 4, toolCallCount: 1 };
+        lines[4] = { ...lines[4], seq: 4 };
       },
     },
   ])("rejects a complete Session containing $name", async ({ mutate }) => {
@@ -455,12 +417,7 @@ describe("Session", () => {
       content: [{ type: "text", text: "answer" }],
       status: "completed",
     });
-    await runLease.appendRunFinished({
-      status: "completed",
-      modelRequestCount: 1,
-      toolCallCount: 0,
-      activeDurationMilliseconds: 1,
-    });
+    await runLease.appendRunFinished({ status: "completed" });
     await runLease.release();
     const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
     const sessionLines = (await readFile(sessionFilePath, "utf8"))
@@ -624,10 +581,6 @@ describe("Session", () => {
         type: "run_finished",
         runId,
         status: "interrupted",
-        metricsStatus: "incomplete",
-        modelRequestCount: null,
-        toolCallCount: withToolCall ? 1 : 0,
-        activeDurationMilliseconds: null,
       });
 
       const bytesAfterFirstRecovery = await readFile(sessionFilePath);

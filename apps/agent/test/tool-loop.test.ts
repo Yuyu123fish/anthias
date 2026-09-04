@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ModelRequest, ModelStream } from "../src/model-stream.js";
 import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
-import { createSession, resolveSessionDirectory } from "../src/session.js";
+import { createSession, resolveSessionDirectory } from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -98,11 +98,7 @@ describe("read-only Agent Tool Loop", () => {
     expect(agent.state.running).toBe(false);
     expect(events.at(-1)).toMatchObject({
       type: "run_end",
-      metrics: {
-        modelRequestCount: 4,
-        producedToolCallCount: 3,
-        processedToolCallCount: 3,
-      },
+      result: { status: "completed" },
     });
 
     const sessionText = await readFile(
@@ -117,10 +113,6 @@ describe("read-only Agent Tool Loop", () => {
     expect(records.at(-1)).toMatchObject({
       type: "run_finished",
       status: "completed",
-      modelRequestCount: 4,
-      toolCallCount: 3,
-      processedToolCallCount: 3,
-      modelUsage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
     });
   });
 });
@@ -136,11 +128,10 @@ function toolCallEvent(toolCallId: string, toolName: string, input: unknown) {
   });
 }
 
-/** 创建一个带确定 token 计量的 finish 事件。 */
+/** 创建一个确定性的 finish 事件。 */
 function finishEvent(finishReason: "stop" | "tool_calls") {
   return Object.freeze({
     type: "finish" as const,
     finishReason,
-    usage: Object.freeze({ inputTokens: 2, outputTokens: 1, totalTokens: 3 }),
   });
 }

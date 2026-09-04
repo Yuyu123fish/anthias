@@ -10,7 +10,12 @@ import {
   streamAssistantMessage,
 } from "../src/model-stream.js";
 import { type Agent, createAgentWithModelStream } from "../src/run.js";
-import { createSession, openSession, type Session, type SessionShell } from "../src/session.js";
+import {
+  createSession,
+  openSession,
+  type Session,
+  type SessionShell,
+} from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
 const sessionFilePaths = new WeakMap<Agent, string>();
@@ -108,7 +113,6 @@ describe("Agent", () => {
         yield Object.freeze({
           type: "finish",
           finishReason: "tool_calls",
-          usage: Object.freeze({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
         });
       },
       modelRequest,
@@ -710,11 +714,10 @@ function textDelta(delta: string): ModelStreamEvent {
   return Object.freeze({ type: "text_delta", delta });
 }
 
-/** 创建一个无计量的正常停止事件。 */
+/** 创建一个正常停止事件。 */
 function stopFinish(): ModelStreamEvent {
   return Object.freeze({
     type: "finish",
     finishReason: "stop",
-    usage: Object.freeze({ inputTokens: null, outputTokens: null, totalTokens: null }),
   });
 }

@@ -23,13 +23,6 @@ export type ModelRequest = Readonly<{
   tools: readonly ModelToolDefinition[];
 }>;
 
-/** 保存一次模型请求可以累加到 Run 的标准化用量。 */
-export type ModelUsage = Readonly<{
-  inputTokens: number | null;
-  outputTokens: number | null;
-  totalTokens: number | null;
-}>;
-
 /** 枚举 Agent 理解的模型完成原因。 */
 export type ModelFinishReason =
   | "stop"
@@ -55,15 +48,14 @@ export type ModelStreamEvent =
   | Readonly<{
       type: "finish";
       finishReason: ModelFinishReason;
-      usage: ModelUsage;
     }>;
 
 /** 枚举流式组装边界交给 Agent Loop 的当前 AssistantMessage。 */
 export type AssistantMessageStreamEvent =
   | Readonly<{
-    type: "start";
-    partialAssistantMessage: AssistantMessage;
-  }>
+      type: "start";
+      partialAssistantMessage: AssistantMessage;
+    }>
   | Readonly<{
       type: "update";
       partialAssistantMessage: AssistantMessage;
@@ -73,7 +65,6 @@ export type AssistantMessageStreamEvent =
       type: "finish";
       message: AssistantMessage;
       finishReason: ModelFinishReason | null;
-      usage: ModelUsage | null;
     }>;
 
 /**
@@ -97,7 +88,6 @@ export async function* streamAssistantMessage(
   const content: AssistantContentPart[] = [];
   const toolCallIds = new Set<string>();
   let finishReason: ModelFinishReason | null = null;
-  let usage: ModelUsage | null = null;
 
   yield Object.freeze({
     type: "start",
@@ -134,7 +124,6 @@ export async function* streamAssistantMessage(
         }
 
         finishReason = modelEvent.finishReason;
-        usage = modelEvent.usage;
         break;
       }
     }
@@ -149,7 +138,7 @@ export async function* streamAssistantMessage(
       ? "completed"
       : "failed";
   const finalMessage = createAssistantMessage(content, status);
-  yield Object.freeze({ type: "finish", message: finalMessage, finishReason, usage });
+  yield Object.freeze({ type: "finish", message: finalMessage, finishReason });
 }
 
 /** 将线性消息投影成内部 Model Stream 所需的 Provider 无关形状。 */

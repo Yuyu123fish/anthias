@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
 import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
-import { createSession, resolveSessionDirectory, resolveSessionShell } from "../src/session.js";
+import {
+  createSession,
+  resolveSessionDirectory,
+  resolveSessionShell,
+} from "../src/session/index.js";
 import { FIXED_TOOL_DEFINITIONS } from "../src/tool/definitions.js";
 
 const servers = new Set<ReturnType<typeof createServer>>();
@@ -72,7 +76,6 @@ describe("createOpenAICompatibleModelStream", () => {
       {
         type: "finish",
         finishReason: "stop",
-        usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
       },
     ]);
     expect(requestCount).toBe(1);
@@ -191,7 +194,6 @@ describe("createOpenAICompatibleModelStream", () => {
       {
         type: "finish",
         finishReason: "tool_calls",
-        usage: { inputTokens: null, outputTokens: null, totalTokens: null },
       },
     ]);
     expect(requestCount).toBe(1);
@@ -274,10 +276,10 @@ describe("createOpenAICompatibleModelStream", () => {
             input: JSON.stringify({ command, timeoutMs: 10_000 }),
           },
         ]);
-        writeFinish(response, "tool_calls", { prompt_tokens: 6, completion_tokens: 3 });
+        writeFinish(response, "tool_calls");
       } else {
         writeChunk(response, "读取、修改和验证完成。");
-        writeFinish(response, "stop", { prompt_tokens: 8, completion_tokens: 4 });
+        writeFinish(response, "stop");
       }
       response.write("data: [DONE]\n\n");
       response.end();
@@ -349,11 +351,6 @@ describe("createOpenAICompatibleModelStream", () => {
     expect(events.at(-1)).toMatchObject({
       type: "run_end",
       result: { status: "completed" },
-      metrics: {
-        modelRequestCount: 2,
-        producedToolCallCount: 3,
-        processedToolCallCount: 3,
-      },
     });
     const sessionRecords = (
       await readFile(join(sessionDirectory, `${session.sessionId}.jsonl`), "utf8")
@@ -364,10 +361,6 @@ describe("createOpenAICompatibleModelStream", () => {
     expect(sessionRecords.at(-1)).toMatchObject({
       type: "run_finished",
       status: "completed",
-      modelRequestCount: 2,
-      toolCallCount: 3,
-      processedToolCallCount: 3,
-      modelUsage: { inputTokens: 14, outputTokens: 7, totalTokens: 21 },
     });
     expect(JSON.stringify(sessionRecords)).not.toContain("stage3-fake-process-key");
     await expect(access(join(sessionDirectory, `${session.sessionId}.lock`))).rejects.toThrow();
@@ -422,19 +415,14 @@ function writeChunk(response: ServerResponse, content: string): void {
   );
 }
 
-/** 写入一个包含 finish reason 与标准 token usage 的终止增量。 */
-function writeFinish(
-  response: ServerResponse,
-  finishReason: "stop" | "tool_calls",
-  usage: Readonly<{ prompt_tokens: number; completion_tokens: number }>,
-): void {
+/** 写入一个包含 finish reason 的终止增量。 */
+function writeFinish(response: ServerResponse, finishReason: "stop" | "tool_calls"): void {
   response.write(
     `data: ${JSON.stringify({
       id: "chatcmpl-finish",
       created: 0,
       model: "stage3-test-model",
       choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-      usage: { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens },
     })}\n\n`,
   );
 }

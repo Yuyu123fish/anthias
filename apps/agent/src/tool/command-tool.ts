@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import type { AssistantToolCallPart } from "../message.js";
-import type { SessionShell } from "../session.js";
+import type { SessionShell } from "../session/index.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
@@ -52,7 +52,7 @@ type CommandOutputEntry = Readonly<{
   text: string;
 }>;
 
-/** 聚合命令输出并在达到展示预算后继续排空但停止保存。 */
+/** 聚合命令输出并在达到展示边界后继续排空但停止保存。 */
 type CommandOutputCollector = Readonly<{
   append(stream: "stdout" | "stderr", text: string): string;
   entries(): readonly CommandOutputEntry[];
@@ -79,7 +79,6 @@ export async function prepareCommandTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   shell: SessionShell,
-  remainingActiveDurationMilliseconds: number,
 ): Promise<PreparedCommandResult> {
   const inputResult = parseCommandInput(toolCall);
   if (!inputResult.ok) {
@@ -91,19 +90,12 @@ export async function prepareCommandTool(
     if (!(await stat(resolvedCwd.absolutePath)).isDirectory()) {
       return failedPreparation("execute_command cwd 不是目录。");
     }
-    const timeoutMilliseconds = Math.max(
-      1,
-      Math.min(
-        inputResult.input.timeoutMilliseconds,
-        Math.floor(remainingActiveDurationMilliseconds),
-      ),
-    );
     const target = resolvedCwd.relativePath.length === 0 ? "." : resolvedCwd.relativePath;
     const previewResult = boundToolOutput([
       "operation: execute command",
       `shell: ${renderShell(shell)}`,
       `cwd: ${target}`,
-      `timeoutMs: ${timeoutMilliseconds}`,
+      `timeoutMs: ${inputResult.input.timeoutMilliseconds}`,
       "command:",
       ...splitLines(inputResult.input.command),
     ]);
@@ -118,7 +110,7 @@ export async function prepareCommandTool(
         preview: previewResult.content,
         command: inputResult.input.command,
         cwd: resolvedCwd.absolutePath,
-        timeoutMilliseconds,
+        timeoutMilliseconds: inputResult.input.timeoutMilliseconds,
         shell,
       }),
     });
@@ -206,7 +198,7 @@ export async function executePreparedCommand(
       );
     };
 
-    /** 保存并发布仍落在统一预算内的输出，订阅者异常不能破坏子进程收口。 */
+    /** 保存并发布仍落在统一边界内的输出，订阅者异常不能破坏子进程收口。 */
     const publishAcceptedOutput = (stream: "stdout" | "stderr", text: string) => {
       const acceptedText = outputCollector.append(stream, text);
       if (acceptedText.length === 0 || settled) {
@@ -328,7 +320,7 @@ function createCommandOutputCollector(): CommandOutputCollector {
       }
       if (acceptedText.length > 0) {
         const previousEntry = entries.at(-1);
-        // 相邻同源块合并后只占一个渲染标签，预留的行预算才能覆盖最终 ToolResult 元数据。
+        // 相邻同源块合并后只占一个渲染标签，预留的行数才能覆盖最终 ToolResult 元数据。
         if (previousEntry?.stream === stream) {
           entries[entries.length - 1] = Object.freeze({
             stream,

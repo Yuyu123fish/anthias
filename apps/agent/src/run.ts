@@ -1,34 +1,23 @@
 import { randomUUID } from "node:crypto";
 import {
   type AgentLoopEvent,
-  type AgentLoopProgress,
   type AgentLoopResult,
   type AgentLoopToolApproval,
   runAgentLoop,
 } from "./agent.js";
 import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
-import type { ModelStream, ModelUsage } from "./model-stream.js";
+import type { ModelStream } from "./model-stream.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
-import type { Session, SessionRunLease } from "./session.js";
+import type { Session, SessionRunLease } from "./session/index.js";
 import { createToolRunner, type ToolApprovalPlan } from "./tool/tool-runner.js";
 
 /** 枚举 Run 对外交付的活动阶段。 */
 type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
 
-/** 描述公开状态中当前 Run 的身份、阶段和实际预算用量。 */
+/** 描述公开状态中当前 Run 的身份与阶段。 */
 export type ActiveRun = Readonly<{
   runId: string;
   phase: RunPhase;
-  modelRequestCount: number;
-  toolCallCount: number;
-}>;
-
-/** 报告一个 Run 对三类执行预算的最终实际用量。 */
-export type RunMetrics = Readonly<{
-  modelRequestCount: number;
-  producedToolCallCount: number;
-  processedToolCallCount: number;
-  activeDurationMilliseconds: number;
 }>;
 
 /** 描述交互 Adapter 需要呈现的一次副作用 Tool 确认请求。 */
@@ -61,11 +50,7 @@ export type AgentState = Readonly<{
 export type FinishedPromptResult =
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "aborted" }>
-  | Readonly<{ status: "failed"; error: string }>
-  | Readonly<{
-      status: "budget_exhausted";
-      budget: "model_requests" | "tool_calls" | "active_duration";
-    }>;
+  | Readonly<{ status: "failed"; error: string }>;
 
 /** 表示提示词被拒绝或完成一次 Run 后的结果。 */
 export type PromptResult =
@@ -106,7 +91,6 @@ export type AgentEvent =
       type: "run_end";
       runId: string;
       result: FinishedPromptResult;
-      metrics: RunMetrics;
     }>;
 
 /** 定义同步观察 AgentEvent 的监听器。 */
@@ -136,12 +120,6 @@ type ActiveRunOwnership = {
   phase: RunPhase;
   sessionLease: SessionRunLease;
   abortController: AbortController;
-  modelRequestCount: number;
-  observedToolCallCount: number;
-  processedToolCallCount: number;
-  cumulativeModelUsage: ModelUsage;
-  activeDurationMilliseconds: number;
-  activeDurationExhausted: boolean;
   sessionWriteFailed: boolean;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
 };
@@ -176,10 +154,6 @@ const SESSION_CHANGED_PROMPT_RESULT = Object.freeze({
   reason: "session_changed",
 } as const);
 const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
-const ACTIVE_DURATION_BUDGET_RESULT = Object.freeze({
-  status: "budget_exhausted",
-  budget: "active_duration",
-} as const);
 
 /** 使用内部 Model Stream 与已打开 Session 创建 Agent 运行宿主。 */
 export function createAgentWithModelStream({
@@ -215,8 +189,6 @@ export function createAgentWithModelStream({
         ? Object.freeze({
             runId: activeRun.runId,
             phase: activeRun.phase,
-            modelRequestCount: activeRun.modelRequestCount,
-            toolCallCount: activeRun.processedToolCallCount,
           })
         : null,
       pendingToolApproval: pendingToolApproval?.request ?? null,
@@ -377,16 +349,6 @@ export function createAgentWithModelStream({
       phase: "requesting_model",
       sessionLease: sessionRunAcquisition.lease,
       abortController: new AbortController(),
-      modelRequestCount: 0,
-      observedToolCallCount: 0,
-      processedToolCallCount: 0,
-      cumulativeModelUsage: Object.freeze({
-        inputTokens: 0,
-        outputTokens: 0,
-        totalTokens: 0,
-      }),
-      activeDurationMilliseconds: 0,
-      activeDurationExhausted: false,
       sessionWriteFailed: false,
       terminalResultPromise: null,
     };
@@ -413,7 +375,9 @@ export function createAgentWithModelStream({
         toolRunner,
         abortController: currentRun.abortController,
         emit: (event) => processAgentLoopEvent(currentRun, event),
-        updateProgress: (progress) => updateRunProgress(currentRun, progress),
+        updatePhase: (phase) => {
+          currentRun.phase = phase;
+        },
         requestToolApproval: (toolCall, approvalPlan) =>
           waitForToolApproval(currentRun, toolCall, approvalPlan),
       });
@@ -422,9 +386,7 @@ export function createAgentWithModelStream({
       const requestedResult = currentRun.sessionWriteFailed
         ? SESSION_FAILED_RESULT
         : currentRun.abortController.signal.aborted
-          ? currentRun.activeDurationExhausted
-            ? ACTIVE_DURATION_BUDGET_RESULT
-            : ABORTED_PROMPT_RESULT
+          ? ABORTED_PROMPT_RESULT
           : MODEL_FAILED_RESULT;
       return finishRun(currentRun, requestedResult);
     }
@@ -444,17 +406,6 @@ export function createAgentWithModelStream({
       activeRun = null;
     }
     return failedResult;
-  }
-
-  /** 用 Agent Loop 的完整快照更新 Run 对外投影与最终计量。 */
-  function updateRunProgress(currentRun: ActiveRunOwnership, progress: AgentLoopProgress): void {
-    currentRun.phase = progress.phase;
-    currentRun.modelRequestCount = progress.modelRequestCount;
-    currentRun.observedToolCallCount = progress.producedToolCallCount;
-    currentRun.processedToolCallCount = progress.processedToolCallCount;
-    currentRun.cumulativeModelUsage = progress.modelUsage;
-    currentRun.activeDurationMilliseconds = progress.activeDurationMilliseconds;
-    currentRun.activeDurationExhausted = progress.activeDurationExhausted;
   }
 
   /** 持久化 Agent Loop 事实，再投影为稳定的公开 AgentEvent。 */
@@ -579,27 +530,7 @@ export function createAgentWithModelStream({
       if (currentRun.sessionWriteFailed) {
         throw new Error(SAFE_SESSION_ERROR);
       }
-      const metrics = createRunMetrics(currentRun);
-      await currentRun.sessionLease.appendRunFinished(
-        finalResult.status === "budget_exhausted"
-          ? {
-              status: "budget_exhausted",
-              budgetKind: finalResult.budget,
-              modelRequestCount: metrics.modelRequestCount,
-              toolCallCount: metrics.producedToolCallCount,
-              processedToolCallCount: metrics.processedToolCallCount,
-              activeDurationMilliseconds: metrics.activeDurationMilliseconds,
-              modelUsage: currentRun.cumulativeModelUsage,
-            }
-          : {
-              status: finalResult.status,
-              modelRequestCount: metrics.modelRequestCount,
-              toolCallCount: metrics.producedToolCallCount,
-              processedToolCallCount: metrics.processedToolCallCount,
-              activeDurationMilliseconds: metrics.activeDurationMilliseconds,
-              modelUsage: currentRun.cumulativeModelUsage,
-            },
-      );
+      await currentRun.sessionLease.appendRunFinished({ status: finalResult.status });
     } catch {
       finalResult = SESSION_FAILED_RESULT;
       lastError = finalResult.error;
@@ -611,7 +542,6 @@ export function createAgentWithModelStream({
       type: "run_end",
       runId: currentRun.runId,
       result: finalResult,
-      metrics: createRunMetrics(currentRun),
     });
     try {
       await currentRun.sessionLease.release();
@@ -637,16 +567,6 @@ export function createAgentWithModelStream({
   });
 }
 
-/** 形成 run_end 对三类预算的不可变最终计量。 */
-function createRunMetrics(currentRun: ActiveRunOwnership): RunMetrics {
-  return Object.freeze({
-    modelRequestCount: currentRun.modelRequestCount,
-    producedToolCallCount: currentRun.observedToolCallCount,
-    processedToolCallCount: currentRun.processedToolCallCount,
-    activeDurationMilliseconds: Math.max(0, Math.round(currentRun.activeDurationMilliseconds)),
-  });
-}
-
 /** 把内部 Loop 终态复制为由 Run Module 拥有的公开结果。 */
 function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResult {
   switch (loopResult.status) {
@@ -656,10 +576,5 @@ function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResu
       return Object.freeze({ status: "aborted" });
     case "failed":
       return Object.freeze({ status: "failed", error: loopResult.error });
-    case "budget_exhausted":
-      return Object.freeze({
-        status: "budget_exhausted",
-        budget: loopResult.budget,
-      });
   }
 }

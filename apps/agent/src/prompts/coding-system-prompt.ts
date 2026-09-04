@@ -1,4 +1,4 @@
-import type { SessionShell } from "../session.js";
+import type { SessionShell } from "../session/index.js";
 import {
   FIXED_TOOL_NAMES,
   READ_ONLY_TOOL_NAMES,

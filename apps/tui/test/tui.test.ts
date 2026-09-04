@@ -15,12 +15,6 @@ import { describe, expect, it, vi } from "vitest";
 import { runTui } from "../src/index.js";
 
 const TEST_RUN_ID = "00000000-0000-4000-8000-000000000002";
-const TEST_RUN_METRICS = Object.freeze({
-  modelRequestCount: 1,
-  producedToolCallCount: 0,
-  processedToolCallCount: 0,
-  activeDurationMilliseconds: 1,
-});
 
 type FakeAgentControls = Readonly<{
   publish(event: AgentEvent): void;
@@ -142,7 +136,6 @@ describe("runTui", () => {
           type: "run_end",
           runId: TEST_RUN_ID,
           result: { status: "completed" },
-          metrics: TEST_RUN_METRICS,
         });
         controls.setRunning(false);
         return { status: "completed" };
@@ -204,7 +197,6 @@ describe("runTui", () => {
             type: "run_end",
             runId: TEST_RUN_ID,
             result: { status: "completed" },
-            metrics: TEST_RUN_METRICS,
           });
           controls.setRunning(false);
           promptCompletion.resolve({ status: "completed" });
@@ -273,7 +265,6 @@ describe("runTui", () => {
         type: "run_end",
         runId: TEST_RUN_ID,
         result: { status: "aborted" },
-        metrics: TEST_RUN_METRICS,
       });
       controls.setRunning(false);
       firstPromptCompletion.resolve({ status: "aborted" });
@@ -351,7 +342,6 @@ describe("runTui", () => {
           type: "run_end",
           runId: TEST_RUN_ID,
           result: { status: "failed", error: "模型请求失败，请检查模型配置或稍后重试。" },
-          metrics: TEST_RUN_METRICS,
         });
         controls.setRunning(false);
         return { status: "failed", error: "模型请求失败，请检查模型配置或稍后重试。" };
@@ -413,8 +403,6 @@ function createFakeAgent(
                 pendingToolApproval === null
                   ? ("requesting_model" as const)
                   : ("awaiting_tool_approval" as const),
-              modelRequestCount: 1,
-              toolCallCount: 0,
             })
           : null,
         pendingToolApproval,
@@ -462,7 +450,6 @@ async function completePrompt(
     type: "run_end",
     runId: TEST_RUN_ID,
     result: { status: "completed" },
-    metrics: TEST_RUN_METRICS,
   });
   controls.setRunning(false);
   return { status: "completed" };

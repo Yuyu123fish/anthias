@@ -1,5 +1,5 @@
 import type { AssistantToolCallPart } from "../message.js";
-import type { SessionShell } from "../session.js";
+import type { SessionShell } from "../session/index.js";
 import { executePreparedCommand, prepareCommandTool } from "./command-tool.js";
 import { isReadOnlyToolName } from "./definitions.js";
 import { executePreparedFileTool, isFileToolName, prepareFileTool } from "./file-tool.js";
@@ -52,12 +52,10 @@ type ToolCallPreparation =
   | Readonly<{ ok: true; preparedExecution: PreparedToolExecution }>
   | Readonly<{ ok: false; result: ToolExecutionResult }>;
 
-/** 隐藏具体 Tool 分派，并声明预检是否消耗 Run 活动时间。 */
+/** 隐藏具体 Tool 分派，并提供统一的无副作用预检入口。 */
 export type ToolCallPlan = Readonly<{
-  preparationConsumesActiveDuration: boolean;
-  preparationUnavailableContent: string;
   abortedPreparationContent: string;
-  prepare(remainingActiveDurationMilliseconds: number): Promise<ToolCallPreparation>;
+  prepare(): Promise<ToolCallPreparation>;
 }>;
 
 /** 创建已经绑定运行环境、可以被 Agent Loop 直接调用的 ToolRunner。 */
@@ -94,8 +92,6 @@ function createReadOnlyToolCallPlan(
   workspace: ToolWorkspace,
 ): ToolCallPlan {
   return Object.freeze({
-    preparationConsumesActiveDuration: false,
-    preparationUnavailableContent: "Run 活动执行时长预算已耗尽，Tool 未执行。",
     abortedPreparationContent: "Tool 执行已停止。",
     prepare: () =>
       Promise.resolve(
@@ -103,7 +99,7 @@ function createReadOnlyToolCallPlan(
           ok: true,
           preparedExecution: Object.freeze({
             approval: null,
-            executionUnavailableContent: "Run 活动执行时长预算已耗尽，Tool 未执行。",
+            executionUnavailableContent: "Run 已停止，Tool 未执行。",
             async execute(abortSignal: AbortSignal) {
               return Object.freeze({
                 ...(await executeReadOnlyTool(toolCall, workspace, abortSignal)),
@@ -116,14 +112,12 @@ function createReadOnlyToolCallPlan(
   });
 }
 
-/** 创建需要活动时间预检和人工确认的文件 Tool 计划。 */
+/** 创建需要预检和人工确认的文件 Tool 计划。 */
 function createFileToolCallPlan(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
 ): ToolCallPlan {
   return Object.freeze({
-    preparationConsumesActiveDuration: true,
-    preparationUnavailableContent: "Run 活动执行时长预算已耗尽，文件未写入。",
     abortedPreparationContent: "Run 已停止，文件未写入。",
     async prepare() {
       const preparedResult = await prepareFileTool(toolCall, workspace);
@@ -157,22 +151,15 @@ function createFileToolCallPlan(
   });
 }
 
-/** 创建需要活动时间预检和人工确认的命令 Tool 计划。 */
+/** 创建需要预检和人工确认的命令 Tool 计划。 */
 function createCommandToolCallPlan(
   toolCall: AssistantToolCallPart,
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   return Object.freeze({
-    preparationConsumesActiveDuration: true,
-    preparationUnavailableContent: "Run 活动执行时长预算已耗尽，命令未启动。",
     abortedPreparationContent: "Run 已停止，命令未启动。",
-    async prepare(remainingActiveDurationMilliseconds) {
-      const preparedResult = await prepareCommandTool(
-        toolCall,
-        options.workspace,
-        options.shell,
-        remainingActiveDurationMilliseconds,
-      );
+    async prepare() {
+      const preparedResult = await prepareCommandTool(toolCall, options.workspace, options.shell);
       if (!preparedResult.ok) {
         return Object.freeze({ ok: false, result: preparedResult.result });
       }
@@ -203,11 +190,9 @@ function createCommandToolCallPlan(
   });
 }
 
-/** 将未知 Tool 或无法解析的调用收敛为无需活动时间的失败计划。 */
+/** 将未知 Tool 或无法解析的调用收敛为直接失败计划。 */
 function createRejectedToolCallPlan(toolCall: AssistantToolCallPart): ToolCallPlan {
   return Object.freeze({
-    preparationConsumesActiveDuration: false,
-    preparationUnavailableContent: "Tool 未执行。",
     abortedPreparationContent: "Tool 未执行。",
     prepare: () =>
       Promise.resolve(

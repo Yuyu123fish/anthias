@@ -11,6 +11,7 @@ specs/
     tasks.md
     plan.md
     report.md
+    increment.md  # 可选
 ```
 
 - Feature 目录直接放在 `specs/` 下，不增加 `features/` 中间层。
@@ -87,6 +88,19 @@ Report 记录已经成立的能力与证据边界，至少说明：
 Report 不是文件 Diff、测试清单或按时间排列的工作日志。尚未实现或尚未验收的行为必须明确标注，不能写成当前事实。
 
 每个 Feature 只维护一个 `report.md`。大型 Feature 可以随着各 Plan 完成逐步补充同一份 Report，不为每个 Stage 创建独立 Report。
+
+## Increment
+
+`increment.md` 用于记录未新开 Feature、但直接延续当前最新 Feature 的后续修改。它是可选的历史参考，不要求每次局部调整都创建。
+
+适合记录：
+
+1. 为什么本次修改仍属于原 Feature。
+2. 改动后的行为或模块边界。
+3. Schema、兼容性和迁移影响。
+4. 实际验证结果与未验证边界。
+
+同一 Feature 最多维护一份 `increment.md`；多次后续修改按日期追加小节。Increment 不承担 Feature 状态、实施进度或当前产品事实的权威职责，也不替代 `spec.md`、`plan.md`、`tasks.md` 或 `report.md`。凡是已经改变稳定合同或已实现能力的内容，必须同时更新对应权威文档。
 
 ## 文档边界
 

@@ -7,7 +7,7 @@ import {
   openSession,
   resolveSessionDirectory,
   resolveSessionShell,
-} from "./session.js";
+} from "./session/index.js";
 
 /** 重新导出交互 Adapter 需要呈现的公开 Message 类型。 */
 export type {
@@ -28,7 +28,6 @@ export type {
   AgentState,
   FinishedPromptResult,
   PromptResult,
-  RunMetrics,
   ToolApprovalRequest,
   ToolApprovalResponse,
 } from "./run.js";

@@ -11,12 +11,12 @@
 
 - 当前分支为 `main`，Stage 01 已在 `8c34b78` 完成，Stage 02 已在 `996556e` 完成，Stage 03 已完成整体集成与验收准备。
 - 当前环境为 Windows、Node.js `v24.13.1`、pnpm `10.33.0`、PowerShell `7.5.4`。
-- `apps/agent` 已实现 Schema 1 Session 的新建、追加、按 UUID 重开与持久投影；一次提示词可以在单 activeRun 内发起多次结构化模型请求，串行处理 ToolCall，并统一支持取消、预算和安全失败。
-- `apps/tui` 仍只依赖 `@anthias/agent`，现已通过同一公开 Interface 呈现 Tool、处理逐次确认、停止当前 Run 并报告实际预算用量。
-- 生产 OpenAI-compatible Adapter 仍位于 Agent Module 内部，使用 AI SDK `7.0.85`，现已转换文本、ToolCall、finish reason 和 usage，但不执行 Tool 或拥有循环。
+- `apps/agent` 已实现 Schema 1 Session 的新建、追加、按 UUID 重开与持久投影；一次提示词可以在单 activeRun 内发起多次结构化模型请求，串行处理 ToolCall，并统一支持取消和安全失败。
+- `apps/tui` 仍只依赖 `@anthias/agent`，现已通过同一公开 Interface 呈现 Tool、处理逐次确认、停止当前 Run 并报告最终结果。
+- 生产 OpenAI-compatible Adapter 仍位于 Agent Module 内部，使用 AI SDK `7.0.85`，现已转换文本、ToolCall 和 finish reason，但不执行 Tool 或拥有循环。
 - Stage 02 完成门的 `pnpm verify` 已通过 Biome、Strict TypeScript、构建和 87 个测试；`pnpm install --frozen-lockfile --offline` 同时通过。
 - Stage 03 最终 `pnpm verify` 已通过 Biome 对 33 个文件的检查、Strict TypeScript、构建和 13 个测试文件中的 89 个测试。
-- 当前已具备线性 Session 恢复与独占写入、六个固定 Tool、逐次副作用确认、Model → Tool → Model 循环和资源预算；Stage 1 产生的 Schema 1 终态记录仍可重开。
+- 当前已具备线性 Session 恢复与独占写入、六个固定 Tool、逐次副作用确认、Model → Tool → Model 循环和内部安全保险丝。Schema 1 的 RunFinishedRecord 已就地收敛为只保存终态；未发布阶段产生的旧预算计量形状不继续兼容。
 
 本 Plan 只交付 Spec 已定义的线性 JSONL Session、六个固定 Tool、逐次副作用确认、多模型请求 Agent Loop、TUI 闭环和整体本地验收。不会加入沙箱、可复用授权、PTY、后台命令、动态 Tool Registry、Compaction、分叉、Desktop 或多 Agent。
 
@@ -25,7 +25,7 @@
 | Stage | 独立结果 | 本阶段不带入 |
 | --- | --- | --- |
 | Stage 01：线性 Session 存储 | 新建、追加、重开、校验和恢复 JSONL Session；现有纯文本 Run 已能持久化并继续 | Tool 定义、Tool 执行、人工确认、多模型请求循环 |
-| Stage 02：Tool 系统与 Agent Loop | 六个 Tool、逐次确认、Model → Tool → Model、预算、取消和 TUI 呈现形成完整 Coding Harness | 沙箱、PTY、动态插件、分叉及其他 Spec 排除项 |
+| Stage 02：Tool 系统与 Agent Loop | 六个 Tool、逐次确认、Model → Tool → Model、内部保险丝、取消和 TUI 呈现形成完整 Coding Harness | 沙箱、PTY、动态插件、分叉及其他 Spec 排除项 |
 | Stage 03：整体集成与验收准备 | 在临时工作区中逐项验证 Spec A–N，完成唯一 Report 并形成可供开发者验收的证据 | 新能力、真实 Provider、真实凭据和开发者仓库副作用 |
 
 三个 Stage 必须线性推进。根据开发者本次明确授权，每个 Stage 实施、验证并提交后直接继续下一 Stage；上一 Stage 未通过或边界发生变化时，不得提前实现下一 Stage。Stage 03 的“验收”表示完成验收准备和证据矩阵，只有开发者可以把 Feature 标记为“已验收”。
@@ -42,7 +42,7 @@ apps/tui
 
 apps/agent
   ├─ Run Module               Prompt 接纳、Session lease、根取消、确认状态、事件投影与唯一终态
-  ├─ Agent Loop Module        Model → Tool → Model、流消费、调用顺序与执行预算
+  ├─ Agent Loop Module        Model → Tool → Model、流消费、调用顺序与内部保险丝
   ├─ Message Module           线性消息类型与极少量类型判断
   ├─ Session Module           JSONL、锁、恢复、投影与追加
   ├─ Prompt Module            每次模型请求使用的 Coding Agent 系统提示词
@@ -51,7 +51,7 @@ apps/agent
 ```
 
 - Run Module 是一次公开运行的宿主：自行定义并实现 Agent Interface、公开 state/event/result，持有 active Run、根 AbortController、Session lease 和待确认请求；接纳 prompt 后调用 Agent Loop，并按 Loop 事实完成持久化与唯一终态。
-- Agent Loop 只负责循环算法及其内部协作协议：在本地消息上下文中消费系统 Prompt 与 Model Stream 已组装的 Assistant partial、串行处理 ToolCall、调用 ToolRunner、执行三类预算判断并返回循环结果；它不定义 Run 的公开类型，不接纳 prompt，不持有 Session、监听器、工作区配置或公开 Agent 状态，也不写 Run 终态。
+- Agent Loop 只负责循环算法及其内部协作协议：在本地消息上下文中消费系统 Prompt 与 Model Stream 已组装的 Assistant partial、串行处理 ToolCall、调用 ToolRunner，并用两个内部保险丝阻止异常连续请求和过大调用批次；它不定义 Run 的公开类型，不接纳 prompt，不持有 Session、监听器、工作区配置或公开 Agent 状态，也不写 Run 终态。
 - TUI 不读取 JSONL、模型配置或 Tool 定义，不计算 Diff、不启动命令，也不维护第二个 Run 状态机。
 - Message Module 不依赖 Agent Loop，只定义单一有序内容来源的消息类型和极少量类型判断；Model Stream 边界唯一负责 Assistant partial 累积与 ToolCall 规范化；Session 只在持久化边界形成稳定值，不复用通用消息快照。Session Module 不知道 Agent Loop、TUI 和 Provider；Tool Module 通过绑定 workspace 与 Shell 的 ToolRunner 隐藏分派上下文且不写 Session；Model Adapter 不执行 Tool、不等待确认、不控制循环。
 - package 入口只导出生产启动工厂、Agent Interface 以及 TUI 必需的 state、message、result 和 event 类型；Model Adapter、Tool Schema、Session Record、Writer 和锁类型均不导出。
@@ -79,7 +79,7 @@ apps/agent
 | `SessionHeader` | `type: "session_header"`、`schemaVersion: 1`、`sessionId`、`createdAt`、`workspaceRoot`、固定 Shell 描述 |
 | `MessageRecord` | `type: "message"`、`entryId`、`seq`、`timestamp`、`runId`、一个完整 UserMessage、AssistantMessage 或 ToolResultMessage |
 | `ToolExecutionStartedRecord` | `type: "tool_execution_started"`、`entryId`、`seq`、`timestamp`、`runId`、`toolCallId`、`toolName`、`toolApprovalRequestId` |
-| `RunFinishedRecord` | `type: "run_finished"`、`entryId`、`seq`、`timestamp`、`runId`、终态、计量完整性、模型请求数、ToolCall 数、活动执行毫秒数、可选预算种类和可用的累计模型 usage |
+| `RunFinishedRecord` | `type: "run_finished"`、`entryId`、`seq`、`timestamp`、`runId`、`completed | aborted | failed | interrupted` 终态 |
 
 消息持久形状固定为：
 
@@ -102,7 +102,7 @@ apps/agent
 - 加载时逐行校验 Header、Schema、字段、UUID、`seq`、引用顺序、ToolCall 唯一性和 Run 线性关系；未知记录类型、工作区不匹配、完整坏行、中间坏行或断裂引用直接拒绝打开。
 - 仅“文件末尾没有换行且 JSON 语法不完整”的最后一段可以截断到前一个完整换行；已经换行结束的无效尾行仍然是损坏。
 - 最后一个 Run 缺少 `RunFinishedRecord` 时，在同一独占锁内按 ToolCall 顺序追加恢复记录：已有开始记录但无结果者补 `unknown`，没有开始记录且无结果者补 `aborted`，最后追加 `interrupted` RunFinishedRecord。
-- 恢复生成的 `interrupted` RunFinishedRecord 使用 `metricsStatus: "incomplete"`；无法从持久记录精确还原的 `modelRequestCount` 与 `activeDurationMilliseconds` 为 `null`，`toolCallCount` 从已持久化 Assistant ToolCall 准确计算。正常终结使用 `metricsStatus: "complete"` 和非负整数计量。
+- 恢复生成的 `interrupted` RunFinishedRecord 与正常终结记录使用同一简单形状，只保存记录身份和终态，不推导或持久化运行计量。
 - 恢复只追加事实，不重写旧记录、不恢复模型流、不执行 Tool，也不自动重试文件或命令。
 
 ### 3.5 Agent Interface 与生命周期
@@ -122,7 +122,7 @@ Agent 的公开行为固定为：
 
 该行为只解决当前等待，不直接调用 Tool。重复响应在请求清除后返回 `not_pending`；另一个请求活动时提交旧标识返回 `request_mismatch`。
 
-`AgentState` 包含 `sessionId`、已结束消息、活动 AssistantMessage、`activeRun`、`lastError` 和 `pendingToolApproval`。`activeRun` 保存 `runId`、`requesting_model | awaiting_tool_approval | executing_tool`、预算用量和开始时间；如保留 `running`，只能由 `activeRun !== null` 派生。
+`AgentState` 包含 `sessionId`、已结束消息、活动 AssistantMessage、`activeRun`、`lastError` 和 `pendingToolApproval`。`activeRun` 只保存 `runId` 和 `requesting_model | awaiting_tool_approval | executing_tool`；如保留 `running`，只能由 `activeRun !== null` 派生。
 
 Feature 001 的 `agent_start` / `agent_end` 更名为 `run_start` / `run_end`。最终事件集合为：
 
@@ -133,7 +133,7 @@ Feature 001 的 `agent_start` / `agent_end` 更名为 `run_start` / `run_end`。
 
 所有事件同步有序发布。`activeRun` 必须保持到 `run_end` 已交付，监听器异常继续被隔离；TUI 只按事件呈现。
 
-Prompt 拒绝原因在原有 `empty | busy` 基础上增加 `session_busy | session_changed`。已接受 Run 的最终结果为 `completed | aborted | failed | budget_exhausted`；`interrupted` 只由重启恢复写入历史，不作为当前 `prompt()` 的返回值。
+Prompt 拒绝原因在原有 `empty | busy` 基础上增加 `session_busy | session_changed`。已接受 Run 的最终结果为 `completed | aborted | failed`；`interrupted` 只由重启恢复写入历史，不作为当前 `prompt()` 的返回值。
 
 ## 4. Stage 01：线性 Session 存储
 
@@ -184,11 +184,11 @@ Stage 01 只增加高价值边界测试：
 
 - `text_delta`：Assistant 文本增量；
 - `tool_call`：完整 `toolCallId`、`toolName`、最终输入和 `invalid` 标记；
-- `finish`：规范化 finish reason 与本次 usage。
+- `finish`：规范化 finish reason。
 
 生产 Adapter 继续使用 `streamText`，但 Tool 定义不提供 `execute`，不使用 AI SDK ToolLoopAgent、多步循环或 Tool approval。Adapter 从 `fullStream` 转换 `text-delta`、完整 `tool-call`、`finish` 和 `error`，并保持 `maxRetries: 0`。这些原始事件在 Model Stream 边界组装为唯一的 Assistant `content[]`：该边界是流式内容的唯一可变所有者，负责 ToolCall 身份与 JSON 输入规范化，并在终结时冻结完成消息；Agent Loop 只接收当前 partial 和最终消息，不维护第二份字符串正文。Model Stream 必须响应根 AbortSignal，在取消后结束迭代或抛出；Agent Loop 只使用 `for await...of` 消费，不手动管理迭代器或与单次 `next()` 竞速。AI SDK 的无效或未知 ToolCall 只要已经包含调用标识，就转换成 `invalid` ToolCall 交给 Agent 生成 failed ToolResult；原始 SDK 异常不得进入公开消息或终端。
 
-工具说明使用现有 AI SDK 的 JSON Schema 能力提供给模型；Agent 仍用项目自己的运行时解析器验证最终 `unknown` 输入。Provider、AI SDK Tool、ModelMessage、LanguageModelUsage 和流 part 类型不从 package 入口导出。
+工具说明使用现有 AI SDK 的 JSON Schema 能力提供给模型；Agent 仍用项目自己的运行时解析器验证最终 `unknown` 输入。Provider、AI SDK Tool、ModelMessage 和流 part 类型不从 package 入口导出。
 
 Agent Module 在每次模型请求前重建 Coding Agent 系统提示词，至少写明规范化 workspace root、当前平台、Session 固定 Shell、六个 Tool 及其确认规则、先检查再修改、优先使用文件 Tool、修改后执行相关验证和如实报告失败。系统提示词与 Tool 定义不写入 JSONL，也不由 TUI 拼装。
 
@@ -211,7 +211,7 @@ Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<wo
 
 - 所有路径参数使用 workspace 相对路径。已有目标通过真实路径校验仍在 workspace 内；创建目标通过最近已有父目录的真实路径校验，拒绝绝对路径、`..` 逃逸和指向工作区外的符号链接或 reparse point。
 - `read_file` 遇到二进制或非法 UTF-8 失败；`grep` 跳过这类文件并在结果中报告跳过数量，不把“有跳过”表述为全量搜索结论。
-- `glob` 和 `grep` 不擅自实现 `.gitignore`、隐藏文件或第三方 ignore 语义；模型必须通过输入模式限定范围，结果达到预算后停止并标记截断。
+- `glob` 和 `grep` 不擅自实现 `.gitignore`、隐藏文件或第三方 ignore 语义；模型必须通过输入模式限定范围，结果达到输出边界后停止并标记截断。
 - `edit_file` 与覆盖型 `write_file` 的预览保存目标内容 SHA-256；新建型 `write_file` 保存“不存在”状态。批准后重新校验，状态变化返回 stale target，不写文件。
 - `edit_file` 的每个 `oldText` 必须非空；`write_file` 只创建或替换目标文件，父目录必须已经存在，不隐式创建目录或其他文件。
 - 确认预览使用与 ToolResult 相同的 64 KiB / 2,000 行上限，但预览不允许截断后继续批准；超限直接产生 failed ToolResult，要求模型缩小修改。命令文本也必须完整落入该确认上限。
@@ -222,11 +222,11 @@ Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<wo
 
 - SessionHeader 在创建时固定 Shell 描述。Windows 使用 `pwsh -NoLogo -NoProfile -NonInteractive -Command`；非 Windows 优先使用可执行的绝对 `$SHELL`，否则使用 `/bin/sh -lc`。重开时当前平台无法提供已记录 Shell，则拒绝启用该 Session，不能静默换 Shell。
 - `cwd` 默认为 workspace root，只能解析到 workspace 内的目录；这只是起始目录限制，不把命令描述为沙箱。
-- `timeoutMs` 默认 120,000，最小 1,000，最大 1,800,000；Run 剩余活动时长更短时，以 Run 剩余预算为有效上限，并在确认中显示最终数值。
+- `timeoutMs` 默认 120,000，最小 1,000，最大 1,800,000；它只约束本次命令，并在确认中显示最终数值。
 - 使用 `spawn` 直接启动固定 Shell，不使用 Node 的隐式 `shell: true`；Windows 设置隐藏窗口。每个 ToolCall 新建进程，不继承上一次 Shell 状态。
 - 子进程环境从宿主环境复制后，按大小写不敏感方式移除 `ANTHIAS_MODEL_API_KEY`；命令、事件、结果和 JSONL 都不得补写该值。
-- stdout 与 stderr 分别读取，并按 Node 观察到的 chunk 顺序形成带来源的有界输出；达到展示预算后继续排空管道但不继续积累内存。
-- 用户停止、命令超时或 Run 活动时长耗尽时：Windows 使用 `taskkill /PID <pid> /T /F` 尽力结束进程树，POSIX 使用独立进程组信号并在宽限后升级；所有流、计时器和监听器随后关闭。
+- stdout 与 stderr 分别读取，并按 Node 观察到的 chunk 顺序形成带来源的有界输出；达到展示边界后继续排空管道但不继续积累内存。
+- 用户停止或命令自身超时时：Windows 使用 `taskkill /PID <pid> /T /F` 尽力结束进程树，POSIX 使用独立进程组信号并在宽限后升级；所有流、命令计时器和监听器随后关闭。
 - 如果无法证明后代进程已经结束，ToolResult 和 `tool_execution_end` 必须标记 `cleanupUncertain: true`，不能把“已经发出终止请求”写成“全部进程已释放”。
 
 ### 5.5 Agent Loop 顺序
@@ -236,32 +236,30 @@ Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<wo
 `runAgentLoop()` 使用 `while (true)` 控制 Model → Tool → Model；每轮由 `streamAssistantResponse()` 使用 `for await...of` 消费 Model Stream 已组装的当前 partial，并通过同一个 `emit` 交付消息事件。模型流的组装、结束与取消由 Model Stream / Adapter seam 保证，Loop 不建立第二套消息累积或流运行时。
 
 1. 取得 Session 锁、核对文件检查点、创建 `runId`，追加 UserMessage，发布 `run_start` 和 User 消息事件；
-2. 检查模型请求与活动时长预算，进入 `requesting_model`，累计一次模型请求；
+2. 进入 `requesting_model`；只有内部连续请求计数尚未触发保险丝时才发起模型请求；
 3. 流式形成一个 AssistantMessage，只发布文本 delta；收到完整 ToolCall 和 finish 后完成 AssistantMessage，并在任何 Tool 处理前追加刷新；
 4. finish reason 为 `stop` 且没有 ToolCall 时 completed；`tool_calls` 却没有完整 ToolCall、`length`、`content_filter`、`error`、无法解释的 reason 或不完整 Tool 输入使 Run failed，已形成但不再执行的 ToolCall 补 aborted ToolResult；
 5. 按 AssistantMessage 中的顺序逐个处理完整 ToolCall。未知名称、无效输入和预览失败直接追加 failed ToolResult，不请求确认；
 6. `read_file`、`glob`、`grep` 进入 `executing_tool` 并自动执行；发布 Tool 执行事件，终结后追加 ToolResult；
-7. `edit_file`、`write_file`、`execute_command` 完成无副作用预检后进入 `awaiting_tool_approval`，发布唯一确认请求并暂停活动时长计时；
+7. `edit_file`、`write_file`、`execute_command` 完成无副作用预检后进入 `awaiting_tool_approval`，发布唯一确认请求；
 8. deny 只发布确认解决事件并追加 denied ToolResult；approve 先追加刷新 ToolExecutionStartedRecord，再进入 `executing_tool` 执行已经展示的准确调用；
 9. 同一 AssistantMessage 的全部 ToolCall 都得到 ToolResult 后，回到步骤 2 发起下一次模型请求；
-10. completed、aborted、failed 或 budget_exhausted 通过同一个终结归约器补齐未决 ToolResult、追加 RunFinishedRecord、发布一次 `run_end`、释放锁和资源，再恢复 idle。
+10. completed、aborted 或 failed 通过同一个终结归约器补齐未决 ToolResult、追加 RunFinishedRecord、发布一次 `run_end`、释放锁和资源，再恢复 idle。
 
 确认等待使用 Agent 内部的单个待决 Promise，由 `activeRun` 持有。批准、拒绝、用户停止、退出和内部失败竞争时只允许第一个终态生效；晚到确认、模型 part、Tool 输出或进程事件全部忽略。
 
 事件顺序与持久事实保持同一因果方向：最终 AssistantMessage 先持久化再发布 `message_end`；副作用开始记录先刷新再发布 `tool_execution_start` 和执行本地效果；ToolResult 先终结并持久化，再发布 `tool_execution_end` 和对应的消息结束事件。AgentEvent 本身不落盘，命令实时输出更新是唯一允许先于最终 ToolResult 持久化的观察事件。
 
-### 5.6 资源预算
+### 5.6 内部保险丝与结果边界
 
-Run 在接受 UserMessage 时固定四个独立预算，不创建统一 step 变量：
+Agent Loop 只维护两个局部安全值，不把它们扩张成 Run 领域状态：
 
-- 最多 12 次模型请求；
-- 最多执行或处理 32 个 ToolCall，无效、未知、失败和拒绝同样占用；
-- 最多 30 分钟活动执行时间，只累计 `requesting_model` 与 `executing_tool`；
-- 单个模型可见 ToolResult 最多 64 KiB 或 2,000 行。
+- 一个 Run 最多实际发起 12 次模型请求；准备发起第 13 次时直接返回普通 failed；
+- 单条 AssistantMessage 最多包含 32 个 ToolCall；超出时整批不执行、不确认，全部补 failed ToolResult 后返回普通 failed。
 
-第 13 次模型请求永远不会发起。第 33 个及其后的已形成 ToolCall 不执行，逐个补 failed ToolResult 并使 Run 以 `budget_exhausted` 收口；RunFinishedRecord 同时保存模型实际产生的 ToolCall 数和实际处理数，避免模型一次返回超额调用时丢失事实。活动时长在进入确认等待时暂停，在离开时恢复，并用当前阶段 AbortController 的预算计时器中止超时操作。
+保险丝只存在于 `runAgentLoop()` 内，不进入公开结果、AgentState、Session Schema 或 TUI。ToolCall 上限不跨 AssistantMessage 累计。Run 不设置活动时长，ToolRunner 不接收“剩余 Run 时间”，`execute_command` 只使用调用自身经过校验的 `timeoutMs`。
 
-`budget_exhausted` 必须携带 `model_requests | tool_calls | active_duration` 和实际用量。ToolResult 自身的 64 KiB / 2,000 行只是结果截断，不单独终止 Run；模型可以缩小请求继续。
+ToolResult 自身仍使用 64 KiB / 2,000 行边界。达到边界只截断该结果，不单独终止 Run；模型可以缩小请求继续。
 
 ### 5.7 TUI 交互
 
@@ -269,7 +267,7 @@ Run 在接受 UserMessage 时固定四个独立预算，不创建统一 step 变
 - 收到 `tool_approval_requested` 后展示目标、完整有界预览和 `允许执行？[y/N]`。等待期间，`y` / `yes` 解释为 approve，`n` / `no` 或空行解释为 deny；其他输入提示重新选择，不作为新 prompt。
 - `/exit`、EOF 始终优先进入退出收口；activeRun 中的 Ctrl+C 调用 `abort()`，包括等待确认和命令执行阶段。空闲 Ctrl+C 退出。
 - 等待确认、模型请求或 Tool 执行期间的普通新提示词仍返回或显示 busy，不排队。
-- `session_busy`、`session_changed`、stale target、Tool 失败、非零命令退出、预算耗尽和清理不确定都使用明确、可安全展示的不同文案。
+- `session_busy`、`session_changed`、stale target、Tool 失败、非零命令退出、内部保险丝触发和清理不确定都使用明确、可安全展示的文案。
 
 ### 5.8 验证
 
@@ -281,8 +279,8 @@ Stage 02 的自动化验证以 Agent 公共 Interface 为主，使用确定性 M
 4. 未知 Tool、非法 JSON、Schema 错误和超限预览形成 failed ToolResult，模型可在下一次请求修正；
 5. 多 Tool 串行、多次模型请求、逐次确认和最终回答形成一个 Run，第二条 prompt 仍被 busy 拒绝；
 6. 分别从请求模型、等待确认和执行 Tool 阶段停止，只产生一个 aborted 终态并补齐所有 ToolResult；
-7. 三类 Run 预算和 ToolResult 截断按各自单位触发，确认等待不计入活动时长；
-8. 本地 loopback OpenAI-compatible 流证明文本、有效/无效 ToolCall、finish reason、usage、取消和一次 Adapter 调用一次 HTTP 请求；
+7. 连续模型请求与单响应 ToolCall 批次保险丝分别触发，命令只遵守自身超时，ToolResult 截断不终止 Run；
+8. 本地 loopback OpenAI-compatible 流证明文本、有效/无效 ToolCall、finish reason、取消和一次 Adapter 调用一次 HTTP 请求；
 9. TUI fake 只通过 Agent Interface 完成批准、拒绝、停止、错误呈现和退出，不导入内部 Model Adapter、Tool 或 Session 类型。
 
 ### 5.9 Stage 02 完成门
@@ -310,7 +308,7 @@ Stage 03 不再增加产品能力。它冻结 Stage 02 的公开合同，在全�
 | G 完整循环 | 读取、编辑、命令验证、最终总结在一个 Run 内串行完成 |
 | H 无效调用 | 未知 Tool、非法输入与 Schema 错误无副作用并可由模型修正 |
 | I 分阶段停止 | 模型、确认、命令三个阶段分别停止，终态唯一且资源收口 |
-| J 预算 | 12 次模型请求、32 个 ToolCall、30 分钟活动时长的可控时钟测试及结果截断 |
+| J 安全边界 | 第 13 次模型请求不发出、单响应超过 32 个 ToolCall 整批不执行、命令自身超时及结果截断 |
 | K 保存重载 | 完整 JSONL、稳定 ID、消息投影一致并能继续下一 Run |
 | L 中断恢复 | 未开始副作用为 aborted，已开始无结果为 unknown，旧 Run interrupted 且不重放 |
 | M 职责 | package 公开面、依赖方向和真实 TUI fake 证明内部 seam 未泄漏 |
@@ -369,7 +367,7 @@ Stage 02 首次加入依赖时由实施 Agent 更新 manifest 与 lockfile；之
 
 出现以下情况时当前 Stage 立即停止：
 
-- 需要改变 Spec 的确认范围、Session 恢复语义、公开 Agent Interface、JSONL Schema 或资源预算；
+- 需要改变 Spec 的确认范围、Session 恢复语义、公开 Agent Interface、JSONL Schema 或安全边界；
 - 无法在副作用发生前可靠刷新 ToolExecutionStartedRecord；
 - 无法阻止两个进程在同一历史检查点静默追加；
 - 文件 Tool 无法在当前 Node 能力内保持工作区边界、原子写入或 stale target 保护；

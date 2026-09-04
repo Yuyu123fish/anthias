@@ -17,6 +17,7 @@ Anthias 由开发者长期主导，Agent 辅助讨论、研究、实现和审查
 | 讨论 | 产品方向、术语或取舍尚未确认 | 核对现状 → 讨论 → 记录已确认决定 |
 | Research | 关键事实需要外部证据，或方案存在明显未知 | 定义问题 → 限定来源与时效 → 调查 → 记录证据边界 |
 | 小型修改 | 文案、局部缺陷或低风险内部调整 | 明确结果 → 允许实施 → 聚焦验证 → 汇报 |
+| Feature 后续增量 | 没有创建新 Feature，且修改直接延续最新 Feature | 明确边界 → 允许实施 → 验证 → 可选 Increment → 汇报 |
 | 中小型 Feature | 一个完整用户行为或重要内部合同 | Spec → Plan → Tasks → 允许实施 → 验证 → Report → 验收 |
 | 大型 Feature | 多个可独立验收的能力或跨边界改造 | Spec → 多个 Plan → 统一 Tasks → 逐 Plan 实施 → Report → 验收 |
 | 项目基线 | 产品定义、技术基线或协作规则变化 | 只读核查 → 文档草案 → 开发者确认 → 更新文档 |
@@ -113,6 +114,14 @@ Plan 可以为低风险实现细节留出调整空间，但不能把产品语义
 6. 当前 Git 状态和提交前需要检查的变更范围。
 
 一个 Plan 对应的增量汇报后停止。每个 Feature 只维护一个 `report.md`；大型 Feature 按已经完成的 Plan 逐步补充同一份 Report。只有开发者可以把 Feature 标记为 `已验收`。验收后，再把已经成立的能力同步到 `README.md`、稳定 `docs/` 和 Feature `report.md`。
+
+### 9. 记录 Feature 后续增量
+
+没有创建新 Feature，且修改直接延续当前最新 Feature 时，可以在对应 Feature 目录维护一份可选的 `increment.md`。它记录这次调整为什么仍属于原 Feature、实际改变了什么、兼容性边界和验证结果，便于以后追溯。
+
+`increment.md` 只是带日期的历史参考，不是当前状态的权威来源，也不替代 Spec、Plan、Tasks 或 Report。修改影响产品语义、公开接口、Schema、模块职责或已实现能力时，仍要同步更新对应的权威文档；当前代码、实际运行结果和权威文档优先于旧 Increment。
+
+同一 Feature 最多维护一份 `increment.md`；后续仍属于该 Feature 的补充修改按日期追加小节。创建或更新 Increment 不改变 Feature 状态，也不代表实施、提交、推送或验收已经获得授权。
 
 ## Agent 交接与验证复用
 

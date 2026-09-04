@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件保存 Anthias 中每次工作都需要遵守的高频规则。讨论产品定位、用户、交互或核心术语时读取 [产品定义](docs/product-definition.md)；讨论语言、运行时、构建、界面、并发、模型或 Tool 技术选择时读取 [技术基线](docs/technical-baseline.md)；进入 Spec、Tasks、Plan、实施或验收时读取 [开发流程](docs/development-workflow.md) 和 [Feature 文档约定](specs/README.md)。
+本文件保存 Anthias 中每次工作都需要遵守的高频规则。讨论产品定位、用户、交互或核心术语时读取 [产品定义](docs/product-definition.md)；讨论语言、运行时、构建、界面、并发、模型或 Tool 技术选择时读取 [技术基线](docs/technical-baseline.md)；进入 Spec、Tasks、Plan、Increment、实施或验收时读取 [开发流程](docs/development-workflow.md) 和 [Feature 文档约定](specs/README.md)。
 
 ## 开始工作
 

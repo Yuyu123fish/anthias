@@ -14,7 +14,7 @@ import {
   openSession,
   resolveSessionDirectory,
   resolveSessionShell,
-} from "../src/session.js";
+} from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -307,11 +307,10 @@ function toolCallEvent(index: number, toolName: string, input: unknown) {
   });
 }
 
-/** 创建一个没有 token 计量的确定性 finish 事件。 */
+/** 创建一个确定性的 finish 事件。 */
 function finishEvent(finishReason: "stop" | "tool_calls") {
   return Object.freeze({
     type: "finish" as const,
     finishReason,
-    usage: Object.freeze({ inputTokens: null, outputTokens: null, totalTokens: null }),
   });
 }

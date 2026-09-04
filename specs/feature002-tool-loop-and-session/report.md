@@ -14,7 +14,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Run 宿主持有 prompt 接纳、Session lease、根取消、确认状态、事件投影和唯一终态；Agent Loop 只推进模型与 Tool 的迭代。TUI 仍只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
 
-验收前的结构整理已把系统提示词归入 `src/prompts/`，把单一有序内容来源的消息类型与极少量类型判断归入 `src/message.ts`，把 Provider 无关模型事件、Assistant partial 组装与 ToolCall 规范化归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只定义并实现 Model → Tool → Model 循环及其内部协作协议；`src/run.ts` 自行定义并实现公开 Agent Interface，持有 Session 与运行生命周期，调用 `runAgentLoop` 后显式映射公开结果；Tool Module 通过已绑定 workspace 与 Shell 的 ToolRunner 向循环隐藏分派上下文。Session、Tool 和 Model Adapter 不反向依赖二者，package 入口仍不导出内部 Model Stream、Provider、Tool Schema 或 Session 实现。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
+验收前的结构整理已把系统提示词归入 `src/prompts/`，把单一有序内容来源的消息类型与极少量类型判断归入 `src/message.ts`，把 Provider 无关模型事件、Assistant partial 组装与 ToolCall 规范化归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果边界、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只定义并实现 Model → Tool → Model 循环及其内部协作协议；`src/run.ts` 自行定义并实现公开 Agent Interface，持有 Session 与运行生命周期，调用 `runAgentLoop` 后显式映射公开结果；Tool Module 通过已绑定 workspace 与 Shell 的 ToolRunner 向循环隐藏分派上下文。Session、Tool 和 Model Adapter 不反向依赖二者，package 入口仍不导出内部 Model Stream、Provider、Tool Schema 或 Session 实现。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
 
 本 Feature 没有实现 OS 沙箱、通用权限策略、Session 分叉、Compaction、PTY、后台命令、持久 Shell、动态 Tool Registry、Desktop、跨进程协议或多 Agent。
 
@@ -24,7 +24,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 - 中断恢复不会重放旧工作：未开始的 ToolCall 补 `aborted`，已经记录副作用开始但缺少结果的 ToolCall 补 `unknown`，旧 Run 以 `interrupted` 收口。
 - 文件 Tool 只接受 workspace 内路径，并把实际 Session 目录作为保留路径。修改类 Tool 先生成完整预览与目标指纹，批准后复核状态，再用同目录临时文件、刷新和原子 rename 生效。
 - `execute_command` 使用 Session 固定的非交互 Shell，不使用 `shell: true`；每次执行都是独立子进程。子进程环境会移除 `ANTHIAS_MODEL_API_KEY`，超时或停止时回收进程树并报告清理是否确定。
-- Run 预算是三个不同维度：最多 12 次模型请求、处理最多 32 个 ToolCall、最多 30 分钟活动执行时间；等待人工确认不计入活动时间。单个 ToolResult 另受 64 KiB 和 2,000 行限制。
+- Agent Loop 只保留两个内部保险丝：第 13 次连续模型请求不发出；单条 AssistantMessage 超过 32 个 ToolCall 时整批不执行。两者都以普通 failed 收口，不进入公开 Run 状态、Session 或 TUI。Run 没有活动时长预算；单次命令只遵守自己的 `timeoutMs`，单个 ToolResult 受 64 KiB 和 2,000 行限制。
 - AssistantMessage、ToolExecutionStartedRecord、ToolResultMessage 和 RunFinishedRecord 按事实发生顺序刷新到 JSONL；流式 delta 和瞬时 AgentEvent 不持久化。
 - `runAgentLoop()` 使用 `while (true)` 推进模型与 Tool；Model Stream 边界把原始事件组装为唯一 Assistant `content[]` 和当前 partial，`streamAssistantResponse()` 通过 `for await...of` 消费后统一 `emit`。Agent Loop 不再同步字符串正文与 parts，也不持有手写迭代器、取消竞速或清理协议。
 
@@ -32,17 +32,17 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 | Spec | 结果 | 可复核证据 |
 | --- | --- | --- |
-| A 只读编码检查 | PASS | `tool-loop.test.ts` 证明 `glob → grep → read_file → final` 顺序、三条对应 ToolResult、后续模型上下文和 Run 计量。 |
+| A 只读编码检查 | PASS | `tool-loop.test.ts` 证明 `glob → grep → read_file → final` 顺序、三条对应 ToolResult 和后续模型上下文。 |
 | B 批准精确编辑 | PASS | `file-tool-loop.test.ts` 证明批准前文件不变、Diff 确认、当前确认 ID 匹配、开始记录先于副作用、精确替换成功。 |
 | C 陈旧编辑预览 | PASS | `file-tool-loop.test.ts` 在确认期间外部改写目标，旧预览返回 stale target，外部内容保持不变并回传 failed ToolResult。 |
 | D 创建与覆盖文件 | PASS | `file-tool-loop.test.ts` 分别确认新建和覆盖，实际文件只获得已展示内容；拒绝路径由同文件的独立测试覆盖。 |
 | E 命令确认与失败 | PASS | `command-tool-loop.test.ts` 覆盖批准前无进程副作用、Shell/cwd/命令/超时预览、成功、非零退出、超时、输出截断后继续排空，以及模型 Key 隔离。 |
 | F 拒绝副作用 | PASS | `file-tool-loop.test.ts` 证明拒绝不写文件、不产生开始记录，denied 结果进入下一次模型请求，重复确认被拒绝；`tui.test.ts` 证明确认输入只映射到 Agent。 |
 | G 多 Tool 多模型循环 | PASS | `complete-tool-loop.test.ts` 用四次模型请求完成读取、编辑、真实本地命令验证、总结并接受后续提示；生产 Adapter 集成测试用两次 loopback HTTP 请求完成读—改—命令—总结。 |
-| H 参数错误与未知 Tool | PASS | `read-only-tool.test.ts`、`file-tool-loop.test.ts`、`agent-budget.test.ts` 和 `openai-compatible-model.test.ts` 覆盖越界/保留路径、二进制、非法 Schema、未知 Tool 与不可解析调用，均无副作用且形成对应失败结果。 |
+| H 参数错误与未知 Tool | PASS | `read-only-tool.test.ts`、`file-tool-loop.test.ts`、`agent-loop-safety.test.ts` 和 `openai-compatible-model.test.ts` 覆盖越界/保留路径、二进制、非法 Schema、未知 Tool 与不可解析调用，均无副作用且形成对应失败结果。 |
 | I 分阶段停止 | PASS | `agent.test.ts`、`file-tool-loop.test.ts` 和 `command-tool-loop.test.ts` 分别覆盖模型流、等待确认、命令执行期间停止，均只有一个终态并回到 idle。 |
-| J 执行预算 | PASS | `agent-budget.test.ts` 证明第 13 次模型请求不发送、第 33 个 ToolCall 不处理、30 分钟活动时长终止及确认等待不计时；`command-tool-loop.test.ts` 证明输出达到限制后明确截断且管道继续排空。 |
-| K JSONL 保存与重载 | PASS | `session.test.ts`、`agent.test.ts` 与生产 Adapter 集成测试检查记录顺序、稳定引用、累计 usage、重开投影和沿线性上下文继续。 |
+| J 安全保险丝与结果边界 | PASS | `agent-loop-safety.test.ts` 证明第 13 次模型请求不发送、单响应 33 个 ToolCall 时整批不处理且全部形成 failed ToolResult；`command-tool-loop.test.ts` 证明命令自身超时，以及输出达到限制后明确截断并继续排空管道。 |
+| K JSONL 保存与重载 | PASS | `session.test.ts`、`agent.test.ts` 与生产 Adapter 集成测试检查记录顺序、稳定引用、简单 Run 终态、重开投影和沿线性上下文继续。 |
 | L 中断恢复 | PASS | `session.test.ts` 分别构造 requesting_model、awaiting_tool_approval、executing_tool 中断，证明 `aborted` / `unknown` 补录、`interrupted` 终态、幂等重开且不重放。 |
 | M 接口与职责 | PASS | `apps/agent/src/index.ts` 只导出交互所需 Message、Agent 类型与生产工厂；Session、Model Stream、Provider、Tool Schema/执行器未导出。AssistantMessage 只有一个有序 `content[]`，TUI 需要历史文本时自行投影。`apps/tui/package.json` 的唯一运行时依赖是 `@anthias/agent`，完整构建通过。 |
 | N 干净退出 | PASS | Agent、命令、TUI 和生产 Adapter 测试覆盖 idle、模型、确认和命令阶段；断言模型流、HTTP 服务、Session 锁、临时写入和进程树已收口，TUI 移除监听并取消订阅。 |
@@ -55,11 +55,11 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 - Stage 02：`pnpm verify` 通过，当时为 13 个测试文件、87 个测试；`pnpm install --frozen-lockfile --offline` 通过，manifest 和 lockfile 只增加直接运行时依赖 `diff@9.0.0`。
 - Stage 03 定向验证：`pnpm exec vitest run apps/agent/test/command-tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts` 通过，2 个测试文件、9 个测试。
-- 当前最终验证：受影响的 Agent、Session、Model Adapter、Tool Loop 与 TUI 定向回归通过，7 个测试文件、61 个测试；`pnpm verify` 通过，Biome 检查 42 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 90 个测试全部通过。
+- 本次简化定向验证：受影响的 Agent Loop、Session、Tool Loop、Model Adapter 与 TUI 回归通过，6 个测试文件、42 个测试；`pnpm verify` 通过，Biome 检查 45 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 87 个测试全部通过。
 
-Stage 3 的输出边界强化测试发现：同一输出流的连续小块会重复产生渲染标签，可能提前挤占最终 ToolResult 的 2,000 行预算并覆盖命令专用截断说明。实现已改为只合并相邻同源块，stdout / stderr 的观察顺序不变，截断后仍继续排空管道；对应定向测试和完整门禁均在修复后重新通过。
+Stage 3 的输出边界强化测试发现：同一输出流的连续小块会重复产生渲染标签，可能提前挤占最终 ToolResult 的 2,000 行边界并覆盖命令专用截断说明。实现已改为只合并相邻同源块，stdout / stderr 的观察顺序不变，截断后仍继续排空管道；对应定向测试和完整门禁均在修复后重新通过。
 
-Stage 3 新增的生产 Adapter 集成测试只监听 `127.0.0.1` 的随机端口，使用假 Provider Key 和假进程 Key；它实际创建临时 Session、读写临时文件并运行本机固定 Shell。测试验证了两次 HTTP 模型请求、三个顺序 ToolResult、两次副作用确认、最终文件内容、`run_end` 计量、JSONL 累计 token usage、Key 不泄漏、Session 锁删除、原子写临时文件删除和 HTTP 服务关闭。
+Stage 3 新增的生产 Adapter 集成测试只监听 `127.0.0.1` 的随机端口，使用假 Provider Key 和假进程 Key；它实际创建临时 Session、读写临时文件并运行本机固定 Shell。测试验证了两次 HTTP 模型请求、三个顺序 ToolResult、两次副作用确认、最终文件内容、简单 `run_end` 与 RunFinishedRecord、Key 不泄漏、Session 锁删除、原子写临时文件删除和 HTTP 服务关闭。
 
 所有文件与命令副作用都发生在测试创建的系统临时目录。测试结束后统一删除目录；没有在 Anthias 或开发者其他项目中留下运行 Session、目标文件、子进程或后台服务。
 
