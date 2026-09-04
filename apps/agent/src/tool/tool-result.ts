@@ -1,9 +1,15 @@
-/** 表示一个已经收敛且可直接持久化的 Tool 结果。 */
-export type ToolExecutionResult = Readonly<{
-  status: "completed" | "failed";
+type ToolExecutionResultContent = Readonly<{
   content: string;
   truncated: boolean;
 }>;
+
+/** 表示预检与执行层可以安全返回的失败结果。 */
+export type ToolFailedResult = ToolExecutionResultContent & Readonly<{ status: "failed" }>;
+
+/** 表示一个已经收敛且可直接持久化的 Tool 执行结果。 */
+export type ToolExecutionResult =
+  | (ToolExecutionResultContent & Readonly<{ status: "completed" }>)
+  | ToolFailedResult;
 
 /** 限制单个 ToolResult 可以保存的 UTF-8 字节数。 */
 export const TOOL_RESULT_BYTE_LIMIT = 64 * 1024;

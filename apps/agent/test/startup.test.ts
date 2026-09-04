@@ -50,6 +50,7 @@ describe("createAgentFromEnvironment", () => {
       expect(creationResult.agent.state).toEqual({
         sessionId: expect.any(String),
         workspaceRoot,
+        permissionMode: "agent",
         messageHistory: [],
         activeAssistantMessage: null,
         activeRun: null,
@@ -82,6 +83,29 @@ describe("createAgentFromEnvironment", () => {
       `${creationResult.agent.state.sessionId}.jsonl`,
     ]);
     await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
+  });
+
+  it("creates a Plan-mode Agent without persisting the runtime mode", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-startup-plan-");
+    const sessionDirectory = join(workspaceRoot, "sessions");
+    const environment = await createValidEnvironment(sessionDirectory);
+
+    const creationResult = await createAgentFromEnvironment({
+      environment,
+      workspaceRoot,
+      permissionMode: "plan",
+    });
+
+    expect(creationResult.ok).toBe(true);
+    if (!creationResult.ok) {
+      return;
+    }
+    expect(creationResult.agent.state.permissionMode).toBe("plan");
+    const sessionText = await readFile(
+      join(sessionDirectory, `${creationResult.agent.state.sessionId}.jsonl`),
+      "utf8",
+    );
+    expect(sessionText).not.toContain("permissionMode");
   });
 
   it("reopens a requested Session in the same workspace", async () => {

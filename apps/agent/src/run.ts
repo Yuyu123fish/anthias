@@ -7,9 +7,13 @@ import {
 } from "./agent.js";
 import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
 import type { ModelStream } from "./model-stream.js";
+import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission-mode.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import type { Session, SessionRunLease } from "./session/index.js";
-import { createToolRunner, type ToolApprovalPlan } from "./tool/tool-runner.js";
+import { getToolDefinitions } from "./tool/definitions.js";
+import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
+
+export type { PermissionMode } from "./permission-mode.js";
 
 /** 枚举 Run 对外交付的活动阶段。 */
 type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
@@ -27,6 +31,9 @@ export type ToolApprovalRequest = Readonly<{
   toolName: "edit_file" | "write_file" | "execute_command";
   target: string;
   preview: string;
+  permissionMode: PermissionMode;
+  riskSummary: string;
+  executionBoundary: string;
 }>;
 
 /** 表示 TUI 对当前 Tool 确认响应的同步接纳结果。 */
@@ -34,10 +41,16 @@ export type ToolApprovalResponse =
   | Readonly<{ status: "accepted" }>
   | Readonly<{ status: "rejected"; reason: "not_pending" | "request_mismatch" }>;
 
+/** 表示权限模式切换已经生效，或因活动 Run 被拒绝。 */
+export type PermissionModeChangeResult =
+  | Readonly<{ status: "accepted"; permissionMode: PermissionMode }>
+  | Readonly<{ status: "rejected"; reason: "busy" }>;
+
 /** 提供交互 Adapter 可读取但不能修改的 Agent 状态快照。 */
 export type AgentState = Readonly<{
   sessionId: string;
   workspaceRoot: string;
+  permissionMode: PermissionMode;
   messageHistory: readonly Message[];
   activeAssistantMessage: AssistantMessage | null;
   activeRun: ActiveRun | null;
@@ -63,6 +76,7 @@ export type PromptResult =
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
 export type AgentEvent =
   | Readonly<{ type: "run_start"; runId: string }>
+  | Readonly<{ type: "permission_mode_changed"; permissionMode: PermissionMode }>
   | Readonly<{ type: "message_start"; message: Message }>
   | Readonly<{ type: "message_update"; message: AssistantMessage; delta: string }>
   | Readonly<{ type: "message_end"; message: Message }>
@@ -100,6 +114,7 @@ export type AgentListener = (event: AgentEvent) => void;
 export type Agent = Readonly<{
   readonly state: AgentState;
   prompt(promptText: string): Promise<PromptResult>;
+  setPermissionMode(permissionMode: PermissionMode): PermissionModeChangeResult;
   respondToToolApproval(
     toolApprovalRequestId: string,
     decision: "approve" | "deny",
@@ -112,6 +127,8 @@ export type Agent = Readonly<{
 export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
   session: Session;
+  permissionMode?: PermissionMode | undefined;
+  toolRunner?: ToolRunner | undefined;
 }>;
 
 /** 集中持有一个活动 Run 的取消、Session lease、Loop 投影与唯一终态。 */
@@ -120,6 +137,7 @@ type ActiveRunOwnership = {
   phase: RunPhase;
   sessionLease: SessionRunLease;
   abortController: AbortController;
+  permissionMode: PermissionMode;
   sessionWriteFailed: boolean;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
 };
@@ -159,17 +177,21 @@ const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
 export function createAgentWithModelStream({
   modelStream,
   session,
+  permissionMode: initialPermissionMode = DEFAULT_PERMISSION_MODE,
+  toolRunner: providedToolRunner,
 }: CreateAgentWithModelStreamOptions): Agent {
   const messageHistory: Message[] = [...session.messageHistory];
-  const toolRunner = createToolRunner({
-    workspace: Object.freeze({
-      workspaceRoot: session.workspaceRoot,
-      sessionDirectory: session.sessionDirectory,
-    }),
-    shell: session.shell,
-  });
-  const systemPrompt = createCodingSystemPrompt(session.workspaceRoot, session.shell);
+  const toolRunner =
+    providedToolRunner ??
+    createToolRunner({
+      workspace: Object.freeze({
+        workspaceRoot: session.workspaceRoot,
+        sessionDirectory: session.sessionDirectory,
+      }),
+      shell: session.shell,
+    });
   const eventListeners = new Set<AgentListener>();
+  let permissionMode = initialPermissionMode;
   let activeAssistantMessage: AssistantMessage | null = null;
   let lastError: string | null = null;
   let activeRun: ActiveRunOwnership | null = null;
@@ -183,6 +205,7 @@ export function createAgentWithModelStream({
     return Object.freeze({
       sessionId: session.sessionId,
       workspaceRoot: session.workspaceRoot,
+      permissionMode,
       messageHistory: Object.freeze([...messageHistory]),
       activeAssistantMessage,
       activeRun: activeRun
@@ -220,6 +243,18 @@ export function createAgentWithModelStream({
       subscribed = false;
       eventListeners.delete(listener);
     };
+  }
+
+  /** 只在 Agent 空闲时改变后续 Run 的权限快照。 */
+  function setPermissionMode(nextPermissionMode: PermissionMode): PermissionModeChangeResult {
+    if (activeRun !== null || sessionLeaseAcquisitionPending) {
+      return Object.freeze({ status: "rejected", reason: "busy" });
+    }
+    if (permissionMode !== nextPermissionMode) {
+      permissionMode = nextPermissionMode;
+      publishEvent({ type: "permission_mode_changed", permissionMode });
+    }
+    return Object.freeze({ status: "accepted", permissionMode });
   }
 
   /** 请求中止当前 Run，实际终结继续由 Agent Loop 和统一收口路径完成。 */
@@ -288,6 +323,9 @@ export function createAgentWithModelStream({
       toolName: approvalPlan.toolName,
       target: approvalPlan.target,
       preview: approvalPlan.preview,
+      permissionMode: currentRun.permissionMode,
+      riskSummary: approvalPlan.riskSummary,
+      executionBoundary: approvalPlan.executionBoundary,
     });
     return new Promise((resolve) => {
       pendingToolApproval = Object.freeze({
@@ -349,6 +387,7 @@ export function createAgentWithModelStream({
       phase: "requesting_model",
       sessionLease: sessionRunAcquisition.lease,
       abortController: new AbortController(),
+      permissionMode,
       sessionWriteFailed: false,
       terminalResultPromise: null,
     };
@@ -371,7 +410,13 @@ export function createAgentWithModelStream({
       const loopResult = await runAgentLoop({
         messages: messageHistory,
         modelStream,
-        systemPrompt,
+        systemPrompt: createCodingSystemPrompt(
+          session.workspaceRoot,
+          session.shell,
+          currentRun.permissionMode,
+        ),
+        toolDefinitions: getToolDefinitions(currentRun.permissionMode),
+        permissionMode: currentRun.permissionMode,
         toolRunner,
         abortController: currentRun.abortController,
         emit: (event) => processAgentLoopEvent(currentRun, event),
@@ -561,6 +606,7 @@ export function createAgentWithModelStream({
       return createStateSnapshot();
     },
     prompt: submitPrompt,
+    setPermissionMode,
     respondToToolApproval,
     abort: abortActiveRun,
     subscribe: subscribeToEvents,

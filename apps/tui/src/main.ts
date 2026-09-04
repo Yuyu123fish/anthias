@@ -1,27 +1,33 @@
 #!/usr/bin/env node
 
 import { parseArgs } from "node:util";
-import { createAgentFromEnvironment } from "@anthias/agent";
+import { createAgentFromEnvironment, type PermissionMode } from "@anthias/agent";
 import { runTui } from "./index.js";
 
 /** 创建生产 Agent 并进入 TUI；启动配置无效时以非零状态退出。 */
 async function main(): Promise<number> {
   let sessionId: string | undefined;
+  let permissionMode: PermissionMode = "agent";
   try {
     const parsedArguments = parseArgs({
       args: process.argv.slice(2),
-      options: { session: { type: "string" } },
+      options: { session: { type: "string" }, mode: { type: "string" } },
       allowPositionals: false,
       strict: true,
     });
     sessionId = parsedArguments.values.session;
+    const requestedMode = parsedArguments.values.mode;
+    if (requestedMode !== undefined && requestedMode !== "agent" && requestedMode !== "plan") {
+      throw new Error("invalid mode");
+    }
+    permissionMode = requestedMode ?? "agent";
   } catch {
-    process.stderr.write("命令行参数无效；仅支持无参数启动或 --session <UUID>。\n");
+    process.stderr.write("命令行参数无效；支持 --session <UUID> 与 --mode <agent|plan>。\n");
     return 1;
   }
 
   const agentCreationResult = await createAgentFromEnvironment(
-    sessionId === undefined ? {} : { sessionId },
+    sessionId === undefined ? { permissionMode } : { sessionId, permissionMode },
   );
   if (!agentCreationResult.ok) {
     process.stderr.write(`${agentCreationResult.error}\n`);

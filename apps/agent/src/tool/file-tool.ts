@@ -1,11 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+  sep,
+  win32,
+} from "node:path";
 import { createTwoFilesPatch } from "diff";
 import type { AssistantToolCallPart } from "../message.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "./input-validation.js";
-import { boundToolOutput, type ToolExecutionResult } from "./tool-result.js";
+import { boundToolOutput, type ToolExecutionResult, type ToolFailedResult } from "./tool-result.js";
 import {
+  arePathsEqual,
   isPathSameOrInside,
   type ToolWorkspace,
   validateWorkspaceRelativePath,
@@ -24,17 +35,34 @@ export type PreparedFileTool = Readonly<{
   parentRealPath: string;
   newContent: string;
   expectedFingerprint: TargetFingerprint;
+  parentIdentity: FileSystemIdentity;
   fileMode: number | undefined;
+  scope: "workspace" | "external";
   workspace: ToolWorkspace;
 }>;
 
 /** 表示文件预检成功，或无需确认即可返回模型的安全失败。 */
 export type PreparedFileResult =
   | Readonly<{ ok: true; preparedTool: PreparedFileTool }>
-  | Readonly<{ ok: false; result: ToolExecutionResult }>;
+  | Readonly<{ ok: false; result: ToolFailedResult }>;
 
 /** 描述确认预览绑定的已有文件内容或不存在状态。 */
-type TargetFingerprint = Readonly<{ kind: "missing" }> | Readonly<{ kind: "file"; sha256: string }>;
+type FileSystemIdentifier = number | bigint;
+
+type TargetFingerprint =
+  | Readonly<{ kind: "missing" }>
+  | Readonly<{
+      kind: "file";
+      sha256: string;
+      device: FileSystemIdentifier;
+      inode: FileSystemIdentifier;
+    }>;
+
+/** 绑定确认时父目录的文件系统身份，防止同路径目录被替换。 */
+type FileSystemIdentity = Readonly<{
+  device: FileSystemIdentifier;
+  inode: FileSystemIdentifier;
+}>;
 
 /** 表示文件 Tool 已完成运行时校验后的固定输入。 */
 type FileToolInput =
@@ -48,15 +76,23 @@ type FileToolInput =
 /** 保存预检时解析出的真实目标、原始内容与文件模式。 */
 type ResolvedFileTarget = Readonly<{
   absolutePath: string;
-  relativePath: string;
+  displayPath: string;
   parentRealPath: string;
+  parentIdentity: FileSystemIdentity;
   exists: boolean;
   originalContent: string;
   fingerprint: TargetFingerprint;
   fileMode: number | undefined;
+  scope: "workspace" | "external";
 }>;
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+/** 只检查文件 Tool 的运行时输入形状，不读取或写入目标。 */
+export function validateFileToolCallInput(toolCall: AssistantToolCallPart): string | null {
+  const inputResult = parseFileToolInput(toolCall);
+  return inputResult.ok ? null : inputResult.error;
+}
 
 /** 无副作用地校验 edit_file 或 write_file，并生成不可截断的确认预览。 */
 export async function prepareFileTool(
@@ -89,8 +125,8 @@ export async function prepareFileTool(
     }
 
     const patch = createTwoFilesPatch(
-      target.exists ? `a/${target.relativePath}` : "/dev/null",
-      `b/${target.relativePath}`,
+      target.exists ? `a/${target.displayPath}` : "/dev/null",
+      `b/${target.displayPath}`,
       target.originalContent,
       calculatedChange.content,
       target.exists ? "before" : "missing",
@@ -99,7 +135,7 @@ export async function prepareFileTool(
     );
     const previewResult = boundToolOutput([
       `operation: ${calculatedChange.operation}`,
-      `path: ${target.relativePath}`,
+      `path: ${target.displayPath}`,
       ...splitLines(patch),
     ]);
     if (previewResult.truncated) {
@@ -111,14 +147,16 @@ export async function prepareFileTool(
       ok: true,
       preparedTool: Object.freeze({
         toolName: inputResult.input.toolName,
-        target: target.relativePath,
+        target: target.displayPath,
         preview: previewResult.content,
         operation: calculatedChange.operation,
         absolutePath: target.absolutePath,
         parentRealPath: target.parentRealPath,
+        parentIdentity: target.parentIdentity,
         newContent: calculatedChange.content,
         expectedFingerprint: target.fingerprint,
         fileMode: target.fileMode,
+        scope: target.scope,
         workspace,
       }),
     });
@@ -300,21 +338,40 @@ function calculateExactEdit(
   return Object.freeze({ ok: true, content: editedContent, operation: "edit" });
 }
 
-/** 解析已有或待创建文件，校验真实父目录仍位于工作区且未命中 Session。 */
+/** 解析已有或待创建文件，并把一个精确目标绑定到 workspace 或 external 范围。 */
 async function resolveFileTarget(
   requestedPath: string,
   workspace: ToolWorkspace,
 ): Promise<ResolvedFileTarget> {
-  validateWorkspaceRelativePath(requestedPath, "文件 Tool path");
-  const lexicalTargetPath = resolve(workspace.workspaceRoot, requestedPath);
+  const absoluteRequest = isAbsolute(requestedPath) || win32.isAbsolute(requestedPath);
+  if (!absoluteRequest) {
+    validateWorkspaceRelativePath(requestedPath, "文件 Tool path");
+  }
+  const lexicalTargetPath = resolve(
+    absoluteRequest ? requestedPath : resolve(workspace.workspaceRoot, requestedPath),
+  );
+  const scope = isPathSameOrInside(workspace.workspaceRoot, lexicalTargetPath)
+    ? "workspace"
+    : "external";
+  if (absoluteRequest && scope === "external") {
+    validateExternalAbsoluteFilePath(requestedPath);
+  }
   const lexicalParentPath = dirname(lexicalTargetPath);
   const parentRealPath = await realpath(lexicalParentPath);
-  const parentStats = await stat(parentRealPath);
+  const parentStats = await lstat(parentRealPath);
   if (!parentStats.isDirectory()) {
     throw new Error("文件 Tool 的父路径不是目录。");
   }
-  assertAllowedPath(parentRealPath, workspace);
+  if (scope === "external" && !arePathsEqual(lexicalParentPath, parentRealPath)) {
+    throw new Error("外部文件路径不能经过 Symbolic Link 或 Reparse Point。");
+  }
+  assertAllowedPath(parentRealPath, workspace, scope);
   const targetPath = join(parentRealPath, basename(lexicalTargetPath));
+  const displayPath =
+    scope === "workspace"
+      ? normalizeRelativePath(relative(workspace.workspaceRoot, targetPath))
+      : targetPath;
+  const parentIdentity = fileSystemIdentity(parentStats);
   let targetStats: Awaited<ReturnType<typeof lstat>> | null = null;
   try {
     targetStats = await lstat(targetPath);
@@ -324,20 +381,28 @@ async function resolveFileTarget(
     }
   }
   if (targetStats === null) {
-    assertAllowedPath(targetPath, workspace);
+    assertAllowedPath(targetPath, workspace, scope);
     return Object.freeze({
       absolutePath: targetPath,
-      relativePath: normalizeRelativePath(relative(workspace.workspaceRoot, targetPath)),
+      displayPath,
       parentRealPath,
+      parentIdentity,
       exists: false,
       originalContent: "",
       fingerprint: Object.freeze({ kind: "missing" }),
       fileMode: undefined,
+      scope,
     });
   }
 
+  if (targetStats.isSymbolicLink()) {
+    throw new Error("文件 Tool 目标不能是 Symbolic Link 或 Reparse Point。");
+  }
   const targetRealPath = await realpath(targetPath);
-  assertAllowedPath(targetRealPath, workspace);
+  if (scope === "external" && !arePathsEqual(targetPath, targetRealPath)) {
+    throw new Error("外部文件路径不能经过 Symbolic Link 或 Reparse Point。");
+  }
+  assertAllowedPath(targetRealPath, workspace, scope);
   const actualStats = await stat(targetRealPath);
   if (!actualStats.isFile()) {
     throw new Error("文件 Tool 目标不是普通文件。");
@@ -345,22 +410,34 @@ async function resolveFileTarget(
   const originalBytes = await readFile(targetRealPath);
   return Object.freeze({
     absolutePath: targetRealPath,
-    relativePath: normalizeRelativePath(relative(workspace.workspaceRoot, targetRealPath)),
+    displayPath:
+      scope === "workspace"
+        ? normalizeRelativePath(relative(workspace.workspaceRoot, targetRealPath))
+        : targetRealPath,
     parentRealPath: dirname(targetRealPath),
+    parentIdentity,
     exists: true,
     originalContent: decodeStrictUtf8(originalBytes),
-    fingerprint: fingerprintBytes(originalBytes),
+    fingerprint: fingerprintBytes(originalBytes, actualStats),
     fileMode: actualStats.mode & 0o777,
+    scope,
   });
 }
 
 /** 复核目标存在状态、真实路径、内容指纹及父目录边界均未变化。 */
 async function matchesPreparedTarget(preparedTool: PreparedFileTool): Promise<boolean> {
   const currentParentRealPath = await realpath(dirname(preparedTool.absolutePath));
-  if (currentParentRealPath !== preparedTool.parentRealPath) {
+  if (!arePathsEqual(currentParentRealPath, preparedTool.parentRealPath)) {
     return false;
   }
-  assertAllowedPath(currentParentRealPath, preparedTool.workspace);
+  const currentParentStats = await lstat(currentParentRealPath);
+  if (
+    !currentParentStats.isDirectory() ||
+    !sameFileSystemIdentity(currentParentStats, preparedTool.parentIdentity)
+  ) {
+    return false;
+  }
+  assertAllowedPath(currentParentRealPath, preparedTool.workspace, preparedTool.scope);
   if (preparedTool.expectedFingerprint.kind === "missing") {
     try {
       await lstat(preparedTool.absolutePath);
@@ -369,27 +446,96 @@ async function matchesPreparedTarget(preparedTool: PreparedFileTool): Promise<bo
       return (error as NodeJS.ErrnoException).code === "ENOENT";
     }
   }
-  const currentRealPath = await realpath(preparedTool.absolutePath);
-  if (currentRealPath !== preparedTool.absolutePath) {
+  const currentLexicalStats = await lstat(preparedTool.absolutePath);
+  if (currentLexicalStats.isSymbolicLink()) {
     return false;
   }
-  assertAllowedPath(currentRealPath, preparedTool.workspace);
+  const currentRealPath = await realpath(preparedTool.absolutePath);
+  if (!arePathsEqual(currentRealPath, preparedTool.absolutePath)) {
+    return false;
+  }
+  assertAllowedPath(currentRealPath, preparedTool.workspace, preparedTool.scope);
   const currentStats = await stat(currentRealPath);
-  if (!currentStats.isFile()) {
+  if (
+    !currentStats.isFile() ||
+    currentStats.dev !== preparedTool.expectedFingerprint.device ||
+    currentStats.ino !== preparedTool.expectedFingerprint.inode
+  ) {
     return false;
   }
   const currentBytes = await readFile(currentRealPath);
-  return fingerprintBytes(currentBytes).sha256 === preparedTool.expectedFingerprint.sha256;
+  return (
+    fingerprintBytes(currentBytes, currentStats).sha256 === preparedTool.expectedFingerprint.sha256
+  );
 }
 
-/** 校验真实路径仍在工作区内且没有进入 Agent 自有 Session 目录。 */
-function assertAllowedPath(targetPath: string, workspace: ToolWorkspace): void {
-  if (!isPathSameOrInside(workspace.workspaceRoot, targetPath)) {
-    throw new Error("文件 Tool path 越出工作区。");
-  }
+/** 校验真实目标仍符合确认时的 workspace 或 external 范围。 */
+function assertAllowedPath(
+  targetPath: string,
+  workspace: ToolWorkspace,
+  scope: "workspace" | "external",
+): void {
   if (isPathSameOrInside(workspace.sessionDirectory, targetPath)) {
     throw new Error("文件 Tool path 命中 Session 保留目录。");
   }
+  if (scope === "workspace") {
+    if (!isPathSameOrInside(workspace.workspaceRoot, targetPath)) {
+      throw new Error("文件 Tool path 越出工作区。");
+    }
+    return;
+  }
+  if (isProtectedSystemPath(targetPath)) {
+    throw new Error("外部文件 path 命中系统保护目录。");
+  }
+  if (arePathsEqual(parse(targetPath).root, targetPath)) {
+    throw new Error("外部文件 path 不能是卷根目录。");
+  }
+}
+
+/** 在文件系统访问前拒绝不能表达为单个本地文件的绝对路径。 */
+function validateExternalAbsoluteFilePath(requestedPath: string): void {
+  const slashNormalizedPath = requestedPath.replaceAll("/", "\\");
+  if (
+    slashNormalizedPath.startsWith("\\\\") ||
+    slashNormalizedPath.startsWith("\\?\\") ||
+    slashNormalizedPath.startsWith("\\.\\")
+  ) {
+    throw new Error("外部文件 path 不接受 UNC 或设备命名空间。");
+  }
+  if (/[*?[\]{}]/u.test(requestedPath)) {
+    throw new Error("外部文件 path 必须是精确文件，不能包含 Glob。");
+  }
+  if (win32.isAbsolute(requestedPath) && slashNormalizedPath.slice(2).includes(":")) {
+    throw new Error("外部文件 path 不接受 Alternate Data Stream。");
+  }
+  const normalizedPath = resolve(requestedPath);
+  const parsedPath = parse(normalizedPath);
+  const fileName = basename(normalizedPath);
+  if (
+    arePathsEqual(parsedPath.root, normalizedPath) ||
+    fileName.length === 0 ||
+    fileName === "." ||
+    fileName === ".."
+  ) {
+    throw new Error("外部文件 path 必须指向一个文件名，不能是卷根目录。");
+  }
+}
+
+/** 用当前主机的真实系统目录建立不可批准的保守边界。 */
+function isProtectedSystemPath(targetPath: string): boolean {
+  const protectedRoots =
+    process.platform === "win32"
+      ? [
+          process.env.SystemRoot,
+          process.env.WINDIR,
+          process.env.ProgramFiles,
+          process.env["ProgramFiles(x86)"],
+          process.env.ProgramData,
+        ]
+      : ["/bin", "/boot", "/dev", "/etc", "/proc", "/sbin", "/sys", "/usr", "/var"];
+  return protectedRoots.some(
+    (protectedRoot) => protectedRoot !== undefined && isPathSameOrInside(protectedRoot, targetPath),
+  );
 }
 
 /** 将平台路径分隔符统一为模型与 Session 可稳定使用的斜杠。 */
@@ -398,8 +544,27 @@ function normalizeRelativePath(filePath: string): string {
 }
 
 /** 为已有文件内容创建确认后复核使用的 SHA-256 指纹。 */
-function fingerprintBytes(bytes: Uint8Array): Extract<TargetFingerprint, { kind: "file" }> {
-  return Object.freeze({ kind: "file", sha256: createHash("sha256").update(bytes).digest("hex") });
+function fingerprintBytes(
+  bytes: Uint8Array,
+  stats: Awaited<ReturnType<typeof stat>>,
+): Extract<TargetFingerprint, { kind: "file" }> {
+  return Object.freeze({
+    kind: "file",
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    device: stats.dev,
+    inode: stats.ino,
+  });
+}
+
+function fileSystemIdentity(stats: Awaited<ReturnType<typeof lstat>>): FileSystemIdentity {
+  return Object.freeze({ device: stats.dev, inode: stats.ino });
+}
+
+function sameFileSystemIdentity(
+  stats: Awaited<ReturnType<typeof lstat>>,
+  identity: FileSystemIdentity,
+): boolean {
+  return stats.dev === identity.device && stats.ino === identity.inode;
 }
 
 /** 以 fatal UTF-8 解码文本，并拒绝包含 NUL 的二进制内容。 */

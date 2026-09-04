@@ -1,7 +1,11 @@
 import type { JSONSchema7 } from "ai";
+import type { PermissionMode } from "../permission-mode.js";
 
 /** 保存无需人工确认即可执行的固定 Tool 名称。 */
 export const READ_ONLY_TOOL_NAMES = Object.freeze(["read_file", "glob", "grep"] as const);
+
+/** 枚举无需人工确认的固定只读 Tool 名称。 */
+export type ReadOnlyToolName = (typeof READ_ONLY_TOOL_NAMES)[number];
 
 /** 保存每次执行前都必须取得人工确认的固定 Tool 名称。 */
 export const SIDE_EFFECT_TOOL_NAMES = Object.freeze([
@@ -10,16 +14,11 @@ export const SIDE_EFFECT_TOOL_NAMES = Object.freeze([
   "execute_command",
 ] as const);
 
-/** 枚举 Feature 002 固定提供给模型的六个 Tool 名称。 */
-export type FixedToolName =
-  | (typeof READ_ONLY_TOOL_NAMES)[number]
-  | (typeof SIDE_EFFECT_TOOL_NAMES)[number];
+/** 枚举每次执行前都必须取得人工确认的 Tool 名称。 */
+export type SideEffectToolName = (typeof SIDE_EFFECT_TOOL_NAMES)[number];
 
-/** 保存按照模型展示顺序排列的全部固定 Tool 名称。 */
-export const FIXED_TOOL_NAMES: readonly FixedToolName[] = Object.freeze([
-  ...READ_ONLY_TOOL_NAMES,
-  ...SIDE_EFFECT_TOOL_NAMES,
-]);
+/** 枚举 Agent 固定提供给模型的六个 Tool 名称。 */
+export type FixedToolName = ReadOnlyToolName | SideEffectToolName;
 
 /** 描述 Model Adapter 所需且不含 execute 回调的固定 Tool。 */
 export type ModelToolDefinition = Readonly<{
@@ -28,8 +27,8 @@ export type ModelToolDefinition = Readonly<{
   inputSchema: JSONSchema7;
 }>;
 
-/** Feature 002 的固定 Tool Schema；实际输入仍由 Agent 自己再次校验。 */
-export const FIXED_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
+/** 固定 Tool Schema；实际输入仍由 Agent 自己再次校验。 */
+const ALL_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
   defineTool("read_file", "读取工作区内 UTF-8 文本文件的指定行范围。", {
     type: "object",
     additionalProperties: false,
@@ -102,9 +101,27 @@ export const FIXED_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.fre
   }),
 ]);
 
+/** Agent 模式向模型暴露的六个固定 Tool Schema。 */
+export const FIXED_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = ALL_TOOL_DEFINITIONS;
+
+/** Plan 模式只向模型暴露三个工作区只读 Tool。 */
+export const READ_ONLY_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze(
+  ALL_TOOL_DEFINITIONS.filter((definition) => isReadOnlyToolName(definition.name)),
+);
+
+/** 按 Run 的权限快照返回不可变 Tool definitions。 */
+export function getToolDefinitions(permissionMode: PermissionMode): readonly ModelToolDefinition[] {
+  return permissionMode === "plan" ? READ_ONLY_TOOL_DEFINITIONS : FIXED_TOOL_DEFINITIONS;
+}
+
 /** 判断名称是否属于无需人工确认的三个只读 Tool。 */
-export function isReadOnlyToolName(toolName: string): boolean {
+export function isReadOnlyToolName(toolName: string): toolName is ReadOnlyToolName {
   return toolName === "read_file" || toolName === "glob" || toolName === "grep";
+}
+
+/** 判断名称是否属于三个有副作用的固定 Tool。 */
+export function isSideEffectToolName(toolName: string): toolName is SideEffectToolName {
+  return toolName === "edit_file" || toolName === "write_file" || toolName === "execute_command";
 }
 
 /** 创建并冻结一个不含执行行为的 Model Tool 定义。 */

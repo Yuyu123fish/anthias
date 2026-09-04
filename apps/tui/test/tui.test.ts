@@ -54,6 +54,7 @@ describe("runTui", () => {
     await expect(tuiExit).resolves.toBe(0);
     expect(rendered).toContain("Session: 00000000-0000-4000-8000-000000000001\n");
     expect(rendered).toContain("Workspace: C:\\workspace\n");
+    expect(rendered).toContain("Mode: Agent\n");
     expect(rendered).toContain("You: previous\nAssistant: answer\n");
     expect(promptHandler).not.toHaveBeenCalled();
   });
@@ -109,6 +110,13 @@ describe("runTui", () => {
           toolCallId: "00000000-0000-4000-8000-000000000010",
           toolName: "read_file",
         });
+        controls.publish({
+          type: "tool_execution_update",
+          toolCallId: "00000000-0000-4000-8000-000000000010",
+          toolName: "read_file",
+          stream: "stdout",
+          delta: "chunk",
+        });
         const result = {
           role: "tool" as const,
           toolCallId: "00000000-0000-4000-8000-000000000010",
@@ -154,6 +162,9 @@ describe("runTui", () => {
     input.write("inspect\n");
     await vi.waitFor(() => {
       expect(rendered).toContain("Tool: read_file");
+      expect(rendered).toContain("[00000010] start");
+      expect(rendered).toContain("[read_file 00000010 stdout] chunk");
+      expect(rendered).toContain("[00000010] end completed");
       expect(rendered).toContain("ToolResult: read_file completed\npath: README.md\n");
     });
     input.write("/exit\n");
@@ -177,6 +188,9 @@ describe("runTui", () => {
         toolName: "edit_file" as const,
         target: "src/example.ts",
         preview: "--- old\n+++ new",
+        permissionMode: "agent" as const,
+        riskSummary: "将修改工作区文件。",
+        executionBoundary: "一次只写入一个精确文件。",
       });
       const approvalHandler = vi.fn(
         (
@@ -225,6 +239,12 @@ describe("runTui", () => {
       const tuiExit = runTui({ agent, input, output, signalSource });
       input.write("change\n");
       await vi.waitFor(() => expect(rendered).toContain("允许执行？[y/N]"));
+      expect(rendered).toContain("权限模式：Agent");
+      expect(rendered).toContain("风险：将修改工作区文件。");
+      expect(rendered).toContain("执行边界：一次只写入一个精确文件。");
+      input.write("/mode plan\n");
+      await vi.waitFor(() => expect(rendered).toContain("不能切换权限模式"));
+      expect(approvalHandler).not.toHaveBeenCalled();
       input.write("maybe\n");
       await vi.waitFor(() => expect(rendered).toContain("请输入 y/yes 批准"));
       expect(approvalHandler).not.toHaveBeenCalled();
@@ -240,6 +260,34 @@ describe("runTui", () => {
       await expect(tuiExit).resolves.toBe(0);
     },
   );
+
+  it("queries and changes mode without submitting a prompt", async () => {
+    const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
+    const agent = createFakeAgent({ prompt: promptHandler });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({ agent, input, output, signalSource });
+    input.write("/mode\n");
+    input.write("/mode plan\n");
+
+    await vi.waitFor(() => {
+      expect(agent.state.permissionMode).toBe("plan");
+      expect(rendered.match(/Mode: Plan/g)?.length).toBe(1);
+    });
+    expect(promptHandler).not.toHaveBeenCalled();
+
+    input.write("/mode invalid\n");
+    await vi.waitFor(() => expect(rendered).toContain("用法：/mode"));
+    input.write("/exit\n");
+    await expect(tuiExit).resolves.toBe(0);
+  });
 
   it("maps active SIGINT to abort and accepts another prompt", async () => {
     const firstPromptCompletion = Promise.withResolvers<PromptResult>();
@@ -374,6 +422,7 @@ function createFakeAgent(
 ): Agent {
   const listeners = new Set<AgentListener>();
   let running = false;
+  let permissionMode: "agent" | "plan" = "agent";
   let pendingToolApproval: ToolApprovalRequest | null = null;
   const controls: FakeAgentControls = {
     publish(event) {
@@ -394,6 +443,7 @@ function createFakeAgent(
       return Object.freeze({
         sessionId: "00000000-0000-4000-8000-000000000001",
         workspaceRoot: "C:\\workspace",
+        permissionMode,
         messageHistory: Object.freeze([...messageHistory]),
         activeAssistantMessage: null,
         activeRun: running
@@ -411,6 +461,16 @@ function createFakeAgent(
       });
     },
     prompt: (promptText) => prompt(promptText, controls),
+    setPermissionMode(nextPermissionMode) {
+      if (running) {
+        return Object.freeze({ status: "rejected", reason: "busy" });
+      }
+      if (permissionMode !== nextPermissionMode) {
+        permissionMode = nextPermissionMode;
+        controls.publish({ type: "permission_mode_changed", permissionMode });
+      }
+      return Object.freeze({ status: "accepted", permissionMode });
+    },
     respondToToolApproval: (toolApprovalRequestId, decision) =>
       respondToToolApproval?.(toolApprovalRequestId, decision, controls) ??
       Object.freeze({ status: "rejected", reason: "not_pending" }),

@@ -1,9 +1,20 @@
-import type { AssistantToolCallPart } from "../message.js";
+import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
+import type { PermissionMode } from "../permission-mode.js";
 import type { SessionShell } from "../session/index.js";
-import { executePreparedCommand, prepareCommandTool } from "./command-tool.js";
-import { isReadOnlyToolName } from "./definitions.js";
-import { executePreparedFileTool, isFileToolName, prepareFileTool } from "./file-tool.js";
-import { executeReadOnlyTool } from "./read-only-tool.js";
+import {
+  executePreparedCommand,
+  prepareCommandTool,
+  validateCommandToolCallInput,
+} from "./command-tool.js";
+import { isReadOnlyToolName, type ReadOnlyToolName } from "./definitions.js";
+import {
+  executePreparedFileTool,
+  isFileToolName,
+  prepareFileTool,
+  validateFileToolCallInput,
+} from "./file-tool.js";
+import { executeReadOnlyTool, validateReadOnlyToolCallInput } from "./read-only-tool.js";
+import { decideToolPolicy, type ToolPolicyDecision } from "./tool-policy.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
 
@@ -15,7 +26,7 @@ export type CreateToolRunnerOptions = Readonly<{
 
 /** 隐藏 Tool 分派细节，只向 Agent Loop 提供统一计划入口。 */
 export type ToolRunner = Readonly<{
-  createPlan(toolCall: AssistantToolCallPart): ToolCallPlan;
+  createPlan(toolCall: AssistantToolCallPart, permissionMode: PermissionMode): ToolCallPlan;
 }>;
 
 /** 描述 Tool 执行期间可以按发生顺序发布的输出。 */
@@ -29,6 +40,9 @@ export type ToolApprovalPlan = Readonly<{
   toolName: "edit_file" | "write_file" | "execute_command";
   target: string;
   preview: string;
+  ruleId: string;
+  riskSummary: string;
+  executionBoundary: string;
   deniedContent: string;
 }>;
 
@@ -47,13 +61,24 @@ export type PreparedToolExecution = Readonly<{
   >;
 }>;
 
-/** 表示 ToolCall 已形成可执行计划，或可以立即返回安全失败。 */
-type ToolCallPreparation =
+/** 表示预检或 Policy 已经可以直接形成的非执行结果。 */
+type ImmediateToolResult = Readonly<{
+  status: Extract<ToolResultMessage["status"], "failed" | "denied">;
+  content: string;
+  truncated: boolean;
+}>;
+
+/** 表示 ToolCall 已形成可执行计划，或可以立即返回安全结果。 */
+export type ToolCallPreparation =
   | Readonly<{ ok: true; preparedExecution: PreparedToolExecution }>
-  | Readonly<{ ok: false; result: ToolExecutionResult }>;
+  | Readonly<{ ok: false; result: ImmediateToolResult }>;
+
+/** 描述单个调用对整个 Tool Batch 调度方式的要求。 */
+export type ToolCallScheduling = "parallel_read_only" | "source_order_serial";
 
 /** 隐藏具体 Tool 分派，并提供统一的无副作用预检入口。 */
 export type ToolCallPlan = Readonly<{
+  scheduling: ToolCallScheduling;
   abortedPreparationContent: string;
   prepare(): Promise<ToolCallPreparation>;
 }>;
@@ -65,33 +90,67 @@ export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
     shell: options.shell,
   });
   return Object.freeze({
-    createPlan: (toolCall) => createToolCallPlan(toolCall, runnerOptions),
+    createPlan: (toolCall, permissionMode) =>
+      createToolCallPlan(toolCall, permissionMode, runnerOptions),
   });
 }
 
-/** 将任意 ToolCall 解析为统一的预检与执行计划。 */
+/** 将任意 ToolCall 解析为统一的预检、Policy 与执行计划。 */
 function createToolCallPlan(
   toolCall: AssistantToolCallPart,
+  permissionMode: PermissionMode,
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   if (isReadOnlyToolName(toolCall.toolName)) {
-    return createReadOnlyToolCallPlan(toolCall, options.workspace);
+    const validationError = validateReadOnlyToolCallInput(toolCall);
+    return validationError === null
+      ? createReadOnlyToolCallPlan(toolCall, toolCall.toolName, permissionMode, options.workspace)
+      : createRejectedToolCallPlan(validationError);
   }
   if (toolCall.toolName === "execute_command") {
-    return createCommandToolCallPlan(toolCall, options);
+    const validationError = validateCommandToolCallInput(toolCall);
+    if (validationError !== null) {
+      return createRejectedToolCallPlan(validationError);
+    }
+    if (permissionMode === "plan") {
+      return createPolicyDeniedPlan(
+        decideToolPolicy({ permissionMode, toolName: "execute_command" }),
+      );
+    }
+    return createCommandToolCallPlan(toolCall, permissionMode, options);
   }
   if (isFileToolName(toolCall.toolName)) {
-    return createFileToolCallPlan(toolCall, options.workspace);
+    const validationError = validateFileToolCallInput(toolCall);
+    if (validationError !== null) {
+      return createRejectedToolCallPlan(validationError);
+    }
+    if (permissionMode === "plan") {
+      return createPolicyDeniedPlan(
+        decideToolPolicy({ permissionMode, toolName: toolCall.toolName }),
+      );
+    }
+    return createFileToolCallPlan(toolCall, permissionMode, options.workspace);
   }
-  return createRejectedToolCallPlan(toolCall);
+  return createRejectedToolCallPlan(
+    toolCall.invalid
+      ? `${toolCall.toolName} 输入无法解析或不符合 Schema。`
+      : `未知或尚不可执行的 Tool：${toolCall.toolName}`,
+  );
 }
 
-/** 创建无需预检和人工确认的只读 Tool 计划。 */
+/** 创建无需人工确认的只读 Tool 计划。 */
 function createReadOnlyToolCallPlan(
   toolCall: AssistantToolCallPart,
+  toolName: ReadOnlyToolName,
+  permissionMode: PermissionMode,
   workspace: ToolWorkspace,
 ): ToolCallPlan {
+  const policyDecision = decideToolPolicy({ permissionMode, toolName });
+  if (policyDecision.kind !== "allow") {
+    return createPolicyDeniedPlan(policyDecision);
+  }
   return Object.freeze({
+    scheduling: "parallel_read_only",
     abortedPreparationContent: "Tool 执行已停止。",
     prepare: () =>
       Promise.resolve(
@@ -115,9 +174,11 @@ function createReadOnlyToolCallPlan(
 /** 创建需要预检和人工确认的文件 Tool 计划。 */
 function createFileToolCallPlan(
   toolCall: AssistantToolCallPart,
+  permissionMode: PermissionMode,
   workspace: ToolWorkspace,
 ): ToolCallPlan {
   return Object.freeze({
+    scheduling: "source_order_serial",
     abortedPreparationContent: "Run 已停止，文件未写入。",
     async prepare() {
       const preparedResult = await prepareFileTool(toolCall, workspace);
@@ -125,15 +186,23 @@ function createFileToolCallPlan(
         return Object.freeze({ ok: false, result: preparedResult.result });
       }
       const preparedTool = preparedResult.preparedTool;
+      const policyDecision = decideToolPolicy({
+        permissionMode,
+        toolName: preparedTool.toolName,
+        externalFile: preparedTool.scope === "external",
+      });
+      if (policyDecision.kind !== "ask") {
+        return Object.freeze({ ok: false, result: policyResult(policyDecision) });
+      }
       return Object.freeze({
         ok: true,
         preparedExecution: Object.freeze({
-          approval: Object.freeze({
-            toolName: preparedTool.toolName,
-            target: preparedTool.target,
-            preview: preparedTool.preview,
-            deniedContent: `用户拒绝执行 ${preparedTool.toolName}。`,
-          }),
+          approval: createApprovalPlan(
+            preparedTool.toolName,
+            preparedTool.target,
+            preparedTool.preview,
+            policyDecision,
+          ),
           executionUnavailableContent: "Run 已停止，文件未写入。",
           async execute(abortSignal: AbortSignal) {
             try {
@@ -151,12 +220,14 @@ function createFileToolCallPlan(
   });
 }
 
-/** 创建需要预检和人工确认的命令 Tool 计划。 */
+/** 创建需要预检、分类和人工确认的命令 Tool 计划。 */
 function createCommandToolCallPlan(
   toolCall: AssistantToolCallPart,
+  permissionMode: PermissionMode,
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   return Object.freeze({
+    scheduling: "source_order_serial",
     abortedPreparationContent: "Run 已停止，命令未启动。",
     async prepare() {
       const preparedResult = await prepareCommandTool(toolCall, options.workspace, options.shell);
@@ -164,15 +235,26 @@ function createCommandToolCallPlan(
         return Object.freeze({ ok: false, result: preparedResult.result });
       }
       const preparedTool = preparedResult.preparedTool;
+      const policyDecision = decideToolPolicy({
+        permissionMode,
+        toolName: "execute_command",
+        command: preparedTool.command,
+      });
+      if (policyDecision.kind === "deny") {
+        return Object.freeze({ ok: false, result: policyResult(policyDecision) });
+      }
+      if (policyDecision.kind !== "ask") {
+        throw new Error("execute_command Policy 必须是 ask 或 deny。");
+      }
       return Object.freeze({
         ok: true,
         preparedExecution: Object.freeze({
-          approval: Object.freeze({
-            toolName: preparedTool.toolName,
-            target: preparedTool.target,
-            preview: preparedTool.preview,
-            deniedContent: "用户拒绝执行 execute_command。",
-          }),
+          approval: createApprovalPlan(
+            preparedTool.toolName,
+            preparedTool.target,
+            preparedTool.preview,
+            policyDecision,
+          ),
           executionUnavailableContent: "Run 已停止，命令未启动。",
           async execute(
             abortSignal: AbortSignal,
@@ -190,23 +272,53 @@ function createCommandToolCallPlan(
   });
 }
 
-/** 将未知 Tool 或无法解析的调用收敛为直接失败计划。 */
-function createRejectedToolCallPlan(toolCall: AssistantToolCallPart): ToolCallPlan {
+/** 创建 Permission 或 hard danger 的不可批准结果。 */
+function createPolicyDeniedPlan(policyDecision: ToolPolicyDecision): ToolCallPlan {
   return Object.freeze({
+    scheduling: "source_order_serial",
+    abortedPreparationContent: "Tool 未执行。",
+    prepare: () =>
+      Promise.resolve(Object.freeze({ ok: false, result: policyResult(policyDecision) })),
+  });
+}
+
+/** 创建无效输入或未知 Tool 的直接失败计划。 */
+function createRejectedToolCallPlan(content: string): ToolCallPlan {
+  return Object.freeze({
+    scheduling: "source_order_serial",
     abortedPreparationContent: "Tool 未执行。",
     prepare: () =>
       Promise.resolve(
         Object.freeze({
           ok: false,
-          result: Object.freeze({
-            status: "failed",
-            content: toolCall.invalid
-              ? `${toolCall.toolName} 输入无法解析或不符合 Schema。`
-              : `未知或尚不可执行的 Tool：${toolCall.toolName}`,
-            truncated: false,
-          }),
+          result: Object.freeze({ status: "failed", content, truncated: false }),
         }),
       ),
+  });
+}
+
+function createApprovalPlan(
+  toolName: ToolApprovalPlan["toolName"],
+  target: string,
+  preview: string,
+  policyDecision: ToolPolicyDecision,
+): ToolApprovalPlan {
+  return Object.freeze({
+    toolName,
+    target,
+    preview,
+    ruleId: policyDecision.ruleId,
+    riskSummary: policyDecision.riskSummary,
+    executionBoundary: policyDecision.executionBoundary,
+    deniedContent: `用户拒绝执行 ${toolName}。`,
+  });
+}
+
+function policyResult(policyDecision: ToolPolicyDecision): ImmediateToolResult {
+  return Object.freeze({
+    status: policyDecision.kind === "deny" ? "denied" : "failed",
+    content: `${policyDecision.riskSummary}（规则：${policyDecision.ruleId}）`,
+    truncated: false,
   });
 }
 

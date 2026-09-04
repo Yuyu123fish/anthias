@@ -1,5 +1,11 @@
 import { createInterface } from "node:readline";
-import type { Agent, AgentEvent, AssistantMessage, PromptResult } from "@anthias/agent";
+import type {
+  Agent,
+  AgentEvent,
+  AssistantMessage,
+  PermissionMode,
+  PromptResult,
+} from "@anthias/agent";
 
 /** 抽象 TUI 所需的最小 SIGINT 订阅行为。 */
 export type TuiSignalSource = Readonly<{
@@ -64,13 +70,19 @@ export function runTui({
     if (exitStarted) {
       return;
     }
-    if (line.trim() === "/exit") {
+    const trimmedLine = line.trim();
+    if (trimmedLine === "/exit") {
       await requestExit();
+      return;
+    }
+    if (trimmedLine === "/mode" || trimmedLine.startsWith("/mode ")) {
+      handleModeCommand(trimmedLine, agent, output);
+      writeInputPrompt(output);
       return;
     }
     const pendingApproval = agent.state.pendingToolApproval;
     if (pendingApproval !== null) {
-      const normalizedDecision = line.trim().toLocaleLowerCase("en-US");
+      const normalizedDecision = trimmedLine.toLocaleLowerCase("en-US");
       if (normalizedDecision === "y" || normalizedDecision === "yes") {
         agent.respondToToolApproval(pendingApproval.toolApprovalRequestId, "approve");
       } else if (
@@ -84,7 +96,7 @@ export function runTui({
       }
       return;
     }
-    if (line.trim().length === 0) {
+    if (trimmedLine.length === 0) {
       output.write("请输入非空提示词。\n");
       writeInputPrompt(output);
       return;
@@ -126,6 +138,9 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   switch (event.type) {
     case "run_start":
       return;
+    case "permission_mode_changed":
+      output.write(`Mode: ${renderPermissionMode(event.permissionMode)}\n`);
+      return;
     case "message_start":
       if (event.message.role === "user") {
         output.write(`You: ${event.message.content}\n`);
@@ -146,19 +161,24 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       }
       return;
     case "tool_execution_start":
-      output.write(`Tool: ${event.toolName} (${event.toolCallId})\n`);
+      output.write(`Tool: ${event.toolName} [${shortToolCallId(event.toolCallId)}] start\n`);
       return;
     case "tool_execution_update":
-      output.write(`[${event.stream}] ${event.delta}`);
+      output.write(
+        `[${event.toolName} ${shortToolCallId(event.toolCallId)} ${event.stream}] ${event.delta}`,
+      );
       return;
     case "tool_execution_end":
+      output.write(
+        `Tool: ${event.toolName} [${shortToolCallId(event.toolCallId)}] end ${event.result.status}\n`,
+      );
       if (event.cleanupUncertain) {
         output.write("警告：Tool 资源清理结果不确定。\n");
       }
       return;
     case "tool_approval_requested":
       output.write(
-        `需要确认：${event.request.toolName}\n目标：${event.request.target}\n${event.request.preview}\n允许执行？[y/N] `,
+        `需要确认：${event.request.toolName}\n权限模式：${renderPermissionMode(event.request.permissionMode)}\n目标：${event.request.target}\n风险：${event.request.riskSummary}\n执行边界：${event.request.executionBoundary}\n${event.request.preview}\n允许执行？[y/N] `,
       );
       return;
     case "tool_approval_resolved":
@@ -184,6 +204,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
 function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream): void {
   output.write(`Session: ${state.sessionId}\n`);
   output.write(`Workspace: ${state.workspaceRoot}\n`);
+  output.write(`Mode: ${renderPermissionMode(state.permissionMode)}\n`);
   for (const message of state.messageHistory) {
     if (message.role === "user") {
       output.write(`You: ${message.content}\n`);
@@ -193,6 +214,37 @@ function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream
       output.write(`ToolResult: ${message.toolName} ${message.status}\n${message.content}\n`);
     }
   }
+}
+
+/** 解析 TUI 自有模式命令，权限判断仍完全委托给 Agent。 */
+function handleModeCommand(command: string, agent: Agent, output: NodeJS.WritableStream): void {
+  const commandParts = command.split(/\s+/u);
+  if (commandParts.length === 1) {
+    output.write(`Mode: ${renderPermissionMode(agent.state.permissionMode)}\n`);
+    return;
+  }
+  const requestedMode = commandParts[1];
+  if (commandParts.length !== 2 || (requestedMode !== "agent" && requestedMode !== "plan")) {
+    output.write("用法：/mode、/mode agent 或 /mode plan。\n");
+    return;
+  }
+  const previousMode = agent.state.permissionMode;
+  const result = agent.setPermissionMode(requestedMode);
+  if (result.status === "rejected") {
+    output.write("当前 Run 正在进行，不能切换权限模式。\n");
+    return;
+  }
+  if (previousMode === result.permissionMode) {
+    output.write(`Mode: ${renderPermissionMode(result.permissionMode)}\n`);
+  }
+}
+
+function renderPermissionMode(permissionMode: PermissionMode): "Agent" | "Plan" {
+  return permissionMode === "agent" ? "Agent" : "Plan";
+}
+
+function shortToolCallId(toolCallId: string): string {
+  return toolCallId.slice(-8);
 }
 
 /** TUI 在呈现历史时按顺序投影 Assistant 文本，不持有第二份正文。 */

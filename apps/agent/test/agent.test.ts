@@ -72,6 +72,7 @@ describe("Agent", () => {
       lastError: null,
       sessionId: expect.any(String),
       workspaceRoot: expect.any(String),
+      permissionMode: "agent",
     });
     expect(events).toEqual([
       "run_start",

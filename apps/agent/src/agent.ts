@@ -12,8 +12,14 @@ import {
   streamAssistantMessage,
   toModelInputMessage,
 } from "./model-stream.js";
-import { FIXED_TOOL_DEFINITIONS } from "./tool/definitions.js";
-import type { PreparedToolExecution, ToolApprovalPlan, ToolRunner } from "./tool/tool-runner.js";
+import type { PermissionMode } from "./permission-mode.js";
+import type { ModelToolDefinition } from "./tool/definitions.js";
+import type {
+  PreparedToolExecution,
+  ToolApprovalPlan,
+  ToolCallPlan,
+  ToolRunner,
+} from "./tool/tool-runner.js";
 
 /** 枚举 Agent Loop 当前正在推进的活动阶段。 */
 export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
@@ -74,6 +80,8 @@ export type RunAgentLoopOptions = Readonly<{
   messages: readonly Message[];
   modelStream: ModelStream;
   systemPrompt: string;
+  toolDefinitions: readonly ModelToolDefinition[];
+  permissionMode: PermissionMode;
   toolRunner: ToolRunner;
   abortController: AbortController;
   emit(event: AgentLoopEvent): Promise<void>;
@@ -90,9 +98,35 @@ type AssistantRequestResult = Readonly<{
   finishReason: ModelFinishReason | null;
 }>;
 
+/** 保存批次中一个 ToolCall 的源位置和一次性执行计划。 */
+type PlannedToolCall = Readonly<{
+  sourceIndex: number;
+  toolCall: AssistantToolCallPart;
+  plan: ToolCallPlan;
+}>;
+
+/** 保存尚未提交到 Session 的一个完整 Tool 结果。 */
+type ToolOutcome = Readonly<{
+  sourceIndex: number;
+  message: ToolResultMessage;
+}>;
+
+/** 表示 Tool 预检已返回、失败，或因 Run 停止而不再等待。 */
+type ToolPreparationWaitResult =
+  | Readonly<{ status: "prepared"; preparation: Awaited<ReturnType<ToolCallPlan["prepare"]>> }>
+  | Readonly<{ status: "failed" }>
+  | Readonly<{ status: "aborted" }>;
+
+/** 协调并发调用按源顺序发布 execution start。 */
+type SourceOrderStartGate = Readonly<{
+  waitForTurn(sourceIndex: number): Promise<void>;
+  completeTurn(sourceIndex: number): void;
+}>;
+
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const MODEL_REQUEST_LIMIT = 12;
 const TOOL_CALL_BATCH_LIMIT = 32;
+const READ_ONLY_TOOL_CONCURRENCY_LIMIT = 4;
 const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
 const ABORTED_LOOP_RESULT = Object.freeze({ status: "aborted" } as const);
 const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
@@ -156,16 +190,37 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       return TOOL_CALL_BATCH_LIMIT_RESULT;
     }
 
-    // 执行工具调用
-    for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
-      const toolCall = toolCalls[toolIndex];
-      if (toolCall === undefined) {
+    const plannedToolCalls = toolCalls.map((toolCall, sourceIndex) =>
+      Object.freeze({
+        sourceIndex,
+        toolCall,
+        plan: options.toolRunner.createPlan(toolCall, options.permissionMode),
+      }),
+    );
+    const parallelReadOnlyBatch = plannedToolCalls.every(
+      ({ plan }) => plan.scheduling === "parallel_read_only",
+    );
+    if (parallelReadOnlyBatch) {
+      const outcomes = await executeParallelReadOnlyBatch(plannedToolCalls, options);
+      for (const outcome of outcomes) {
+        await appendToolOutcome(outcome, messageHistory, options);
+      }
+      if (options.abortController.signal.aborted) {
+        return ABORTED_LOOP_RESULT;
+      }
+      continue;
+    }
+
+    for (let toolIndex = 0; toolIndex < plannedToolCalls.length; toolIndex += 1) {
+      const plannedToolCall = plannedToolCalls[toolIndex];
+      if (plannedToolCall === undefined) {
         throw new Error("ToolCall 顺序状态缺失。");
       }
-      await processToolCall(toolCall, messageHistory, options);
+      const outcome = await formToolOutcome(plannedToolCall, options, null);
+      await appendToolOutcome(outcome, messageHistory, options);
       if (options.abortController.signal.aborted) {
         await appendToolResults(
-          toolCalls.slice(toolIndex + 1),
+          plannedToolCalls.slice(toolIndex + 1).map(({ toolCall }) => toolCall),
           "aborted",
           "Run 已停止，调用未执行。",
           messageHistory,
@@ -188,7 +243,7 @@ async function streamAssistantResponse(
   const modelRequest: ModelRequest = Object.freeze({
     systemPrompt: options.systemPrompt,
     messages: Object.freeze(messageHistory.map(toModelInputMessage)),
-    tools: FIXED_TOOL_DEFINITIONS,
+    tools: options.toolDefinitions,
   });
 
   // 异步遍历可迭代模型响应
@@ -225,89 +280,147 @@ async function streamAssistantResponse(
   return Object.freeze({ message: finalMessage, finishReason });
 }
 
-/** 通过统一 Tool Module 预检并处理一个 ToolCall。 */
-async function processToolCall(
-  toolCall: AssistantToolCallPart,
-  messageHistory: Message[],
+/** 使用固定 worker 数执行纯只读批次，并为未领取调用补齐 aborted outcome。 */
+async function executeParallelReadOnlyBatch(
+  plannedToolCalls: readonly PlannedToolCall[],
   options: RunAgentLoopOptions,
-): Promise<void> {
-  const toolCallPlan = options.toolRunner.createPlan(toolCall);
-  options.updatePhase("executing_tool");
-  const preparation = await toolCallPlan.prepare();
-  if (options.abortController.signal.aborted) {
-    await appendToolResult(
-      toolCall,
-      {
-        status: "aborted",
-        content: toolCallPlan.abortedPreparationContent,
-        truncated: false,
-      },
-      messageHistory,
-      options,
+): Promise<readonly ToolOutcome[]> {
+  const outcomes: Array<ToolOutcome | undefined> = Array.from({
+    length: plannedToolCalls.length,
+  });
+  const startGate = createSourceOrderStartGate(plannedToolCalls.length);
+  let nextSourceIndex = 0;
+
+  /** 单个 worker 每次只领取下一个递增索引，abort 后不再领取。 */
+  async function runWorker(): Promise<void> {
+    while (!options.abortController.signal.aborted) {
+      const sourceIndex = nextSourceIndex;
+      if (sourceIndex >= plannedToolCalls.length) {
+        return;
+      }
+      nextSourceIndex += 1;
+      const plannedToolCall = plannedToolCalls[sourceIndex];
+      if (plannedToolCall === undefined) {
+        throw new Error("ToolCall 并发队列状态缺失。");
+      }
+      outcomes[sourceIndex] = await formToolOutcome(plannedToolCall, options, startGate);
+    }
+  }
+
+  const workerCount = Math.min(READ_ONLY_TOOL_CONCURRENCY_LIMIT, plannedToolCalls.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  for (const plannedToolCall of plannedToolCalls) {
+    outcomes[plannedToolCall.sourceIndex] ??= createAbortedOutcome(
+      plannedToolCall,
+      "Run 已停止，调用未执行。",
     );
-    return;
+  }
+  return Object.freeze(
+    outcomes.map((outcome) => {
+      if (outcome === undefined) {
+        throw new Error("ToolCall outcome 缺失。");
+      }
+      return outcome;
+    }),
+  );
+}
+
+/** 通过统一 Tool Module 预检、确认并形成一个尚未提交的 outcome。 */
+async function formToolOutcome(
+  plannedToolCall: PlannedToolCall,
+  options: RunAgentLoopOptions,
+  startGate: SourceOrderStartGate | null,
+): Promise<ToolOutcome> {
+  const { plan } = plannedToolCall;
+  options.updatePhase("executing_tool");
+  const preparationWaitResult = await waitForPreparationOrAbort(
+    plan,
+    options.abortController.signal,
+  );
+  if (preparationWaitResult.status === "aborted") {
+    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
+    return createAbortedOutcome(plannedToolCall, plan.abortedPreparationContent);
+  }
+  if (preparationWaitResult.status === "failed") {
+    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
+    return createOutcome(plannedToolCall, {
+      status: "failed",
+      content: "Tool 预检失败。",
+      truncated: false,
+    });
+  }
+  const { preparation } = preparationWaitResult;
+  if (options.abortController.signal.aborted) {
+    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
+    return createAbortedOutcome(plannedToolCall, plan.abortedPreparationContent);
   }
 
   if (!preparation.ok) {
-    await appendToolResult(toolCall, preparation.result, messageHistory, options);
-    return;
+    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
+    return createOutcome(plannedToolCall, preparation.result);
   }
-  await executePreparedToolCall(toolCall, preparation.preparedExecution, messageHistory, options);
+  return executePreparedToolCall(
+    plannedToolCall,
+    preparation.preparedExecution,
+    options,
+    startGate,
+  );
 }
 
-/** 协调一个已预检 Tool 的确认、执行、输出与结果顺序。 */
+/** 协调一个已预检 Tool 的确认、执行和事件，结果由调用方串行提交。 */
 async function executePreparedToolCall(
-  toolCall: AssistantToolCallPart,
+  plannedToolCall: PlannedToolCall,
   preparedExecution: PreparedToolExecution,
-  messageHistory: Message[],
   options: RunAgentLoopOptions,
-): Promise<void> {
+  startGate: SourceOrderStartGate | null,
+): Promise<ToolOutcome> {
+  const { toolCall, sourceIndex } = plannedToolCall;
   let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
+    if (startGate !== null) {
+      await skipExecutionStart(sourceIndex, startGate);
+      return createOutcome(plannedToolCall, {
+        status: "failed",
+        content: "只读并发计划不能请求副作用确认。",
+        truncated: false,
+      });
+    }
     // 需要人工确认的 ToolCall，切换到等待人工确认阶段
     options.updatePhase("awaiting_tool_approval");
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
     toolApprovalRequestId = approval.toolApprovalRequestId;
     if (approval.decision !== "approve" || options.abortController.signal.aborted) {
-      // 如果人工确认被拒绝或被 abort，则写入 aborted 的 ToolResult
-      await appendToolResult(
-        toolCall,
-        {
-          status: approval.decision === "deny" ? "denied" : "aborted",
-          content:
-            approval.decision === "deny"
-              ? approvalPlan.deniedContent
-              : preparedExecution.executionUnavailableContent,
-          truncated: false,
-        },
-        messageHistory,
-        options,
-      );
-      return;
+      return createOutcome(plannedToolCall, {
+        status: approval.decision === "deny" ? "denied" : "aborted",
+        content:
+          approval.decision === "deny"
+            ? approvalPlan.deniedContent
+            : preparedExecution.executionUnavailableContent,
+        truncated: false,
+      });
     }
   }
 
   if (options.abortController.signal.aborted) {
-    await appendToolResult(
-      toolCall,
-      {
-        status: "aborted",
-        content: preparedExecution.executionUnavailableContent,
-        truncated: false,
-      },
-      messageHistory,
-      options,
-    );
-    return;
+    await skipExecutionStart(sourceIndex, startGate);
+    return createAbortedOutcome(plannedToolCall, preparedExecution.executionUnavailableContent);
   }
 
   options.updatePhase("executing_tool");
-  // 开始执行 ToolCall
-  await options.emit({ type: "tool_execution_start", toolCall, toolApprovalRequestId });
-  const executionResult = await preparedExecution.execute(
-    options.abortController.signal,
-    (update) => {
+  const executionStarted = await publishExecutionStart(
+    plannedToolCall,
+    toolApprovalRequestId,
+    options,
+    startGate,
+  );
+  if (!executionStarted) {
+    return createAbortedOutcome(plannedToolCall, preparedExecution.executionUnavailableContent);
+  }
+
+  let executionResult: Awaited<ReturnType<PreparedToolExecution["execute"]>>;
+  try {
+    executionResult = await preparedExecution.execute(options.abortController.signal, (update) => {
       if (!options.abortController.signal.aborted) {
         void options.emit({
           type: "tool_execution_update",
@@ -317,29 +430,99 @@ async function executePreparedToolCall(
           delta: update.delta,
         });
       }
-    },
-  );
+    });
+  } catch {
+    executionResult = Object.freeze({
+      status: "failed",
+      content: "Tool 执行失败。",
+      truncated: false,
+      cleanupUncertain: true,
+    });
+  }
 
-  const resultMessage = await appendToolResult(
-    toolCall,
-    {
-      status: options.abortController.signal.aborted ? "aborted" : executionResult.status,
-      content: executionResult.content,
-      truncated: executionResult.truncated,
-    },
-    messageHistory,
-    options,
-  );
+  const outcome = createOutcome(plannedToolCall, {
+    status:
+      executionResult.status === "completed"
+        ? "completed"
+        : options.abortController.signal.aborted
+          ? "aborted"
+          : "failed",
+    content: executionResult.content,
+    truncated: executionResult.truncated,
+  });
   await options.emit({
     type: "tool_execution_end",
     toolCallId: toolCall.toolCallId,
     toolName: toolCall.toolName,
-    result: resultMessage,
+    result: outcome.message,
     cleanupUncertain: executionResult.cleanupUncertain,
+  });
+  return outcome;
+}
+
+/** abort 后立即结束对无副作用预检的等待，迟到的预检结果不会进入执行。 */
+function waitForPreparationOrAbort(
+  plan: ToolCallPlan,
+  abortSignal: AbortSignal,
+): Promise<ToolPreparationWaitResult> {
+  if (abortSignal.aborted) {
+    return Promise.resolve(Object.freeze({ status: "aborted" }));
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: ToolPreparationWaitResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      abortSignal.removeEventListener("abort", handleAbort);
+      resolve(result);
+    };
+    const handleAbort = () => finish(Object.freeze({ status: "aborted" }));
+    abortSignal.addEventListener("abort", handleAbort, { once: true });
+    if (abortSignal.aborted) {
+      handleAbort();
+      return;
+    }
+    void Promise.resolve()
+      .then(() => plan.prepare())
+      .then(
+        (preparation) => finish(Object.freeze({ status: "prepared", preparation })),
+        () => finish(Object.freeze({ status: "failed" })),
+      );
   });
 }
 
-/** 形成并交付一条 ToolResultMessage，再把它加入下一轮模型上下文。 */
+/** 按源位置创建一条尚未持久化的 ToolResultMessage。 */
+function createOutcome(
+  plannedToolCall: PlannedToolCall,
+  result: Readonly<{
+    status: ToolResultMessage["status"];
+    content: string;
+    truncated: boolean;
+  }>,
+): ToolOutcome {
+  return Object.freeze({
+    sourceIndex: plannedToolCall.sourceIndex,
+    message: createToolResultMessage(plannedToolCall.toolCall, result),
+  });
+}
+
+function createAbortedOutcome(plannedToolCall: PlannedToolCall, content: string): ToolOutcome {
+  return createOutcome(plannedToolCall, { status: "aborted", content, truncated: false });
+}
+
+/** 串行提交已经形成的 outcome，再把它加入下一轮模型上下文。 */
+async function appendToolOutcome(
+  outcome: ToolOutcome,
+  messageHistory: Message[],
+  options: RunAgentLoopOptions,
+): Promise<void> {
+  await options.emit({ type: "tool_result", message: outcome.message });
+  messageHistory.push(outcome.message);
+}
+
+/** 形成并立即交付一条 ToolResultMessage。 */
 async function appendToolResult(
   toolCall: AssistantToolCallPart,
   result: Readonly<{
@@ -350,7 +533,24 @@ async function appendToolResult(
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<ToolResultMessage> {
-  const resultMessage: ToolResultMessage = Object.freeze({
+  const resultMessage = createToolResultMessage(toolCall, result);
+  await appendToolOutcome(
+    Object.freeze({ sourceIndex: 0, message: resultMessage }),
+    messageHistory,
+    options,
+  );
+  return resultMessage;
+}
+
+function createToolResultMessage(
+  toolCall: AssistantToolCallPart,
+  result: Readonly<{
+    status: ToolResultMessage["status"];
+    content: string;
+    truncated: boolean;
+  }>,
+): ToolResultMessage {
+  return Object.freeze({
     role: "tool",
     toolCallId: toolCall.toolCallId,
     toolName: toolCall.toolName,
@@ -358,9 +558,57 @@ async function appendToolResult(
     content: result.content,
     truncated: result.truncated,
   });
-  await options.emit({ type: "tool_result", message: resultMessage });
-  messageHistory.push(resultMessage);
-  return resultMessage;
+}
+
+/** 建立一组只在前一个索引完成 start 决策后开放的有界 gate。 */
+function createSourceOrderStartGate(toolCallCount: number): SourceOrderStartGate {
+  const turns = Array.from({ length: toolCallCount }, () => Promise.withResolvers<void>());
+  turns[0]?.resolve();
+  return Object.freeze({
+    async waitForTurn(sourceIndex) {
+      await turns[sourceIndex]?.promise;
+    },
+    completeTurn(sourceIndex) {
+      turns[sourceIndex + 1]?.resolve();
+    },
+  });
+}
+
+/** 对不执行的调用也按源顺序释放后续 start gate。 */
+async function skipExecutionStart(
+  sourceIndex: number,
+  startGate: SourceOrderStartGate | null,
+): Promise<void> {
+  if (startGate === null) {
+    return;
+  }
+  await startGate.waitForTurn(sourceIndex);
+  startGate.completeTurn(sourceIndex);
+}
+
+/** 在 gate 内按源顺序发布 start，并在 abort 时只释放后续调用。 */
+async function publishExecutionStart(
+  plannedToolCall: PlannedToolCall,
+  toolApprovalRequestId: string | null,
+  options: RunAgentLoopOptions,
+  startGate: SourceOrderStartGate | null,
+): Promise<boolean> {
+  if (startGate !== null) {
+    await startGate.waitForTurn(plannedToolCall.sourceIndex);
+  }
+  try {
+    if (options.abortController.signal.aborted) {
+      return false;
+    }
+    await options.emit({
+      type: "tool_execution_start",
+      toolCall: plannedToolCall.toolCall,
+      toolApprovalRequestId,
+    });
+    return true;
+  } finally {
+    startGate?.completeTurn(plannedToolCall.sourceIndex);
+  }
 }
 
 /** 按模型给出的顺序为一组未执行 ToolCall 补齐结果。 */

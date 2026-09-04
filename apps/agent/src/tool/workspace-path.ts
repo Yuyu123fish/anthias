@@ -17,13 +17,11 @@ export type ResolvedWorkspacePath = Readonly<{
 export async function resolveExistingWorkspacePath(
   requestedPath: string,
   workspace: ToolWorkspace,
-  allowSessionDirectory = false,
 ): Promise<ResolvedWorkspacePath> {
   validateWorkspaceRelativePath(requestedPath, "Tool path");
   return resolveExistingAbsoluteWorkspacePath(
     resolve(workspace.workspaceRoot, requestedPath),
     workspace,
-    allowSessionDirectory,
   );
 }
 
@@ -31,13 +29,12 @@ export async function resolveExistingWorkspacePath(
 export async function resolveExistingAbsoluteWorkspacePath(
   candidatePath: string,
   workspace: ToolWorkspace,
-  allowSessionDirectory = false,
 ): Promise<ResolvedWorkspacePath> {
   const actualPath = await realpath(candidatePath);
   if (!isPathSameOrInside(workspace.workspaceRoot, actualPath)) {
     throw new Error("Tool path 越出工作区。");
   }
-  if (!allowSessionDirectory && isPathSameOrInside(workspace.sessionDirectory, actualPath)) {
+  if (isPathSameOrInside(workspace.sessionDirectory, actualPath)) {
     throw new Error("Tool path 命中 Session 保留目录。");
   }
   return Object.freeze({
@@ -60,11 +57,29 @@ export function validateWorkspaceRelativePath(requestedPath: string, label: stri
 
 /** 使用平台路径语义判断目标是否等于或位于父目录内。 */
 export function isPathSameOrInside(parentPath: string, targetPath: string): boolean {
-  const relativePath = relative(parentPath, targetPath);
-  return relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..");
+  const normalizedParentPath = normalizePathForComparison(parentPath);
+  const normalizedTargetPath = normalizePathForComparison(targetPath);
+  const relativePath = relative(normalizedParentPath, normalizedTargetPath);
+  return (
+    relativePath === "" ||
+    (!isAbsolute(relativePath) &&
+      !win32.isAbsolute(relativePath) &&
+      !relativePath.startsWith(`..${sep}`) &&
+      relativePath !== "..")
+  );
+}
+
+/** 按当前平台的大小写语义判断两个绝对路径是否表示同一位置。 */
+export function arePathsEqual(leftPath: string, rightPath: string): boolean {
+  return normalizePathForComparison(leftPath) === normalizePathForComparison(rightPath);
 }
 
 /** 把平台分隔符统一为模型可复用的正斜杠相对路径。 */
 export function normalizeWorkspaceRelativePath(filePath: string): string {
   return filePath.replaceAll("\\", "/");
+}
+
+function normalizePathForComparison(filePath: string): string {
+  const normalizedPath = resolve(filePath);
+  return process.platform === "win32" ? normalizedPath.toLocaleLowerCase("en-US") : normalizedPath;
 }

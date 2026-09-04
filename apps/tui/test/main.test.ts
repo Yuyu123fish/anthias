@@ -42,6 +42,7 @@ describe("Anthias CLI", () => {
       throw new Error("expected CLI to print the created Session UUID");
     }
     expect(firstProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
+    expect(firstProcessResult.stdout).toContain("Mode: Agent\n");
     expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
     const sessionHeader = JSON.parse(
       (await readFile(join(sessionDirectory, `${sessionId}.jsonl`), "utf8")).trimEnd(),
@@ -64,6 +65,7 @@ describe("Anthias CLI", () => {
     expect(reopenedProcessResult.stderr).toBe("");
     expect(reopenedProcessResult.stdout).toContain(`Session: ${sessionId}\n`);
     expect(reopenedProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
+    expect(reopenedProcessResult.stdout).toContain("Mode: Agent\n");
     expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
   });
 
@@ -92,6 +94,26 @@ describe("Anthias CLI", () => {
 
     expect(processResult.status).toBe(1);
     expect(processResult.stderr).toContain("命令行参数无效");
+  });
+
+  it("accepts Plan mode and rejects an unknown mode before startup", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
+    const sessionDirectory = join(workspaceRoot, "sessions");
+    const environment = {
+      ...process.env,
+      ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
+      ANTHIAS_MODEL_ID: "model-id",
+      ANTHIAS_MODEL_API_KEY: "local-key",
+      ANTHIAS_SESSION_DIR: sessionDirectory,
+    };
+
+    const planResult = spawnCli(["--mode", "plan"], environment, workspaceRoot, "/exit\n");
+    expect(planResult.status).toBe(0);
+    expect(planResult.stdout).toContain("Mode: Plan\n");
+
+    const invalidResult = spawnCli(["--mode", "unsafe"], environment, workspaceRoot);
+    expect(invalidResult.status).toBe(1);
+    expect(invalidResult.stderr).toContain("--mode <agent|plan>");
   });
 
   it("rejects an invalid --session UUID without a model request", async () => {

@@ -25,8 +25,17 @@ import {
 
 /** 表示只读 Tool 已完成运行时校验后的固定输入。 */
 type ReadOnlyToolInput =
-  | Readonly<{ toolName: "read_file"; path: string; startLine: number; lineCount: number }>
-  | Readonly<{ toolName: "glob"; pattern: string; path: string }>
+  | Readonly<{
+      toolName: "read_file";
+      path: string;
+      startLine: number;
+      lineCount: number;
+    }>
+  | Readonly<{
+      toolName: "glob";
+      pattern: string;
+      path: string;
+    }>
   | Readonly<{
       toolName: "grep";
       pattern: string;
@@ -43,6 +52,12 @@ type DiscoveredFiles = Readonly<{
 
 const FILE_DISCOVERY_LIMIT = 10000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+/** 只检查只读 Tool 的运行时输入形状，不访问文件系统。 */
+export function validateReadOnlyToolCallInput(toolCall: AssistantToolCallPart): string | null {
+  const inputResult = parseReadOnlyToolInput(toolCall);
+  return inputResult.ok ? null : inputResult.error;
+}
 
 /** 自动执行一个已形成的只读 ToolCall，并把预期失败收敛为 ToolResult。 */
 export async function executeReadOnlyTool(

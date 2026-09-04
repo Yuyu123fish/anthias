@@ -11,13 +11,25 @@ import {
 } from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
-const originalApiKey = process.env.ANTHIAS_MODEL_API_KEY;
+const sensitiveEnvironmentNames = [
+  "ANTHIAS_MODEL_API_KEY",
+  "ANTHIAS_TEST_SECRET",
+  "GITHUB_TOKEN",
+  "NODE_OPTIONS",
+  "HTTPS_PROXY",
+] as const;
+const originalSensitiveEnvironment = new Map(
+  sensitiveEnvironmentNames.map((name) => [name, process.env[name]] as const),
+);
 
 afterEach(async () => {
-  if (originalApiKey === undefined) {
-    delete process.env.ANTHIAS_MODEL_API_KEY;
-  } else {
-    process.env.ANTHIAS_MODEL_API_KEY = originalApiKey;
+  for (const name of sensitiveEnvironmentNames) {
+    const originalValue = originalSensitiveEnvironment.get(name);
+    if (originalValue === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = originalValue;
+    }
   }
   await Promise.all(
     [...temporaryDirectories].map((directory) => rm(directory, { recursive: true, force: true })),
@@ -26,18 +38,20 @@ afterEach(async () => {
 });
 
 describe("execute_command Agent Tool Loop", () => {
-  it("waits for approval, removes the model API key, and persists execution order", async () => {
+  it("waits for approval, uses an environment allowlist, and persists execution order", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-tool-"));
     temporaryDirectories.add(workspaceRoot);
-    process.env.ANTHIAS_MODEL_API_KEY = "fake-command-secret";
+    for (const name of sensitiveEnvironmentNames) {
+      process.env[name] = `fake-${name.toLocaleLowerCase("en-US")}`;
+    }
     const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
     const shell = await resolveSessionShell(process.env);
     const session = await createSession({ workspaceRoot, sessionDirectory, shell });
     const modelRequests: ModelRequest[] = [];
     const command =
       shell.kind === "powershell"
-        ? "$present=[bool]$env:ANTHIAS_MODEL_API_KEY; Set-Content -LiteralPath 'command-ran.txt' -Value 'ran'; Write-Output \"key=$present\"; [Console]::Error.WriteLine('stderr')"
-        : `present=\${ANTHIAS_MODEL_API_KEY:+true}; printf 'ran\\n' > command-ran.txt; printf 'key=%s\\n' "\${present:-false}"; printf 'stderr\\n' >&2`;
+        ? "$names=@('ANTHIAS_MODEL_API_KEY','ANTHIAS_TEST_SECRET','GITHUB_TOKEN','NODE_OPTIONS','HTTPS_PROXY'); foreach($name in $names){ $present=[bool][Environment]::GetEnvironmentVariable($name); Write-Output \"$name=$present\" }; Set-Content -LiteralPath 'command-ran.txt' -Value 'ran'; [Console]::Error.WriteLine('stderr')"
+        : `for name in ANTHIAS_MODEL_API_KEY ANTHIAS_TEST_SECRET GITHUB_TOKEN NODE_OPTIONS HTTPS_PROXY; do if printenv "\${name}" >/dev/null; then present=true; else present=false; fi; printf '%s=%s\\n' "\${name}" "\${present}"; done; printf 'ran\\n' > command-ran.txt; printf 'stderr\\n' >&2`;
     const modelStream: ModelStream = async function* (modelRequest) {
       modelRequests.push(modelRequest);
       if (modelRequests.length === 1) {
@@ -74,6 +88,9 @@ describe("execute_command Agent Tool Loop", () => {
     expect(approvalRequest.preview).toContain("cwd: .");
     expect(approvalRequest.preview).toContain("timeoutMs: 10000");
     expect(approvalRequest.preview).toContain(`command:\n${command}`);
+    expect(approvalRequest.permissionMode).toBe("agent");
+    expect(approvalRequest.riskSummary).toContain("当前用户权限");
+    expect(approvalRequest.executionBoundary).toContain("无 OS 沙箱");
 
     expect(agent.respondToToolApproval(approvalRequest.toolApprovalRequestId, "approve")).toEqual({
       status: "accepted",
@@ -82,8 +99,10 @@ describe("execute_command Agent Tool Loop", () => {
 
     expect(await readFile(join(workspaceRoot, "command-ran.txt"), "utf8")).toContain("ran");
     const serializedEvidence = JSON.stringify({ events, state: agent.state });
-    expect(serializedEvidence).not.toContain("fake-command-secret");
-    expect(serializedEvidence).toMatch(/key=(False|false)/u);
+    for (const name of sensitiveEnvironmentNames) {
+      expect(serializedEvidence).not.toContain(`fake-${name.toLocaleLowerCase("en-US")}`);
+      expect(serializedEvidence).toMatch(new RegExp(`${name}=(False|false)`, "u"));
+    }
     expect(serializedEvidence).toContain("stderr");
     expect(modelRequests[1]?.messages.at(-1)).toMatchObject({
       role: "tool",

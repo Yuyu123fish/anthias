@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { readModelConfig } from "./model-config.js";
 import { createOpenAICompatibleModelStream } from "./openai-compatible-model.js";
+import type { PermissionMode } from "./permission-mode.js";
 import { type Agent, createAgentWithModelStream } from "./run.js";
 import {
   createSession,
@@ -27,6 +28,8 @@ export type {
   AgentListener,
   AgentState,
   FinishedPromptResult,
+  PermissionMode,
+  PermissionModeChangeResult,
   PromptResult,
   ToolApprovalRequest,
   ToolApprovalResponse,
@@ -42,6 +45,7 @@ export type CreateAgentFromEnvironmentOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   workspaceRoot?: string;
   sessionId?: string;
+  permissionMode?: PermissionMode | undefined;
 }>;
 
 const SAFE_SESSION_STARTUP_ERROR =
@@ -52,6 +56,7 @@ export async function createAgentFromEnvironment({
   environment = process.env,
   workspaceRoot = process.cwd(),
   sessionId,
+  permissionMode,
 }: CreateAgentFromEnvironmentOptions = {}): Promise<AgentCreationResult> {
   const modelConfigResult = readModelConfig(environment);
   if (!modelConfigResult.ok) {
@@ -77,6 +82,7 @@ export async function createAgentFromEnvironment({
       agent: createAgentWithModelStream({
         modelStream: createOpenAICompatibleModelStream(modelConfigResult.config),
         session,
+        permissionMode,
       }),
     });
   } catch {

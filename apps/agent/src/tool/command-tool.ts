@@ -15,6 +15,7 @@ import {
   TOOL_RESULT_BYTE_LIMIT,
   TOOL_RESULT_LINE_LIMIT,
   type ToolExecutionResult,
+  type ToolFailedResult,
 } from "./tool-result.js";
 import { resolveExistingWorkspacePath, type ToolWorkspace } from "./workspace-path.js";
 
@@ -32,7 +33,7 @@ export type PreparedCommandTool = Readonly<{
 /** 表示命令预检成功，或无需确认即可返回模型的安全失败。 */
 export type PreparedCommandResult =
   | Readonly<{ ok: true; preparedTool: PreparedCommandTool }>
-  | Readonly<{ ok: false; result: ToolExecutionResult }>;
+  | Readonly<{ ok: false; result: ToolFailedResult }>;
 
 /** 描述一次命令执行期间可公开的有界输出增量。 */
 export type CommandExecutionUpdate = Readonly<{
@@ -74,6 +75,12 @@ const PROCESS_TREE_SHUTDOWN_GRACE_MILLISECONDS = 2_000;
 const PROCESS_TREE_SIGNAL_GRACE_MILLISECONDS = 750;
 const PROCESS_TREE_POLL_MILLISECONDS = 25;
 
+/** 只检查 command Tool 的运行时输入形状，不解析路径或启动进程。 */
+export function validateCommandToolCallInput(toolCall: AssistantToolCallPart): string | null {
+  const inputResult = parseCommandInput(toolCall);
+  return inputResult.ok ? null : inputResult.error;
+}
+
 /** 无副作用地校验并形成每次 execute_command 确认所需的完整预览。 */
 export async function prepareCommandTool(
   toolCall: AssistantToolCallPart,
@@ -86,7 +93,7 @@ export async function prepareCommandTool(
   }
 
   try {
-    const resolvedCwd = await resolveExistingWorkspacePath(inputResult.input.cwd, workspace, true);
+    const resolvedCwd = await resolveExistingWorkspacePath(inputResult.input.cwd, workspace);
     if (!(await stat(resolvedCwd.absolutePath)).isDirectory()) {
       return failedPreparation("execute_command cwd 不是目录。");
     }
@@ -452,10 +459,29 @@ function forceTerminateProcessTree(childProcess: ReturnType<typeof spawn>): void
   }
 }
 
-/** 从子进程环境中大小写不敏感地移除 Anthias 模型凭据。 */
+/** 从宿主环境的明确允许列表构造命令环境，避免隐式继承凭据和注入配置。 */
 function createSanitizedEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowedNames =
+    process.platform === "win32"
+      ? [
+          "PATH",
+          "PATHEXT",
+          "SYSTEMROOT",
+          "WINDIR",
+          "COMSPEC",
+          "SYSTEMDRIVE",
+          "TEMP",
+          "TMP",
+          "OS",
+          "PROCESSOR_ARCHITECTURE",
+          "NUMBER_OF_PROCESSORS",
+        ]
+      : ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+  const allowedNameSet = new Set(allowedNames.map((name) => name.toLocaleLowerCase("en-US")));
   return Object.fromEntries(
-    Object.entries(environment).filter(([name]) => name.toLowerCase() !== "anthias_model_api_key"),
+    Object.entries(environment).filter(
+      ([name, value]) => value !== undefined && allowedNameSet.has(name.toLocaleLowerCase("en-US")),
+    ),
   );
 }
 
@@ -484,7 +510,8 @@ function failedPreparation(error: string): PreparedCommandResult {
 /** 收敛路径和系统错误，避免绝对路径或堆栈进入消息。 */
 function toSafeCommandError(error: unknown): string {
   const errorCode = (error as NodeJS.ErrnoException | undefined)?.code;
-  return typeof errorCode === "string"
-    ? `execute_command 预检失败：${errorCode}`
-    : "execute_command 预检失败。";
+  if (typeof errorCode === "string") {
+    return `execute_command 预检失败：${errorCode}`;
+  }
+  return error instanceof Error ? error.message : "execute_command 预检失败。";
 }
