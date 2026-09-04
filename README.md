@@ -39,4 +39,4 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 - [技术基线](docs/technical-baseline.md)：当前 TypeScript、Agent、TUI、事件和模型方向。
 - [开发流程](docs/development-workflow.md)：讨论、Spec、Plan、实施与验收的协作方式。
 - [Feature 文档约定](specs/README.md)：编号 Feature 的目录、文档结构和状态。
-- [Research](research/README.md)：调查规则和历史研究归档。
+- [Research](research/README.md)：项目级或跨 Feature 的调查规则和历史归档；Feature 专属 Research 见对应 Feature 目录。

@@ -1,8 +1,8 @@
 # Research
 
-`research/` 保存为产品或技术决定提供证据的限时调查。Research 用来回答明确问题，不是产品定义、Feature、Plan 或实施授权。
+`research/` 只保存为项目级或跨 Feature 决定提供证据的限时调查。属于某个编号 Feature 的 Research 必须放在对应的 `specs/featurexxx-xxxxx/` 目录；具体命名见 [Feature 文档约定](../specs/README.md)。Research 用来回答明确问题，不是产品定义、Feature、Plan 或实施授权。
 
-当前没有进行中的 Research。
+当前没有进行中的项目级或跨 Feature Research。
 
 ## 目录约定
 
@@ -32,7 +32,7 @@ research/archive/YYYY-MM-DD-topic/
 - 无法证明或需要后续验证的部分；
 - 调查结果将影响哪一项产品或技术决定。
 
-研究结论需要回到稳定文档或对应 Feature 才能成为当前决定。归档材料只用于追溯当时的来源、推理和取舍。
+研究结论需要回到稳定文档或对应 Feature 的 Spec 才能成为当前决定。归档材料只用于追溯当时的来源、推理和取舍。
 
 ## 已归档
 

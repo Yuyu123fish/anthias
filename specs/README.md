@@ -7,6 +7,7 @@
 ```text
 specs/
   featurexxx-xxxxx/
+    research.md  # 可选
     spec.md
     tasks.md
     plan.md
@@ -16,6 +17,7 @@ specs/
 
 - Feature 目录直接放在 `specs/` 下，不增加 `features/` 中间层。
 - `featurexxx-xxxxx` 中的 `xxx` 从 `001` 开始，使用三位序号；`xxxxx` 使用稳定的小写英文短名和连字符。
+- 属于某个编号 Feature 的 Research 必须放在该 Feature 目录。一个主题默认使用 `research.md`；确有多个相互独立的调查时使用 `research-xxxxx.md`，不放回根 `research/`。
 - 中小型 Feature 只维护一个 `spec.md`、一个 `tasks.md`、一个 `plan.md` 和一个 `report.md`。
 - 大型 Feature 仍只维护一个 `spec.md`、一个 `tasks.md` 和一个 `report.md`，允许出现多个 `plan-NN-xxxxx.md`。
 - 文档在流程进入对应阶段时创建，不预建空 Plan、空 Report 或未来 Feature 目录。
@@ -35,6 +37,24 @@ specs/
 - `已实现` 表示实现和约定验证完成，正在等待验收。
 - `已验收` 只由开发者确认。
 
+## 开发者速览
+
+每份 Feature Research、Spec、Plan、Tasks、Report 和 Increment 都要在标题与状态之后、其他元信息和正文之前放置 `## 开发者速览`。它是固定的首屏信息卡，让开发者不滚动正文也能判断文档目的、方案、边界和待审内容；正文继续保存 Agent 执行所需的完整合同。
+
+```markdown
+## 开发者速览
+> **一句话**：这份文档最终要解决、证明或改变什么。<br>
+> **核心做法**：准备怎样完成，或已有结论由什么关键证据支撑。<br>
+> **边界**：明确包含什么，以及最容易被误解的不包含项。<br>
+> **风险 / 未验证**：当前最可能改变结论的风险或证据缺口。<br>
+> **当前 / 请审阅**：所处阶段，以及开发者现在需要确认的决定。
+```
+
+- 固定使用以上五个字段，每个字段只写一个短句，整张信息卡不超过三百个中文字符；不放表格、嵌套列表、代码、文件清单和完整验收项。
+- “一句话”按文档类型表达最重要的结果：Research 写结论，Spec 写目标能力，Plan 写交付路径，Tasks 写当前进度，Report 写已成立结果，Increment 写实际变化。
+- 速览只索引正文已经成立的内容，不能引入正文没有的新决定。正文发生实质变化时同步更新；不一致按文档缺陷处理。
+- 新建文档必须包含速览。存量文档在下一次实质更新时补齐，不为纯格式统一批量改写已经完成的 Feature。
+
 ## Spec
 
 Spec 回答“要做成什么”，默认包含：
@@ -51,6 +71,15 @@ Spec 回答“要做成什么”，默认包含：
 已经确认的 Agent、AgentEvent、TUI Adapter 和 Model Adapter 可以在相关 Feature 中直接使用；除此之外，不为尚未出现的状态对象、传输协议、Adapter 或未来框架预建合同。
 
 Spec 记录稳定合同，不保存实施流水账，也不以具体文件清单代替产品行为。开发者确认后，执行者应能判断 Feature 做成和没做成的区别。
+
+## Research
+
+Feature Research 回答“作出 Feature 决定前需要确认哪些外部事实”。它必须说明问题、来源与核验日期、已验证事实、项目推断和证据边界，状态不得伪装成产品合同。
+
+- Research 属于 Feature 时，与 `spec.md` 放在同一目录；即使完成，也不移入根 `research/archive/`。
+- 一个 Feature 只有一个主要调查主题时使用 `research.md`；多个独立主题才拆成 `research-xxxxx.md`。
+- Research 不能代替 Spec、Plan、Tasks 或 Report，也不代表产品决定、实施授权或已实现能力。
+- 没有真实研究问题时不预建 Research 文件。
 
 ## Plan
 
@@ -109,4 +138,4 @@ Report 不是文件 Diff、测试清单或按时间排列的工作日志。尚�
 - `specs/` 可以描述尚未实现但已经确认的 Feature，必须用状态区分计划与事实。
 - `README.md` 和稳定 `docs/` 必须区分已确认决定和已实现能力。
 - 难以逆转、跨多个 Feature 且经过真实取舍的架构决定才考虑 ADR。
-- Research、临时提示词、检查点、Agent 草稿和测试日志不进入 `specs/`。
+- Feature 专属 Research 可以进入对应 Feature 目录；项目级或跨 Feature Research 仍保存在根 `research/`。临时提示词、检查点、Agent 草稿和测试日志不进入 `specs/`。
