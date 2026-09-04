@@ -15,7 +15,7 @@ Anthias 是一个本地优先、交互形态无关的可分叉 Coding Agent。
 
 ## 当前重点
 
-Anthias 先建立一个可复用的 Coding Harness，再逐步加入 Tool、工作区操作、上下文管理和执行分叉。Coding Harness 与具体界面分离：
+Anthias 先建立一个可复用的 Coding Harness，再逐步完善交互体验、上下文管理和执行分叉。当前 Coding Harness 已形成模型对话、线性 Session、基础 Tool、工作区操作、权限与安全策略的本地闭环，并继续与具体界面分离：
 
     Anthias Agent（运行核心）
       ├─ TUI 适配器（首个交互入口）
@@ -26,12 +26,14 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 ## 当前状态
 
 - 旧的 Desktop、Local Agent Host、JSON-RPC 和 Protocol 实现已经撤销。
-- Feature 001 的“TUI 优先、事件驱动的最小 Agent Loop”已完成本地实现和约定验证，当前等待开发者验收。
-- 仓库已有可构建、可启动的内存 Agent 与行式 TUI；生产 OpenAI-compatible Model Adapter 由 Agent 内部持有，TUI 只负责终端交互；真实 Provider 和人工 Windows 终端体验尚未验证。
+- Feature 001–003 已累计实现事件驱动的 Agent Loop、线性 JSONL Session、六个固定 Tool、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策和只读 Tool 四并发；Feature 003 已由开发者验收。
+- 仓库已有可构建、可启动的 Agent 与行式 TUI；生产 OpenAI-compatible Model Adapter、Session、Tool 和运行生命周期均由 Agent Module 持有，TUI 只通过公开 Agent Interface 输入和呈现。
+- 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider、外部网络与长期人工终端体验不在现有自动验证证据内。
 - 已确认的基础方向是 Strict TypeScript、Node.js 24 LTS、ESM 和 pnpm workspace。
 - 首个模型接入继续使用通用 OpenAI-compatible 接口；DeepSeek V4 Flash 只是日常使用与联调的参考模型。
 - Electron 不再是产品前提；Desktop 的框架、进程模型和传输方式留给未来 Feature 决定。
-- Tool、文件与命令、持久化、Compaction 和执行分叉均未实现。
+- [Feature 004 已计划 Spec](specs/feature004-tui-workspace-experience/spec.md) 与四个 Plan 已确认 TUI 视觉与完整对话周期、工作路径常驻呈现、任意工作目录启动、Workspace Root 与 Anthias Data Root 分离，以及 TUI 内使用 Shiki 高亮代码；相关行为尚未实现。
+- Compaction、执行分叉、候选比较和 Desktop 尚未实现。
 
 ## 文档入口
 

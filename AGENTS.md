@@ -16,7 +16,7 @@
 - Agent 持有消息、模型运行以及后续 Tool 和工作区副作用；交互 Adapter 只负责输入与呈现。
 - 执行分支是产品概念，不等同于 Git 分支、只复制消息的对话分支、多 Agent 或 Agent 自我进化；具体实现机制尚未确认。
 - Java/JVM/Maven/JLine 路线，以及旧的 Electron Desktop、独立 Host、JSON-RPC 和 Feature 001 实现均已撤销。
-- Feature 001 的最小 Agent Loop、TUI Adapter 与 Agent 内部 OpenAI-compatible Model Adapter 已完成本地实现和约定验证，当前等待开发者验收；真实 Provider 验证仍未授权。
+- Feature 001–003 已累计形成 Agent Loop、线性 Session、六个固定 Tool、权限与安全策略和只读有界并发；Feature 003 已由开发者验收。除 Feature 004 最终阶段已授权的一次受限 DeepSeek V4 Flash 冒烟外，真实 Provider 验证仍需另行授权；当前也没有 OS 沙箱。
 - 后续设计先完成模型对话、Tool、本地能力和上下文等 Coding Harness 闭环，再证明从共同检查点分叉、独立推进、比较并选择的核心价值。
 
 ## 代码与运行时
@@ -26,6 +26,7 @@
 - TUI 与 Agent 首期在同一进程直接协作。Agent 以有序 AgentEvent 发布变化；未来 Desktop Adapter 可以转发同一事件，不要求现在创建 Electron、Host 或协议层。
 - Model Stream 是 Agent Module 的内部 seam：生产 Adapter 使用通用 OpenAI-compatible 接口，Agent 内部测试 Adapter 使用确定性本地流；Model Stream、模型消息、AI SDK 和 Provider 类型不得从 Agent package 入口导出。
 - TUI 不读取模型配置，不构造 Provider 或 Model Stream，也不依赖 AI SDK；它只接收已创建的 Agent，负责输入、呈现、停止和退出。
+- 当前 TUI 仍是 Node.js `readline` 行式界面，Session 默认目录仍由 Workspace Root 推导。[Feature 004 已计划 Spec](specs/feature004-tui-workspace-experience/spec.md) 与四个 Plan 已确认 TUI、启动路径、Anthias Data Root 和 Shiki 高亮；在对应 Plan 完成实施与验证前，不把这些合同写成当前能力。
 - DeepSeek V4 Flash 只是 OpenAI-compatible 日常参考配置，不得产生模型专用 Provider、枚举或条件分支。
 - 普通函数和判别联合足以表达的行为不增加类层级、Registry、Manager 或为未来变化预建的 Interface。
 - 终端状态、AbortController、模型流以及后续线程、进程、文件句柄和网络请求必须有明确持有者、取消方式和关闭时机。
