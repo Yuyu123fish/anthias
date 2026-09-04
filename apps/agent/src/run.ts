@@ -6,14 +6,7 @@ import {
   type AgentLoopToolApproval,
   runAgentLoop,
 } from "./agent.js";
-import {
-  type AssistantMessage,
-  type AssistantToolCallPart,
-  type Message,
-  snapshotAssistantMessage,
-  snapshotMessage,
-  type UserMessage,
-} from "./message.js";
+import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
 import type { ModelStream, ModelUsage } from "./model-stream.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import type { Session, SessionRunLease } from "./session.js";
@@ -193,7 +186,7 @@ export function createAgentWithModelStream({
   modelStream,
   session,
 }: CreateAgentWithModelStreamOptions): Agent {
-  const messageHistory: Message[] = session.messageHistory.map(snapshotMessage);
+  const messageHistory: Message[] = [...session.messageHistory];
   const toolRunner = createToolRunner({
     workspace: Object.freeze({
       workspaceRoot: session.workspaceRoot,
@@ -211,15 +204,13 @@ export function createAgentWithModelStream({
   let sessionChanged = false;
   let pendingToolApproval: PendingToolApproval | null = null;
 
-  /** 生成只读状态快照，避免调用者修改 Run 持有的消息。 */
+  /** 生成只读状态投影；完成消息与活动 partial 的生命周期由各自形成边界持有。 */
   function createStateSnapshot(): AgentState {
     return Object.freeze({
       sessionId: session.sessionId,
       workspaceRoot: session.workspaceRoot,
-      messageHistory: Object.freeze(messageHistory.map(snapshotMessage)),
-      activeAssistantMessage: activeAssistantMessage
-        ? snapshotAssistantMessage(activeAssistantMessage)
-        : null,
+      messageHistory: Object.freeze([...messageHistory]),
+      activeAssistantMessage,
       activeRun: activeRun
         ? Object.freeze({
             runId: activeRun.runId,
@@ -473,16 +464,18 @@ export function createAgentWithModelStream({
   ): Promise<void> {
     switch (event.type) {
       case "assistant_message_start":
-        activeAssistantMessage = snapshotAssistantMessage(event.message);
+        activeAssistantMessage = event.message;
         publishEvent({ type: "message_start", message: event.message });
         return;
       case "assistant_message_update":
-        activeAssistantMessage = snapshotAssistantMessage(event.message);
-        publishEvent({
-          type: "message_update",
-          message: event.message,
-          delta: event.delta,
-        });
+        activeAssistantMessage = event.message;
+        if (event.delta !== null) {
+          publishEvent({
+            type: "message_update",
+            message: event.message,
+            delta: event.delta,
+          });
+        }
         return;
       case "assistant_message_end":
         await appendCompletedMessage(currentRun, event.message, true);
@@ -551,7 +544,7 @@ export function createAgentWithModelStream({
       lastError = SAFE_SESSION_ERROR;
       throw new Error(SAFE_SESSION_ERROR);
     }
-    messageHistory.push(snapshotMessage(message));
+    messageHistory.push(message);
     if (!messageStartAlreadyPublished) {
       publishEvent({ type: "message_start", message });
     }

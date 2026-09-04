@@ -106,8 +106,7 @@ describe("Session", () => {
     const userMessage: Message = Object.freeze({ role: "user", content: "hello" });
     const assistantMessage: Message = Object.freeze({
       role: "assistant",
-      content: "world",
-      parts: Object.freeze([{ type: "text" as const, text: "world" }]),
+      content: Object.freeze([{ type: "text" as const, text: "world" }]),
       status: "completed",
     });
 
@@ -202,8 +201,7 @@ describe("Session", () => {
       await runLease.appendMessage({ role: "user", content: question });
       await runLease.appendMessage({
         role: "assistant",
-        content: answer,
-        parts: [{ type: "text", text: answer }],
+        content: [{ type: "text", text: answer }],
         status: "completed",
       });
       await runLease.appendRunFinished({
@@ -454,8 +452,7 @@ describe("Session", () => {
     await runLease.appendMessage({ role: "user", content: "question" });
     await runLease.appendMessage({
       role: "assistant",
-      content: "answer",
-      parts: [{ type: "text", text: "answer" }],
+      content: [{ type: "text", text: "answer" }],
       status: "completed",
     });
     await runLease.appendRunFinished({

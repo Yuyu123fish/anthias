@@ -12,13 +12,13 @@ import {
   unlink,
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import {
-  type AssistantContentPart,
-  type AssistantMessage,
-  type Message,
-  snapshotMessage,
-  type ToolResultMessage,
-  type UserMessage,
+import type {
+  AssistantContentPart,
+  AssistantMessage,
+  JsonValue,
+  Message,
+  ToolResultMessage,
+  UserMessage,
 } from "./message.js";
 
 /** 描述 Session 创建时固定、重开时必须一致的 Shell。 */
@@ -129,12 +129,6 @@ type DurableToolCallPart = Readonly<{
   input: JsonValue;
   invalid: boolean;
 }>;
-
-/** 表示 Schema 1 可以无损保存的 JSON 值。 */
-type JsonValue = null | boolean | number | string | readonly JsonValue[] | JsonObject;
-
-/** 表示 Schema 1 可以无损保存的 JSON 对象。 */
-type JsonObject = Readonly<{ [key: string]: JsonValue }>;
 
 /** 表示 Schema 1 可持久化的完整消息。 */
 type DurableMessage =
@@ -494,7 +488,7 @@ function createSessionRuntime(
   lockDirectory: string,
   lockSystem: SessionLockSystem,
 ): Session {
-  const messageHistory = initialMessageHistory.map(snapshotMessage);
+  const messageHistory = [...initialMessageHistory];
   let checkpoint = initialCheckpoint;
   let sessionChanged = false;
 
@@ -557,7 +551,8 @@ function createSessionRuntime(
 
       const lease: SessionRunLease = Object.freeze({
         appendMessage(message) {
-          const messageSnapshot = snapshotMessage(message);
+          const durableMessage = toDurableMessage(message);
+          const historyMessage = fromDurableMessage(durableMessage);
           return enqueueRecord(
             (sequence) =>
               Object.freeze({
@@ -566,9 +561,9 @@ function createSessionRuntime(
                 seq: sequence,
                 timestamp: new Date().toISOString(),
                 runId,
-                message: toDurableMessage(messageSnapshot),
+                message: durableMessage,
               }),
-            () => messageHistory.push(messageSnapshot),
+            () => messageHistory.push(historyMessage),
           );
         },
         appendToolExecutionStarted(details) {
@@ -1495,7 +1490,7 @@ function toDurableMessage(message: Message): DurableMessage {
   }
   return Object.freeze({
     type: "assistant",
-    content: Object.freeze(message.parts.map(toDurableAssistantPart)),
+    content: Object.freeze(message.content.map(toDurableAssistantPart)),
     status: message.status,
   });
 }
@@ -1512,14 +1507,13 @@ function fromDurableMessage(message: DurableMessage): Message {
       truncated: message.truncated,
     } satisfies ToolResultMessage);
   }
-  const content = message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
   if (message.type === "user") {
+    const content = message.content.map((part) => part.text).join("");
     return Object.freeze({ role: "user", content } satisfies UserMessage);
   }
   return Object.freeze({
     role: "assistant",
-    content,
-    parts: Object.freeze(message.content.map(fromDurableAssistantPart)),
+    content: Object.freeze(message.content.map(fromDurableAssistantPart)),
     status: message.status,
   } satisfies AssistantMessage);
 }

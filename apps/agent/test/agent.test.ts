@@ -2,8 +2,13 @@ import { access, appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentEvent, Message } from "../src/index.js";
-import type { ModelStream, ModelStreamEvent } from "../src/model-stream.js";
+import type { AgentEvent, AssistantMessage, Message } from "../src/index.js";
+import {
+  type ModelRequest,
+  type ModelStream,
+  type ModelStreamEvent,
+  streamAssistantMessage,
+} from "../src/model-stream.js";
 import { type Agent, createAgentWithModelStream } from "../src/run.js";
 import { createSession, openSession, type Session, type SessionShell } from "../src/session.js";
 
@@ -35,11 +40,11 @@ describe("Agent", () => {
     };
     const agent = await createTestAgent(modelStream);
     const events: string[] = [];
-    const updateSnapshots: string[] = [];
+    const updateMessages: AssistantMessage[] = [];
     agent.subscribe((event) => {
       events.push(event.type);
       if (event.type === "message_update") {
-        updateSnapshots.push(event.message.content);
+        updateMessages.push(event.message);
       }
     });
 
@@ -51,8 +56,7 @@ describe("Agent", () => {
         { role: "user", content: "你好" },
         {
           role: "assistant",
-          content: "你好",
-          parts: [{ type: "text", text: "你好" }],
+          content: [{ type: "text", text: "你好" }],
           status: "completed",
         },
       ],
@@ -74,7 +78,7 @@ describe("Agent", () => {
       "message_end",
       "run_end",
     ]);
-    expect(updateSnapshots).toEqual(["你", "你好"]);
+    expect(updateMessages.map(assistantText)).toEqual(["你", "你好"]);
     expect(Object.isFrozen(agent.state)).toBe(true);
     expect(Object.isFrozen(agent.state.messageHistory)).toBe(true);
     expect(Object.isFrozen(agent.state.messageHistory[0])).toBe(true);
@@ -82,6 +86,47 @@ describe("Agent", () => {
       type: "run_finished",
       status: "completed",
     });
+  });
+
+  it("freezes nested ToolCall input before publishing a partial message", async () => {
+    const modelRequest: ModelRequest = Object.freeze({
+      systemPrompt: "test",
+      messages: Object.freeze([]),
+      tools: Object.freeze([]),
+    });
+    let toolCallMessage: AssistantMessage | null = null;
+
+    for await (const event of streamAssistantMessage(
+      async function* () {
+        yield Object.freeze({
+          type: "tool_call",
+          toolCallId: "00000000-0000-4000-8000-000000000001",
+          toolName: "read_file",
+          input: { range: { lines: [1, 2] } },
+          invalid: false,
+        });
+        yield Object.freeze({
+          type: "finish",
+          finishReason: "tool_calls",
+          usage: Object.freeze({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+        });
+      },
+      modelRequest,
+      new AbortController().signal,
+    )) {
+      if (event.type === "update") {
+        toolCallMessage = event.partialAssistantMessage;
+      }
+    }
+
+    const toolCall = toolCallMessage?.content[0];
+    if (toolCall?.type !== "tool_call") {
+      throw new Error("expected a ToolCall partial");
+    }
+    const input = toolCall.input as { range: { lines: number[] } };
+    expect(Object.isFrozen(input)).toBe(true);
+    expect(Object.isFrozen(input.range)).toBe(true);
+    expect(Object.isFrozen(input.range.lines)).toBe(true);
   });
 
   it("keeps ordered context and rejects empty prompts without events", async () => {
@@ -125,7 +170,11 @@ describe("Agent", () => {
     };
     const agent = await createTestAgent(modelStream);
     const firstPromptResult = agent.prompt("first");
-    await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("working"));
+    await vi.waitFor(() =>
+      expect(agent.state.activeAssistantMessage?.content).toEqual([
+        { type: "text", text: "working" },
+      ]),
+    );
 
     await expect(agent.prompt("second")).resolves.toEqual({
       status: "rejected",
@@ -213,7 +262,11 @@ describe("Agent", () => {
     const eventTypes: string[] = [];
     agent.subscribe((event) => eventTypes.push(event.type));
     const firstPromptResult = agent.prompt("stop this");
-    await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
+    await vi.waitFor(() =>
+      expect(agent.state.activeAssistantMessage?.content).toEqual([
+        { type: "text", text: "partial" },
+      ]),
+    );
 
     agent.abort();
     await abortObserved.promise;
@@ -222,8 +275,7 @@ describe("Agent", () => {
     const finalAssistantMessage = agent.state.messageHistory.at(-1);
     expect(finalAssistantMessage).toEqual({
       role: "assistant",
-      content: "partial",
-      parts: [{ type: "text", text: "partial" }],
+      content: [{ type: "text", text: "partial" }],
       status: "aborted",
     });
     expect(eventTypes.filter((type) => type === "run_end")).toHaveLength(1);
@@ -257,8 +309,7 @@ describe("Agent", () => {
     }
     expect(agent.state.messageHistory.at(-1)).toEqual({
       role: "assistant",
-      content: "partial",
-      parts: [{ type: "text", text: "partial" }],
+      content: [{ type: "text", text: "partial" }],
       status: "failed",
     });
     expect(JSON.stringify(agent.state)).not.toContain("secret-value");
@@ -506,7 +557,11 @@ describe("Agent", () => {
       });
       const promptResultPromise = agent.prompt("terminal");
       if (terminalStatus === "aborted") {
-        await vi.waitFor(() => expect(agent.state.activeAssistantMessage?.content).toBe("partial"));
+        await vi.waitFor(() =>
+          expect(agent.state.activeAssistantMessage?.content).toEqual([
+            { type: "text", text: "partial" },
+          ]),
+        );
         agent.abort();
         responseGate.resolve();
       }
@@ -589,8 +644,7 @@ describe("Agent", () => {
       { role: "user", content: "first question" },
       {
         role: "assistant",
-        content: "first answer",
-        parts: [{ type: "text", text: "first answer" }],
+        content: [{ type: "text", text: "first answer" }],
         status: "completed",
       },
     ]);
@@ -642,6 +696,13 @@ function getSessionLockPath(agent: Agent): string {
 
 function randomSessionId(): string {
   return "00000000-0000-4000-8000-000000000003";
+}
+
+function assistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("");
 }
 
 /** 创建一个确定性文本增量事件。 */

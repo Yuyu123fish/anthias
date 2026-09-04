@@ -1,13 +1,8 @@
 import {
   type AssistantMessage,
   type AssistantToolCallPart,
-  appendTextPart,
   isToolCallPart,
   type Message,
-  type MutableAssistantMessage,
-  normalizeToolCall,
-  snapshotAssistantMessage,
-  snapshotMessage,
   type ToolResultMessage,
 } from "./message.js";
 import {
@@ -15,6 +10,7 @@ import {
   type ModelRequest,
   type ModelStream,
   type ModelUsage,
+  streamAssistantMessage,
   toModelInputMessage,
 } from "./model-stream.js";
 import { FIXED_TOOL_DEFINITIONS } from "./tool/definitions.js";
@@ -64,7 +60,7 @@ export type AgentLoopEvent =
   | Readonly<{
       type: "assistant_message_update";
       message: AssistantMessage;
-      delta: string;
+      delta: string | null;
     }>
   | Readonly<{
       type: "assistant_message_end";
@@ -164,7 +160,7 @@ const ACTIVE_DURATION_BUDGET_RESULT = Object.freeze({
 
 /** 推进 Model → Tool → Model，直到完成、失败、停止或预算耗尽。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
-  const messageHistory = options.messages.map(snapshotMessage);
+  const messageHistory = [...options.messages];
   // 初始化 Agent Loop 状态
   const loopState: AgentLoopState = {
     phase: "requesting_model",
@@ -207,7 +203,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         return FAILED_LOOP_RESULT;
       }
 
-      const toolCalls = assistantRequest.message.parts.filter(isToolCallPart);
+      const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
       loopState.producedToolCallCount += toolCalls.length;
       updateLoopProgress(loopState, options);
       if (toolCalls.length === 0) {
@@ -268,85 +264,53 @@ async function streamAssistantResponse(
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<AssistantRequestResult> {
-  const mutableMessage: MutableAssistantMessage = {
-    role: "assistant",
-    content: "",
-    parts: [],
-    status: "streaming",
-  };
+  let finalMessage: AssistantMessage | null = null;
   let finishReason: ModelFinishReason | null = null;
-  let finishUsageObserved = false;
 
   try {
-    await options.emit({
-      type: "assistant_message_start",
-      message: snapshotAssistantMessage(mutableMessage),
-    });
     const modelRequest: ModelRequest = Object.freeze({
       systemPrompt: options.systemPrompt,
       messages: Object.freeze(messageHistory.map(toModelInputMessage)),
       tools: FIXED_TOOL_DEFINITIONS,
     });
 
-    try {
-      for await (const modelEvent of options.modelStream(
-        modelRequest,
-        options.abortController.signal,
-      )) {
-        if (options.abortController.signal.aborted) {
-          mutableMessage.status = "aborted";
-          break;
-        }
-        if (modelEvent.type === "text_delta") {
-          if (modelEvent.delta.length > 0) {
-            mutableMessage.content += modelEvent.delta;
-            appendTextPart(mutableMessage.parts, modelEvent.delta);
-            await options.emit({
-              type: "assistant_message_update",
-              message: snapshotAssistantMessage(mutableMessage),
-              delta: modelEvent.delta,
-            });
-          }
-          continue;
-        }
-        if (modelEvent.type === "tool_call") {
-          const toolCallIds = new Set(
-            mutableMessage.parts.filter(isToolCallPart).map((part) => part.toolCallId),
-          );
-          mutableMessage.parts.push(normalizeToolCall(modelEvent, toolCallIds));
-          continue;
-        }
-
-        finishReason = modelEvent.finishReason;
-        finishUsageObserved = true;
-        loopState.cumulativeModelUsage = addModelUsage(
-          loopState.cumulativeModelUsage,
-          modelEvent.usage,
-        );
-        updateLoopProgress(loopState, options);
-        mutableMessage.status = isSuccessfulAssistantFinish(
-          finishReason,
-          mutableMessage.parts.some(isToolCallPart),
-        )
-          ? "completed"
-          : "failed";
-        break;
+    // 异步遍历可迭代模型响应
+    for await (const messageEvent of streamAssistantMessage(
+      options.modelStream,
+      modelRequest,
+      options.abortController.signal,
+    )) {
+      if (messageEvent.type === "start") {
+        await options.emit({
+          type: "assistant_message_start",
+          message: messageEvent.partialAssistantMessage,
+        });
+        continue;
       }
-    } catch {
-      mutableMessage.status = options.abortController.signal.aborted ? "aborted" : "failed";
-    }
-    if (mutableMessage.status === "streaming") {
-      mutableMessage.status = options.abortController.signal.aborted ? "aborted" : "failed";
-    }
-  } finally {
-    if (!finishUsageObserved) {
-      loopState.cumulativeModelUsage = UNKNOWN_MODEL_USAGE;
+      if (messageEvent.type === "update") {
+        await options.emit({
+          type: "assistant_message_update",
+          message: messageEvent.partialAssistantMessage,
+          delta: messageEvent.delta,
+        });
+        continue;
+      }
+
+      finalMessage = messageEvent.message;
+      finishReason = messageEvent.finishReason;
+      loopState.cumulativeModelUsage =
+        messageEvent.usage === null
+          ? UNKNOWN_MODEL_USAGE
+          : addModelUsage(loopState.cumulativeModelUsage, messageEvent.usage);
       updateLoopProgress(loopState, options);
     }
+  } finally {
     pauseActivePhase(loopState, options);
   }
 
-  const finalMessage = snapshotAssistantMessage(mutableMessage);
+  if (finalMessage === null) {
+    throw new Error("Model Stream 未形成最终 AssistantMessage。");
+  }
   await options.emit({ type: "assistant_message_end", message: finalMessage });
   messageHistory.push(finalMessage);
   return Object.freeze({ message: finalMessage, finishReason });
@@ -543,7 +507,7 @@ async function appendUnresolvedToolResults(
   options: RunAgentLoopOptions,
 ): Promise<void> {
   await appendToolResults(
-    assistantMessage.parts.filter(isToolCallPart),
+    assistantMessage.content.filter(isToolCallPart),
     "aborted",
     "模型请求未正常完成，ToolCall 未执行。",
     messageHistory,
@@ -656,16 +620,6 @@ function updateLoopProgress(loopState: AgentLoopState, options: RunAgentLoopOpti
       modelUsage: Object.freeze({ ...loopState.cumulativeModelUsage }),
       activeDurationExhausted: loopState.activeDurationExhausted,
     }),
-  );
-}
-
-/** 判断 finish reason 与 ToolCall 组合是否形成完整 AssistantMessage。 */
-function isSuccessfulAssistantFinish(
-  finishReason: ModelFinishReason,
-  hasToolCall: boolean,
-): boolean {
-  return (
-    (finishReason === "stop" && !hasToolCall) || (finishReason === "tool_calls" && hasToolCall)
   );
 }
 

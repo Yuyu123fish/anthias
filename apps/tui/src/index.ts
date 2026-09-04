@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline";
-import type { Agent, AgentEvent, PromptResult } from "@anthias/agent";
+import type { Agent, AgentEvent, AssistantMessage, PromptResult } from "@anthias/agent";
 
 /** 抽象 TUI 所需的最小 SIGINT 订阅行为。 */
 export type TuiSignalSource = Readonly<{
@@ -193,11 +193,19 @@ function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream
     if (message.role === "user") {
       output.write(`You: ${message.content}\n`);
     } else if (message.role === "assistant") {
-      output.write(`Assistant: ${message.content}\n`);
+      output.write(`Assistant: ${getAssistantText(message)}\n`);
     } else {
       output.write(`ToolResult: ${message.toolName} ${message.status}\n${message.content}\n`);
     }
   }
+}
+
+/** TUI 在呈现历史时按顺序投影 Assistant 文本，不持有第二份正文。 */
+function getAssistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("");
 }
 
 /** 写出下一次终端输入提示。 */

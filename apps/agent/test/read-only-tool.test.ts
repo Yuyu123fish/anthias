@@ -120,7 +120,7 @@ async function createWorkspace(): Promise<
 }
 
 /** 创建一个已经由 Model Adapter 完整形成的测试 ToolCall。 */
-function toolCall(toolName: string, input: unknown): AssistantToolCallPart {
+function toolCall(toolName: string, input: AssistantToolCallPart["input"]): AssistantToolCallPart {
   return Object.freeze({
     type: "tool_call",
     toolCallId: "00000000-0000-4000-8000-000000000001",

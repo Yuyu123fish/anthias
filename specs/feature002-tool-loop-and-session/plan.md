@@ -43,17 +43,17 @@ apps/tui
 apps/agent
   ├─ Run Module               Prompt 接纳、Session lease、根取消、确认状态、事件投影与唯一终态
   ├─ Agent Loop Module        Model → Tool → Model、流消费、调用顺序与执行预算
-  ├─ Message Module           线性消息形状、不可变快照与 ToolCall 规范化
+  ├─ Message Module           线性消息类型与极少量类型判断
   ├─ Session Module           JSONL、锁、恢复、投影与追加
   ├─ Prompt Module            每次模型请求使用的 Coding Agent 系统提示词
   ├─ Fixed Tool Module        六个 Tool 的定义、分派、校验、预览与执行
-  └─ Model Stream / Adapter   Provider 无关事件 seam 与生产转换
+  └─ Model Stream / Adapter   Provider 无关事件、Assistant partial 组装与生产转换
 ```
 
 - Run Module 是一次公开运行的宿主：自行定义并实现 Agent Interface、公开 state/event/result，持有 active Run、根 AbortController、Session lease 和待确认请求；接纳 prompt 后调用 Agent Loop，并按 Loop 事实完成持久化与唯一终态。
-- Agent Loop 只负责循环算法及其内部协作协议：在本地消息上下文中消费已经组装好的系统 Prompt 与 Model Stream、串行处理 ToolCall、调用 ToolRunner、执行三类预算判断并返回循环结果；它不定义 Run 的公开类型，不接纳 prompt，不持有 Session、监听器、工作区配置或公开 Agent 状态，也不写 Run 终态。
+- Agent Loop 只负责循环算法及其内部协作协议：在本地消息上下文中消费系统 Prompt 与 Model Stream 已组装的 Assistant partial、串行处理 ToolCall、调用 ToolRunner、执行三类预算判断并返回循环结果；它不定义 Run 的公开类型，不接纳 prompt，不持有 Session、监听器、工作区配置或公开 Agent 状态，也不写 Run 终态。
 - TUI 不读取 JSONL、模型配置或 Tool 定义，不计算 Diff、不启动命令，也不维护第二个 Run 状态机。
-- Message Module 不依赖 Agent Loop，Session 复用其统一消息快照；Session Module 不知道 Agent Loop、TUI 和 Provider；Tool Module 通过绑定 workspace 与 Shell 的 ToolRunner 隐藏分派上下文且不写 Session；Model Adapter 不执行 Tool、不等待确认、不控制循环。
+- Message Module 不依赖 Agent Loop，只定义单一有序内容来源的消息类型和极少量类型判断；Model Stream 边界唯一负责 Assistant partial 累积与 ToolCall 规范化；Session 只在持久化边界形成稳定值，不复用通用消息快照。Session Module 不知道 Agent Loop、TUI 和 Provider；Tool Module 通过绑定 workspace 与 Shell 的 ToolRunner 隐藏分派上下文且不写 Session；Model Adapter 不执行 Tool、不等待确认、不控制循环。
 - package 入口只导出生产启动工厂、Agent Interface 以及 TUI 必需的 state、message、result 和 event 类型；Model Adapter、Tool Schema、Session Record、Writer 和锁类型均不导出。
 - 不建立 Tool Registry、Manager、通用插件协议或类层级。六个 Tool 使用一个固定、穷尽的内部映射和判别联合。
 - Stage 02 允许在 `apps/agent` 增加唯一一个直接运行时依赖 `diff@9.0.0`，用于不启动 Git 或 Shell 的统一 Diff；该版本自带 TypeScript 类型，不增加 `@types/diff`。其他能力优先使用 Node.js 24 标准库和现有 AI SDK。
@@ -186,7 +186,7 @@ Stage 01 只增加高价值边界测试：
 - `tool_call`：完整 `toolCallId`、`toolName`、最终输入和 `invalid` 标记；
 - `finish`：规范化 finish reason 与本次 usage。
 
-生产 Adapter 继续使用 `streamText`，但 Tool 定义不提供 `execute`，不使用 AI SDK ToolLoopAgent、多步循环或 Tool approval。Adapter 从 `fullStream` 转换 `text-delta`、完整 `tool-call`、`finish` 和 `error`，并保持 `maxRetries: 0`。Model Stream 必须响应根 AbortSignal，在取消后结束迭代或抛出；Agent Loop 只使用 `for await...of` 消费，不手动管理迭代器或与单次 `next()` 竞速。AI SDK 的无效或未知 ToolCall 只要已经包含调用标识，就转换成 `invalid` ToolCall 交给 Agent 生成 failed ToolResult；原始 SDK 异常不得进入公开消息或终端。
+生产 Adapter 继续使用 `streamText`，但 Tool 定义不提供 `execute`，不使用 AI SDK ToolLoopAgent、多步循环或 Tool approval。Adapter 从 `fullStream` 转换 `text-delta`、完整 `tool-call`、`finish` 和 `error`，并保持 `maxRetries: 0`。这些原始事件在 Model Stream 边界组装为唯一的 Assistant `content[]`：该边界是流式内容的唯一可变所有者，负责 ToolCall 身份与 JSON 输入规范化，并在终结时冻结完成消息；Agent Loop 只接收当前 partial 和最终消息，不维护第二份字符串正文。Model Stream 必须响应根 AbortSignal，在取消后结束迭代或抛出；Agent Loop 只使用 `for await...of` 消费，不手动管理迭代器或与单次 `next()` 竞速。AI SDK 的无效或未知 ToolCall 只要已经包含调用标识，就转换成 `invalid` ToolCall 交给 Agent 生成 failed ToolResult；原始 SDK 异常不得进入公开消息或终端。
 
 工具说明使用现有 AI SDK 的 JSON Schema 能力提供给模型；Agent 仍用项目自己的运行时解析器验证最终 `unknown` 输入。Provider、AI SDK Tool、ModelMessage、LanguageModelUsage 和流 part 类型不从 package 入口导出。
 
@@ -233,7 +233,7 @@ Stage 02 建立文件 Tool 前，先把生产 Session 默认目录迁移到 `<wo
 
 一次已接受 Run 使用以下唯一循环：
 
-`runAgentLoop()` 使用 `while (true)` 控制 Model → Tool → Model；每轮由 `streamAssistantResponse()` 使用 `for await...of` 消费一次 Model Stream，并通过同一个 `emit` 交付消息事件。模型流的结束与取消由 Model Adapter seam 保证，Loop 不建立第二套流运行时。
+`runAgentLoop()` 使用 `while (true)` 控制 Model → Tool → Model；每轮由 `streamAssistantResponse()` 使用 `for await...of` 消费 Model Stream 已组装的当前 partial，并通过同一个 `emit` 交付消息事件。模型流的组装、结束与取消由 Model Stream / Adapter seam 保证，Loop 不建立第二套消息累积或流运行时。
 
 1. 取得 Session 锁、核对文件检查点、创建 `runId`，追加 UserMessage，发布 `run_start` 和 User 消息事件；
 2. 检查模型请求与活动时长预算，进入 `requesting_model`，累计一次模型请求；

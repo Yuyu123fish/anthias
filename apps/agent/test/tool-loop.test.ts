@@ -92,7 +92,7 @@ describe("read-only Agent Tool Loop", () => {
     ).toEqual(["glob", "grep", "read_file"]);
     expect(agent.state.messageHistory.at(-1)).toMatchObject({
       role: "assistant",
-      content: "检查完成。",
+      content: [{ type: "text", text: "检查完成。" }],
       status: "completed",
     });
     expect(agent.state.running).toBe(false);

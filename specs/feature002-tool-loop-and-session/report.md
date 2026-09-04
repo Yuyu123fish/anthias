@@ -14,7 +14,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 对话和 Tool 事实保存为 workspace 内 `data/conversation/<sessionId>.jsonl`。文件修改和命令执行逐次等待人工确认；只读 Tool 自动执行。Run 宿主持有 prompt 接纳、Session lease、根取消、确认状态、事件投影和唯一终态；Agent Loop 只推进模型与 Tool 的迭代。TUI 仍只通过公开 Agent Interface 输入、呈现、确认、停止和退出。
 
-验收前的结构整理已把系统提示词归入 `src/prompts/`，把消息形状与唯一快照实现归入 `src/message.ts`，把 Provider 无关模型事件 seam 归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只定义并实现 Model → Tool → Model 循环及其内部协作协议；`src/run.ts` 自行定义并实现公开 Agent Interface，持有 Session 与运行生命周期，调用 `runAgentLoop` 后显式映射公开结果；Tool Module 通过已绑定 workspace 与 Shell 的 ToolRunner 向循环隐藏分派上下文。Session、Tool 和 Model Adapter 不反向依赖二者，package 公开面保持不变。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
+验收前的结构整理已把系统提示词归入 `src/prompts/`，把单一有序内容来源的消息类型与极少量类型判断归入 `src/message.ts`，把 Provider 无关模型事件、Assistant partial 组装与 ToolCall 规范化归入 `src/model-stream.ts`，并把定义、分派、输入校验、结果预算、工作区路径以及三类 Tool 实现归入 `src/tool/`。其中 `src/agent.ts` 只定义并实现 Model → Tool → Model 循环及其内部协作协议；`src/run.ts` 自行定义并实现公开 Agent Interface，持有 Session 与运行生命周期，调用 `runAgentLoop` 后显式映射公开结果；Tool Module 通过已绑定 workspace 与 Shell 的 ToolRunner 向循环隐藏分派上下文。Session、Tool 和 Model Adapter 不反向依赖二者，package 入口仍不导出内部 Model Stream、Provider、Tool Schema 或 Session 实现。本次没有增加 Registry、Manager、公开能力或第二套生命周期。
 
 本 Feature 没有实现 OS 沙箱、通用权限策略、Session 分叉、Compaction、PTY、后台命令、持久 Shell、动态 Tool Registry、Desktop、跨进程协议或多 Agent。
 
@@ -26,7 +26,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 - `execute_command` 使用 Session 固定的非交互 Shell，不使用 `shell: true`；每次执行都是独立子进程。子进程环境会移除 `ANTHIAS_MODEL_API_KEY`，超时或停止时回收进程树并报告清理是否确定。
 - Run 预算是三个不同维度：最多 12 次模型请求、处理最多 32 个 ToolCall、最多 30 分钟活动执行时间；等待人工确认不计入活动时间。单个 ToolResult 另受 64 KiB 和 2,000 行限制。
 - AssistantMessage、ToolExecutionStartedRecord、ToolResultMessage 和 RunFinishedRecord 按事实发生顺序刷新到 JSONL；流式 delta 和瞬时 AgentEvent 不持久化。
-- `runAgentLoop()` 使用 `while (true)` 推进模型与 Tool；单次模型响应由 `streamAssistantResponse()` 通过 `for await...of` 消费并统一 `emit`。Model Adapter 响应根 AbortSignal，Loop 不再持有手写迭代器、取消竞速或清理协议。
+- `runAgentLoop()` 使用 `while (true)` 推进模型与 Tool；Model Stream 边界把原始事件组装为唯一 Assistant `content[]` 和当前 partial，`streamAssistantResponse()` 通过 `for await...of` 消费后统一 `emit`。Agent Loop 不再同步字符串正文与 parts，也不持有手写迭代器、取消竞速或清理协议。
 
 ## 3. Spec A–N 验收矩阵
 
@@ -44,7 +44,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 | J 执行预算 | PASS | `agent-budget.test.ts` 证明第 13 次模型请求不发送、第 33 个 ToolCall 不处理、30 分钟活动时长终止及确认等待不计时；`command-tool-loop.test.ts` 证明输出达到限制后明确截断且管道继续排空。 |
 | K JSONL 保存与重载 | PASS | `session.test.ts`、`agent.test.ts` 与生产 Adapter 集成测试检查记录顺序、稳定引用、累计 usage、重开投影和沿线性上下文继续。 |
 | L 中断恢复 | PASS | `session.test.ts` 分别构造 requesting_model、awaiting_tool_approval、executing_tool 中断，证明 `aborted` / `unknown` 补录、`interrupted` 终态、幂等重开且不重放。 |
-| M 接口与职责 | PASS | `apps/agent/src/index.ts` 只导出交互所需类型与生产工厂；Session、Model Stream、Provider、Tool Schema/执行器未导出。`apps/tui/package.json` 的唯一运行时依赖是 `@anthias/agent`，完整构建通过。 |
+| M 接口与职责 | PASS | `apps/agent/src/index.ts` 只导出交互所需 Message、Agent 类型与生产工厂；Session、Model Stream、Provider、Tool Schema/执行器未导出。AssistantMessage 只有一个有序 `content[]`，TUI 需要历史文本时自行投影。`apps/tui/package.json` 的唯一运行时依赖是 `@anthias/agent`，完整构建通过。 |
 | N 干净退出 | PASS | Agent、命令、TUI 和生产 Adapter 测试覆盖 idle、模型、确认和命令阶段；断言模型流、HTTP 服务、Session 锁、临时写入和进程树已收口，TUI 移除监听并取消订阅。 |
 
 矩阵没有 FAIL、BLOCKED 或 WAIVED。这里的 PASS 表示实现已通过约定的本地自动化验证，不表示开发者已经完成产品验收。
@@ -55,10 +55,7 @@ Feature 002 已把 Feature 001 的单次纯文本响应推进为一个可持久�
 
 - Stage 02：`pnpm verify` 通过，当时为 13 个测试文件、87 个测试；`pnpm install --frozen-lockfile --offline` 通过，manifest 和 lockfile 只增加直接运行时依赖 `diff@9.0.0`。
 - Stage 03 定向验证：`pnpm exec vitest run apps/agent/test/command-tool-loop.test.ts apps/agent/test/openai-compatible-model.test.ts` 通过，2 个测试文件、9 个测试。
-- Stage 03 最终门禁：`pnpm verify` 通过；Biome 检查 33 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
-- 验收前结构整理：`pnpm verify` 通过；Biome 检查当前 38 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
-- Agent Loop 职责收敛：定向回归 8 个测试文件、61 个测试通过；随后 `pnpm verify` 通过，Biome 检查 41 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
-- Agent Loop 流消费收敛：Agent 与生产 Model Adapter 定向验证通过，2 个测试文件、23 个测试；随后 `pnpm verify` 通过，Biome 检查 42 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 89 个测试全部通过。
+- 当前最终验证：受影响的 Agent、Session、Model Adapter、Tool Loop 与 TUI 定向回归通过，7 个测试文件、61 个测试；`pnpm verify` 通过，Biome 检查 42 个文件无修改，Strict TypeScript 检查与构建通过，13 个测试文件中的 90 个测试全部通过。
 
 Stage 3 的输出边界强化测试发现：同一输出流的连续小块会重复产生渲染标签，可能提前挤占最终 ToolResult 的 2,000 行预算并覆盖命令专用截断说明。实现已改为只合并相邻同源块，stdout / stderr 的观察顺序不变，截断后仍继续排空管道；对应定向测试和完整门禁均在修复后重新通过。
 

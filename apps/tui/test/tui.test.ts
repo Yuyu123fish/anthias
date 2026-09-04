@@ -501,8 +501,7 @@ function publishPromptOpening(promptText: string, controls: FakeAgentControls): 
 function assistantMessage(content: string, status: AssistantMessage["status"]): AssistantMessage {
   return Object.freeze({
     role: "assistant",
-    content,
-    parts: Object.freeze(content.length === 0 ? [] : [{ type: "text" as const, text: content }]),
+    content: Object.freeze(content.length === 0 ? [] : [{ type: "text" as const, text: content }]),
     status,
   });
 }

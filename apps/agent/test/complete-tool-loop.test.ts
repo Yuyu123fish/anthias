@@ -81,7 +81,7 @@ describe("complete Coding Agent Tool Loop", () => {
     expect(modelRequests[3]?.messages.filter((message) => message.role === "tool")).toHaveLength(4);
     expect(agent.state.messageHistory.at(-1)).toMatchObject({
       role: "assistant",
-      content: "修改与验证均已完成。",
+      content: [{ type: "text", text: "修改与验证均已完成。" }],
       status: "completed",
     });
     expect(agent.state.running).toBe(false);

@@ -65,7 +65,7 @@ async function* streamModelEvents(
         type: "tool_call",
         toolCallId: streamPart.toolCallId,
         toolName: streamPart.toolName,
-        input: structuredClone(streamPart.input),
+        input: streamPart.input,
         invalid: streamPart.invalid === true,
       });
       continue;
