@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AssistantToolCallPart } from "../src/message.js";
-import { executeReadOnlyTool } from "../src/tool/read-only-tool.js";
+import { executeGlobTool } from "../src/tool/basetool/glob.js";
+import { executeGrepTool } from "../src/tool/basetool/grep.js";
+import { executeReadFileTool } from "../src/tool/basetool/read-file.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -19,7 +21,7 @@ describe("read-only tools", () => {
     const workspace = await createWorkspace();
     await writeFile(join(workspace.workspaceRoot, "notes.txt"), "one\ntwo\nthree\n", "utf8");
 
-    const result = await executeReadOnlyTool(
+    const result = await executeReadFileTool(
       toolCall("read_file", { path: "notes.txt", startLine: 2, lineCount: 1 }),
       workspace,
       new AbortController().signal,
@@ -39,7 +41,7 @@ describe("read-only tools", () => {
     await writeFile(join(workspace.workspaceRoot, "src", "a.ts"), "a", "utf8");
     await writeFile(join(workspace.sessionDirectory, "hidden.ts"), "hidden", "utf8");
 
-    const result = await executeReadOnlyTool(
+    const result = await executeGlobTool(
       toolCall("glob", { pattern: "**/*.ts" }),
       workspace,
       new AbortController().signal,
@@ -59,7 +61,7 @@ describe("read-only tools", () => {
       "utf8",
     );
 
-    const result = await executeReadOnlyTool(
+    const result = await executeGrepTool(
       toolCall("grep", { pattern: "target", path: "src", filePattern: "**/*.ts" }),
       workspace,
       new AbortController().signal,
@@ -70,32 +72,45 @@ describe("read-only tools", () => {
     expect(result.truncated).toBe(false);
   });
 
+  it("preserves the non-object input error for every read-only tool", async () => {
+    const workspace = await createWorkspace();
+    const abortSignal = new AbortController().signal;
+
+    const results = await Promise.all([
+      executeReadFileTool(toolCall("read_file", []), workspace, abortSignal),
+      executeGlobTool(toolCall("glob", "**/*.ts"), workspace, abortSignal),
+      executeGrepTool(toolCall("grep", 1), workspace, abortSignal),
+    ]);
+
+    expect(results.map((result) => result.content)).toEqual([
+      "read_file 输入必须是 JSON 对象。",
+      "glob 输入必须是 JSON 对象。",
+      "grep 输入必须是 JSON 对象。",
+    ]);
+  });
+
   it("rejects traversal, reserved paths, binary content, and invalid schemas", async () => {
     const workspace = await createWorkspace();
     await writeFile(join(workspace.workspaceRoot, "binary.bin"), Buffer.from([0, 1, 2]));
     await writeFile(join(workspace.sessionDirectory, "session.jsonl"), "secret", "utf8");
 
     const results = await Promise.all([
-      executeReadOnlyTool(
+      executeReadFileTool(
         toolCall("read_file", { path: "../outside.txt" }),
         workspace,
         new AbortController().signal,
       ),
-      executeReadOnlyTool(
+      executeReadFileTool(
         toolCall("read_file", { path: "data/conversation/session.jsonl" }),
         workspace,
         new AbortController().signal,
       ),
-      executeReadOnlyTool(
+      executeReadFileTool(
         toolCall("read_file", { path: "binary.bin" }),
         workspace,
         new AbortController().signal,
       ),
-      executeReadOnlyTool(
-        toolCall("grep", { pattern: "[" }),
-        workspace,
-        new AbortController().signal,
-      ),
+      executeGrepTool(toolCall("grep", { pattern: "[" }), workspace, new AbortController().signal),
     ]);
 
     expect(results.every((result) => result.status === "failed")).toBe(true);

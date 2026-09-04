@@ -9,7 +9,7 @@
 > **核心做法**：统一执行入口先预检和决策，再确认与执行，结果按模型源顺序提交。<br>
 > **边界**：没有 OS 沙箱，也未调用真实 Provider、外网或凭据。<br>
 > **风险 / 未验证**：获批命令仍拥有当前用户权限，静态规则不能证明命令完全安全。<br>
-> **当前 / 请审阅**：完整验证为 16 个文件、124 个测试通过，等待开发者验收。
+> **当前 / 请审阅**：完整验证为 16 个文件、125 个测试通过，等待开发者验收。
 
 - 对应 Spec：[spec.md](spec.md)
 - 对应 Plan：[plan.md](plan.md)
@@ -37,7 +37,7 @@ TUI 或启动配置 → Agent 创建与模式状态 → Run 快照模式和 Tool
 - agent.ts 持有批次调度、并发上限、事件时序、outcome 收集和提交顺序。
 - tool-policy.ts 是无 I/O 的纯决策模块，只返回稳定 ruleId、风险和执行边界。
 - tool-runner.ts 是预检、Policy、approval 计划和执行器之间的唯一内部入口。
-- read-only-tool.ts、file-tool.ts、command-tool.ts 分别持有具体读取、文件副作用和命令生命周期。
+- basetool/ 下的 read-file.ts、glob.ts、grep.ts、edit-file.ts、write-file.ts 和 execute-command.ts 分别持有具体 Tool；text-file.ts、workspace-file-discovery.ts 与 file-change.ts 集中共享文件能力和安全不变量。
 - TUI 只调用 Agent Interface 并呈现 AgentEvent，不复制安全判断或业务生命周期。
 - package 公开面只增加 PermissionMode、AgentState.permissionMode 和模式切换结果；Policy、scheduler 与 ToolRunner 仍为内部实现。
 
@@ -71,10 +71,10 @@ TUI 或启动配置 → Agent 创建与模式状态 → Run 快照模式和 Tool
 
 最终执行 pnpm verify，结果为：
 
-- Biome 检查 50 个文件，无错误、无格式修改。
+- Biome 检查 56 个文件，无错误、无格式修改。
 - TypeScript 测试类型检查通过。
 - TypeScript project build 通过。
-- Vitest 共 16 个测试文件、124 个测试全部通过。
+- Vitest 共 16 个测试文件、125 个测试全部通过。
 
 额外只读审计确认：
 
@@ -89,5 +89,5 @@ TUI 或启动配置 → Agent 创建与模式状态 → Run 快照模式和 Tool
 - 未使用真实 Provider、外部网络、付费 API 或真实凭据。
 - 未把自动化 TUI 测试扩大为真实 Provider 下的长期人工交互验收。
 - 未实现 OS 沙箱、低权限账户、文件系统 capability 或网络隔离；这些能力若未来需要，应另开 Feature。
-- 报告生成时 HEAD 为 7832b76，Feature 实现仍是未提交工作区变更；没有推送或创建 PR。
+- 本次内部目录整理开始时 HEAD 为 c808d9e；当前仍是未提交工作区变更，没有推送或创建 PR。
 - 状态“已实现”只表示实现与约定验证完成，最终“已验收”仍由开发者确认。

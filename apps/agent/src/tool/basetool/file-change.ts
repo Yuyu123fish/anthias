@@ -12,18 +12,31 @@ import {
   win32,
 } from "node:path";
 import { createTwoFilesPatch } from "diff";
-import type { AssistantToolCallPart } from "../message.js";
-import { hasOnlyKeys, isNonEmptyString, isRecord } from "./input-validation.js";
-import { boundToolOutput, type ToolExecutionResult, type ToolFailedResult } from "./tool-result.js";
+import {
+  boundToolOutput,
+  failedToolResult,
+  type ToolExecutionResult,
+  type ToolFailedResult,
+} from "../tool-result.js";
 import {
   arePathsEqual,
   isPathSameOrInside,
   type ToolWorkspace,
   validateWorkspaceRelativePath,
-} from "./workspace-path.js";
+} from "../workspace-path.js";
+import { decodeStrictUtf8, splitTextLines } from "./text-file.js";
 
 /** 枚举两个需要人工确认的文件副作用 Tool。 */
-export type FileToolName = "edit_file" | "write_file";
+type FileToolName = "edit_file" | "write_file";
+
+/** 描述具体文件 Tool 根据同一目标快照计算出的内容变化。 */
+type FileChangeCalculation =
+  | Readonly<{ ok: true; content: string; operation: "edit" | "create" | "overwrite" }>
+  | Readonly<{ ok: false; error: string }>;
+
+type FileChangeCalculator = (
+  target: Readonly<{ exists: boolean; originalContent: string }>,
+) => FileChangeCalculation;
 
 /** 保存一个已经展示、仍未写入磁盘的准确文件变更。 */
 export type PreparedFileTool = Readonly<{
@@ -64,15 +77,6 @@ type FileSystemIdentity = Readonly<{
   inode: FileSystemIdentifier;
 }>;
 
-/** 表示文件 Tool 已完成运行时校验后的固定输入。 */
-type FileToolInput =
-  | Readonly<{
-      toolName: "edit_file";
-      path: string;
-      replacements: readonly Readonly<{ oldText: string; newText: string }>[];
-    }>
-  | Readonly<{ toolName: "write_file"; path: string; content: string }>;
-
 /** 保存预检时解析出的真实目标、原始内容与文件模式。 */
 type ResolvedFileTarget = Readonly<{
   absolutePath: string;
@@ -86,42 +90,23 @@ type ResolvedFileTarget = Readonly<{
   scope: "workspace" | "external";
 }>;
 
-const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
-
-/** 只检查文件 Tool 的运行时输入形状，不读取或写入目标。 */
-export function validateFileToolCallInput(toolCall: AssistantToolCallPart): string | null {
-  const inputResult = parseFileToolInput(toolCall);
-  return inputResult.ok ? null : inputResult.error;
-}
-
-/** 无副作用地校验 edit_file 或 write_file，并生成不可截断的确认预览。 */
-export async function prepareFileTool(
-  toolCall: AssistantToolCallPart,
+/** 基于具体 Tool 已校验的输入解析目标，并生成不可截断的确认预览。 */
+export async function prepareFileChange(
+  toolName: FileToolName,
+  requestedPath: string,
   workspace: ToolWorkspace,
+  calculateChange: FileChangeCalculator,
 ): Promise<PreparedFileResult> {
-  const inputResult = parseFileToolInput(toolCall);
-  if (!inputResult.ok) {
-    return failedPreparation(inputResult.error);
-  }
-
   try {
-    const target = await resolveFileTarget(inputResult.input.path, workspace);
-    if (inputResult.input.toolName === "edit_file" && !target.exists) {
-      return failedPreparation("edit_file 目标文件不存在。");
-    }
-    const calculatedChange =
-      inputResult.input.toolName === "edit_file"
-        ? calculateExactEdit(target.originalContent, inputResult.input.replacements)
-        : Object.freeze({
-            ok: true as const,
-            content: inputResult.input.content,
-            operation: target.exists ? ("overwrite" as const) : ("create" as const),
-          });
+    const target = await resolveFileTarget(requestedPath, workspace);
+    const calculatedChange = calculateChange(
+      Object.freeze({ exists: target.exists, originalContent: target.originalContent }),
+    );
     if (!calculatedChange.ok) {
-      return failedPreparation(calculatedChange.error);
+      return failedFilePreparation(calculatedChange.error);
     }
     if (calculatedChange.content === target.originalContent && target.exists) {
-      return failedPreparation(`${inputResult.input.toolName} 没有产生内容变化。`);
+      return failedFilePreparation(`${toolName} 没有产生内容变化。`);
     }
 
     const patch = createTwoFilesPatch(
@@ -136,17 +121,15 @@ export async function prepareFileTool(
     const previewResult = boundToolOutput([
       `operation: ${calculatedChange.operation}`,
       `path: ${target.displayPath}`,
-      ...splitLines(patch),
+      ...splitTextLines(patch),
     ]);
     if (previewResult.truncated) {
-      return failedPreparation(
-        `${inputResult.input.toolName} 确认预览超过 64 KiB 或 2,000 行，请缩小修改。`,
-      );
+      return failedFilePreparation(`${toolName} 确认预览超过 64 KiB 或 2,000 行，请缩小修改。`);
     }
     return Object.freeze({
       ok: true,
       preparedTool: Object.freeze({
-        toolName: inputResult.input.toolName,
+        toolName,
         target: target.displayPath,
         preview: previewResult.content,
         operation: calculatedChange.operation,
@@ -161,7 +144,7 @@ export async function prepareFileTool(
       }),
     });
   } catch (error) {
-    return failedPreparation(toSafeFileError(error));
+    return failedFilePreparation(toSafeFileError(error));
   }
 }
 
@@ -171,14 +154,14 @@ export async function executePreparedFileTool(
   abortSignal: AbortSignal,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
-    return failedExecution("Run 已停止，文件未写入。");
+    return failedToolResult("Run 已停止，文件未写入。");
   }
   const fingerprintMatches = await matchesPreparedTarget(preparedTool).catch(() => false);
   if (!fingerprintMatches) {
-    return failedExecution("stale target：目标在确认后发生变化，文件未写入。");
+    return failedToolResult("stale target：目标在确认后发生变化，文件未写入。");
   }
   if (abortSignal.aborted) {
-    return failedExecution("Run 已停止，文件未写入。");
+    return failedToolResult("Run 已停止，文件未写入。");
   }
 
   const temporaryFilePath = join(
@@ -202,12 +185,12 @@ export async function executePreparedFileTool(
     if (abortSignal.aborted) {
       await unlink(temporaryFilePath).catch(() => undefined);
       temporaryFileCreated = false;
-      return failedExecution("Run 已停止，文件未写入。");
+      return failedToolResult("Run 已停止，文件未写入。");
     }
     if (!(await matchesPreparedTarget(preparedTool))) {
       await unlink(temporaryFilePath).catch(() => undefined);
       temporaryFileCreated = false;
-      return failedExecution("stale target：目标在确认后发生变化，文件未写入。");
+      return failedToolResult("stale target：目标在确认后发生变化，文件未写入。");
     }
     await rename(temporaryFilePath, preparedTool.absolutePath);
     temporaryFileCreated = false;
@@ -220,122 +203,8 @@ export async function executePreparedFileTool(
     if (temporaryFileCreated) {
       await unlink(temporaryFilePath).catch(() => undefined);
     }
-    return failedExecution(toSafeFileError(error));
+    return failedToolResult(toSafeFileError(error));
   }
-}
-
-/** 判断名称是否属于必须逐次确认的文件 Tool。 */
-export function isFileToolName(toolName: string): toolName is FileToolName {
-  return toolName === "edit_file" || toolName === "write_file";
-}
-
-/** 解析两个文件 Tool 的精确输入，拒绝未知字段和错误类型。 */
-function parseFileToolInput(
-  toolCall: AssistantToolCallPart,
-): Readonly<{ ok: true; input: FileToolInput }> | Readonly<{ ok: false; error: string }> {
-  if (toolCall.invalid || !isFileToolName(toolCall.toolName) || !isRecord(toolCall.input)) {
-    return Object.freeze({
-      ok: false,
-      error: `${toolCall.toolName} 输入无法解析或不符合 Schema。`,
-    });
-  }
-  const input = toolCall.input;
-  if (toolCall.toolName === "edit_file") {
-    if (
-      !hasOnlyKeys(input, ["path", "replacements"]) ||
-      !isNonEmptyString(input.path) ||
-      !Array.isArray(input.replacements) ||
-      input.replacements.length === 0
-    ) {
-      return Object.freeze({ ok: false, error: "edit_file 输入不符合 Schema。" });
-    }
-    const replacements: Readonly<{ oldText: string; newText: string }>[] = [];
-    for (const replacement of input.replacements) {
-      if (
-        !isRecord(replacement) ||
-        !hasOnlyKeys(replacement, ["oldText", "newText"]) ||
-        !isNonEmptyString(replacement.oldText) ||
-        typeof replacement.newText !== "string"
-      ) {
-        return Object.freeze({ ok: false, error: "edit_file replacements 不符合 Schema。" });
-      }
-      replacements.push(
-        Object.freeze({ oldText: replacement.oldText, newText: replacement.newText }),
-      );
-    }
-    return Object.freeze({
-      ok: true,
-      input: Object.freeze({
-        toolName: "edit_file",
-        path: input.path,
-        replacements: Object.freeze(replacements),
-      }),
-    });
-  }
-  if (
-    !hasOnlyKeys(input, ["path", "content"]) ||
-    !isNonEmptyString(input.path) ||
-    typeof input.content !== "string"
-  ) {
-    return Object.freeze({ ok: false, error: "write_file 输入不符合 Schema。" });
-  }
-  return Object.freeze({
-    ok: true,
-    input: Object.freeze({ toolName: "write_file", path: input.path, content: input.content }),
-  });
-}
-
-/** 在同一原始快照中验证唯一且不重叠的精确替换。 */
-function calculateExactEdit(
-  originalContent: string,
-  replacements: readonly Readonly<{ oldText: string; newText: string }>[],
-):
-  | Readonly<{ ok: true; content: string; operation: "edit" }>
-  | Readonly<{ ok: false; error: string }> {
-  const indexedReplacements: Array<
-    Readonly<{ start: number; end: number; oldText: string; newText: string }>
-  > = [];
-  for (const replacement of replacements) {
-    const firstMatchIndex = originalContent.indexOf(replacement.oldText);
-    if (
-      firstMatchIndex < 0 ||
-      originalContent.indexOf(replacement.oldText, firstMatchIndex + 1) >= 0
-    ) {
-      return Object.freeze({
-        ok: false,
-        error: "edit_file 的每个 oldText 必须在同一原始文件中恰好匹配一次。",
-      });
-    }
-    indexedReplacements.push(
-      Object.freeze({
-        start: firstMatchIndex,
-        end: firstMatchIndex + replacement.oldText.length,
-        oldText: replacement.oldText,
-        newText: replacement.newText,
-      }),
-    );
-  }
-  indexedReplacements.sort((left, right) => left.start - right.start);
-  for (let index = 1; index < indexedReplacements.length; index += 1) {
-    const previousReplacement = indexedReplacements[index - 1];
-    const currentReplacement = indexedReplacements[index];
-    if (
-      previousReplacement === undefined ||
-      currentReplacement === undefined ||
-      currentReplacement.start < previousReplacement.end
-    ) {
-      return Object.freeze({ ok: false, error: "edit_file replacements 不能重叠。" });
-    }
-  }
-
-  let editedContent = originalContent;
-  for (const replacement of [...indexedReplacements].reverse()) {
-    editedContent =
-      editedContent.slice(0, replacement.start) +
-      replacement.newText +
-      editedContent.slice(replacement.end);
-  }
-  return Object.freeze({ ok: true, content: editedContent, operation: "edit" });
 }
 
 /** 解析已有或待创建文件，并把一个精确目标绑定到 workspace 或 external 范围。 */
@@ -567,38 +436,12 @@ function sameFileSystemIdentity(
   return stats.dev === identity.device && stats.ino === identity.inode;
 }
 
-/** 以 fatal UTF-8 解码文本，并拒绝包含 NUL 的二进制内容。 */
-function decodeStrictUtf8(bytes: Uint8Array): string {
-  if (bytes.includes(0)) {
-    throw new Error("文件包含二进制内容。");
-  }
-  try {
-    return UTF8_DECODER.decode(bytes);
-  } catch {
-    throw new Error("文件不是有效的 UTF-8 文本。");
-  }
-}
-
-/** 按跨平台换行拆分预览文本，不虚构额外尾行。 */
-function splitLines(text: string): string[] {
-  const lines = text.split(/\r?\n/u);
-  if (lines.at(-1) === "") {
-    lines.pop();
-  }
-  return lines;
-}
-
 /** 创建一个无需确认即可返回模型的文件预检失败。 */
-function failedPreparation(error: string): PreparedFileResult {
+export function failedFilePreparation(error: string): PreparedFileResult {
   return Object.freeze({
     ok: false,
-    result: Object.freeze({ status: "failed", content: error, truncated: false }),
+    result: failedToolResult(error),
   });
-}
-
-/** 创建一个由 Agent 继续映射取消状态的文件执行失败。 */
-function failedExecution(error: string): ToolExecutionResult {
-  return Object.freeze({ status: "failed", content: error, truncated: false });
 }
 
 /** 收敛文件系统错误，避免绝对路径或堆栈进入模型与 TUI。 */

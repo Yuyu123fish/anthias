@@ -1,23 +1,23 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
-import type { AssistantToolCallPart } from "../message.js";
-import type { SessionShell } from "../session/index.js";
+import type { AssistantToolCallPart } from "../../message.js";
+import type { SessionShell } from "../../session/index.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
   isOptionalIntegerInRange,
   isOptionalNonEmptyString,
   isRecord,
-} from "./input-validation.js";
+} from "../input-validation.js";
 import {
   boundToolOutput,
   TOOL_RESULT_BYTE_LIMIT,
   TOOL_RESULT_LINE_LIMIT,
   type ToolExecutionResult,
   type ToolFailedResult,
-} from "./tool-result.js";
-import { resolveExistingWorkspacePath, type ToolWorkspace } from "./workspace-path.js";
+} from "../tool-result.js";
+import { resolveExistingWorkspacePath, type ToolWorkspace } from "../workspace-path.js";
 
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{

@@ -10,7 +10,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
-import { prepareFileTool } from "../src/tool/file-tool.js";
+import { prepareWriteFileTool } from "../src/tool/basetool/write-file.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -110,7 +110,7 @@ describe("external single-file approval", () => {
     const rejectedPaths = [volumeRoot, fixture.externalDirectory, ...platformSpecificPaths];
 
     for (const [index, rejectedPath] of rejectedPaths.entries()) {
-      const result = await prepareFileTool(
+      const result = await prepareWriteFileTool(
         fileToolCall(index + 10, "write_file", { path: rejectedPath, content: "blocked" }),
         {
           workspaceRoot: fixture.workspaceRoot,
@@ -125,7 +125,7 @@ describe("external single-file approval", () => {
     const fixture = await createFixture();
     const workspacePath = join(fixture.workspaceRoot, "report[1].txt");
 
-    const result = await prepareFileTool(
+    const result = await prepareWriteFileTool(
       fileToolCall(30, "write_file", { path: workspacePath, content: "workspace" }),
       {
         workspaceRoot: fixture.workspaceRoot,

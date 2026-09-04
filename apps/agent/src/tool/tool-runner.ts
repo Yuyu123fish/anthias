@@ -1,19 +1,18 @@
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
 import type { PermissionMode } from "../permission-mode.js";
 import type { SessionShell } from "../session/index.js";
+import { prepareEditFileTool, validateEditFileToolCallInput } from "./basetool/edit-file.js";
 import {
   executePreparedCommand,
   prepareCommandTool,
   validateCommandToolCallInput,
-} from "./command-tool.js";
-import { isReadOnlyToolName, type ReadOnlyToolName } from "./definitions.js";
-import {
-  executePreparedFileTool,
-  isFileToolName,
-  prepareFileTool,
-  validateFileToolCallInput,
-} from "./file-tool.js";
-import { executeReadOnlyTool, validateReadOnlyToolCallInput } from "./read-only-tool.js";
+} from "./basetool/execute-command.js";
+import { executePreparedFileTool, type PreparedFileResult } from "./basetool/file-change.js";
+import { executeGlobTool, validateGlobToolCallInput } from "./basetool/glob.js";
+import { executeGrepTool, validateGrepToolCallInput } from "./basetool/grep.js";
+import { executeReadFileTool, validateReadFileToolCallInput } from "./basetool/read-file.js";
+import { prepareWriteFileTool, validateWriteFileToolCallInput } from "./basetool/write-file.js";
+import type { ReadOnlyToolName } from "./definitions.js";
 import { decideToolPolicy, type ToolPolicyDecision } from "./tool-policy.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
@@ -101,10 +100,40 @@ function createToolCallPlan(
   permissionMode: PermissionMode,
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
-  if (isReadOnlyToolName(toolCall.toolName)) {
-    const validationError = validateReadOnlyToolCallInput(toolCall);
+  if (toolCall.toolName === "read_file") {
+    const validationError = validateReadFileToolCallInput(toolCall);
     return validationError === null
-      ? createReadOnlyToolCallPlan(toolCall, toolCall.toolName, permissionMode, options.workspace)
+      ? createReadOnlyToolCallPlan(
+          toolCall,
+          "read_file",
+          permissionMode,
+          options.workspace,
+          executeReadFileTool,
+        )
+      : createRejectedToolCallPlan(validationError);
+  }
+  if (toolCall.toolName === "glob") {
+    const validationError = validateGlobToolCallInput(toolCall);
+    return validationError === null
+      ? createReadOnlyToolCallPlan(
+          toolCall,
+          "glob",
+          permissionMode,
+          options.workspace,
+          executeGlobTool,
+        )
+      : createRejectedToolCallPlan(validationError);
+  }
+  if (toolCall.toolName === "grep") {
+    const validationError = validateGrepToolCallInput(toolCall);
+    return validationError === null
+      ? createReadOnlyToolCallPlan(
+          toolCall,
+          "grep",
+          permissionMode,
+          options.workspace,
+          executeGrepTool,
+        )
       : createRejectedToolCallPlan(validationError);
   }
   if (toolCall.toolName === "execute_command") {
@@ -119,17 +148,30 @@ function createToolCallPlan(
     }
     return createCommandToolCallPlan(toolCall, permissionMode, options);
   }
-  if (isFileToolName(toolCall.toolName)) {
-    const validationError = validateFileToolCallInput(toolCall);
+  if (toolCall.toolName === "edit_file") {
+    const validationError = validateEditFileToolCallInput(toolCall);
     if (validationError !== null) {
       return createRejectedToolCallPlan(validationError);
     }
     if (permissionMode === "plan") {
-      return createPolicyDeniedPlan(
-        decideToolPolicy({ permissionMode, toolName: toolCall.toolName }),
-      );
+      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "edit_file" }));
     }
-    return createFileToolCallPlan(toolCall, permissionMode, options.workspace);
+    return createFileToolCallPlan(toolCall, permissionMode, options.workspace, prepareEditFileTool);
+  }
+  if (toolCall.toolName === "write_file") {
+    const validationError = validateWriteFileToolCallInput(toolCall);
+    if (validationError !== null) {
+      return createRejectedToolCallPlan(validationError);
+    }
+    if (permissionMode === "plan") {
+      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "write_file" }));
+    }
+    return createFileToolCallPlan(
+      toolCall,
+      permissionMode,
+      options.workspace,
+      prepareWriteFileTool,
+    );
   }
   return createRejectedToolCallPlan(
     toolCall.invalid
@@ -144,6 +186,11 @@ function createReadOnlyToolCallPlan(
   toolName: ReadOnlyToolName,
   permissionMode: PermissionMode,
   workspace: ToolWorkspace,
+  executeTool: (
+    toolCall: AssistantToolCallPart,
+    workspace: ToolWorkspace,
+    abortSignal: AbortSignal,
+  ) => Promise<ToolExecutionResult>,
 ): ToolCallPlan {
   const policyDecision = decideToolPolicy({ permissionMode, toolName });
   if (policyDecision.kind !== "allow") {
@@ -161,7 +208,7 @@ function createReadOnlyToolCallPlan(
             executionUnavailableContent: "Run 已停止，Tool 未执行。",
             async execute(abortSignal: AbortSignal) {
               return Object.freeze({
-                ...(await executeReadOnlyTool(toolCall, workspace, abortSignal)),
+                ...(await executeTool(toolCall, workspace, abortSignal)),
                 cleanupUncertain: false,
               });
             },
@@ -176,12 +223,16 @@ function createFileToolCallPlan(
   toolCall: AssistantToolCallPart,
   permissionMode: PermissionMode,
   workspace: ToolWorkspace,
+  prepareTool: (
+    toolCall: AssistantToolCallPart,
+    workspace: ToolWorkspace,
+  ) => Promise<PreparedFileResult>,
 ): ToolCallPlan {
   return Object.freeze({
     scheduling: "source_order_serial",
     abortedPreparationContent: "Run 已停止，文件未写入。",
     async prepare() {
-      const preparedResult = await prepareFileTool(toolCall, workspace);
+      const preparedResult = await prepareTool(toolCall, workspace);
       if (!preparedResult.ok) {
         return Object.freeze({ ok: false, result: preparedResult.result });
       }
