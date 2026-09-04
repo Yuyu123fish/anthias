@@ -8,7 +8,7 @@
 > **核心做法**：Session 归 Anthias `data`；TUI 常驻路径，Shiki 高亮代码并收起思考。<br>
 > **边界**：只显示 Provider 给出的 Reasoning；不含完整 Markdown、Session 管理器或 OS 沙箱。<br>
 > **风险 / 未验证**：终端能力、Shiki 性能、Provider 差异和 Windows 清理待验证。<br>
-> **当前 / 请审阅**：实施中；Plan 01 已提交，Plan 02 已完成并准备提交，随后连续实施 Plan 03。
+> **当前 / 请审阅**：实施中；Plan 01–02 已提交，Plan 03 已完成并准备提交，随后连续实施 Plan 04。
 
 - 文档类型：Spec
 - Feature 目录：`feature004-tui-workspace-experience`

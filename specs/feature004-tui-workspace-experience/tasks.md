@@ -7,8 +7,8 @@
 > **一句话**：十五项任务按四个 Plan 交付工作区启动、Agent 可观察性、内容渲染和完整 TUI。<br>
 > **核心做法**：每项任务形成可验证 tracer，按依赖顺序推进，每个 Plan 完成后独立提交。<br>
 > **边界**：不改变 Session Schema、Tool Policy 或 Agent 核心操作 Interface；不推送或创建 PR。<br>
-> **风险 / 未验证**：Shiki、终端重绘与真实 Provider 仍待后续 Plan 证明。<br>
-> **当前 / 请审阅**：实施中；T001–T007 已完成，Plan 02 提交后连续推进 T008。
+> **风险 / 未验证**：动态终端重绘、resize、Windows Terminal 人工体验与真实 Provider 仍待 Plan 04 证明。<br>
+> **当前 / 请审阅**：实施中；T001–T011 已完成，Plan 03 提交后连续推进 T012。
 
 - 对应 Spec：[spec.md](spec.md)
 - 实施计划：[Plan 01](plan-01-workspace-and-data-root.md)、[Plan 02](plan-02-agent-observability.md)、[Plan 03](plan-03-terminal-content-rendering.md)、[Plan 04](plan-04-interactive-tui-and-closeout.md)
@@ -105,50 +105,50 @@ Blocked by：T005、T006
 
 ### T008：Content Renderer 安全 seam
 
-状态：待开始
+状态：已完成
 
 Blocked by：T007
 
-- [ ] 在 `apps/tui` 内建立单一 Assistant Content Renderer 与明确 TerminalCapabilities。
-- [ ] 模型内容先安全化为语义 spans / lines，只有 Terminal Writer 可以生成 ANSI / OSC。
-- [ ] 跨 delta 只提交稳定块，异步结果保持消息与 Run 顺序。
-- [ ] plain 与 interactive writer 共用解析结果，不导出内部 renderer 框架。
+- [x] 在 `apps/tui` 内建立单一 Assistant Content Renderer 与明确 TerminalCapabilities。
+- [x] 模型内容先安全化为语义 spans / lines，只有 Terminal Writer 可以生成 ANSI / OSC。
+- [x] 跨 delta 只提交稳定块，异步结果保持消息与 Run 顺序。
+- [x] plain 与 interactive writer 共用解析结果，不导出内部 renderer 框架。
 
 ### T009：Workspace 文件引用 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T008
 
-- [ ] inline code 和 Markdown 本地链接经 `realpath`、普通文件与 Workspace 范围验证。
-- [ ] 合格目标显示 `▧` / `[file]`、相对路径和行列号；URI 使用 `pathToFileURL()`。
-- [ ] hyperlink 与颜色分别降级，链接不会自动打开。
-- [ ] 缺失、目录、Workspace 外、UNC、WSL UNC、SSH 和解析失败目标保持原文。
-- [ ] 恶意 ESC / OSC 和特殊 Windows 路径不能注入终端控制。
+- [x] inline code 和 Markdown 本地链接经 `realpath`、普通文件与 Workspace 范围验证。
+- [x] 合格目标显示 `▧` / `[file]`、相对路径和行列号；URI 使用 `pathToFileURL()`。
+- [x] hyperlink 与颜色分别降级，链接不会自动打开。
+- [x] 缺失、目录、Workspace 外、UNC、WSL UNC、SSH 和解析失败目标保持原文。
+- [x] 恶意 ESC / OSC 和特殊 Windows 路径不能注入终端控制。
 
 ### T010：Shiki 代码块 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T008
 
-- [ ] 只在 `apps/tui` 安装并锁定 `@shikijs/core`、`@shikijs/langs`、`@shikijs/engine-javascript` 4.4.3。
-- [ ] lazy highlighter、按需 grammar、并发加载合并与 Anthias 自有 theme 按 Plan 工作。
-- [ ] 首批语言与别名全部可用，代表性 token 映射到五类语义色。
-- [ ] 未知、未标、未闭合、64 KiB / 2,000 行超限和 Shiki 异常保持 plain 原文。
-- [ ] 无颜色、256 色与 16 色由注入能力决定，不由 Shiki 读取进程状态。
+- [x] 只在 `apps/tui` 安装并锁定 `@shikijs/core`、`@shikijs/langs`、`@shikijs/engine-javascript` 4.4.3。
+- [x] lazy highlighter、按需 grammar、并发加载合并与 Anthias 自有 theme 按 Plan 工作。
+- [x] 首批语言与别名全部可用，代表性 token 映射到五类语义色。
+- [x] 未知、未标、未闭合、64 KiB / 2,000 行超限和 Shiki 异常保持 plain 原文。
+- [x] 无颜色、256 色与 16 色由注入能力决定，不由 Shiki 读取进程状态。
 
 ### T011：Plan 03 门禁与阶段报告
 
-状态：待开始
+状态：已完成
 
 Blocked by：T009、T010
 
-- [ ] Content Renderer 与 TUI 定向测试通过，去除 renderer 样式后代码内容保持一致。
-- [ ] `pnpm check` 通过，无完整 Markdown、LSP、自动语言猜测或 Provider 类型泄漏。
-- [ ] 记录本机首块冷加载和热加载结果，不设 CI 时间断言。
-- [ ] Report 补充文件、Shiki、fallback 与控制序列安全证据。
-- [ ] 更新任务状态并汇报；停止，不进入 Plan 04。
+- [x] Content Renderer 与 TUI 定向测试通过，去除 renderer 样式后代码内容保持一致。
+- [x] `pnpm check` 通过，无完整 Markdown、LSP、自动语言猜测或 Provider 类型泄漏。
+- [x] 记录本机首块冷加载和热加载结果，不设 CI 时间断言。
+- [x] Report 补充文件、Shiki、fallback 与控制序列安全证据。
+- [x] 更新任务状态并提交；按最新授权连续进入 Plan 04。
 
 ## Plan 04：交互式 TUI 与整体验收
 

@@ -6,6 +6,14 @@ import type {
   PermissionMode,
   PromptResult,
 } from "@anthias/agent";
+import {
+  type AssistantContentRenderer,
+  createAssistantContentRenderer,
+  detectTerminalCapabilities,
+  renderAssistantContent,
+  sanitizeTerminalText,
+  type TerminalCapabilities,
+} from "./content-renderer.js";
 
 /** 抽象 TUI 所需的最小 SIGINT 订阅行为。 */
 export type TuiSignalSource = Readonly<{
@@ -19,7 +27,13 @@ export type RunTuiOptions = Readonly<{
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
   signalSource?: TuiSignalSource;
+  terminalCapabilities?: TerminalCapabilities;
 }>;
+
+type TuiPresentationState = {
+  activeAssistantRenderer: AssistantContentRenderer | null;
+  receivedAssistantText: string;
+};
 
 const INPUT_PROMPT = "anthias> ";
 
@@ -29,14 +43,41 @@ export function runTui({
   input = process.stdin,
   output = process.stdout,
   signalSource = process,
+  terminalCapabilities: requestedTerminalCapabilities,
 }: RunTuiOptions): Promise<number> {
   const readlineInterface = createInterface({ input, output, terminal: false });
+  const terminalCapabilities = requestedTerminalCapabilities ?? detectTerminalCapabilities(output);
+  const presentationState: TuiPresentationState = {
+    activeAssistantRenderer: null,
+    receivedAssistantText: "",
+  };
   const exitCompletion = Promise.withResolvers<number>();
   let pendingPromptResultPromise: Promise<PromptResult> | null = null;
   let exitStarted = false;
+  let renderQueue: Promise<void> = Promise.resolve();
 
-  renderInitialState(agent.state, output);
-  const unsubscribeFromAgentEvents = agent.subscribe((event) => renderEvent(event, output));
+  /** 所有异步内容解析与终端写入共享同一队列，AgentEvent 的源顺序不会被越过。 */
+  function enqueueRender(operation: () => void | Promise<void>): Promise<void> {
+    renderQueue = renderQueue.then(operation).catch(() => {
+      presentationState.activeAssistantRenderer = null;
+      presentationState.receivedAssistantText = "";
+      output.write("内容呈现失败，已回退到下一条事件。\n");
+    });
+    return renderQueue;
+  }
+
+  void enqueueRender(() => renderInitialState(agent.state, output, terminalCapabilities));
+  const unsubscribeFromAgentEvents = agent.subscribe((event) => {
+    void enqueueRender(() =>
+      renderEvent(
+        event,
+        output,
+        presentationState,
+        agent.state.workspaceRoot,
+        terminalCapabilities,
+      ),
+    );
+  });
 
   /** 运行时 Ctrl+C 只停止当前生成；空闲时 Ctrl+C 退出 TUI。 */
   const onSigint = () => {
@@ -59,6 +100,13 @@ export function runTui({
     try {
       await pendingPromptResultPromise;
     } finally {
+      await enqueueRender(async () => {
+        const remainingAssistantText = await flushActiveAssistant(presentationState);
+        if (remainingAssistantText.length > 0) {
+          output.write(remainingAssistantText);
+          output.write("\n");
+        }
+      });
       unsubscribeFromAgentEvents();
       signalSource.off("SIGINT", onSigint);
       exitCompletion.resolve(0);
@@ -67,6 +115,7 @@ export function runTui({
 
   /** 将一行终端输入转换为退出命令或 Agent prompt。 */
   async function handleLine(line: string): Promise<void> {
+    await renderQueue;
     if (exitStarted) {
       return;
     }
@@ -76,8 +125,10 @@ export function runTui({
       return;
     }
     if (trimmedLine === "/mode" || trimmedLine.startsWith("/mode ")) {
-      handleModeCommand(trimmedLine, agent, output);
-      writeInputPrompt(agent.state, output);
+      await enqueueRender(() => {
+        handleModeCommand(trimmedLine, agent, output);
+        writeInputPrompt(agent.state, output);
+      });
       return;
     }
     const pendingApproval = agent.state.pendingToolApproval;
@@ -92,18 +143,24 @@ export function runTui({
       ) {
         agent.respondToToolApproval(pendingApproval.toolApprovalRequestId, "deny");
       } else {
-        output.write("请输入 y/yes 批准，或 n/no/空行拒绝。\n");
+        await enqueueRender(() => {
+          output.write("请输入 y/yes 批准，或 n/no/空行拒绝。\n");
+        });
       }
       return;
     }
     if (trimmedLine.length === 0) {
-      output.write("请输入非空提示词。\n");
-      writeInputPrompt(agent.state, output);
+      await enqueueRender(() => {
+        output.write("请输入非空提示词。\n");
+        writeInputPrompt(agent.state, output);
+      });
       return;
     }
     if (agent.state.running) {
-      output.write("当前响应仍在生成，请先停止。\n");
-      writeInputPrompt(agent.state, output);
+      await enqueueRender(() => {
+        output.write("当前响应仍在生成，请先停止。\n");
+        writeInputPrompt(agent.state, output);
+      });
       return;
     }
 
@@ -114,12 +171,14 @@ export function runTui({
       pendingPromptResultPromise = null;
     }
 
-    if (promptResult.status === "rejected") {
-      output.write(renderPromptRejection(promptResult.reason));
-    }
-    if (!exitStarted) {
-      writeInputPrompt(agent.state, output);
-    }
+    await enqueueRender(() => {
+      if (promptResult.status === "rejected") {
+        output.write(renderPromptRejection(promptResult.reason));
+      }
+      if (!exitStarted) {
+        writeInputPrompt(agent.state, output);
+      }
+    });
   }
 
   signalSource.on("SIGINT", onSigint);
@@ -130,12 +189,20 @@ export function runTui({
     void requestExit();
   });
 
-  writeInputPrompt(agent.state, output);
+  void enqueueRender(() => {
+    writeInputPrompt(agent.state, output);
+  });
   return exitCompletion.promise;
 }
 
 /** 将 AgentEvent 顺序映射为终端输出，不维护第二份 Agent 状态。 */
-function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
+async function renderEvent(
+  event: AgentEvent,
+  output: NodeJS.WritableStream,
+  presentationState: TuiPresentationState,
+  workspaceRoot: string,
+  terminalCapabilities: TerminalCapabilities,
+): Promise<void> {
   switch (event.type) {
     case "run_start":
       output.write("Status: Requesting model\n");
@@ -147,7 +214,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       output.write("Thinking: ");
       return;
     case "reasoning_update":
-      output.write(event.delta);
+      output.write(sanitizeTerminalText(event.delta));
       return;
     case "reasoning_end":
       output.write("\n");
@@ -157,31 +224,68 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       return;
     case "message_start":
       if (event.message.role === "user") {
-        output.write(`You: ${event.message.content}\n`);
+        output.write(`You: ${sanitizeTerminalText(event.message.content)}\n`);
       } else if (event.message.role === "assistant") {
+        const unfinishedAssistantText = await flushActiveAssistant(presentationState);
+        if (unfinishedAssistantText.length > 0) {
+          output.write(`${unfinishedAssistantText}\n`);
+        }
         output.write("Assistant: ");
+        presentationState.activeAssistantRenderer = createAssistantContentRenderer({
+          workspaceRoot,
+          capabilities: terminalCapabilities,
+        });
+        presentationState.receivedAssistantText = "";
       }
       return;
     case "message_update":
-      output.write(event.delta);
+      if (presentationState.activeAssistantRenderer === null) {
+        output.write("Assistant: ");
+        presentationState.activeAssistantRenderer = createAssistantContentRenderer({
+          workspaceRoot,
+          capabilities: terminalCapabilities,
+        });
+      }
+      presentationState.receivedAssistantText += event.delta;
+      output.write(await presentationState.activeAssistantRenderer.push(event.delta));
       return;
     case "message_end":
       if (event.message.role === "assistant") {
+        if (presentationState.activeAssistantRenderer === null) {
+          output.write("Assistant: ");
+          presentationState.activeAssistantRenderer = createAssistantContentRenderer({
+            workspaceRoot,
+            capabilities: terminalCapabilities,
+          });
+        }
+        const completeAssistantText = getAssistantText(event.message);
+        if (completeAssistantText.startsWith(presentationState.receivedAssistantText)) {
+          const missingAssistantText = completeAssistantText.slice(
+            presentationState.receivedAssistantText.length,
+          );
+          if (missingAssistantText.length > 0) {
+            presentationState.receivedAssistantText += missingAssistantText;
+            output.write(
+              await presentationState.activeAssistantRenderer.push(missingAssistantText),
+            );
+          }
+        }
+        output.write(await flushActiveAssistant(presentationState));
         output.write("\n");
       } else if (event.message.role === "tool") {
         output.write(
-          `ToolResult: ${event.message.toolName} ${event.message.status}${event.message.truncated ? "（已截断）" : ""}\n${event.message.content}\n`,
+          `ToolResult: ${event.message.toolName} ${event.message.status}${event.message.truncated ? "（已截断）" : ""}\n${sanitizeTerminalText(event.message.content)}\n`,
         );
       }
       return;
     case "tool_execution_start":
       output.write(
-        `Tool: ${event.activity.toolName} [${shortToolCallId(event.activity.toolCallId)}] ${event.activity.summary}\n`,
+        `Tool: ${event.activity.toolName} [${shortToolCallId(event.activity.toolCallId)}] ${sanitizeTerminalText(event.activity.summary)}\n`,
       );
       return;
     case "tool_execution_update":
       output.write(
-        `[${event.toolName} ${shortToolCallId(event.toolCallId)} ${event.stream}] ${event.delta}`,
+        `[${event.toolName} ${shortToolCallId(event.toolCallId)} ${event.stream}] ${sanitizeTerminalText(event.delta)}`,
       );
       return;
     case "tool_execution_end":
@@ -194,7 +298,7 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       return;
     case "tool_approval_requested":
       output.write(
-        `需要确认：${event.request.toolName}\n权限模式：${renderPermissionMode(event.request.permissionMode)}\n目标：${event.request.target}\n风险：${event.request.riskSummary}\n执行边界：${event.request.executionBoundary}\n${event.request.preview}\n允许执行？[y/N] `,
+        `需要确认：${event.request.toolName}\n权限模式：${renderPermissionMode(event.request.permissionMode)}\n目标：${sanitizeTerminalText(event.request.target)}\n风险：${sanitizeTerminalText(event.request.riskSummary)}\n执行边界：${sanitizeTerminalText(event.request.executionBoundary)}\n${sanitizeTerminalText(event.request.preview)}\n允许执行？[y/N] `,
       );
       return;
     case "tool_approval_resolved":
@@ -205,8 +309,14 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       }
       return;
     case "run_end":
+      {
+        const unfinishedAssistantText = await flushActiveAssistant(presentationState);
+        if (unfinishedAssistantText.length > 0) {
+          output.write(`${unfinishedAssistantText}\n`);
+        }
+      }
       if (event.result.status === "failed") {
-        output.write(`错误：${event.result.error}\n`);
+        output.write(`错误：${sanitizeTerminalText(event.result.error)}\n`);
       } else if (event.result.status === "aborted") {
         output.write("已停止当前响应。\n");
       } else {
@@ -217,19 +327,37 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
 }
 
 /** TUI 只从 AgentState 呈现重开投影，不直接读取 Session 文件。 */
-function renderInitialState(state: Agent["state"], output: NodeJS.WritableStream): void {
+async function renderInitialState(
+  state: Agent["state"],
+  output: NodeJS.WritableStream,
+  terminalCapabilities: TerminalCapabilities,
+): Promise<void> {
   output.write(`Session: ${state.sessionId}\n`);
   output.write(`Workspace: ${renderSafePath(state.workspaceRoot)}\n`);
   output.write(`Mode: ${renderPermissionMode(state.permissionMode)}\n`);
   for (const message of state.messageHistory) {
     if (message.role === "user") {
-      output.write(`You: ${message.content}\n`);
+      output.write(`You: ${sanitizeTerminalText(message.content)}\n`);
     } else if (message.role === "assistant") {
-      output.write(`Assistant: ${getAssistantText(message)}\n`);
+      const assistantContent = await renderAssistantContent(getAssistantText(message), {
+        workspaceRoot: state.workspaceRoot,
+        capabilities: terminalCapabilities,
+      });
+      output.write(`Assistant: ${assistantContent}\n`);
     } else {
-      output.write(`ToolResult: ${message.toolName} ${message.status}\n${message.content}\n`);
+      output.write(
+        `ToolResult: ${message.toolName} ${message.status}\n${sanitizeTerminalText(message.content)}\n`,
+      );
     }
   }
+}
+
+/** 完成当前 Assistant Message，并立即清空瞬时 renderer 所有权。 */
+async function flushActiveAssistant(presentationState: TuiPresentationState): Promise<string> {
+  const activeAssistantRenderer = presentationState.activeAssistantRenderer;
+  presentationState.activeAssistantRenderer = null;
+  presentationState.receivedAssistantText = "";
+  return activeAssistantRenderer === null ? "" : activeAssistantRenderer.finish();
 }
 
 /** 解析 TUI 自有模式命令，权限判断仍完全委托给 Agent。 */
@@ -290,14 +418,9 @@ function writeInputPrompt(state: Agent["state"], output: NodeJS.WritableStream):
   output.write(INPUT_PROMPT);
 }
 
-/** 当前行式界面先阻断路径控制字符，完整 ANSI / OSC 策略由 Content Renderer 统一接管。 */
+/** 路径与正文使用同一控制字符安全规则。 */
 function renderSafePath(path: string): string {
-  return [...path]
-    .map((character) => {
-      const codePoint = character.codePointAt(0) ?? 0;
-      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ? "�" : character;
-    })
-    .join("");
+  return sanitizeTerminalText(path);
 }
 
 /** 将不同 prompt 拒绝原因映射为可操作且不混淆的终端文案。 */

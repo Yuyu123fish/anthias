@@ -62,6 +62,82 @@ describe("runTui", () => {
     expect(promptHandler).not.toHaveBeenCalled();
   });
 
+  it("renders reopened Assistant files and code through the content renderer", async () => {
+    const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
+    const agent = createFakeAgent(
+      { prompt: promptHandler },
+      [
+        assistantMessage(
+          "See `package.json:1`\n```ts\nconst anthias: string = 'fish';\n```",
+          "completed",
+        ),
+      ],
+      process.cwd(),
+    );
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({
+      agent,
+      input,
+      output,
+      signalSource,
+      terminalCapabilities: { colorDepth: "none", hyperlinks: false, unicode: true },
+    });
+    input.write("/exit\n");
+
+    await expect(tuiExit).resolves.toBe(0);
+    expect(rendered).toContain("See ▧ package.json:1");
+    expect(rendered).toContain("╭─ ts\nconst anthias: string = 'fish';\n╰─\n");
+    expect(promptHandler).not.toHaveBeenCalled();
+  });
+
+  it("keeps async syntax highlighting before Run completion and the next prompt", async () => {
+    const agent = createFakeAgent(
+      {
+        prompt: (promptText, controls) =>
+          completePrompt(promptText, ["```ts\nconst answer: number = 42;\n```"], controls),
+      },
+      [],
+      process.cwd(),
+    );
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const signalSource = new EventEmitter();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+
+    const tuiExit = runTui({
+      agent,
+      input,
+      output,
+      signalSource,
+      terminalCapabilities: { colorDepth: "truecolor", hyperlinks: false, unicode: true },
+    });
+    input.write("highlight\n");
+
+    await vi.waitFor(() => expect(rendered).toContain("已完成。\n"));
+    const codeEndIndex = rendered.indexOf("╰─\n");
+    const runEndIndex = rendered.indexOf("已完成。\n");
+    const nextPromptIndex = rendered.lastIndexOf("cwd:");
+    expect(codeEndIndex).toBeGreaterThanOrEqual(0);
+    expect(codeEndIndex).toBeLessThan(runEndIndex);
+    expect(runEndIndex).toBeLessThan(nextPromptIndex);
+    expect(rendered).toContain("\u001B[38;2;");
+
+    input.write("/exit\n");
+    await expect(tuiExit).resolves.toBe(0);
+  });
+
   it("renders Agent events and submits multiple prompts", async () => {
     let promptCount = 0;
     const promptHandler = vi.fn(
@@ -377,7 +453,10 @@ describe("runTui", () => {
 
     const tuiExit = runTui({ agent, input, output, signalSource });
     input.write("stop\n");
-    await vi.waitFor(() => expect(rendered).toContain("Assistant: partial"));
+    await vi.waitFor(() => {
+      expect(agent.state.running).toBe(true);
+      expect(rendered).toContain("Assistant: ");
+    });
 
     signalSource.emit("SIGINT");
     await vi.waitFor(() => {
@@ -467,6 +546,7 @@ describe("runTui", () => {
 function createFakeAgent(
   { prompt, respondToToolApproval, abort }: FakeAgentBehavior,
   messageHistory: readonly Message[] = [],
+  workspaceRoot = "C:\\workspace",
 ): Agent {
   const listeners = new Set<AgentListener>();
   let running = false;
@@ -490,7 +570,7 @@ function createFakeAgent(
     get state(): AgentState {
       return Object.freeze({
         sessionId: "00000000-0000-4000-8000-000000000001",
-        workspaceRoot: "C:\\workspace",
+        workspaceRoot,
         permissionMode,
         messageHistory: Object.freeze([...messageHistory]),
         activeAssistantMessage: null,

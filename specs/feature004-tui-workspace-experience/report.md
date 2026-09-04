@@ -5,14 +5,14 @@
 
 ## 开发者速览
 
-> **一句话**：Plan 01 已分离 Workspace/Data Root，Plan 02 已让真实 Agent 生命周期、Reasoning 与 Tool 动作可观察。<br>
-> **核心做法**：Run 发布去重 phase，Model Stream 双轨处理瞬时 Reasoning，Tool plan 形成安全 summary。<br>
-> **边界**：当前仍为行式 TUI；文件引用、Shiki、动态区域与完整底栏由 Plan 03–04 实现。<br>
-> **风险 / 未验证**：旧 Session 未迁移；真实 Provider、最终视觉和 resize 尚未验证。<br>
-> **当前 / 请审阅**：Plan 01 已提交，Plan 02 全量门禁通过并准备提交；随后连续实施 Plan 03。
+> **一句话**：Plan 01–03 已交付路径分离、可观察 Agent 周期，以及安全文件引用和 Shiki 代码呈现。<br>
+> **核心做法**：Agent 发布真实生命周期，TUI 用串行 Content Renderer 校验文件、清理控制字符并按需加载 Shiki。<br>
+> **边界**：当前仍为行式 scrollback；动态区、Reasoning 折叠、详情、resize 和完整输入壳由 Plan 04 实现。<br>
+> **风险 / 未验证**：旧 Session 未迁移；真实 Provider、最终视觉、交互式清理和 resize 尚未验证。<br>
+> **当前 / 请审阅**：Plan 01–02 已提交，Plan 03 定向与完整门禁通过并准备提交；随后连续实施 Plan 04。
 
 - 对应 Spec：[spec.md](spec.md)
-- 当前 Plan：[Plan 02](plan-02-agent-observability.md)
+- 当前 Plan：[Plan 03](plan-03-terminal-content-rendering.md)
 - 任务事实源：[tasks.md](tasks.md)
 
 ## 1. Plan 01 已成立结果
@@ -25,7 +25,7 @@
 - 当前行式 TUI 在每次普通输入前显示完整 `cwd`、Permission Mode、Session 短 ID 与 `idle | active`，作为后续动态底栏的文案基线。
 - 根 `.gitignore` 已加入 `/data/`；Session Directory 内原有 `*` 忽略规则保持不变。
 
-尚未完成的范围：Plan 03 的文件引用和 Shiki Content Renderer，以及 Plan 04 的动态 TUI、Windows Terminal 人工验收和真实 DeepSeek V4 Flash 冒烟。
+尚未完成的范围：Plan 04 的动态 TUI、Windows Terminal 人工验收和真实 DeepSeek V4 Flash 冒烟。
 
 ## 2. Plan 02 已成立结果
 
@@ -56,7 +56,19 @@ run_end
 
 已验证摘要样例：`pattern: **/*.ts; base: .`、`path: src/example.ts`、`target: existing.txt`、`cwd: .; command: ...`。
 
-## 3. 入口与调用链
+## 3. Plan 03 已成立结果
+
+- `AssistantContentRenderer` 是 TUI 内部唯一内容 seam。流式输入只提交完整普通行和闭合 fence；message end flush 尾部，历史消息走同一条渲染链。
+- TUI 用一个 Promise render queue 串行处理初始历史、AgentEvent、异步 `realpath`、Shiki 结果、Run 终态和下一次输入提示，因此晚到结果不能越过源事件顺序。
+- 文件只从完整 inline code 或 Markdown link target 识别。候选经过行列拆分、远程与 UNC 拒绝、`realpath`、普通文件检查和 Workspace containment；symlink 逃逸也由真实路径边界拒绝。
+- 合格文件显示 `▧ <relative-path>:<line>:<column>`，无 Unicode 时显示 `[file]`。OSC 8 只包装 `pathToFileURL(realpath)` 生成的 URI，行列号只在 label 中；颜色与 hyperlink 能力独立。
+- 模型正文、Reasoning、Tool output、approval 文本和路径在写终端前清理 ESC、C0 / C1 与孤立 surrogate。只有 Terminal Writer 可以生成 SGR 或 OSC 8。
+- `@shikijs/core`、`@shikijs/langs` 与 `@shikijs/engine-javascript` 固定为 `4.4.3`。Shiki Module、highlighter 与 grammar 都按需加载；相同 grammar 的并发加载共享 Promise。
+- Anthias theme 把已知 token 收窄到 Fin Violet、Reef Rose、Lagoon、Anthias Coral 与 Reef Slate，并明确忽略背景。24-bit、256 色、16 色和无颜色由注入的 TerminalCapabilities 决定。
+- 支持 TypeScript / TSX、JavaScript / JSX、JSON / JSONC、Markdown、Bash / shell、PowerShell、Java、Python、YAML 与 SQL 的固定别名。未知、未标、未闭合、超过 64 KiB / 2,000 行或 Shiki 失败时保持安全 plain 内容。
+- 普通 CLI 启动不会解析 Shiki package；只有首个合格且需要颜色的代码块才动态载入高亮 Module。
+
+## 4. 入口与调用链
 
 ```text
 编译后 anthias bin
@@ -72,6 +84,11 @@ run_end
       → 创建 Agent
   → runTui({ agent })
       → 从 AgentState 呈现历史和输入上下文行
+      → 串行消费 AgentEvent
+      → AssistantContentRenderer
+          → 稳定块与控制字符清理
+          → Workspace 文件 realpath / containment
+          → lazy Shiki token → TerminalCapabilities writer
 ```
 
 - `apps/tui` 的启动 Module 只拥有 CLI 路径语义；它不读取 Provider 专属配置，也不推进 Agent 生命周期。
@@ -79,7 +96,7 @@ run_end
 - Session Module 仍拥有 Schema 1、Workspace 绑定、锁、checkpoint、恢复与持久化。
 - `runTui()` 仍是唯一公开 TUI 入口，只读取 Agent state 和事件。
 
-## 4. 失败表现与兼容性
+## 5. 失败表现与兼容性
 
 | reason | 用户可操作结果 |
 | --- | --- |
@@ -97,7 +114,7 @@ run_end
 - 路径进入启动错误或上下文行前会替换 C0 / C1 控制字符，普通路径内容保持可辨认。
 - 旧调用方若直接使用生产工厂，必须补充显式 `workspaceRoot` 与 `sessionDirectory`；这是本 Plan 有意收窄的装配合同，Agent 的运行操作与事件接口没有变化。
 
-## 5. 验证证据
+## 6. 验证证据
 
 验证环境：Windows，Node.js `v24.13.1`，pnpm `10.33.0`，PowerShell `7.5.4`。
 
@@ -143,10 +160,26 @@ pnpm verify
 
 定向证据同时证明：Reasoning 多 span、error / abort 收口、同 Run Tool continuation、Session 与下一 Run 不继承；六类 Tool summary、并发 start / end 归属、phase 去重和非法只读输入 no-start。
 
-## 6. 证据边界与 Git 状态
+### Plan 03 定向门禁与本地测量
+
+```text
+pnpm exec vitest run apps/tui/test/content-renderer.test.ts apps/tui/test/tui.test.ts
+pnpm exec vitest run apps/tui/test/main.test.ts apps/tui/test/content-renderer.test.ts apps/tui/test/tui.test.ts
+pnpm verify
+```
+
+结果：Content Renderer / TUI 定向 2 个测试文件、22 个测试通过；CLI / Content Renderer / TUI 回归 3 个测试文件、30 个测试通过。
+
+完整门禁首次运行时，既有 Windows command timeout 清理出现一次 `cleanupUncertain`，同时隔离 CLI 暴露 Shiki 顶层解析问题。前者单文件复跑 4 个测试通过；后者改为真正 lazy Module 后，CLI 定向回归通过。提交前最终复跑静态检查、构建以及 17 个测试文件、150 个测试全部通过。
+
+内容证据覆盖跨 delta 稳定提交、历史与流式共用 renderer、异步顺序、Workspace 内外文件、空格 / 中文 / `#` / `%`、行列号、OSC 8、恶意控制序列、四种代表 grammar、三档颜色与无颜色，以及 plain fallback。
+
+本机同一 Node.js 进程对 TypeScript 样例测量：首块冷加载 `325.56 ms`，同语言热加载 `1.21 ms`。该数据只记录本机时点，不是 CI 阈值或性能承诺。
+
+## 7. 证据边界与 Git 状态
 
 - 没有使用真实 Provider、外部网络、付费 API 或真实凭据；`DEEPSEEK_API_KEY` 未读取、未映射、未输出，也未进入文件。
 - `session_changed` 有稳定公开 reason 和真实 checkpoint 变化映射；自动测试覆盖既有 Run 期 checkpoint 变化，但没有用非确定性并发写入强制制造启动瞬间竞态。
 - 自动测试证明路径、持久化位置和文本合同，不证明 Plan 04 的最终视觉质量、resize 或 Windows Terminal 交互体验。
-- 文档提交为 `0cbb45e`，Plan 01 提交为 `8b2f2f8`。Plan 02 当前是 `main` 上准备提交的单一增量；没有推送或创建 PR。
+- 文档提交为 `0cbb45e`，Plan 01 提交为 `8b2f2f8`，Plan 02 提交为 `95611c8`。Plan 03 当前是 `main` 上准备提交的单一增量；没有推送或创建 PR。
 - 开发者已授权连续完成整个 Feature，并要求每个 Plan 独立提交；真实 Provider 仍只在 Plan 04 冒烟时使用。

@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003 已验收；Feature 004 Plan 01 已实现独立 Workspace / Data Root 启动装配并等待审查。
+状态：Feature 003 已验收；Feature 004 Plan 01–03 已实现启动分离、Agent 可观察性与终端内容渲染。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -54,7 +54,7 @@ Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 Ab
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
-当前 TUI 仍使用 Node.js `readline` 的普通行式界面，已经能够呈现模式、Tool 归属、approval 风险边界、Run 终态，并在普通输入前显示完整 Workspace、模式、Session 短 ID 与运行状态。Feature 004 Plan 01 已让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。后续 Plan 才会重新设计视觉、输入区和完整对话周期，并把 Shiki 限定为 TUI Content Renderer 的代码高亮依赖。
+当前 TUI 仍使用 Node.js `readline` 的行式输入，已经能够呈现模式、Tool 归属、approval 风险边界、Run 终态，并在普通输入前显示完整 Workspace、模式、Session 短 ID 与运行状态。Feature 004 Plan 01 已让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。Plan 02 已增加真实 Run phase、瞬时 Visible Reasoning 与安全 ToolActivity。Plan 03 在 TUI 内加入单一 Content Renderer：经 Workspace 校验的文件引用使用可降级标识与 OSC 8，已标记 fenced code 由 lazy Shiki Core 着色，普通和异步输出按 AgentEvent 顺序写出。Plan 04 才会完成动态区、输入区、详情与 resize。
 
 ### 未来 Desktop 适配器
 
@@ -62,7 +62,7 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 ## 事件方向
 
-AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、消息开始/更新/结束、权限模式变化、Tool approval 请求与结果，以及带 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；交互 Adapter 根据事件渲染，不通过事件反向控制 Agent。
+AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 通过自己的串行 render queue 保留该顺序，不通过事件反向控制 Agent。
 
 Session 只持久化完整消息、副作用开始事实和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 

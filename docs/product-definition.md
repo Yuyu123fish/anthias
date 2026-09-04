@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 实施中，Plan 01 已实现并等待审查。
+状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 实施中，Plan 01–03 已实现。
 
 2026-08-30，开发者撤销了此前围绕 Java/JVM 形成的产品与技术决定，并确认 Anthias 的长期路线是做一个可分叉的 Coding Agent。
 

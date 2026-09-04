@@ -22,7 +22,10 @@
     "start": "node ./dist/main.js"
   },
   "dependencies": {
-    "@anthias/agent": "workspace:*"
+    "@anthias/agent": "workspace:*",
+    "@shikijs/core": "4.4.3",
+    "@shikijs/engine-javascript": "4.4.3",
+    "@shikijs/langs": "4.4.3"
   },
   "engines": {
     "node": ">=24 <25"

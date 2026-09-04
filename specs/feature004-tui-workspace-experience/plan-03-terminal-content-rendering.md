@@ -1,6 +1,6 @@
 # Feature 004 Plan 03：终端内容渲染
 
-状态：已计划
+状态：已实现
 
 ## 开发者速览
 
@@ -8,7 +8,7 @@
 > **核心做法**：建立内部 Content Renderer，以 Shiki Core 按需着色，并在校验后生成文件标识和链接。<br>
 > **边界**：只支持 Spec 的 Markdown 子集，不做完整 CommonMark、自动语言猜测或 LSP。<br>
 > **风险 / 未验证**：异步顺序、控制序列注入、Unicode 宽度与 Shiki 首次加载最易出错。<br>
-> **当前 / 请审阅**：已计划；须在 Plan 02 验收后才能实施。
+> **当前 / 请审阅**：已实现；内容、文件与代码渲染门禁通过，提交后连续进入 Plan 04。
 
 - 对应 Spec：[spec.md](spec.md)
 - 技术依据：[终端内容渲染 Research](research-terminal-rendering.md)
@@ -71,7 +71,7 @@
 3. 接入 Workspace 文件校验、label、`pathToFileURL()` 与 hyperlink fallback。
 4. 接入 Shiki lazy highlighter、自有 theme、grammar 别名和 ANSI 色阶转换。
 5. 把 renderer 接入 Assistant 历史与流式正文，保持原文可复制。
-6. 运行定向门禁、记录冷 / 热高亮测量、更新 Tasks / Report 后停止。
+6. 运行定向门禁、记录冷 / 热高亮测量、更新 Tasks / Report 并独立提交。
 
 ## 6. 验证
 
@@ -100,5 +100,5 @@ pnpm check
 ## 8. 汇报与停止
 
 - Report 记录 Shiki 依赖、grammar、主题、fallback、安全边界和本地测量。
-- 本 Plan 完成后停止，等待开发者检查，再进入 Plan 04。
-- 不运行真实 Provider；代码提交、推送和 PR 需另行授权。
+- 本 Plan 完成后按开发者最新授权独立提交，并连续进入 Plan 04。
+- 本 Plan 不运行真实 Provider；提交已授权，推送和 PR 未授权。

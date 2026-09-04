@@ -8,7 +8,7 @@
 > **核心做法**：用一个深 Terminal Conversation Module 管理 scrollback、动态区、输入、底栏与清理。<br>
 > **边界**：不进入 alternate screen，不加入多行编辑器、Session 管理器、Desktop 或新 Tool。<br>
 > **风险 / 未验证**：readline 光标、窄终端、异步重绘、退出清理和真实 Provider 表现最易出错。<br>
-> **当前 / 请审阅**：已计划；须在 Plan 03 验收后才能实施。
+> **当前 / 请审阅**：已计划；Plan 03 已完成，按连续授权在独立提交后立即实施。
 
 - 对应 Spec：[spec.md](spec.md)
 - 前置 Plan：[Plan 03](plan-03-terminal-content-rendering.md)
@@ -110,4 +110,4 @@ pnpm verify
 
 - Report 汇总四个 Plan 已成立能力、调用链、验证、真实 Provider 证据与未验证限制。
 - 只有全部门禁通过后，Spec、四个 Plan、Tasks 与 Report 进入“已实现”，等待开发者验收。
-- 本 Plan 不自动获得代码提交、推送或 PR 授权。
+- 本 Plan 的本地提交已由开发者授权；推送和 PR 仍未授权。
