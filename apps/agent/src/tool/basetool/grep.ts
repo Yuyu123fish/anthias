@@ -12,13 +12,14 @@ import {
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
-import type { ToolWorkspace } from "../workspace-path.js";
+import { type ToolWorkspace, validateWorkspaceRelativePath } from "../workspace-path.js";
 import { readStrictUtf8File, splitTextLines } from "./text-file.js";
 import { discoverWorkspaceFiles } from "./workspace-file-discovery.js";
 
 /** 表示 grep 已完成运行时校验后的固定输入。 */
 type GrepToolInput = Readonly<{
   pattern: string;
+  searchPattern: RegExp;
   path: string;
   filePattern: string;
   contextLines: number;
@@ -44,12 +45,7 @@ export async function executeGrepTool(
     return failedToolResult(inputResult.error);
   }
   try {
-    let searchPattern: RegExp;
-    try {
-      searchPattern = new RegExp(inputResult.input.pattern, "u");
-    } catch {
-      return failedToolResult("grep pattern 不是有效的 JavaScript Unicode 正则。");
-    }
+    const searchPattern = inputResult.input.searchPattern;
     const discoveredFiles = await discoverWorkspaceFiles(
       inputResult.input.filePattern,
       inputResult.input.path,
@@ -138,10 +134,27 @@ function parseGrepToolInput(
   ) {
     return Object.freeze({ ok: false, error: "grep 输入不符合 Schema。" });
   }
+  let searchPattern: RegExp;
+  try {
+    searchPattern = new RegExp(input.pattern, "u");
+    validateWorkspaceRelativePath(input.path ?? ".", "grep path");
+    validateWorkspaceRelativePath(input.filePattern ?? "**/*", "grep filePattern");
+  } catch (error) {
+    return Object.freeze({
+      ok: false,
+      error:
+        error instanceof SyntaxError
+          ? "grep pattern 不是有效的 JavaScript Unicode 正则。"
+          : error instanceof Error
+            ? error.message
+            : "grep 输入无效。",
+    });
+  }
   return Object.freeze({
     ok: true,
     input: Object.freeze({
       pattern: input.pattern,
+      searchPattern,
       path: input.path ?? ".",
       filePattern: input.filePattern ?? "**/*",
       contextLines: input.contextLines ?? 0,

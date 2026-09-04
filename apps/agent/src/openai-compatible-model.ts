@@ -51,6 +51,18 @@ async function* streamModelEvents(
   fullStream: AsyncIterable<Readonly<{ type: string; [key: string]: unknown }>>,
 ): AsyncIterable<ModelStreamEvent> {
   for await (const streamPart of fullStream) {
+    if (streamPart.type === "reasoning-start") {
+      yield Object.freeze({ type: "reasoning_start" });
+      continue;
+    }
+    if (streamPart.type === "reasoning-delta" && typeof streamPart.text === "string") {
+      yield Object.freeze({ type: "reasoning_delta", delta: streamPart.text });
+      continue;
+    }
+    if (streamPart.type === "reasoning-end") {
+      yield Object.freeze({ type: "reasoning_end" });
+      continue;
+    }
     if (streamPart.type === "text-delta" && typeof streamPart.text === "string") {
       yield Object.freeze({ type: "text_delta", delta: streamPart.text });
       continue;
@@ -90,16 +102,20 @@ function toProviderMessage(message: ModelInputMessage): ModelMessage {
   if (message.role === "assistant") {
     return {
       role: "assistant",
-      content: message.content.map((part) =>
-        part.type === "text"
-          ? { type: "text" as const, text: part.text }
-          : {
-              type: "tool-call" as const,
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              input: part.input,
-            },
-      ),
+      content: message.content.map((part) => {
+        if (part.type === "text") {
+          return { type: "text" as const, text: part.text };
+        }
+        if (part.type === "reasoning") {
+          return { type: "reasoning" as const, text: part.text };
+        }
+        return {
+          type: "tool-call" as const,
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          input: part.input,
+        };
+      }),
     };
   }
   return {

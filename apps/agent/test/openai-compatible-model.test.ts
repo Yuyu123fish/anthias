@@ -27,6 +27,54 @@ afterEach(async () => {
 });
 
 describe("createOpenAICompatibleModelStream", () => {
+  it("normalizes OpenAI-compatible reasoning chunks", async () => {
+    const server = await startServer((_request, response) => {
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        connection: "keep-alive",
+      });
+      writeReasoningChunk(response, "inspect ");
+      writeReasoningChunk(response, "the workspace");
+      writeChunk(response, "done");
+      response.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-reasoning",
+          created: 0,
+          model: "test-model",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`,
+      );
+      response.write("data: [DONE]\n\n");
+      response.end();
+    });
+    const address = server.address() as AddressInfo;
+    const modelStream = createOpenAICompatibleModelStream({
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      modelId: "test-model",
+      apiKey: "test-key",
+    });
+
+    await expect(
+      collect(
+        modelStream(
+          {
+            systemPrompt: "system rules",
+            messages: [{ role: "user", content: "inspect" }],
+            tools: FIXED_TOOL_DEFINITIONS,
+          },
+          new AbortController().signal,
+        ),
+      ),
+    ).resolves.toEqual([
+      { type: "reasoning_start" },
+      { type: "reasoning_delta", delta: "inspect " },
+      { type: "reasoning_delta", delta: "the workspace" },
+      { type: "reasoning_end" },
+      { type: "text_delta", delta: "done" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+  });
+
   it("streams text through one local OpenAI-compatible request", async () => {
     let requestCount = 0;
     let requestBody: unknown;
@@ -411,6 +459,17 @@ function writeChunk(response: ServerResponse, content: string): void {
       created: 0,
       model: "test-model",
       choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    })}\n\n`,
+  );
+}
+
+function writeReasoningChunk(response: ServerResponse, content: string): void {
+  response.write(
+    `data: ${JSON.stringify({
+      id: "chatcmpl-reasoning",
+      created: 0,
+      model: "test-model",
+      choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
     })}\n\n`,
   );
 }

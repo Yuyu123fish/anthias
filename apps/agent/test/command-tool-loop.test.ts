@@ -104,6 +104,9 @@ describe("execute_command Agent Tool Loop", () => {
       expect(serializedEvidence).toMatch(new RegExp(`${name}=(False|false)`, "u"));
     }
     expect(serializedEvidence).toContain("stderr");
+    const executionStart = events.find((event) => event.type === "tool_execution_start");
+    expect(executionStart?.activity.summary).toMatch(/^cwd: \.; command: /u);
+    expect([...(executionStart?.activity.summary ?? "")]).toHaveLength(160);
     expect(modelRequests[1]?.messages.at(-1)).toMatchObject({
       role: "tool",
       toolName: "execute_command",

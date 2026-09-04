@@ -79,7 +79,7 @@ describe("complete Coding Agent Tool Loop", () => {
     expect(
       events
         .filter((event) => event.type === "tool_execution_start")
-        .map((event) => event.toolName),
+        .map((event) => event.activity.toolName),
     ).toEqual(["glob", "read_file", "edit_file", "execute_command"]);
     expect(modelRequests).toHaveLength(4);
     expect(modelRequests[3]?.messages.filter((message) => message.role === "tool")).toHaveLength(4);

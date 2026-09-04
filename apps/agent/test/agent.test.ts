@@ -35,6 +35,146 @@ afterEach(async () => {
 });
 
 describe("Agent", () => {
+  it("normalizes visible reasoning spans without changing the durable AssistantMessage", async () => {
+    const modelRequest: ModelRequest = Object.freeze({
+      systemPrompt: "test",
+      messages: Object.freeze([]),
+      tools: Object.freeze([]),
+    });
+    const events = [];
+
+    for await (const event of streamAssistantMessage(
+      async function* () {
+        yield Object.freeze({ type: "reasoning_start" as const });
+        yield Object.freeze({ type: "reasoning_delta" as const, delta: "" });
+        yield Object.freeze({ type: "reasoning_delta" as const, delta: "first" });
+        yield Object.freeze({ type: "reasoning_start" as const });
+        yield Object.freeze({ type: "reasoning_delta" as const, delta: "second" });
+        yield textDelta("answer");
+        yield stopFinish();
+      },
+      modelRequest,
+      new AbortController().signal,
+    )) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "start",
+      "reasoning_start",
+      "reasoning_update",
+      "reasoning_end",
+      "reasoning_start",
+      "reasoning_update",
+      "reasoning_end",
+      "update",
+      "finish",
+    ]);
+    const finalEvent = events.at(-1);
+    expect(finalEvent).toMatchObject({
+      type: "finish",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "answer" }],
+        status: "completed",
+      },
+      modelInputMessage: {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "first" },
+          { type: "reasoning", text: "second" },
+          { type: "text", text: "answer" },
+        ],
+      },
+    });
+  });
+
+  it.each(["provider_error", "abort"] as const)(
+    "closes visible reasoning before a %s terminal message",
+    async (terminalBoundary) => {
+      const abortController = new AbortController();
+      const modelRequest: ModelRequest = Object.freeze({
+        systemPrompt: "test",
+        messages: Object.freeze([]),
+        tools: Object.freeze([]),
+      });
+      const events = [];
+
+      for await (const event of streamAssistantMessage(
+        async function* () {
+          yield Object.freeze({ type: "reasoning_start" as const });
+          yield Object.freeze({ type: "reasoning_delta" as const, delta: "working" });
+          if (terminalBoundary === "provider_error") {
+            throw new Error("provider failed");
+          }
+          abortController.abort();
+        },
+        modelRequest,
+        abortController.signal,
+      )) {
+        events.push(event);
+      }
+
+      expect(events.map((event) => event.type)).toEqual([
+        "start",
+        "reasoning_start",
+        "reasoning_update",
+        "reasoning_end",
+        "finish",
+      ]);
+      expect(events.at(-1)).toMatchObject({
+        type: "finish",
+        message: { status: terminalBoundary === "abort" ? "aborted" : "failed" },
+      });
+    },
+  );
+
+  it("keeps reasoning in same-Run Tool continuation but out of state, Session, and later Runs", async () => {
+    const reasoningMarker = "VISIBLE_REASONING_NOT_DURABLE";
+    const modelRequests: ModelRequest[] = [];
+    const modelStream: ModelStream = async function* (modelRequest) {
+      modelRequests.push(modelRequest);
+      if (modelRequests.length === 1) {
+        yield Object.freeze({ type: "reasoning_start" as const });
+        yield Object.freeze({ type: "reasoning_delta" as const, delta: reasoningMarker });
+        yield Object.freeze({ type: "reasoning_end" as const });
+        yield Object.freeze({
+          type: "tool_call" as const,
+          toolCallId: "00000000-0000-4000-8000-000000000021",
+          toolName: "read_file",
+          input: { path: "missing.txt" },
+          invalid: false,
+        });
+        yield Object.freeze({ type: "finish" as const, finishReason: "tool_calls" as const });
+        return;
+      }
+      yield textDelta(modelRequests.length === 2 ? "first done" : "second done");
+      yield stopFinish();
+    };
+    const agent = await createTestAgent(modelStream);
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
+
+    await expect(agent.prompt("first")).resolves.toEqual({ status: "completed" });
+
+    const firstRunId = events.find((event) => event.type === "run_start")?.runId;
+    expect(
+      events
+        .filter((event) => event.type.startsWith("reasoning_"))
+        .map((event) => ({ type: event.type, runId: "runId" in event ? event.runId : null })),
+    ).toEqual([
+      { type: "reasoning_start", runId: firstRunId },
+      { type: "reasoning_update", runId: firstRunId },
+      { type: "reasoning_end", runId: firstRunId },
+    ]);
+    expect(JSON.stringify(modelRequests[1])).toContain(reasoningMarker);
+    expect(JSON.stringify(agent.state)).not.toContain(reasoningMarker);
+    expect(JSON.stringify(await readSessionRecords(agent))).not.toContain(reasoningMarker);
+
+    await expect(agent.prompt("second")).resolves.toEqual({ status: "completed" });
+    expect(JSON.stringify(modelRequests[2])).not.toContain(reasoningMarker);
+  });
+
   it("streams one assistant message through the public interface", async () => {
     const modelStream: ModelStream = async function* (modelRequest, abortSignal) {
       expect(modelRequest.messages).toEqual([{ role: "user", content: "你好" }]);

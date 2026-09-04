@@ -88,8 +88,34 @@ describe("read-only Agent Tool Loop", () => {
     expect(
       events
         .filter((event) => event.type === "tool_execution_start")
-        .map((event) => event.toolName),
-    ).toEqual(["glob", "grep", "read_file"]);
+        .map((event) => event.activity),
+    ).toEqual([
+      {
+        toolCallId: "00000000-0000-4000-8000-000000000011",
+        toolName: "glob",
+        summary: "pattern: **/*.ts; base: .",
+      },
+      {
+        toolCallId: "00000000-0000-4000-8000-000000000012",
+        toolName: "grep",
+        summary: "pattern: target; base: .; files: **/*.ts",
+      },
+      {
+        toolCallId: "00000000-0000-4000-8000-000000000013",
+        toolName: "read_file",
+        summary: "path: src/example.ts",
+      },
+    ]);
+    expect(
+      events.filter((event) => event.type === "run_phase_changed").map((event) => event.phase),
+    ).toEqual([
+      "executing_tool",
+      "requesting_model",
+      "executing_tool",
+      "requesting_model",
+      "executing_tool",
+      "requesting_model",
+    ]);
     expect(agent.state.messageHistory.at(-1)).toMatchObject({
       role: "assistant",
       content: [{ type: "text", text: "检查完成。" }],
@@ -114,6 +140,46 @@ describe("read-only Agent Tool Loop", () => {
       type: "run_finished",
       status: "completed",
     });
+  });
+
+  it("rejects deterministic read-only input errors before execution start", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-invalid-read-tool-"));
+    temporaryDirectories.add(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const session = await createSession({
+      workspaceRoot,
+      sessionDirectory,
+      shell: { kind: "powershell", executable: "pwsh.exe", arguments: ["-Command"] },
+    });
+    let modelRequestCount = 0;
+    const modelStream: ModelStream = async function* () {
+      modelRequestCount += 1;
+      if (modelRequestCount === 1) {
+        yield toolCallEvent("00000000-0000-4000-8000-000000000021", "read_file", {
+          path: "../outside.txt",
+        });
+        yield toolCallEvent("00000000-0000-4000-8000-000000000022", "grep", {
+          pattern: "[",
+        });
+        yield finishEvent("tool_calls");
+        return;
+      }
+      yield { type: "text_delta", delta: "已拒绝。" };
+      yield finishEvent("stop");
+    };
+    const agent = createAgentWithModelStream({ modelStream, session });
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
+
+    await expect(agent.prompt("检查非法调用")).resolves.toEqual({ status: "completed" });
+
+    expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
+    expect(events.some((event) => event.type === "run_phase_changed")).toBe(false);
+    expect(
+      agent.state.messageHistory
+        .filter((message) => message.role === "tool")
+        .map((message) => message.status),
+    ).toEqual(["failed", "failed"]);
   });
 });
 

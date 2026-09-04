@@ -8,7 +8,7 @@
 > **核心做法**：Session 归 Anthias `data`；TUI 常驻路径，Shiki 高亮代码并收起思考。<br>
 > **边界**：只显示 Provider 给出的 Reasoning；不含完整 Markdown、Session 管理器或 OS 沙箱。<br>
 > **风险 / 未验证**：终端能力、Shiki 性能、Provider 差异和 Windows 清理待验证。<br>
-> **当前 / 请审阅**：实施中；Plan 01 已实现并停止，等待开发者审查。
+> **当前 / 请审阅**：实施中；Plan 01 已提交，Plan 02 已完成并准备提交，随后连续实施 Plan 03。
 
 - 文档类型：Spec
 - Feature 目录：`feature004-tui-workspace-experience`
@@ -402,4 +402,4 @@ Session 7b4c2a91 │ Ctrl+C 退出
 - 本 Spec 与四个 Plan 已由开发者确认，Feature 进入“已计划”；开发者同时授权提交本轮文档，并在提交后直接实施 Plan 01。
 - Shiki 已经确定为唯一语法高亮库。其 package 入口、首批 grammar 的具体导入、主题映射、缓存生命周期与性能预算，以及内部组件拆分、统一详情快捷键和本地 link 命令，由 Plan 根据 Research 固定，但不能改用其他 highlighter，也不能改变本 Spec 的路径、Reasoning、所有权、用户流程和失败合同。
 - 如果实现需要持久化 Reasoning、改变 Session Schema、自动切换 Session Workspace、增加 Session 管理器或扩展 Tool/Permission Policy，必须停止并回到 Spec。
-- Plan 01 完成并汇报后按项目规则停止；后续 Plan、代码提交、推送和 PR 不从本次授权自动推断。
+- 开发者最新授权要求连续实施完整 Feature，并在每个 Plan 完成后各做一次本地提交；推送和 PR 仍不在授权范围内。

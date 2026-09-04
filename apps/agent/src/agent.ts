@@ -7,6 +7,7 @@ import {
 } from "./message.js";
 import {
   type ModelFinishReason,
+  type ModelInputMessage,
   type ModelRequest,
   type ModelStream,
   streamAssistantMessage,
@@ -39,6 +40,16 @@ export type AgentLoopToolApproval = Readonly<{
 /** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
 export type AgentLoopEvent =
   | Readonly<{
+      type: "reasoning_start";
+    }>
+  | Readonly<{
+      type: "reasoning_update";
+      delta: string;
+    }>
+  | Readonly<{
+      type: "reasoning_end";
+    }>
+  | Readonly<{
       type: "assistant_message_start";
       message: AssistantMessage;
     }>
@@ -59,6 +70,7 @@ export type AgentLoopEvent =
       type: "tool_execution_start";
       toolCall: AssistantToolCallPart;
       toolApprovalRequestId: string | null;
+      activitySummary: string;
     }>
   | Readonly<{
       type: "tool_execution_update";
@@ -95,6 +107,7 @@ export type RunAgentLoopOptions = Readonly<{
 /** 表示一次模型请求形成的 AssistantMessage 与完成原因。 */
 type AssistantRequestResult = Readonly<{
   message: AssistantMessage;
+  modelInputMessage: Extract<ModelInputMessage, { role: "assistant" }>;
   finishReason: ModelFinishReason | null;
 }>;
 
@@ -142,6 +155,10 @@ const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
 /** 推进 Model → Tool → Model，并用内部上限阻止异常循环和过大调用批次。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = [...options.messages];
+  const transientModelMessages = new Map<
+    AssistantMessage,
+    Extract<ModelInputMessage, { role: "assistant" }>
+  >();
   let modelRequestCount = 0;
 
   while (true) {
@@ -154,7 +171,11 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
     options.updatePhase("requesting_model");
     modelRequestCount += 1;
-    const assistantRequest = await streamAssistantResponse(messageHistory, options);
+    const assistantRequest = await streamAssistantResponse(
+      messageHistory,
+      transientModelMessages,
+      options,
+    );
     if (assistantRequest.message.status === "aborted") {
       await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
       return ABORTED_LOOP_RESULT;
@@ -235,14 +256,22 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 /** 流式形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
 async function streamAssistantResponse(
   messageHistory: Message[],
+  transientModelMessages: Map<AssistantMessage, Extract<ModelInputMessage, { role: "assistant" }>>,
   options: RunAgentLoopOptions,
 ): Promise<AssistantRequestResult> {
   let finalMessage: AssistantMessage | null = null;
+  let finalModelInputMessage: Extract<ModelInputMessage, { role: "assistant" }> | null = null;
   let finishReason: ModelFinishReason | null = null;
 
   const modelRequest: ModelRequest = Object.freeze({
     systemPrompt: options.systemPrompt,
-    messages: Object.freeze(messageHistory.map(toModelInputMessage)),
+    messages: Object.freeze(
+      messageHistory.map((message) =>
+        message.role === "assistant"
+          ? (transientModelMessages.get(message) ?? toModelInputMessage(message))
+          : toModelInputMessage(message),
+      ),
+    ),
     tools: options.toolDefinitions,
   });
 
@@ -252,6 +281,18 @@ async function streamAssistantResponse(
     modelRequest,
     options.abortController.signal,
   )) {
+    if (messageEvent.type === "reasoning_start") {
+      await options.emit({ type: "reasoning_start" });
+      continue;
+    }
+    if (messageEvent.type === "reasoning_update") {
+      await options.emit({ type: "reasoning_update", delta: messageEvent.delta });
+      continue;
+    }
+    if (messageEvent.type === "reasoning_end") {
+      await options.emit({ type: "reasoning_end" });
+      continue;
+    }
     if (messageEvent.type === "start") {
       await options.emit({
         type: "assistant_message_start",
@@ -269,15 +310,21 @@ async function streamAssistantResponse(
     }
 
     finalMessage = messageEvent.message;
+    finalModelInputMessage = messageEvent.modelInputMessage;
     finishReason = messageEvent.finishReason;
   }
 
-  if (finalMessage === null) {
+  if (finalMessage === null || finalModelInputMessage === null) {
     throw new Error("Model Stream 未形成最终 AssistantMessage。");
   }
   await options.emit({ type: "assistant_message_end", message: finalMessage });
+  transientModelMessages.set(finalMessage, finalModelInputMessage);
   messageHistory.push(finalMessage);
-  return Object.freeze({ message: finalMessage, finishReason });
+  return Object.freeze({
+    message: finalMessage,
+    modelInputMessage: finalModelInputMessage,
+    finishReason,
+  });
 }
 
 /** 使用固定 worker 数执行纯只读批次，并为未领取调用补齐 aborted outcome。 */
@@ -332,7 +379,6 @@ async function formToolOutcome(
   startGate: SourceOrderStartGate | null,
 ): Promise<ToolOutcome> {
   const { plan } = plannedToolCall;
-  options.updatePhase("executing_tool");
   const preparationWaitResult = await waitForPreparationOrAbort(
     plan,
     options.abortController.signal,
@@ -411,6 +457,7 @@ async function executePreparedToolCall(
   const executionStarted = await publishExecutionStart(
     plannedToolCall,
     toolApprovalRequestId,
+    preparedExecution.activitySummary,
     options,
     startGate,
   );
@@ -590,6 +637,7 @@ async function skipExecutionStart(
 async function publishExecutionStart(
   plannedToolCall: PlannedToolCall,
   toolApprovalRequestId: string | null,
+  activitySummary: string,
   options: RunAgentLoopOptions,
   startGate: SourceOrderStartGate | null,
 ): Promise<boolean> {
@@ -604,6 +652,7 @@ async function publishExecutionStart(
       type: "tool_execution_start",
       toolCall: plannedToolCall.toolCall,
       toolApprovalRequestId,
+      activitySummary,
     });
     return true;
   } finally {

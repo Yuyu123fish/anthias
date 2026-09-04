@@ -36,6 +36,8 @@ export type {
   PermissionMode,
   PermissionModeChangeResult,
   PromptResult,
+  RunPhase,
+  ToolActivity,
   ToolApprovalRequest,
   ToolApprovalResponse,
 } from "./run.js";

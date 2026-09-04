@@ -1,6 +1,6 @@
 # Feature 004 Plan 02：Agent 可观察生命周期
 
-状态：已计划
+状态：已实现
 
 ## 开发者速览
 
@@ -8,7 +8,7 @@
 > **核心做法**：扩展内部 Model Stream 和少量 AgentEvent，Reasoning 保持瞬时，Tool 摘要由计划层形成。<br>
 > **边界**：不改变 Message、Session Schema、Tool Policy，也不展示隐藏 Chain-of-Thought。<br>
 > **风险 / 未验证**：Reasoning 收口、Tool continuation、并发归属和取消竞态最易出错。<br>
-> **当前 / 请审阅**：已计划；须在 Plan 01 验收后才能实施。
+> **当前 / 请审阅**：已实现；事件、持久化与安全摘要门禁通过，提交后连续进入 Plan 03。
 
 - 对应 Spec：[spec.md](spec.md)
 - 前置 Plan：[Plan 01](plan-01-workspace-and-data-root.md)
@@ -67,7 +67,7 @@
 3. 在 Agent Loop 建立 Run 内临时模型上下文，保持 Message 与 Schema 1 不变。
 4. 让 Tool plan 形成安全摘要，并贯通 Loop、Run 和 TUI。
 5. 更新当前行式 TUI 的事实文案，为 Plan 04 的动态呈现提供稳定输入。
-6. 运行定向与全量门禁，更新 Tasks / Report 后停止。
+6. 运行定向与全量门禁，更新 Tasks / Report 并提交本 Plan。
 
 ## 6. 验证
 
@@ -85,8 +85,8 @@ pnpm check
 - 若 Tool summary 只能通过暴露写入正文、敏感环境或原始 JSON 才能形成，停止并重新设计计划层摘要。
 - 若阶段事件让 TUI 成为第二个生命周期权威，停止并删去推断逻辑。
 
-## 8. 汇报与停止
+## 8. 汇报与衔接
 
 - Report 记录事件顺序、持久化边界、Tool 摘要样例与确定性证据。
-- 本 Plan 完成后停止，等待开发者检查，再进入 Plan 03。
-- 不运行真实 Provider；代码提交、推送和 PR 需另行授权。
+- 本 Plan 完成后按开发者最新授权独立提交，并连续进入 Plan 03。
+- 本 Plan 不运行真实 Provider；推送和 PR 仍需另行授权。

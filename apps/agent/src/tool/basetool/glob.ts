@@ -11,7 +11,7 @@ import {
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
-import type { ToolWorkspace } from "../workspace-path.js";
+import { type ToolWorkspace, validateWorkspaceRelativePath } from "../workspace-path.js";
 import { discoverWorkspaceFiles } from "./workspace-file-discovery.js";
 
 /** 表示 glob 已完成运行时校验后的固定输入。 */
@@ -83,6 +83,15 @@ function parseGlobToolInput(
     !isOptionalNonEmptyString(input.path)
   ) {
     return Object.freeze({ ok: false, error: "glob 输入不符合 Schema。" });
+  }
+  try {
+    validateWorkspaceRelativePath(input.pattern, "glob pattern");
+    validateWorkspaceRelativePath(input.path ?? ".", "glob path");
+  } catch (error) {
+    return Object.freeze({
+      ok: false,
+      error: error instanceof Error ? error.message : "glob path 无效。",
+    });
   }
   return Object.freeze({
     ok: true,

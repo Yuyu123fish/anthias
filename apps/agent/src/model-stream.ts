@@ -10,10 +10,22 @@ import {
 } from "./message.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 
+/** 表示只在当前 Run 的 Provider continuation 中存活的 Reasoning 文本。 */
+type ModelReasoningPart = Readonly<{
+  type: "reasoning";
+  text: string;
+}>;
+
+type ModelAssistantContentPart = AssistantContentPart | ModelReasoningPart;
+type ModelAssistantInputMessage = Readonly<{
+  role: "assistant";
+  content: readonly ModelAssistantContentPart[];
+}>;
+
 /** 表示送入 Model Adapter 的一条 Agent 自有消息。 */
 export type ModelInputMessage =
   | Readonly<{ role: "user"; content: string }>
-  | Readonly<{ role: "assistant"; content: readonly AssistantContentPart[] }>
+  | ModelAssistantInputMessage
   | ToolResultMessage;
 
 /** 描述一次 Model Adapter 调用需要的完整 Agent 自有输入。 */
@@ -34,6 +46,16 @@ export type ModelFinishReason =
 
 /** 枚举生产 Adapter 和确定性测试 Adapter 产生的结构化事件。 */
 export type ModelStreamEvent =
+  | Readonly<{
+      type: "reasoning_start";
+    }>
+  | Readonly<{
+      type: "reasoning_delta";
+      delta: string;
+    }>
+  | Readonly<{
+      type: "reasoning_end";
+    }>
   | Readonly<{
       type: "text_delta";
       delta: string;
@@ -62,8 +84,19 @@ export type AssistantMessageStreamEvent =
       delta: string | null;
     }>
   | Readonly<{
+      type: "reasoning_start";
+    }>
+  | Readonly<{
+      type: "reasoning_update";
+      delta: string;
+    }>
+  | Readonly<{
+      type: "reasoning_end";
+    }>
+  | Readonly<{
       type: "finish";
       message: AssistantMessage;
+      modelInputMessage: ModelAssistantInputMessage;
       finishReason: ModelFinishReason | null;
     }>;
 
@@ -85,13 +118,16 @@ export async function* streamAssistantMessage(
   modelRequest: ModelRequest,
   abortSignal: AbortSignal,
 ): AsyncIterable<AssistantMessageStreamEvent> {
-  const content: AssistantContentPart[] = [];
+  const durableContent: AssistantContentPart[] = [];
+  const modelContent: ModelAssistantContentPart[] = [];
   const toolCallIds = new Set<string>();
   let finishReason: ModelFinishReason | null = null;
+  let reasoningState: "idle" | "pending" | "active" = "idle";
+  let activeReasoningPartIndex: number | null = null;
 
   yield Object.freeze({
     type: "start",
-    partialAssistantMessage: createAssistantMessage(content, "streaming"),
+    partialAssistantMessage: createAssistantMessage(durableContent, "streaming"),
   });
 
   try {
@@ -100,12 +136,60 @@ export async function* streamAssistantMessage(
         if (abortSignal.aborted) {
           break;
         }
+        if (modelEvent.type === "reasoning_start") {
+          if (reasoningState === "active") {
+            yield Object.freeze({ type: "reasoning_end" });
+          }
+          reasoningState = "pending";
+          activeReasoningPartIndex = null;
+          continue;
+        }
+        if (modelEvent.type === "reasoning_delta") {
+          if (modelEvent.delta.length === 0) {
+            continue;
+          }
+          if (reasoningState !== "active") {
+            reasoningState = "active";
+            activeReasoningPartIndex = modelContent.length;
+            modelContent.push(Object.freeze({ type: "reasoning", text: "" }));
+            yield Object.freeze({ type: "reasoning_start" });
+          }
+          if (activeReasoningPartIndex === null) {
+            throw new Error("Reasoning span 缺少活动内容位置。");
+          }
+          const activeReasoningPart = modelContent[activeReasoningPartIndex];
+          if (activeReasoningPart?.type !== "reasoning") {
+            throw new Error("Reasoning span 内容位置无效。");
+          }
+          modelContent[activeReasoningPartIndex] = Object.freeze({
+            type: "reasoning",
+            text: activeReasoningPart.text + modelEvent.delta,
+          });
+          yield Object.freeze({ type: "reasoning_update", delta: modelEvent.delta });
+          continue;
+        }
+        if (modelEvent.type === "reasoning_end") {
+          if (reasoningState === "active") {
+            yield Object.freeze({ type: "reasoning_end" });
+          }
+          reasoningState = "idle";
+          activeReasoningPartIndex = null;
+          continue;
+        }
+
+        // Reasoning 是严格 span；任何可持久化内容或终态都必须在它之后开始。
+        if (reasoningState === "active") {
+          yield Object.freeze({ type: "reasoning_end" });
+        }
+        reasoningState = "idle";
+        activeReasoningPartIndex = null;
         if (modelEvent.type === "text_delta") {
           if (modelEvent.delta.length > 0) {
-            appendTextPart(content, modelEvent.delta);
+            appendTextPart(durableContent, modelEvent.delta);
+            appendTextPart(modelContent, modelEvent.delta);
             yield Object.freeze({
               type: "update",
-              partialAssistantMessage: createAssistantMessage(content, "streaming"),
+              partialAssistantMessage: createAssistantMessage(durableContent, "streaming"),
               delta: modelEvent.delta,
             });
           }
@@ -114,10 +198,11 @@ export async function* streamAssistantMessage(
         if (modelEvent.type === "tool_call") {
           const toolCall = normalizeToolCall(modelEvent, toolCallIds);
           toolCallIds.add(toolCall.toolCallId);
-          content.push(toolCall);
+          durableContent.push(toolCall);
+          modelContent.push(toolCall);
           yield Object.freeze({
             type: "update",
-            partialAssistantMessage: createAssistantMessage(content, "streaming"),
+            partialAssistantMessage: createAssistantMessage(durableContent, "streaming"),
             delta: null,
           });
           continue;
@@ -131,14 +216,26 @@ export async function* streamAssistantMessage(
     // Provider 错误只决定本条消息失败，原始异常不得越过 Model Stream seam。
   }
 
+  if (reasoningState === "active") {
+    yield Object.freeze({ type: "reasoning_end" });
+  }
+
   const status: AssistantMessage["status"] = abortSignal.aborted
     ? "aborted"
     : finishReason !== null &&
-        isSuccessfulAssistantFinish(finishReason, content.some(isToolCallPart))
+        isSuccessfulAssistantFinish(finishReason, durableContent.some(isToolCallPart))
       ? "completed"
       : "failed";
-  const finalMessage = createAssistantMessage(content, status);
-  yield Object.freeze({ type: "finish", message: finalMessage, finishReason });
+  const finalMessage = createAssistantMessage(durableContent, status);
+  yield Object.freeze({
+    type: "finish",
+    message: finalMessage,
+    modelInputMessage: Object.freeze({
+      role: "assistant",
+      content: Object.freeze([...modelContent]),
+    }),
+    finishReason,
+  });
 }
 
 /** 将线性消息投影成内部 Model Stream 所需的 Provider 无关形状。 */
@@ -156,7 +253,10 @@ export function toModelInputMessage(message: Message): ModelInputMessage {
 }
 
 /** 把相邻文本增量合并为一个 text part，同时保留 ToolCall 相对顺序。 */
-function appendTextPart(content: AssistantContentPart[], delta: string): void {
+function appendTextPart(
+  content: Array<AssistantContentPart | ModelReasoningPart>,
+  delta: string,
+): void {
   const previousPart = content.at(-1);
   if (previousPart?.type === "text") {
     content[content.length - 1] = Object.freeze({

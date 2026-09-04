@@ -5,10 +5,10 @@
 ## 开发者速览
 
 > **一句话**：十五项任务按四个 Plan 交付工作区启动、Agent 可观察性、内容渲染和完整 TUI。<br>
-> **核心做法**：每项任务形成可验证 tracer，按依赖顺序推进，每个 Plan 完成后停止。<br>
-> **边界**：不改变 Session Schema、Tool Policy 或 Agent 核心 Interface，不自动跨 Plan。<br>
-> **风险 / 未验证**：路径、Reasoning 顺序、Shiki、终端重绘与真实 Provider 仍待实施证明。<br>
-> **当前 / 请审阅**：实施中；T001–T003 已完成，Plan 01 已停止并等待开发者审查。
+> **核心做法**：每项任务形成可验证 tracer，按依赖顺序推进，每个 Plan 完成后独立提交。<br>
+> **边界**：不改变 Session Schema、Tool Policy 或 Agent 核心操作 Interface；不推送或创建 PR。<br>
+> **风险 / 未验证**：Shiki、终端重绘与真实 Provider 仍待后续 Plan 证明。<br>
+> **当前 / 请审阅**：实施中；T001–T007 已完成，Plan 02 提交后连续推进 T008。
 
 - 对应 Spec：[spec.md](spec.md)
 - 实施计划：[Plan 01](plan-01-workspace-and-data-root.md)、[Plan 02](plan-02-agent-observability.md)、[Plan 03](plan-03-terminal-content-rendering.md)、[Plan 04](plan-04-interactive-tui-and-closeout.md)
@@ -57,49 +57,49 @@ Blocked by：T001、T002
 
 ### T004：真实 RunPhase tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T003
 
-- [ ] 导出三值 `RunPhase`，新增归属 `runId` 的 `run_phase_changed`。
-- [ ] `run_start` 建立初始 requesting_model；相同 phase 不重复发布。
-- [ ] Model → approval → Tool → Model、failed 和 aborted 的阶段顺序由公开 Agent Interface 验证。
-- [ ] TUI 只呈现事件与 state，不自行推断阶段。
+- [x] 导出三值 `RunPhase`，新增归属 `runId` 的 `run_phase_changed`。
+- [x] `run_start` 建立初始 requesting_model；相同 phase 不重复发布。
+- [x] Model → approval → Tool → Model、failed 和 aborted 的阶段顺序由公开 Agent Interface 验证。
+- [x] TUI 只呈现事件与 state，不自行推断阶段。
 
 ### T005：Visible Reasoning tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T004
 
-- [ ] Model Stream 与 OpenAI-compatible Adapter 规范化 reasoning start / delta / end。
-- [ ] 每个 span 在 text、ToolCall、finish、error 或 abort 前唯一收口。
-- [ ] 同一 Run 的 Tool continuation 可以按 Provider 协议使用临时 Reasoning，上下文在 Run 结束后释放。
-- [ ] Reasoning 不进入 Message、AgentState、Session JSONL 或下一 Run。
-- [ ] 无 Reasoning、多 span、Reasoning → text / Tool / failure / abort 均有确定性验证。
+- [x] Model Stream 与 OpenAI-compatible Adapter 规范化 reasoning start / delta / end。
+- [x] 每个 span 在 text、ToolCall、finish、error 或 abort 前唯一收口。
+- [x] 同一 Run 的 Tool continuation 可以按 Provider 协议使用临时 Reasoning，上下文在 Run 结束后释放。
+- [x] Reasoning 不进入 Message、AgentState、Session JSONL 或下一 Run。
+- [x] 无 Reasoning、多 span、Reasoning → text / Tool / failure / abort 均有确定性验证。
 
 ### T006：安全 ToolActivity tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T004
 
-- [ ] 六个 Tool 在输入验证后的计划层形成不超过 160 个可见字符的一行 summary。
-- [ ] `tool_execution_start` 携带 `ToolActivity`，并发 update / end 继续按 `toolCallId` 归属。
-- [ ] 文件写入正文、敏感环境、原始 JSON 和控制序列不进入 summary。
-- [ ] denied、invalid 与预检失败不伪造 execution start。
-- [ ] 当前 TUI 能以纯文本呈现 phase、Reasoning 与 ToolActivity。
+- [x] 六个 Tool 在输入验证后的计划层形成不超过 160 个可见字符的一行 summary。
+- [x] `tool_execution_start` 携带 `ToolActivity`，并发 update / end 继续按 `toolCallId` 归属。
+- [x] 文件写入正文、敏感环境、原始 JSON 和控制序列不进入 summary。
+- [x] denied、invalid 与预检失败不伪造 execution start。
+- [x] 当前 TUI 能以纯文本呈现 phase、Reasoning 与 ToolActivity。
 
 ### T007：Plan 02 门禁与阶段报告
 
-状态：待开始
+状态：已完成
 
 Blocked by：T005、T006
 
-- [ ] Agent、Model Adapter、Tool Loop、调度和 TUI 定向测试通过。
-- [ ] `pnpm check` 通过，公开 Agent 操作、Session Schema 1、六个 Tool 与 Permission Policy 无回归。
-- [ ] Report 补充事件顺序、瞬时 Reasoning 和 Tool summary 证据。
-- [ ] 更新任务状态并汇报；停止，不进入 Plan 03。
+- [x] Agent、Model Adapter、Tool Loop、调度和 TUI 定向测试通过。
+- [x] `pnpm check` 通过，公开 Agent 操作、Session Schema 1、六个 Tool 与 Permission Policy 无回归。
+- [x] Report 补充事件顺序、瞬时 Reasoning 和 Tool summary 证据。
+- [x] 更新任务状态并提交；按最新授权连续进入 Plan 03。
 
 ## Plan 03：终端内容渲染
 
@@ -203,5 +203,5 @@ Blocked by：T014
 - 开发者已确认 Spec、Shiki 选型、四个 Plan 与本 Tasks 的连续交付方向。
 - 开发者已授权先提交截至本 Tasks 的文档变更，再直接实施 Plan 01。
 - 开发者已授权 Plan 04 进行一次 DeepSeek V4 Flash 真实冒烟；凭据仅来自 `DEEPSEEK_API_KEY`。
-- 按仓库规则，Plan 01 完成后必须汇报并停止；后续 Plan 仍等待逐 Plan 审查。
-- 本轮授权不包含 Plan 01 代码提交、后续提交、推送或创建 PR。
+- 开发者最新授权覆盖完整 Feature 的连续实施，并要求每个 Plan 完成后各做一次本地提交。
+- 本轮授权不包含推送或创建 PR；真实 Provider 只在 Plan 04 的既定冒烟范围内使用。

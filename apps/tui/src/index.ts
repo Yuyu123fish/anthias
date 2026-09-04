@@ -138,6 +138,19 @@ export function runTui({
 function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
   switch (event.type) {
     case "run_start":
+      output.write("Status: Requesting model\n");
+      return;
+    case "run_phase_changed":
+      output.write(`Status: ${renderRunPhase(event.phase)}\n`);
+      return;
+    case "reasoning_start":
+      output.write("Thinking: ");
+      return;
+    case "reasoning_update":
+      output.write(event.delta);
+      return;
+    case "reasoning_end":
+      output.write("\n");
       return;
     case "permission_mode_changed":
       output.write(`Mode: ${renderPermissionMode(event.permissionMode)}\n`);
@@ -162,7 +175,9 @@ function renderEvent(event: AgentEvent, output: NodeJS.WritableStream): void {
       }
       return;
     case "tool_execution_start":
-      output.write(`Tool: ${event.toolName} [${shortToolCallId(event.toolCallId)}] start\n`);
+      output.write(
+        `Tool: ${event.activity.toolName} [${shortToolCallId(event.activity.toolCallId)}] ${event.activity.summary}\n`,
+      );
       return;
     case "tool_execution_update":
       output.write(
@@ -242,6 +257,17 @@ function handleModeCommand(command: string, agent: Agent, output: NodeJS.Writabl
 
 function renderPermissionMode(permissionMode: PermissionMode): "Agent" | "Plan" {
   return permissionMode === "agent" ? "Agent" : "Plan";
+}
+
+function renderRunPhase(phase: NonNullable<Agent["state"]["activeRun"]>["phase"]): string {
+  switch (phase) {
+    case "requesting_model":
+      return "Requesting model";
+    case "awaiting_tool_approval":
+      return "Awaiting tool approval";
+    case "executing_tool":
+      return "Executing tool";
+  }
 }
 
 function shortToolCallId(toolCallId: string): string {

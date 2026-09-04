@@ -136,10 +136,25 @@ describe("runTui", () => {
       prompt: async (promptText, controls) => {
         controls.setRunning(true);
         publishPromptOpening(promptText, controls);
+        controls.publish({ type: "reasoning_start", runId: TEST_RUN_ID });
+        controls.publish({
+          type: "reasoning_update",
+          runId: TEST_RUN_ID,
+          delta: "inspect",
+        });
+        controls.publish({ type: "reasoning_end", runId: TEST_RUN_ID });
+        controls.publish({
+          type: "run_phase_changed",
+          runId: TEST_RUN_ID,
+          phase: "executing_tool",
+        });
         controls.publish({
           type: "tool_execution_start",
-          toolCallId: "00000000-0000-4000-8000-000000000010",
-          toolName: "read_file",
+          activity: {
+            toolCallId: "00000000-0000-4000-8000-000000000010",
+            toolName: "read_file",
+            summary: "path: README.md",
+          },
         });
         controls.publish({
           type: "tool_execution_update",
@@ -193,7 +208,9 @@ describe("runTui", () => {
     input.write("inspect\n");
     await vi.waitFor(() => {
       expect(rendered).toContain("Tool: read_file");
-      expect(rendered).toContain("[00000010] start");
+      expect(rendered).toContain("Thinking: inspect\n");
+      expect(rendered).toContain("Status: Executing tool\n");
+      expect(rendered).toContain("[00000010] path: README.md");
       expect(rendered).toContain("[read_file 00000010 stdout] chunk");
       expect(rendered).toContain("[00000010] end completed");
       expect(rendered).toContain("ToolResult: read_file completed\npath: README.md\n");

@@ -12,7 +12,11 @@ import {
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
-import { resolveExistingWorkspacePath, type ToolWorkspace } from "../workspace-path.js";
+import {
+  resolveExistingWorkspacePath,
+  type ToolWorkspace,
+  validateWorkspaceRelativePath,
+} from "../workspace-path.js";
 import { readStrictUtf8File, splitTextLines } from "./text-file.js";
 
 /** 表示 read_file 已完成运行时校验后的固定输入。 */
@@ -98,6 +102,14 @@ function parseReadFileToolInput(
     !isOptionalIntegerInRange(input.lineCount, 1, 2000)
   ) {
     return Object.freeze({ ok: false, error: "read_file 输入不符合 Schema。" });
+  }
+  try {
+    validateWorkspaceRelativePath(input.path, "read_file path");
+  } catch (error) {
+    return Object.freeze({
+      ok: false,
+      error: error instanceof Error ? error.message : "read_file path 无效。",
+    });
   }
   return Object.freeze({
     ok: true,

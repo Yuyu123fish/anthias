@@ -16,12 +16,19 @@ import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool
 export type { PermissionMode } from "./permission-mode.js";
 
 /** 枚举 Run 对外交付的活动阶段。 */
-type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
+export type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
 
 /** 描述公开状态中当前 Run 的身份与阶段。 */
 export type ActiveRun = Readonly<{
   runId: string;
   phase: RunPhase;
+}>;
+
+/** 描述一个已经通过校验和预检、即将真实执行的 Tool 动作。 */
+export type ToolActivity = Readonly<{
+  toolCallId: string;
+  toolName: string;
+  summary: string;
 }>;
 
 /** 描述交互 Adapter 需要呈现的一次副作用 Tool 确认请求。 */
@@ -76,11 +83,15 @@ export type PromptResult =
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
 export type AgentEvent =
   | Readonly<{ type: "run_start"; runId: string }>
+  | Readonly<{ type: "run_phase_changed"; runId: string; phase: RunPhase }>
+  | Readonly<{ type: "reasoning_start"; runId: string }>
+  | Readonly<{ type: "reasoning_update"; runId: string; delta: string }>
+  | Readonly<{ type: "reasoning_end"; runId: string }>
   | Readonly<{ type: "permission_mode_changed"; permissionMode: PermissionMode }>
   | Readonly<{ type: "message_start"; message: Message }>
   | Readonly<{ type: "message_update"; message: AssistantMessage; delta: string }>
   | Readonly<{ type: "message_end"; message: Message }>
-  | Readonly<{ type: "tool_execution_start"; toolCallId: string; toolName: string }>
+  | Readonly<{ type: "tool_execution_start"; activity: ToolActivity }>
   | Readonly<{
       type: "tool_execution_update";
       toolCallId: string;
@@ -138,6 +149,7 @@ type ActiveRunOwnership = {
   sessionLease: SessionRunLease;
   abortController: AbortController;
   permissionMode: PermissionMode;
+  visibleReasoningActive: boolean;
   sessionWriteFailed: boolean;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
 };
@@ -230,6 +242,28 @@ export function createAgentWithModelStream({
         // 订阅者没有第二条错误通道；呈现异常不能破坏 Run 的唯一终结路径。
       }
     }
+  }
+
+  /** 同步更新唯一 Run phase，并只为真实变化发布一次事件。 */
+  function updateRunPhase(currentRun: ActiveRunOwnership, nextPhase: RunPhase): void {
+    if (currentRun.phase === nextPhase) {
+      return;
+    }
+    currentRun.phase = nextPhase;
+    publishEvent({
+      type: "run_phase_changed",
+      runId: currentRun.runId,
+      phase: nextPhase,
+    });
+  }
+
+  /** 防御性收口仍活动的瞬时 Reasoning，不保存它的正文。 */
+  function closeVisibleReasoning(currentRun: ActiveRunOwnership): void {
+    if (!currentRun.visibleReasoningActive) {
+      return;
+    }
+    currentRun.visibleReasoningActive = false;
+    publishEvent({ type: "reasoning_end", runId: currentRun.runId });
   }
 
   /** 注册事件监听器，并返回可重复调用的取消订阅函数。 */
@@ -388,6 +422,7 @@ export function createAgentWithModelStream({
       sessionLease: sessionRunAcquisition.lease,
       abortController: new AbortController(),
       permissionMode,
+      visibleReasoningActive: false,
       sessionWriteFailed: false,
       terminalResultPromise: null,
     };
@@ -420,9 +455,7 @@ export function createAgentWithModelStream({
         toolRunner,
         abortController: currentRun.abortController,
         emit: (event) => processAgentLoopEvent(currentRun, event),
-        updatePhase: (phase) => {
-          currentRun.phase = phase;
-        },
+        updatePhase: (phase) => updateRunPhase(currentRun, phase),
         requestToolApproval: (toolCall, approvalPlan) =>
           waitForToolApproval(currentRun, toolCall, approvalPlan),
       });
@@ -459,6 +492,25 @@ export function createAgentWithModelStream({
     event: AgentLoopEvent,
   ): Promise<void> {
     switch (event.type) {
+      case "reasoning_start":
+        closeVisibleReasoning(currentRun);
+        currentRun.visibleReasoningActive = true;
+        publishEvent({ type: "reasoning_start", runId: currentRun.runId });
+        return;
+      case "reasoning_update":
+        if (!currentRun.visibleReasoningActive) {
+          currentRun.visibleReasoningActive = true;
+          publishEvent({ type: "reasoning_start", runId: currentRun.runId });
+        }
+        publishEvent({
+          type: "reasoning_update",
+          runId: currentRun.runId,
+          delta: event.delta,
+        });
+        return;
+      case "reasoning_end":
+        closeVisibleReasoning(currentRun);
+        return;
       case "assistant_message_start":
         activeAssistantMessage = event.message;
         publishEvent({ type: "message_start", message: event.message });
@@ -486,8 +538,11 @@ export function createAgentWithModelStream({
         }
         publishEvent({
           type: "tool_execution_start",
-          toolCallId: event.toolCall.toolCallId,
-          toolName: event.toolCall.toolName,
+          activity: Object.freeze({
+            toolCallId: event.toolCall.toolCallId,
+            toolName: event.toolCall.toolName,
+            summary: event.activitySummary,
+          }),
         });
         return;
       case "tool_execution_update":
@@ -566,6 +621,7 @@ export function createAgentWithModelStream({
   ): Promise<FinishedPromptResult> {
     let finalResult = requestedResult;
     resolvePendingToolApproval(currentRun, "aborted");
+    closeVisibleReasoning(currentRun);
     activeAssistantMessage = null;
     if (finalResult.status === "failed") {
       lastError = finalResult.error;

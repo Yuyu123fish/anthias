@@ -13,6 +13,7 @@ import { executeGrepTool, validateGrepToolCallInput } from "./basetool/grep.js";
 import { executeReadFileTool, validateReadFileToolCallInput } from "./basetool/read-file.js";
 import { prepareWriteFileTool, validateWriteFileToolCallInput } from "./basetool/write-file.js";
 import type { ReadOnlyToolName } from "./definitions.js";
+import { isRecord } from "./input-validation.js";
 import { decideToolPolicy, type ToolPolicyDecision } from "./tool-policy.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
@@ -48,6 +49,7 @@ export type ToolApprovalPlan = Readonly<{
 /** 保存已经完成预检、可以由 Agent Loop 执行的 ToolCall。 */
 export type PreparedToolExecution = Readonly<{
   approval: ToolApprovalPlan | null;
+  activitySummary: string;
   executionUnavailableContent: string;
   execute(
     abortSignal: AbortSignal,
@@ -205,6 +207,7 @@ function createReadOnlyToolCallPlan(
           ok: true,
           preparedExecution: Object.freeze({
             approval: null,
+            activitySummary: createReadOnlyToolActivitySummary(toolCall, toolName),
             executionUnavailableContent: "Run 已停止，Tool 未执行。",
             async execute(abortSignal: AbortSignal) {
               return Object.freeze({
@@ -254,6 +257,7 @@ function createFileToolCallPlan(
             preparedTool.preview,
             policyDecision,
           ),
+          activitySummary: createToolActivitySummary(`target: ${preparedTool.target}`),
           executionUnavailableContent: "Run 已停止，文件未写入。",
           async execute(abortSignal: AbortSignal) {
             try {
@@ -306,6 +310,9 @@ function createCommandToolCallPlan(
             preparedTool.preview,
             policyDecision,
           ),
+          activitySummary: createToolActivitySummary(
+            `cwd: ${preparedTool.target}; command: ${preparedTool.command}`,
+          ),
           executionUnavailableContent: "Run 已停止，命令未启动。",
           async execute(
             abortSignal: AbortSignal,
@@ -321,6 +328,54 @@ function createCommandToolCallPlan(
       });
     },
   });
+}
+
+/** 从已通过 Schema 校验的只读 ToolCall 形成不含原始 JSON 的动作摘要。 */
+function createReadOnlyToolActivitySummary(
+  toolCall: AssistantToolCallPart,
+  toolName: ReadOnlyToolName,
+): string {
+  if (!isRecord(toolCall.input)) {
+    throw new Error("已校验 ToolCall 缺少对象输入。");
+  }
+  const input = toolCall.input;
+  if (toolName === "read_file") {
+    const range =
+      typeof input.startLine === "number" || typeof input.lineCount === "number"
+        ? `; lines: ${typeof input.startLine === "number" ? input.startLine : 1}-${
+            (typeof input.startLine === "number" ? input.startLine : 1) +
+            (typeof input.lineCount === "number" ? input.lineCount : 200) -
+            1
+          }`
+        : "";
+    return createToolActivitySummary(`path: ${String(input.path)}${range}`);
+  }
+  if (toolName === "glob") {
+    return createToolActivitySummary(
+      `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}`,
+    );
+  }
+  return createToolActivitySummary(
+    `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}; files: ${
+      typeof input.filePattern === "string" ? input.filePattern : "**/*"
+    }`,
+  );
+}
+
+/** 删除终端控制字符、折叠换行，并以 Unicode code point 限制展示长度。 */
+function createToolActivitySummary(summary: string): string {
+  const singleLineSummary = [...summary]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ? " " : character;
+    })
+    .join("")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const visibleCharacters = [...singleLineSummary];
+  return visibleCharacters.length <= 160
+    ? singleLineSummary
+    : `${visibleCharacters.slice(0, 159).join("")}…`;
 }
 
 /** 创建 Permission 或 hard danger 的不可批准结果。 */

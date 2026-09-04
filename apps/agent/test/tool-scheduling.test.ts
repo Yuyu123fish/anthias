@@ -70,13 +70,16 @@ describe("Tool batch scheduling", () => {
     expect(
       events
         .filter((event) => event.type === "tool_execution_start")
-        .map((event) => event.toolCallId),
+        .map((event) => event.activity.toolCallId),
     ).toEqual(toolCallIds(6));
     expect(
       events
         .filter((event) => event.type === "tool_execution_end")
         .map((event) => event.toolCallId),
     ).toEqual([3, 4, 5, 2, 1, 0].map((index) => toolCallId(index + 1)));
+    expect(
+      events.filter((event) => event.type === "run_phase_changed").map((event) => event.phase),
+    ).toEqual(["executing_tool", "requesting_model"]);
 
     const sourceOrderedResults = fixture.agent.state.messageHistory.filter(
       (message) => message.role === "tool",
@@ -132,6 +135,7 @@ describe("Tool batch scheduling", () => {
                         deniedContent: "denied",
                       })
                     : null,
+                  activitySummary: `target: ${toolCall.toolName}`,
                   executionUnavailableContent: "aborted",
                   async execute() {
                     activeCount += 1;
@@ -248,6 +252,7 @@ describe("Tool batch scheduling", () => {
                 ok: true as const,
                 preparedExecution: Object.freeze({
                   approval: null,
+                  activitySummary: "path: file.txt",
                   executionUnavailableContent: "execution aborted",
                   async execute() {
                     abortAgent?.();
@@ -292,6 +297,7 @@ function createControlledReadOnlyRunner(callCount: number, failedIndex?: number)
               ok: true,
               preparedExecution: Object.freeze({
                 approval: null,
+                activitySummary: `path: file-${index}.txt`,
                 executionUnavailableContent: "execution aborted",
                 async execute(abortSignal: AbortSignal) {
                   startedIndices.push(index);

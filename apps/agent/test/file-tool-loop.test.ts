@@ -56,6 +56,8 @@ describe("file Agent Tool Loop", () => {
       yield finishEvent("stop");
     };
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
     const promptResultPromise = agent.prompt("修改文件");
 
     const editApproval = await waitForNextApproval(agent);
@@ -83,6 +85,14 @@ describe("file Agent Tool Loop", () => {
     expect(await readFile(fixture.existingFilePath, "utf8")).toBe("overwritten\n");
     expect(modelRequests).toHaveLength(4);
     expect(modelRequests[3]?.messages.filter((message) => message.role === "tool")).toHaveLength(3);
+    expect(
+      events
+        .filter((event) => event.type === "tool_execution_start")
+        .map((event) => event.activity.summary),
+    ).toEqual(["target: existing.txt", "target: created.txt", "target: existing.txt"]);
+    expect(
+      JSON.stringify(events.filter((event) => event.type === "tool_execution_start")),
+    ).not.toMatch(/alpha|beta|created\\n|overwritten/u);
 
     const records = await readSessionRecords(fixture.sessionFilePath);
     expect(records.filter((record) => record.type === "tool_execution_started")).toHaveLength(3);

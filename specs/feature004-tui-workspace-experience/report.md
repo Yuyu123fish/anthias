@@ -5,14 +5,14 @@
 
 ## 开发者速览
 
-> **一句话**：Plan 01 已支持任意 Workspace 启动，新 Session 归 Anthias Data Root。<br>
-> **核心做法**：CLI 分离三条路径，Agent 显式接收 Workspace 与 Session Directory，输入前显示 cwd。<br>
-> **边界**：仍为行式 TUI；Reasoning、Tool 摘要、文件标识、Shiki 和动态底栏未实现。<br>
-> **风险 / 未验证**：旧 Session 未迁移；真实 Provider 与启动期 Session changed 竞态未实测。<br>
-> **当前 / 请审阅**：Plan 01 已实现；全量 16 个文件、132 个测试通过，等待审查。
+> **一句话**：Plan 01 已分离 Workspace/Data Root，Plan 02 已让真实 Agent 生命周期、Reasoning 与 Tool 动作可观察。<br>
+> **核心做法**：Run 发布去重 phase，Model Stream 双轨处理瞬时 Reasoning，Tool plan 形成安全 summary。<br>
+> **边界**：当前仍为行式 TUI；文件引用、Shiki、动态区域与完整底栏由 Plan 03–04 实现。<br>
+> **风险 / 未验证**：旧 Session 未迁移；真实 Provider、最终视觉和 resize 尚未验证。<br>
+> **当前 / 请审阅**：Plan 01 已提交，Plan 02 全量门禁通过并准备提交；随后连续实施 Plan 03。
 
 - 对应 Spec：[spec.md](spec.md)
-- 当前 Plan：[Plan 01](plan-01-workspace-and-data-root.md)
+- 当前 Plan：[Plan 02](plan-02-agent-observability.md)
 - 任务事实源：[tasks.md](tasks.md)
 
 ## 1. Plan 01 已成立结果
@@ -25,9 +25,38 @@
 - 当前行式 TUI 在每次普通输入前显示完整 `cwd`、Permission Mode、Session 短 ID 与 `idle | active`，作为后续动态底栏的文案基线。
 - 根 `.gitignore` 已加入 `/data/`；Session Directory 内原有 `*` 忽略规则保持不变。
 
-尚未完成的范围：Plan 02 的 RunPhase、Visible Reasoning 与 ToolActivity，Plan 03 的文件引用和 Shiki Content Renderer，以及 Plan 04 的动态 TUI、Windows Terminal 人工验收和真实 DeepSeek V4 Flash 冒烟。
+尚未完成的范围：Plan 03 的文件引用和 Shiki Content Renderer，以及 Plan 04 的动态 TUI、Windows Terminal 人工验收和真实 DeepSeek V4 Flash 冒烟。
 
-## 2. 入口与调用链
+## 2. Plan 02 已成立结果
+
+- `RunPhase` 以既有三值公开；`run_start` 建立初始 `requesting_model`，后续只有真实 phase 变化才发布一次 `run_phase_changed`。
+- `executing_tool` 已从“开始预检”收紧为“即将发布真实 execution start”。invalid、denied、预检失败和被拒 approval 不再伪装成正在执行。
+- Model Stream 规范化 `reasoning_start | reasoning_delta | reasoning_end`。空 span 不显示；text、ToolCall、finish、Provider error 与 abort 都会先唯一结束活动 span。
+- `AssistantMessage` 仍只保存 text / ToolCall。当前 Run 用私有映射保留带 Reasoning 的模型输入用于 Tool continuation；Run 结束后映射释放，后续 Run 只从持久 Message 重建上下文。
+- OpenAI-compatible Adapter 已映射 AI SDK Reasoning part，并能把同 Run 临时 reasoning message 回传；没有增加 DeepSeek 专用类型或条件分支。
+- `tool_execution_start` 现在只携带 `ToolActivity { toolCallId, toolName, summary }`。摘要在已验证/预检计划中形成，单行且最多 160 个可见字符；文件正文、运行时环境值和原始 Tool JSON 不进入事件。
+- 无 I/O 即可判定的路径逃逸和非法 grep 正则已前移到验证，因此不会产生 execution start；文件存在性、权限和实际执行错误仍按 start → end(failed) 呈现。
+- 当前行式 TUI 已能直接呈现 Requesting model、phase 变化、Visible Reasoning 与 Tool summary；它不根据 spinner、计时器或 Tool 事件反推 Agent 阶段。
+
+典型公开顺序：
+
+```text
+run_start                         // 初始 requesting_model
+message_start(assistant)
+reasoning_start → update* → end   // 仅 Provider 明确给出的文本
+message_end(assistant)
+run_phase_changed(executing_tool)
+tool_execution_start(activity)
+tool_execution_end
+message_end(tool)
+run_phase_changed(requesting_model)
+...
+run_end
+```
+
+已验证摘要样例：`pattern: **/*.ts; base: .`、`path: src/example.ts`、`target: existing.txt`、`cwd: .; command: ...`。
+
+## 3. 入口与调用链
 
 ```text
 编译后 anthias bin
@@ -50,7 +79,7 @@
 - Session Module 仍拥有 Schema 1、Workspace 绑定、锁、checkpoint、恢复与持久化。
 - `runTui()` 仍是唯一公开 TUI 入口，只读取 Agent state 和事件。
 
-## 3. 失败表现与兼容性
+## 4. 失败表现与兼容性
 
 | reason | 用户可操作结果 |
 | --- | --- |
@@ -68,7 +97,7 @@
 - 路径进入启动错误或上下文行前会替换 C0 / C1 控制字符，普通路径内容保持可辨认。
 - 旧调用方若直接使用生产工厂，必须补充显式 `workspaceRoot` 与 `sessionDirectory`；这是本 Plan 有意收窄的装配合同，Agent 的运行操作与事件接口没有变化。
 
-## 4. 验证证据
+## 5. 验证证据
 
 验证环境：Windows，Node.js `v24.13.1`，pnpm `10.33.0`，PowerShell `7.5.4`。
 
@@ -103,10 +132,21 @@ pnpm verify
 
 结果：静态检查通过；16 个测试文件、132 个测试全部通过。
 
-## 5. 证据边界与 Git 状态
+### Plan 02 定向与完整门禁
+
+```text
+pnpm exec vitest run apps/agent/test/agent.test.ts apps/agent/test/openai-compatible-model.test.ts apps/agent/test/tool-loop.test.ts apps/agent/test/tool-scheduling.test.ts apps/agent/test/file-tool-loop.test.ts apps/agent/test/command-tool-loop.test.ts apps/tui/test/tui.test.ts
+pnpm verify
+```
+
+结果：定向 7 个测试文件、54 个测试通过；完整静态检查、构建与 16 个测试文件、138 个测试全部通过。
+
+定向证据同时证明：Reasoning 多 span、error / abort 收口、同 Run Tool continuation、Session 与下一 Run 不继承；六类 Tool summary、并发 start / end 归属、phase 去重和非法只读输入 no-start。
+
+## 6. 证据边界与 Git 状态
 
 - 没有使用真实 Provider、外部网络、付费 API 或真实凭据；`DEEPSEEK_API_KEY` 未读取、未映射、未输出，也未进入文件。
 - `session_changed` 有稳定公开 reason 和真实 checkpoint 变化映射；自动测试覆盖既有 Run 期 checkpoint 变化，但没有用非确定性并发写入强制制造启动瞬间竞态。
 - 自动测试证明路径、持久化位置和文本合同，不证明 Plan 04 的最终视觉质量、resize 或 Windows Terminal 交互体验。
-- 文档提交为 `0cbb45e`。Plan 01 实现和本报告当前都是 `main` 上的未提交工作区变更；没有推送或创建 PR。
-- Plan 01 完成后按约定停止。代码提交、Plan 02、推送和 PR 均未获得本阶段授权。
+- 文档提交为 `0cbb45e`，Plan 01 提交为 `8b2f2f8`。Plan 02 当前是 `main` 上准备提交的单一增量；没有推送或创建 PR。
+- 开发者已授权连续完成整个 Feature，并要求每个 Plan 独立提交；真实 Provider 仍只在 Plan 04 冒烟时使用。
