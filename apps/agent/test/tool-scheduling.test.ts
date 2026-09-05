@@ -129,6 +129,7 @@ describe("Tool batch scheduling", () => {
                         toolName: "write_file" as const,
                         target: "file.txt",
                         preview: "preview",
+                        actionFingerprint: "a".repeat(64),
                         ruleId: "file.workspace_exact_review",
                         riskSummary: "write",
                         executionBoundary: "one file",

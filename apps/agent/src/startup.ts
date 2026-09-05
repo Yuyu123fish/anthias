@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { type Agent, createAgentWithModelStream } from "./agent.js";
 import { readModelConfig } from "./model/model-config.js";
 import { createOpenAICompatibleModelStream } from "./model/openai-compatible-model.js";
-import type { PermissionMode } from "./permission-mode.js";
+import type { PermissionMode } from "./permission/permission-mode.js";
 import type { SessionCleanupResult } from "./session/cleanup.js";
 import {
   createSession,

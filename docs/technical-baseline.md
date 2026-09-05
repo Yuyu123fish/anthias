@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003 已验收；Feature 004 四个 Plan 已完成本地实现，真实 Provider 与主观终端视觉验收待补。
+状态：Feature 003 已验收；Feature 004 的主观终端视觉仍待验收；Feature 005 已实现，有限真实模型证据见其 Report。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -39,9 +39,9 @@ Agent 持有消息 transcript、当前流式消息、是否正在运行以及取
 - 通过生产启动工厂从本地环境创建 Agent，并返回安全的配置结果；
 - 读取当前只读 state；
 - 提交一条 prompt；
-- 在空闲时查看或切换 Agent / Plan 权限模式；
+- 在空闲时查看或切换 Agent / Plan / AutoAllow 权限模式；
 - 响应当前待决的 Tool approval；
-- 取消当前运行；
+- 取消当前运行，或关闭 Agent 并等待资源释放；
 - 订阅 AgentEvent，并能取消订阅。
 
 Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。生产启动工厂隐藏模型配置解析与 Adapter 构造；Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
@@ -66,7 +66,7 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 通过自己的串行 render queue 保留该顺序，不通过事件反向控制 Agent。
 
-Session 只持久化完整消息、副作用开始事实和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
+Session 使用 Schema 2 JSONL，持久化完整消息、压缩、调用用量、审批、副作用开始事实、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
 ## 模型配置方向
 
@@ -77,6 +77,11 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 - ANTHIAS_MODEL_API_KEY
 
 三项只供 Agent Module 内部的模型 Adapter 使用，TUI 只接收启动成功后的 Agent 或安全错误文本。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
+
+
+已知 deepseek-v4-flash 使用内置模型能力数据，不需要手工配置安全余量。自定义模型还必须声明 ANTHIAS_MODEL_CONTEXT_WINDOW；ANTHIAS_MODEL_MAX_OUTPUT_TOKENS 可声明输出能力。ANTHIAS_RESPONSE_MAX_TOKENS、ANTHIAS_COMPACTION_MAX_TOKENS、ANTHIAS_CONTEXT_KEEP_TOKENS 分别控制普通输出、摘要输出和保留原文目标，默认 16,000 / 8,000 / 32,000；安全余量固定 20,000。所有数值在 Agent 启动时校验，TUI 不读取这些配置。
+
+上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史。恢复索引与 JSONL 分开，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 的审核是同一模型的独立请求，最多 8,000 输入 / 2,000 输出，不能调用工具或把摘要、工具结果当成授权。
 
 ## 设计约束
 
@@ -90,7 +95,7 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 ## 仍待后续 Feature 决定
 
 - 旧 Workspace 内 Session 的可选迁移能力；当前实现明确不自动扫描或迁移；
-- Session Compaction、检索和后续分叉所需的持久化扩展；
+- 长历史检索和后续执行分叉所需的持久化扩展；
 - 可复用授权、OS 沙箱、低权限执行和网络隔离；
 - 多 Provider、模型切换、重试和 Provider 专属能力；
 - Desktop 框架、进程模型和传输协议；

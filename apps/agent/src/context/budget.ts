@@ -3,6 +3,7 @@ import type { ModelInputMessage, ModelRequest } from "../model/model-stream.js";
 /** 区分模型容量与普通回复、摘要和保留原文的应用策略。 */
 export type ContextBudget = Readonly<{
   contextWindow: number;
+  modelMaxOutputTokens?: number;
   safetyTokens: number;
   responseOutputTokens: number;
   summaryOutputTokens: number;
@@ -39,6 +40,9 @@ export function createContextBudget(
   }
   return Object.freeze({
     contextWindow: capabilities.contextWindow,
+    ...(capabilities.maxOutputTokens === undefined
+      ? {}
+      : { modelMaxOutputTokens: capabilities.maxOutputTokens }),
     safetyTokens: 20_000,
     responseOutputTokens,
     summaryOutputTokens,

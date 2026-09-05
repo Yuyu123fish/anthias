@@ -110,7 +110,7 @@ export function createContextController(options: {
     emit: (event: ContextEvent) => void;
     onFailure: (error: string) => void;
     onStorageFailure: () => void;
-  }): ModelStream {
+  }) {
     async function recordUsage(
       purpose: RequestPurpose,
       requestEntryId: string | null,
@@ -133,7 +133,7 @@ export function createContextController(options: {
       run.emit({ type: "context_usage", usage: snapshot() });
     }
 
-    return async function* requestWithContext(rawRequest, abortSignal) {
+    const requestWithContext: ModelStream = async function* (rawRequest, abortSignal) {
       let projection = projectContextHistory(session.records ?? [], rawRequest.messages);
       let request: ModelRequest = {
         ...rawRequest,
@@ -325,6 +325,16 @@ export function createContextController(options: {
         throw error;
       }
     };
+    return Object.freeze({
+      modelStream: requestWithContext,
+      recordApprovalUsage: (usage: ModelUsage | undefined, actionFingerprint: string) =>
+        recordUsage(
+          "approval",
+          session.records.findLast((record) => record.type === "message")?.entryId ?? null,
+          "approval:" + modelId + ":" + actionFingerprint,
+          usage,
+        ),
+    });
   }
   return Object.freeze({ snapshot, wrapRun });
 }

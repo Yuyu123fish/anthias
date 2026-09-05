@@ -1054,6 +1054,11 @@ describe("runTui", () => {
     });
     expect(promptHandler).not.toHaveBeenCalled();
 
+    input.write("/mode auto_allow\n");
+    await vi.waitFor(() => {
+      expect(agent.state.permissionMode).toBe("auto_allow");
+      expect(rendered).toContain("模式：AutoAllow");
+    });
     input.write("/mode invalid\n");
     await vi.waitFor(() => expect(rendered).toContain("用法：/mode"));
     input.write("/exit\n");
@@ -1341,7 +1346,7 @@ function createFakeAgent(
 ): Agent {
   const listeners = new Set<AgentListener>();
   let running = false;
-  let permissionMode: "agent" | "plan" = "agent";
+  let permissionMode: AgentState["permissionMode"] = "agent";
   let pendingToolApproval: ToolApprovalRequest | null = null;
   const controls: FakeAgentControls = {
     publish(event) {

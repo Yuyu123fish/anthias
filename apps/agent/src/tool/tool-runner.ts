@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
-import type { PermissionMode } from "../permission-mode.js";
+import type { PermissionMode } from "../permission/permission-mode.js";
+import { decideToolPolicy, type ToolPolicyDecision } from "../permission/tool-policy.js";
 import type {
   ArtifactSourceStatus,
   ArtifactWriter,
@@ -9,10 +11,15 @@ import type { SessionShell } from "../session/index.js";
 import { prepareEditFileTool, validateEditFileToolCallInput } from "./basetool/edit-file.js";
 import {
   executePreparedCommand,
+  type PreparedCommandTool,
   prepareCommandTool,
   validateCommandToolCallInput,
 } from "./basetool/execute-command.js";
-import { executePreparedFileTool, type PreparedFileResult } from "./basetool/file-change.js";
+import {
+  executePreparedFileTool,
+  type PreparedFileResult,
+  type PreparedFileTool,
+} from "./basetool/file-change.js";
 import { executeGlobTool, validateGlobToolCallInput } from "./basetool/glob.js";
 import { executeGrepTool, validateGrepToolCallInput } from "./basetool/grep.js";
 import {
@@ -23,7 +30,6 @@ import { executeReadFileTool, validateReadFileToolCallInput } from "./basetool/r
 import { prepareWriteFileTool, validateWriteFileToolCallInput } from "./basetool/write-file.js";
 import type { ReadOnlyToolName } from "./definitions.js";
 import { isRecord } from "./input-validation.js";
-import { decideToolPolicy, type ToolPolicyDecision } from "./tool-policy.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
 
@@ -54,6 +60,7 @@ export type ToolApprovalPlan = Readonly<{
   riskSummary: string;
   executionBoundary: string;
   deniedContent: string;
+  actionFingerprint: string;
 }>;
 
 /** 保存已经完成预检、可以由 Agent Loop 执行的 ToolCall。 */
@@ -302,12 +309,7 @@ function createFileToolCallPlan(
       return Object.freeze({
         ok: true,
         preparedExecution: Object.freeze({
-          approval: createApprovalPlan(
-            preparedTool.toolName,
-            preparedTool.target,
-            preparedTool.preview,
-            policyDecision,
-          ),
+          approval: createApprovalPlan(preparedTool, policyDecision),
           activitySummary: createToolActivitySummary(`target: ${preparedTool.target}`),
           executionUnavailableContent: "Run 已停止，文件未写入。",
           async execute(abortSignal: AbortSignal) {
@@ -355,12 +357,7 @@ function createCommandToolCallPlan(
       return Object.freeze({
         ok: true,
         preparedExecution: Object.freeze({
-          approval: createApprovalPlan(
-            preparedTool.toolName,
-            preparedTool.target,
-            preparedTool.preview,
-            policyDecision,
-          ),
+          approval: createApprovalPlan(preparedTool, policyDecision),
           activitySummary: createToolActivitySummary(
             `cwd: ${preparedTool.target}; command: ${preparedTool.command}`,
           ),
@@ -522,19 +519,26 @@ function createRejectedToolCallPlan(content: string): ToolCallPlan {
 }
 
 function createApprovalPlan(
-  toolName: ToolApprovalPlan["toolName"],
-  target: string,
-  preview: string,
+  preparedTool: PreparedFileTool | PreparedCommandTool,
   policyDecision: ToolPolicyDecision,
 ): ToolApprovalPlan {
+  // 指纹覆盖完整准备快照，不能只绑定展示预览；文件身份在部分平台上可能是 bigint。
+  const actionFingerprint = createHash("sha256")
+    .update(
+      JSON.stringify(preparedTool, (_key, value: unknown) =>
+        typeof value === "bigint" ? value.toString() : value,
+      ),
+    )
+    .digest("hex");
   return Object.freeze({
-    toolName,
-    target,
-    preview,
+    toolName: preparedTool.toolName,
+    target: preparedTool.target,
+    preview: preparedTool.preview,
+    actionFingerprint,
     ruleId: policyDecision.ruleId,
     riskSummary: policyDecision.riskSummary,
     executionBoundary: policyDecision.executionBoundary,
-    deniedContent: `用户拒绝执行 ${toolName}。`,
+    deniedContent: `用户拒绝执行 ${preparedTool.toolName}。`,
   });
 }
 

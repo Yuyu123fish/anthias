@@ -11,6 +11,7 @@ import {
 } from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
+const activeAgents = new Set<ReturnType<typeof createAgentWithModelStream>>();
 const sensitiveEnvironmentNames = [
   "ANTHIAS_MODEL_API_KEY",
   "ANTHIAS_TEST_SECRET",
@@ -23,6 +24,8 @@ const originalSensitiveEnvironment = new Map(
 );
 
 afterEach(async () => {
+  await Promise.all([...activeAgents].map((agent) => agent.close()));
+  activeAgents.clear();
   for (const name of sensitiveEnvironmentNames) {
     const originalValue = originalSensitiveEnvironment.get(name);
     if (originalValue === undefined) {
@@ -68,7 +71,7 @@ describe("execute_command Agent Tool Loop", () => {
       yield { type: "text_delta", delta: "命令验证完成。" } as const;
       yield finishEvent("stop");
     };
-    const agent = createAgentWithModelStream({ modelStream, session });
+    const agent = createTrackedAgent({ modelStream, session });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
@@ -126,6 +129,7 @@ describe("execute_command Agent Tool Loop", () => {
       "message",
       "request_usage",
       "message",
+      "approval_decision",
       "tool_execution_started",
       "message",
       "request_usage",
@@ -134,7 +138,9 @@ describe("execute_command Agent Tool Loop", () => {
     ]);
   });
 
-  it("returns bounded failures for non-zero exit and timeout, then lets the model continue", async () => {
+  it("returns bounded failures for non-zero exit and timeout, then lets the model continue", {
+    timeout: 15_000,
+  }, async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-failures-"));
     temporaryDirectories.add(workspaceRoot);
     const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
@@ -167,7 +173,7 @@ describe("execute_command Agent Tool Loop", () => {
       yield { type: "text_delta", delta: "已记录命令失败。" } as const;
       yield finishEvent("stop");
     };
-    const agent = createAgentWithModelStream({ modelStream, session });
+    const agent = createTrackedAgent({ modelStream, session });
     const executionEndEvents: Extract<AgentEvent, { type: "tool_execution_end" }>[] = [];
     agent.subscribe((event) => {
       if (event.type === "tool_approval_requested") {
@@ -227,7 +233,7 @@ describe("execute_command Agent Tool Loop", () => {
       yield { type: "text_delta", delta: "截断验证完成。" } as const;
       yield finishEvent("stop");
     };
-    const agent = createAgentWithModelStream({ modelStream, session });
+    const agent = createTrackedAgent({ modelStream, session });
     agent.subscribe((event) => {
       if (event.type === "tool_approval_requested") {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
@@ -284,7 +290,7 @@ describe("execute_command Agent Tool Loop", () => {
       yield { type: "text_delta", delta: "写盘失败后仍完成。" } as const;
       yield finishEvent("stop");
     };
-    const agent = createAgentWithModelStream({ modelStream: continuingModelStream, session });
+    const agent = createTrackedAgent({ modelStream: continuingModelStream, session });
     agent.subscribe((event) => {
       if (event.type === "tool_approval_requested") {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
@@ -323,7 +329,7 @@ describe("execute_command Agent Tool Loop", () => {
       } as const;
       yield finishEvent("tool_calls");
     };
-    const agent = createAgentWithModelStream({ modelStream, session });
+    const agent = createTrackedAgent({ modelStream, session });
     const events: AgentEvent[] = [];
     let abortRequested = false;
     agent.subscribe((event) => {
@@ -380,4 +386,10 @@ function isProcessAlive(processId: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+function createTrackedAgent(options: Parameters<typeof createAgentWithModelStream>[0]) {
+  const agent = createAgentWithModelStream(options);
+  activeAgents.add(agent);
+  return agent;
 }

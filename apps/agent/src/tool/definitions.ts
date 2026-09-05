@@ -1,5 +1,5 @@
 import type { JSONSchema7 } from "ai";
-import type { PermissionMode } from "../permission-mode.js";
+import type { PermissionMode } from "../permission/permission-mode.js";
 
 /** 保存无需人工确认即可执行的固定 Tool 名称。 */
 export const READ_ONLY_TOOL_NAMES = Object.freeze([

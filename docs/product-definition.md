@@ -55,10 +55,11 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 - 仓库已有可构建、可启动的 Agent 与对话式 TUI；生产 OpenAI-compatible Model Adapter、线性 Session、Tool 和运行生命周期位于 Agent Module 内部，TUI 不持有这些行为权威。
 - 旧的 Electron Desktop、Utility Process Host、JSON-RPC、Protocol DTO 和 Renderer 状态投影已经撤销。
 - Feature 001–003 已累计实现多轮模型与 Tool 循环、六个固定 Tool、线性 JSONL Session、工作区文件和命令能力、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策与只读 Tool 四并发；Feature 003 已由开发者验收。
-- 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider、外部网络和长期人工终端体验尚未验证。
+- 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider 只有 Feature 005 报告所列的有限冒烟，长期人工终端体验仍待验收。
 - [Feature 004](../specs/feature004-tui-workspace-experience/spec.md) 已在本地实现现代对话层级：稳定 scrollback 与底部动态区域并存，完整 Workspace、模式、Session 和 Run 状态持续可见；Visible Reasoning 自动折叠并可用 `/details` 回看，超出终端高度时通过 `/details prev|next` 分页；Tool 按 `toolCallId` 呈现摘要与详情，Assistant 文件引用经 Workspace 校验，已标记代码块由 Shiki 按需着色。运行中窗口小到无法安全保留上下文时会暂停提交和确认，放大后恢复；非 TTY、无颜色和无 Unicode 均有等价降级。
 - Feature 004 的自动门禁和 Windows ConPTY loopback 已通过；真实 DeepSeek V4 Flash 冒烟与 Windows Terminal 主观视觉检查尚未完成，因此尚未进入“已实现”状态。
-- Compaction、Desktop、检查点、执行分支和候选比较尚未实现。
+- Feature 005 已形成上下文压缩和自动继续、完整历史与模型投影分离、工具原文访问、两周未使用会话的启动清理，以及 AutoAllow 模式。自动审核只能依据真实用户授权，不能覆盖硬禁止策略。
+- Desktop、可用对话 fork、执行检查点、执行分支和候选比较尚未实现。
 
 ## 核心产品术语
 

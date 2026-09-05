@@ -6,12 +6,12 @@ import { type AgentLoopEvent, runAgentLoop } from "../src/agent-loop.js";
 import { estimateTextTokens } from "../src/context/budget.js";
 import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelStream } from "../src/model/model-stream.js";
+import { decideToolPolicy } from "../src/permission/tool-policy.js";
 import {
   createSessionArtifactStore,
   SESSION_ARTIFACT_BYTE_LIMIT,
   type SessionArtifactStore,
 } from "../src/session/artifacts.js";
-import { decideToolPolicy } from "../src/tool/tool-policy.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
 
 const temporaryDirectories = new Set<string>();

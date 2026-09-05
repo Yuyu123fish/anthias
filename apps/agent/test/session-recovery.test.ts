@@ -408,7 +408,7 @@ describe("Session recovery storage", () => {
     await reopenedSession.close();
   });
 
-  it("binds an approval decision appended by a lease to its active Run", async () => {
+  it("recovers a side-effect start only after its bound allowed approval", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-approval-run-id-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     const session = await createSession({
@@ -418,15 +418,98 @@ describe("Session recovery storage", () => {
     });
     const runId = randomUUID();
     const toolCallId = randomUUID();
+    const toolApprovalRequestId = randomUUID();
+    const actionFingerprint = "a".repeat(64);
     const acquisition = await session.acquireRun(runId);
     if (acquisition.status !== "acquired") {
       throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
     }
-    await acquisition.lease.appendMessage({ role: "user", content: "读取文件后回答" });
+    await acquisition.lease.appendMessage({ role: "user", content: "写入文件后回答" });
     const authorizationEntryId = session.records.at(-1)?.entryId;
     if (authorizationEntryId === undefined) {
       throw new Error("expected a persisted authorization source");
     }
+    await acquisition.lease.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          toolCallId,
+          toolName: "write_file",
+          input: { path: "a.txt", content: "内容" },
+          invalid: false,
+        },
+      ],
+      status: "completed",
+    });
+    await acquisition.lease.appendApprovalDecision({
+      toolCallId,
+      toolName: "write_file",
+      permissionMode: "auto_allow",
+      decisionSource: "auto_review",
+      decision: "allowed",
+      reason: "用户已明确授权写入。",
+      authorizationEntryIds: [authorizationEntryId],
+      actionFingerprint,
+      toolApprovalRequestId,
+    });
+    await acquisition.lease.appendToolExecutionStarted({
+      toolCallId,
+      toolName: "write_file",
+      toolApprovalRequestId,
+    });
+    await acquisition.lease.appendMessage({
+      role: "tool",
+      toolCallId,
+      toolName: "write_file",
+      status: "completed",
+      content: "已写入",
+      truncated: false,
+    });
+    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
+    await acquisition.lease.appendRunFinished({ status: "completed" });
+    await acquisition.lease.release();
+
+    expect(session.records.find((record) => record.type === "approval_decision")).toMatchObject({
+      type: "approval_decision",
+      runId,
+      toolCallId,
+      permissionMode: "auto_allow",
+      actionFingerprint,
+      toolApprovalRequestId,
+    });
+    await session.close();
+    const reopenedSession = await openSession({
+      sessionId: session.sessionId,
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    expect(reopenedSession.records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_execution_started",
+          toolCallId,
+          toolApprovalRequestId,
+        }),
+      ]),
+    );
+    await reopenedSession.close();
+  });
+
+  it("rejects an approval that cites an Assistant message as its authorization", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-false-authorization-");
+    const session = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory: join(fixtureRoot, "sessions"),
+      shell: TEST_SHELL,
+    });
+    const acquisition = await session.acquireRun(randomUUID());
+    if (acquisition.status !== "acquired") {
+      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
+    }
+    const toolCallId = randomUUID();
+    await acquisition.lease.appendMessage({ role: "user", content: "读取后回答" });
     await acquisition.lease.appendMessage({
       role: "assistant",
       content: [
@@ -440,32 +523,77 @@ describe("Session recovery storage", () => {
       ],
       status: "completed",
     });
+    const assistantEntryId = session.records.at(-1)?.entryId;
+    if (assistantEntryId === undefined) {
+      throw new Error("expected a persisted Assistant entry");
+    }
+    await expect(
+      acquisition.lease.appendApprovalDecision({
+        toolCallId,
+        toolName: "read_file",
+        permissionMode: "auto_allow",
+        decisionSource: "auto_review",
+        decision: "allowed",
+        reason: "不可信来源。",
+        authorizationEntryIds: [assistantEntryId],
+        actionFingerprint: "b".repeat(64),
+        toolApprovalRequestId: randomUUID(),
+      }),
+    ).rejects.toThrow("授权引用无效");
+    await acquisition.lease.release();
+    await session.close();
+  });
+
+  it("rejects a side-effect start whose approval request ID does not match its bound approval", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-approval-mismatch-");
+    const session = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory: join(fixtureRoot, "sessions"),
+      shell: TEST_SHELL,
+    });
+    const acquisition = await session.acquireRun(randomUUID());
+    if (acquisition.status !== "acquired") {
+      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
+    }
+    const toolCallId = randomUUID();
+    const toolApprovalRequestId = randomUUID();
+    await acquisition.lease.appendMessage({ role: "user", content: "写入文件" });
+    const authorizationEntryId = session.records.at(-1)?.entryId;
+    if (authorizationEntryId === undefined) {
+      throw new Error("expected a persisted authorization source");
+    }
+    await acquisition.lease.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          toolCallId,
+          toolName: "write_file",
+          input: { path: "a.txt", content: "内容" },
+          invalid: false,
+        },
+      ],
+      status: "completed",
+    });
     await acquisition.lease.appendApprovalDecision({
       toolCallId,
-      toolName: "read_file",
-      permissionMode: "agent",
-      decisionSource: "policy",
+      toolName: "write_file",
+      permissionMode: "auto_allow",
+      decisionSource: "auto_review",
       decision: "allowed",
-      reason: "只读操作允许执行。",
+      reason: "用户已授权。",
       authorizationEntryIds: [authorizationEntryId],
+      actionFingerprint: "c".repeat(64),
+      toolApprovalRequestId,
     });
-    await acquisition.lease.appendMessage({
-      role: "tool",
-      toolCallId,
-      toolName: "read_file",
-      status: "completed",
-      content: "内容",
-      truncated: false,
-    });
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
+    await expect(
+      acquisition.lease.appendToolExecutionStarted({
+        toolCallId,
+        toolName: "write_file",
+        toolApprovalRequestId: randomUUID(),
+      }),
+    ).rejects.toThrow("缺少匹配的允许审批");
     await acquisition.lease.release();
-
-    expect(session.records.find((record) => record.type === "approval_decision")).toMatchObject({
-      type: "approval_decision",
-      runId,
-      toolCallId,
-    });
     await session.close();
   });
   it("falls back to the previous valid CompactionEntry while rejecting invalid new appends", async () => {

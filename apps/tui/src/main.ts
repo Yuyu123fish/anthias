@@ -24,13 +24,18 @@ async function main(): Promise<number> {
     sessionId = parsedArguments.values.session;
     requestedWorkspace = parsedArguments.values.workspace;
     const requestedMode = parsedArguments.values.mode;
-    if (requestedMode !== undefined && requestedMode !== "agent" && requestedMode !== "plan") {
+    if (
+      requestedMode !== undefined &&
+      requestedMode !== "agent" &&
+      requestedMode !== "plan" &&
+      requestedMode !== "auto_allow"
+    ) {
       throw new Error("invalid mode");
     }
     permissionMode = requestedMode ?? "agent";
   } catch {
     process.stderr.write(
-      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan>。\n",
+      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan|auto_allow>。\n",
     );
     return 1;
   }

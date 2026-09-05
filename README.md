@@ -31,7 +31,7 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 node 'C:\projects\anthias\apps\tui\dist\main.js'
 ```
 
-把上面的仓库路径替换为你的实际路径。省略 `--workspace` 时使用调用命令的当前目录，也可以传入 `--workspace 'D:\你的项目'`；`--mode plan` 以只读模式启动。Session 默认集中保存在 Anthias 仓库的 `data/conversation/`。
+把上面的仓库路径替换为你的实际路径。省略 `--workspace` 时使用调用命令的当前目录，也可以传入 `--workspace 'D:\你的项目'`；`--mode plan` 以只读模式启动，`--mode auto_allow` 启用独立自动审核。Session 默认集中保存在 Anthias 仓库的 `data/conversation/`。
 
 Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复和常见启动问题。
 
@@ -40,12 +40,13 @@ Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复�
 - 旧的 Desktop、Local Agent Host、JSON-RPC 和 Protocol 实现已经撤销。
 - Feature 001–003 已累计实现事件驱动的 Agent Loop、线性 JSONL Session、六个固定 Tool、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策和只读 Tool 四并发；Feature 003 已由开发者验收。
 - 仓库已有可构建、可启动的 Agent 与对话式 TUI；生产 OpenAI-compatible Model Adapter、Session、Tool 和运行生命周期均由 Agent Module 持有，TUI 只通过公开 Agent Interface 输入和呈现。
-- 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider、外部网络与长期人工终端体验不在现有自动验证证据内。
+- 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider 的有限摘要与审批冒烟另见 Feature 005 Report，长期人工终端体验仍待验收。
 - 已确认的基础方向是 Strict TypeScript、Node.js 24 LTS、ESM 和 pnpm workspace。
 - 首个模型接入继续使用通用 OpenAI-compatible 接口；DeepSeek V4 Flash 只是日常使用与联调的参考模型。
 - Electron 不再是产品前提；Desktop 的框架、进程模型和传输方式留给未来 Feature 决定。
 - [Feature 004](specs/feature004-tui-workspace-experience/spec.md) 的四个 Plan 已完成本地实现：可从任意目录或 `--workspace` 启动，Session 集中保存到 Anthias `data/conversation`；TUI 使用 `><°>` 分叉尾鱼标识、稳定 scrollback、动态运行区和常驻完整工作路径，并呈现 Visible Reasoning、可分页详情、Tool 活动、安全文件引用及 Shiki 代码高亮。自动门禁与 Windows ConPTY loopback 已通过；真实 DeepSeek 冒烟和 Windows Terminal 主观视觉检查仍是验收边界，因此 Feature 暂保持“实施中”。
-- Compaction、执行分叉、候选比较和 Desktop 尚未实现。
+- [Feature 005](specs/feature005-context-engineering/spec.md) 已实现请求前预算、自动 Compaction、历史与模型上下文分离、Schema 2 恢复索引、按 UTC 时间归档、工具原文及 `read_artifact`、启动时清理两周未使用的会话，以及 AutoAllow 独立审核。`/context` 查看窗口与累计用量；[实施报告](specs/feature005-context-engineering/report.md) 记录实际验证边界。
+- 可用的对话 fork、执行分叉、候选比较和 Desktop 尚未实现。
 
 ## 文档入口
 

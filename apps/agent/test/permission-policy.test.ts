@@ -4,12 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream, type PermissionMode } from "../src/agent.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
+import { classifyCommandSafety } from "../src/permission/tool-policy.js";
 import {
   createSession,
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
-import { classifyCommandSafety } from "../src/tool/tool-policy.js";
 
 const temporaryDirectories = new Set<string>();
 

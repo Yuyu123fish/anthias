@@ -16,7 +16,7 @@
 - Agent 持有消息、模型运行以及后续 Tool 和工作区副作用；交互 Adapter 只负责输入与呈现。
 - 执行分支是产品概念，不等同于 Git 分支、只复制消息的对话分支、多 Agent 或 Agent 自我进化；具体实现机制尚未确认。
 - Java/JVM/Maven/JLine 路线，以及旧的 Electron Desktop、独立 Host、JSON-RPC 和 Feature 001 实现均已撤销。
-- Feature 001–003 已累计形成 Agent Loop、线性 Session、六个固定 Tool、权限与安全策略和只读有界并发；Feature 003 已由开发者验收。除 Feature 004 最终阶段已授权的一次受限 DeepSeek V4 Flash 冒烟外，真实 Provider 验证仍需另行授权；当前也没有 OS 沙箱。
+- Feature 001–003 已累计形成 Agent Loop、线性 Session、六个固定 Tool、权限与安全策略和只读有界并发；Feature 003 已由开发者验收。Feature 005 已补齐上下文压缩、产物与会话清理、AutoAllow，并完成其 Report 所列的限量 DeepSeek V4 Flash 冒烟；后续真实 Provider 验证继续单独授权，当前没有 OS 沙箱。
 - 后续设计先完成模型对话、Tool、本地能力和上下文等 Coding Harness 闭环，再证明从共同检查点分叉、独立推进、比较并选择的核心价值。
 
 ## 代码与运行时

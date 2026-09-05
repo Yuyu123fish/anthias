@@ -529,6 +529,14 @@ async function renderEvent(
   eventTimestamp: number,
 ): Promise<void> {
   switch (event.type) {
+    case "tool_auto_review_start":
+      terminalDriver.writeStable(`正在审核 ${event.toolName} 的本次授权…\n`);
+      return;
+    case "tool_authorization":
+      terminalDriver.writeStable(
+        `${event.source === "auto_review" ? "自动审核" : event.source === "user" ? "人工确认" : "权限策略"}：${event.decision === "allowed" ? "已批准" : event.decision === "needs_user" ? "转人工确认" : "已拒绝"}；${sanitizeTerminalText(event.reason)}\n`,
+      );
+      return;
     case "context_usage":
       if (terminalDriver.kind === "plain")
         terminalDriver.writeStable(renderContextUsage(event.usage) + "\n");
@@ -1512,8 +1520,11 @@ function handleModeCommand(command: string, agent: Agent): string | null {
     return `Mode: ${renderPermissionMode(agent.state.permissionMode)}\n`;
   }
   const requestedMode = commandParts[1];
-  if (commandParts.length !== 2 || (requestedMode !== "agent" && requestedMode !== "plan")) {
-    return "用法：/mode、/mode agent 或 /mode plan。\n";
+  if (
+    commandParts.length !== 2 ||
+    (requestedMode !== "agent" && requestedMode !== "plan" && requestedMode !== "auto_allow")
+  ) {
+    return "用法：/mode、/mode agent 、/mode plan 或 /mode auto_allow。\n";
   }
   const previousMode = agent.state.permissionMode;
   const result = agent.setPermissionMode(requestedMode);
@@ -1525,8 +1536,12 @@ function handleModeCommand(command: string, agent: Agent): string | null {
     : null;
 }
 
-function renderPermissionMode(permissionMode: PermissionMode): "Agent" | "Plan" {
-  return permissionMode === "agent" ? "Agent" : "Plan";
+function renderPermissionMode(permissionMode: PermissionMode): "Agent" | "Plan" | "AutoAllow" {
+  return permissionMode === "auto_allow"
+    ? "AutoAllow"
+    : permissionMode === "agent"
+      ? "Agent"
+      : "Plan";
 }
 
 function renderContextUsage(usage: ContextUsage): string {
@@ -1547,6 +1562,8 @@ function renderRunPhase(phase: RunPhase): string {
       return "正在请求模型";
     case "compacting":
       return "正在压缩上下文";
+    case "reviewing_tool":
+      return "正在自动审核";
     case "awaiting_tool_approval":
       return "等待确认";
     case "executing_tool":

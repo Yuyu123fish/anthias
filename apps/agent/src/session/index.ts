@@ -811,6 +811,12 @@ function createApprovalDecisionRecord(
     decision: details.decision,
     reason: details.reason,
     authorizationEntryIds: Object.freeze([...details.authorizationEntryIds]),
+    ...(details.actionFingerprint === undefined
+      ? {}
+      : { actionFingerprint: details.actionFingerprint }),
+    ...(details.toolApprovalRequestId === undefined
+      ? {}
+      : { toolApprovalRequestId: details.toolApprovalRequestId }),
   });
 }
 

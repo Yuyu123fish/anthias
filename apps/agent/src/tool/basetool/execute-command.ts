@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import type { AssistantToolCallPart } from "../../message.js";
 import type { ArtifactWriter } from "../../session/artifacts.js";
@@ -18,7 +18,11 @@ import {
   type ToolExecutionResult,
   type ToolFailedResult,
 } from "../tool-result.js";
-import { resolveExistingWorkspacePath, type ToolWorkspace } from "../workspace-path.js";
+import {
+  arePathsEqual,
+  resolveExistingWorkspacePath,
+  type ToolWorkspace,
+} from "../workspace-path.js";
 
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
@@ -27,6 +31,7 @@ export type PreparedCommandTool = Readonly<{
   preview: string;
   command: string;
   cwd: string;
+  cwdIdentity: Readonly<{ device: number; inode: number }>;
   timeoutMilliseconds: number;
   shell: SessionShell;
 }>;
@@ -95,7 +100,8 @@ export async function prepareCommandTool(
 
   try {
     const resolvedCwd = await resolveExistingWorkspacePath(inputResult.input.cwd, workspace);
-    if (!(await stat(resolvedCwd.absolutePath)).isDirectory()) {
+    const cwdStats = await stat(resolvedCwd.absolutePath);
+    if (!cwdStats.isDirectory()) {
       return failedPreparation("execute_command cwd 不是目录。");
     }
     const target = resolvedCwd.relativePath.length === 0 ? "." : resolvedCwd.relativePath;
@@ -118,6 +124,7 @@ export async function prepareCommandTool(
         preview: previewResult.content,
         command: inputResult.input.command,
         cwd: resolvedCwd.absolutePath,
+        cwdIdentity: Object.freeze({ device: cwdStats.dev, inode: cwdStats.ino }),
         timeoutMilliseconds: inputResult.input.timeoutMilliseconds,
         shell,
       }),
@@ -136,6 +143,31 @@ export async function executePreparedCommand(
 ): Promise<CommandExecutionResult> {
   if (abortSignal.aborted) {
     return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
+  }
+
+  // 批准只绑定准备时的真实目录；同路径目录被替换或转成链接后不得复用旧批准。
+  let cwdUnchanged = false;
+  try {
+    const currentCwd = await realpath(preparedTool.cwd);
+    const currentCwdStats = await stat(currentCwd);
+    cwdUnchanged =
+      arePathsEqual(currentCwd, preparedTool.cwd) &&
+      currentCwdStats.isDirectory() &&
+      currentCwdStats.dev === preparedTool.cwdIdentity.device &&
+      currentCwdStats.ino === preparedTool.cwdIdentity.inode;
+  } catch {
+    cwdUnchanged = false;
+  }
+  if (abortSignal.aborted) {
+    return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
+  }
+  if (!cwdUnchanged) {
+    return Object.freeze({
+      status: "failed",
+      content: "execute_command cwd 已变化，命令未启动。",
+      truncated: false,
+      cleanupUncertain: false,
+    });
   }
 
   const startedAtMilliseconds = Date.now();

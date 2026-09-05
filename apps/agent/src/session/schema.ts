@@ -97,11 +97,13 @@ export type RequestUsageDetails = Readonly<{
 export type ApprovalDecisionDetails = Readonly<{
   toolCallId: string;
   toolName: string;
-  permissionMode: "agent" | "plan";
+  permissionMode: "agent" | "plan" | "auto_allow";
   decisionSource: "user" | "auto_review" | "policy";
   decision: "allowed" | "denied" | "needs_user";
   reason: string;
   authorizationEntryIds: readonly string[];
+  actionFingerprint?: string;
+  toolApprovalRequestId?: string;
 }>;
 
 /** 不能从消息、Run 或 Header 推导的真实使用活动。 */
@@ -215,6 +217,8 @@ export type ApprovalDecisionRecord = SessionEntryBase &
     decision: ApprovalDecisionDetails["decision"];
     reason: string;
     authorizationEntryIds: readonly string[];
+    actionFingerprint?: string;
+    toolApprovalRequestId?: string;
   }>;
 
 /** 枚举 Schema 2 允许出现在 Header 之后的持久记录。 */
@@ -398,7 +402,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
   }
   if (value.type === "approval_decision") {
     if (
-      !hasExactKeysWithOptionalRunId(value, [
+      !hasExactKeysWithOptionalApprovalFields(value, [
         "type",
         "entryId",
         "seq",
@@ -413,6 +417,8 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
         "authorizationEntryIds",
       ]) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
+      !(value.actionFingerprint === undefined || isActionFingerprint(value.actionFingerprint)) ||
+      !(value.toolApprovalRequestId === undefined || isUuid(value.toolApprovalRequestId)) ||
       !isUuid(value.toolCallId) ||
       !isNonEmptyString(value.toolName) ||
       !isPermissionMode(value.permissionMode) ||
@@ -495,6 +501,8 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
 
   const runIds = new Set<string>();
   const toolApprovalRequestIds = new Set<string>();
+  const approvalDecisionsByToolCall = new Map<string, ApprovalDecisionRecord[]>();
+  const previousRecordsByEntryId = new Map<string, SessionRecord>();
   const toolCalls = new Map<
     string,
     { runId: string; toolName: string; started: boolean; resolved: boolean }
@@ -509,11 +517,17 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
     if (entryIds.has(record.entryId) || record.parentEntryId !== expectedParentEntryId) {
       throw new Error("Session entryId 或 parentEntryId 无效。");
     }
-    validateFactReferences(record, entryIds, toolCalls);
+    validateFactReferences(record, previousRecordsByEntryId, toolCalls);
     if (isRunAssociatedFact(record) && record.runId !== undefined && record.runId !== activeRunId) {
       throw new Error("Session 事实的 runId 不属于当前打开的 Run。");
     }
     entryIds.add(record.entryId);
+    previousRecordsByEntryId.set(record.entryId, record);
+    if (record.type === "approval_decision") {
+      const decisions = approvalDecisionsByToolCall.get(record.toolCallId) ?? [];
+      decisions.push(record);
+      approvalDecisionsByToolCall.set(record.toolCallId, decisions);
+    }
     expectedParentEntryId = record.entryId;
 
     if (!isRunRecord(record)) {
@@ -580,6 +594,10 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
       continue;
     }
     if (record.type === "tool_execution_started") {
+      validateToolExecutionApproval(
+        record,
+        approvalDecisionsByToolCall.get(record.toolCallId) ?? [],
+      );
       const referencedToolCall = toolCalls.get(record.toolCallId);
       const firstUnresolvedToolCallId = activeRunToolCallIds.find(
         (toolCallId) => !toolCalls.get(toolCallId)?.resolved,
@@ -690,7 +708,7 @@ export function parseJsonObject(line: string | undefined): Record<string, unknow
 
 function validateFactReferences(
   record: SessionRecord,
-  previousEntryIds: ReadonlySet<string>,
+  previousRecordsByEntryId: ReadonlyMap<string, SessionRecord>,
   previousToolCalls: ReadonlyMap<
     string,
     { runId: string; toolName: string; started: boolean; resolved: boolean }
@@ -702,7 +720,7 @@ function validateFactReferences(
   if (
     record.type === "request_usage" &&
     record.requestEntryId !== null &&
-    !previousEntryIds.has(record.requestEntryId)
+    !previousRecordsByEntryId.has(record.requestEntryId)
   ) {
     throw new Error("RequestUsageRecord 引用无效。");
   }
@@ -712,12 +730,50 @@ function validateFactReferences(
       toolCall === undefined ||
       toolCall.toolName !== record.toolName ||
       new Set(record.authorizationEntryIds).size !== record.authorizationEntryIds.length ||
-      record.authorizationEntryIds.some((entryId) => !previousEntryIds.has(entryId))
+      record.authorizationEntryIds.some((entryId) => {
+        const authorizationRecord = previousRecordsByEntryId.get(entryId);
+        return (
+          authorizationRecord === undefined || !isTrustedAuthorizationSource(authorizationRecord)
+        );
+      })
     ) {
       throw new Error("ApprovalDecisionRecord 授权引用无效。");
     }
   }
 }
+function isTrustedAuthorizationSource(record: SessionRecord): boolean {
+  return (
+    (record.type === "message" && record.message.type === "user") ||
+    (record.type === "approval_decision" &&
+      record.decisionSource === "user" &&
+      record.decision === "allowed")
+  );
+}
+
+function validateToolExecutionApproval(
+  record: ToolExecutionStartedRecord,
+  approvalDecisions: readonly ApprovalDecisionRecord[],
+): void {
+  const boundApprovalDecisions = approvalDecisions.filter(
+    (approvalDecision) =>
+      approvalDecision.actionFingerprint !== undefined ||
+      approvalDecision.toolApprovalRequestId !== undefined,
+  );
+  if (boundApprovalDecisions.length === 0) {
+    return;
+  }
+  if (
+    !boundApprovalDecisions.some(
+      (approvalDecision) =>
+        approvalDecision.toolApprovalRequestId === record.toolApprovalRequestId &&
+        approvalDecision.toolName === record.toolName &&
+        approvalDecision.decision === "allowed",
+    )
+  ) {
+    throw new Error("Session ToolExecutionStarted 缺少匹配的允许审批。");
+  }
+}
+
 function isRunAssociatedFact(
   record: SessionRecord,
 ): record is CompactionRecord | RequestUsageRecord | ApprovalDecisionRecord {
@@ -856,6 +912,17 @@ function snapshotArtifactReference(artifact: ToolArtifactReference): ToolArtifac
     incompleteReason: artifact.incompleteReason,
   });
 }
+function hasExactKeysWithOptionalApprovalFields(
+  value: Record<string, unknown>,
+  requiredKeys: readonly string[],
+): boolean {
+  const optionalKeys = new Set(["runId", "actionFingerprint", "toolApprovalRequestId"]);
+  return (
+    requiredKeys.every((key) => Object.hasOwn(value, key)) &&
+    Object.keys(value).every((key) => requiredKeys.includes(key) || optionalKeys.has(key))
+  );
+}
+
 function hasExactKeysWithOptionalRunId(
   value: Record<string, unknown>,
   requiredKeys: readonly string[],
@@ -988,7 +1055,7 @@ function isRequestUsagePurpose(value: unknown): value is RequestUsageDetails["pu
 }
 
 function isPermissionMode(value: unknown): value is ApprovalDecisionDetails["permissionMode"] {
-  return value === "agent" || value === "plan";
+  return value === "agent" || value === "plan" || value === "auto_allow";
 }
 
 function isDecisionSource(value: unknown): value is ApprovalDecisionDetails["decisionSource"] {
@@ -1095,6 +1162,11 @@ function isAssistantTerminalStatus(value: unknown): value is RunFinishedDetails[
 
 export function isRunFinishedStatus(value: unknown): value is RunFinishedRecord["status"] {
   return isAssistantTerminalStatus(value) || value === "interrupted";
+}
+
+/** 判断动作指纹是否为当前 SHA-256 小写十六进制形状。 */
+function isActionFingerprint(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/u.test(value);
 }
 
 /** 判断未知值是否为 Anthias 当前生成的 UUID v4。 */

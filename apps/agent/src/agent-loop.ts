@@ -20,7 +20,7 @@ import {
   streamAssistantMessage,
   toModelInputMessage,
 } from "./model/model-stream.js";
-import type { PermissionMode } from "./permission-mode.js";
+import type { PermissionMode } from "./permission/permission-mode.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 import type {
   PreparedToolExecution,
@@ -46,6 +46,7 @@ export type AgentLoopToolApproval = Readonly<{
 
 /** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
 export type AgentLoopEvent =
+  | Readonly<{ type: "tool_policy_denied"; toolCall: AssistantToolCallPart; reason: string }>
   | Readonly<{
       type: "reasoning_start";
     }>
@@ -438,6 +439,12 @@ async function formToolResultMessage(
 
   if (!preparation.ok) {
     await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
+    if (preparation.result.status === "denied")
+      await options.emit({
+        type: "tool_policy_denied",
+        toolCall,
+        reason: preparation.result.content,
+      });
     return createToolResultMessage(toolCall, preparation.result);
   }
   return executePreparedToolCall(

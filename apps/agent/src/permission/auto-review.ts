@@ -1,0 +1,314 @@
+import {
+  type ContextBudget,
+  estimateModelRequestTokens,
+  estimateTextTokens,
+} from "../context/budget.js";
+import type { AssistantToolCallPart } from "../message.js";
+import type {
+  ModelFinishReason,
+  ModelRequest,
+  ModelStream,
+  ModelUsage,
+} from "../model/model-stream.js";
+import { APPROVAL_REVIEW_SYSTEM_PROMPT } from "../prompts/approval-review-prompt.js";
+import type { ApprovalDecisionRecord, SessionRecord } from "../session/schema.js";
+import { hasOnlyKeys, isRecord } from "../tool/input-validation.js";
+import type { ToolApprovalPlan } from "../tool/tool-runner.js";
+
+export type ToolApprovalReviewResult = Readonly<{
+  decision: "allow" | "needs_user" | "aborted";
+  reason: string;
+  authorizationEntryIds: readonly string[];
+}>;
+
+type ReviewToolApprovalOptions = Readonly<{
+  modelStream: ModelStream;
+  budget: ContextBudget;
+  records: readonly SessionRecord[];
+  workspaceRoot: string;
+  toolCall: AssistantToolCallPart;
+  approvalPlan: ToolApprovalPlan;
+  abortSignal: AbortSignal;
+  onUsage: (usage: ModelUsage | undefined) => Promise<void>;
+}>;
+
+type AuthorizationSource =
+  | Readonly<{
+      entryId: string;
+      seq: number;
+      source: "user";
+      content: string;
+    }>
+  | Readonly<{
+      entryId: string;
+      seq: number;
+      source: "human_approval";
+      actionFingerprint: string;
+      toolApprovalRequestId: string;
+      toolCall: AssistantToolCallPart;
+    }>;
+
+const APPROVAL_INPUT_TOKEN_LIMIT = 8_000;
+const APPROVAL_OUTPUT_TOKEN_LIMIT = 2_000;
+const APPROVAL_OUTPUT_CHARACTER_LIMIT = 8_000;
+
+/** 对固定准备动作最多发起一次审核；用量持久化失败必须交回 Run 停止处理。 */
+export async function reviewToolApproval(
+  options: ReviewToolApprovalOptions,
+): Promise<ToolApprovalReviewResult> {
+  if (options.abortSignal.aborted) {
+    return abortedReview();
+  }
+  if (
+    options.budget.modelMaxOutputTokens !== undefined &&
+    options.budget.modelMaxOutputTokens < APPROVAL_OUTPUT_TOKEN_LIMIT
+  ) {
+    return needsUser("模型输出能力不足以完成 2,000 token 审核，请人工确认。");
+  }
+  const inputTokenLimit = Math.min(
+    APPROVAL_INPUT_TOKEN_LIMIT,
+    options.budget.contextWindow - 20_000 - APPROVAL_OUTPUT_TOKEN_LIMIT,
+  );
+  const authorizationSources: AuthorizationSource[] = [];
+  let modelRequest = createReviewRequest(options, authorizationSources);
+  if (
+    options.toolCall.invalid ||
+    options.toolCall.toolName !== options.approvalPlan.toolName ||
+    !/^[a-f0-9]{64}$/u.test(options.approvalPlan.actionFingerprint) ||
+    estimateModelRequestTokens(modelRequest) > inputTokenLimit
+  ) {
+    return needsUser("完整动作无法纳入自动审核，请人工确认。");
+  }
+
+  // 从最新来源向前选择完整后缀，遇到放不下的近期原文就停止，避免绕过更新后的限制。
+  for (let index = options.records.length - 1; index >= 0; index--) {
+    const source = readAuthorizationSource(options.records, index);
+    if (source === null) {
+      continue;
+    }
+    const candidateSources = [source, ...authorizationSources];
+    const candidateRequest = createReviewRequest(options, candidateSources);
+    if (estimateModelRequestTokens(candidateRequest) > inputTokenLimit) {
+      break;
+    }
+    authorizationSources.unshift(source);
+    modelRequest = candidateRequest;
+  }
+  if (authorizationSources.length === 0) {
+    return needsUser("没有可完整核验的真实用户授权，请人工确认。");
+  }
+  if (options.abortSignal.aborted) {
+    return abortedReview();
+  }
+
+  let responseText = "";
+  let finishReason: ModelFinishReason | null = null;
+  let usage: ModelUsage | undefined;
+  let invalidResponse = false;
+  try {
+    for await (const event of options.modelStream(modelRequest, options.abortSignal)) {
+      if (options.abortSignal.aborted) {
+        break;
+      }
+      if (event.type === "text_delta") {
+        if (responseText.length + event.delta.length > APPROVAL_OUTPUT_CHARACTER_LIMIT) {
+          invalidResponse = true;
+        } else {
+          responseText += event.delta;
+        }
+      } else if (event.type === "tool_call") {
+        invalidResponse = true;
+      } else if (event.type === "finish") {
+        finishReason = event.finishReason;
+        usage = isModelUsage(event.usage) ? event.usage : undefined;
+        break;
+      }
+      // 审核 Reasoning 既不积累，也不发布到主对话或事件。
+    }
+  } catch {
+    invalidResponse = true;
+  }
+
+  // 每个实际 attempt 恰好记一次；回调失败不能伪装为可继续执行的人工降级。
+  await options.onUsage(usage);
+  if (options.abortSignal.aborted) {
+    return abortedReview();
+  }
+  if (
+    invalidResponse ||
+    finishReason !== "stop" ||
+    usage === undefined ||
+    estimateTextTokens(responseText) > APPROVAL_OUTPUT_TOKEN_LIMIT
+  ) {
+    return needsUser("自动审核未能完成有效判断，请人工确认。");
+  }
+  return parseReviewResult(
+    responseText,
+    new Set(authorizationSources.map((source) => source.entryId)),
+  );
+}
+
+function createReviewRequest(
+  options: ReviewToolApprovalOptions,
+  authorizationSources: readonly AuthorizationSource[],
+): ModelRequest {
+  return Object.freeze({
+    purpose: "approval",
+    maxOutputTokens: APPROVAL_OUTPUT_TOKEN_LIMIT,
+    systemPrompt: APPROVAL_REVIEW_SYSTEM_PROMPT,
+    tools: Object.freeze([]),
+    messages: Object.freeze([
+      Object.freeze({
+        role: "user" as const,
+        content: JSON.stringify({
+          action: {
+            toolCallId: options.toolCall.toolCallId,
+            toolName: options.toolCall.toolName,
+            input: options.toolCall.input,
+            workspaceRoot: options.workspaceRoot,
+            target: options.approvalPlan.target,
+            preview: options.approvalPlan.preview,
+            ruleId: options.approvalPlan.ruleId,
+            riskSummary: options.approvalPlan.riskSummary,
+            executionBoundary: options.approvalPlan.executionBoundary,
+            actionFingerprint: options.approvalPlan.actionFingerprint,
+          },
+          authorizationSources,
+        }),
+      }),
+    ]),
+  });
+}
+
+function readAuthorizationSource(
+  records: readonly SessionRecord[],
+  recordIndex: number,
+): AuthorizationSource | null {
+  const record = records[recordIndex];
+  if (record?.type === "message" && record.message.type === "user") {
+    return {
+      entryId: record.entryId,
+      seq: record.seq,
+      source: "user",
+      content: record.message.content.map((part) => part.text).join(""),
+    };
+  }
+  if (
+    record?.type !== "approval_decision" ||
+    record.decisionSource !== "user" ||
+    record.decision !== "allowed" ||
+    record.actionFingerprint === undefined ||
+    record.toolApprovalRequestId === undefined ||
+    record.runId === undefined
+  ) {
+    return null;
+  }
+  const originalToolCall = findApprovedToolCall(records, recordIndex, record);
+  if (originalToolCall === null) {
+    return null;
+  }
+  return {
+    entryId: record.entryId,
+    seq: record.seq,
+    source: "human_approval",
+    actionFingerprint: record.actionFingerprint,
+    toolApprovalRequestId: record.toolApprovalRequestId,
+    toolCall: originalToolCall,
+  };
+}
+
+function findApprovedToolCall(
+  records: readonly SessionRecord[],
+  approvalRecordIndex: number,
+  approvalRecord: ApprovalDecisionRecord,
+): AssistantToolCallPart | null {
+  for (let index = approvalRecordIndex - 1; index >= 0; index--) {
+    const record = records[index];
+    if (
+      record?.type !== "message" ||
+      record.runId !== approvalRecord.runId ||
+      record.message.type !== "assistant"
+    ) {
+      continue;
+    }
+    for (const part of record.message.content) {
+      if (
+        part.type === "tool_call" &&
+        !part.invalid &&
+        part.toolCallId === approvalRecord.toolCallId &&
+        part.toolName === approvalRecord.toolName
+      ) {
+        return part;
+      }
+    }
+  }
+  return null;
+}
+
+function parseReviewResult(
+  responseText: string,
+  suppliedEntryIds: ReadonlySet<string>,
+): ToolApprovalReviewResult {
+  let response: unknown;
+  try {
+    response = JSON.parse(responseText);
+  } catch {
+    return needsUser("自动审核结果格式无效，请人工确认。");
+  }
+  if (
+    !isRecord(response) ||
+    !hasOnlyKeys(response, ["decision", "reason", "authorizationEntryIds"]) ||
+    (response.decision !== "allow" &&
+      response.decision !== "needs_user" &&
+      response.decision !== "deny") ||
+    typeof response.reason !== "string" ||
+    response.reason.trim().length === 0 ||
+    Array.from(response.reason).length > 300 ||
+    Array.from(response.reason).some((character) => {
+      const characterCode = character.charCodeAt(0);
+      return characterCode < 32 || (characterCode >= 127 && characterCode <= 159);
+    }) ||
+    !Array.isArray(response.authorizationEntryIds) ||
+    response.authorizationEntryIds.some(
+      (entryId) => typeof entryId !== "string" || !suppliedEntryIds.has(entryId),
+    ) ||
+    new Set(response.authorizationEntryIds).size !== response.authorizationEntryIds.length ||
+    (response.decision === "allow" && response.authorizationEntryIds.length === 0)
+  ) {
+    return needsUser("自动审核结果或授权引用无效，请人工确认。");
+  }
+  return Object.freeze({
+    decision: response.decision === "allow" ? "allow" : "needs_user",
+    reason: response.reason.trim(),
+    authorizationEntryIds: Object.freeze([...response.authorizationEntryIds]),
+  });
+}
+
+function isModelUsage(value: unknown): value is ModelUsage {
+  return (
+    isRecord(value) &&
+    ["inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens"].every(
+      (field) =>
+        value[field] === null ||
+        (typeof value[field] === "number" &&
+          Number.isSafeInteger(value[field]) &&
+          value[field] >= 0),
+    )
+  );
+}
+
+function needsUser(reason: string): ToolApprovalReviewResult {
+  return Object.freeze({
+    decision: "needs_user",
+    reason,
+    authorizationEntryIds: Object.freeze([]),
+  });
+}
+
+function abortedReview(): ToolApprovalReviewResult {
+  return Object.freeze({
+    decision: "aborted",
+    reason: "自动审核已取消。",
+    authorizationEntryIds: Object.freeze([]),
+  });
+}

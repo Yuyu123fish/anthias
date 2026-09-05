@@ -1,5 +1,5 @@
-import type { PermissionMode } from "../permission-mode.js";
-import type { FixedToolName } from "./definitions.js";
+import type { FixedToolName } from "../tool/definitions.js";
+import type { PermissionMode } from "./permission-mode.js";
 
 /** 描述一次 ToolCall 在执行前形成的不可变安全决定。 */
 export type ToolPolicyDecision = Readonly<{

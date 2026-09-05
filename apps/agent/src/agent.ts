@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   type AgentLoopEvent,
   type AgentLoopResult,
@@ -8,8 +8,9 @@ import {
 import { type ContextBudget, createContextBudget } from "./context/budget.js";
 import { type ContextUsage, createContextController } from "./context/index.js";
 import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
-import type { ModelStream } from "./model/model-stream.js";
-import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission-mode.js";
+import type { ModelStream, ModelUsage } from "./model/model-stream.js";
+import { reviewToolApproval } from "./permission/auto-review.js";
+import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission/permission-mode.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import { createSessionArtifactStore } from "./session/artifacts.js";
 import type { SessionCleanupResult } from "./session/cleanup.js";
@@ -17,12 +18,13 @@ import type { Session, SessionRunLease } from "./session/index.js";
 import { getToolDefinitions } from "./tool/definitions.js";
 import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
 
-export type { PermissionMode } from "./permission-mode.js";
+export type { PermissionMode } from "./permission/permission-mode.js";
 
 /** 枚举 Run 对外交付的活动阶段。 */
 export type RunPhase =
   | "requesting_model"
   | "compacting"
+  | "reviewing_tool"
   | "awaiting_tool_approval"
   | "executing_tool";
 
@@ -91,6 +93,15 @@ export type PromptResult =
 
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
 export type AgentEvent =
+  | Readonly<{ type: "tool_auto_review_start"; toolCallId: string; toolName: string }>
+  | Readonly<{
+      type: "tool_authorization";
+      toolCallId: string;
+      toolName: string;
+      source: "user" | "auto_review" | "policy";
+      decision: "allowed" | "denied" | "needs_user";
+      reason: string;
+    }>
   | Readonly<{ type: "context_usage"; usage: ContextUsage }>
   | Readonly<{ type: "compaction_start"; runId: string }>
   | Readonly<{
@@ -175,6 +186,9 @@ type ActiveRunOwnership = {
   permissionMode: PermissionMode;
   visibleReasoningActive: boolean;
   sessionWriteFailed: boolean;
+  toolAuthorizations: Map<string, string>;
+  reviewedToolActionFingerprints: Set<string>;
+  deniedToolActionFingerprints: Set<string>;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
 };
 
@@ -220,11 +234,12 @@ export function createAgentWithModelStream({
   startCleanup,
 }: CreateAgentWithModelStreamOptions): Agent {
   const messageHistory: Message[] = [...session.messageHistory];
+  const contextBudget = modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 });
   const contextController = createContextController({
     session,
     modelStream,
     modelId: modelContext?.modelId ?? "deterministic-local",
-    budget: modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 }),
+    budget: contextBudget,
   });
   const artifactStore = createSessionArtifactStore({
     sessionId: session.sessionId,
@@ -429,6 +444,132 @@ export function createAgentWithModelStream({
     });
   }
 
+  async function saveToolAuthorization(
+    currentRun: ActiveRunOwnership,
+    toolCall: AssistantToolCallPart,
+    details: {
+      source: "user" | "auto_review" | "policy";
+      decision: "allowed" | "denied" | "needs_user";
+      reason: string;
+      authorizationEntryIds: readonly string[];
+      actionFingerprint: string;
+      toolApprovalRequestId: string;
+    },
+  ): Promise<void> {
+    const reason = [...details.reason]
+      .map((character) => {
+        const point = character.codePointAt(0) ?? 0;
+        return point < 32 || (point >= 127 && point <= 159) ? " " : character;
+      })
+      .join("")
+      .slice(0, 300);
+    try {
+      await currentRun.sessionLease.appendApprovalDecision({
+        toolCallId: toolCall.toolCallId,
+        toolName: toolCall.toolName,
+        permissionMode: currentRun.permissionMode,
+        decisionSource: details.source,
+        decision: details.decision,
+        reason,
+        authorizationEntryIds: details.authorizationEntryIds,
+        actionFingerprint: details.actionFingerprint,
+        toolApprovalRequestId: details.toolApprovalRequestId,
+      });
+    } catch {
+      currentRun.sessionWriteFailed = true;
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      throw new Error(SAFE_SESSION_ERROR);
+    }
+    if (details.source === "user" && details.decision === "denied")
+      currentRun.deniedToolActionFingerprints.add(details.actionFingerprint);
+    if (details.decision === "allowed") {
+      currentRun.toolAuthorizations.set(toolCall.toolCallId, details.toolApprovalRequestId);
+    }
+    publishEvent({
+      type: "tool_authorization",
+      toolCallId: toolCall.toolCallId,
+      toolName: toolCall.toolName,
+      source: details.source,
+      decision: details.decision,
+      reason,
+    });
+  }
+
+  /** 审核只读取持久真实授权；人工与自动批准共用同一落盘后执行路径。 */
+  async function authorizeTool(
+    currentRun: ActiveRunOwnership,
+    toolCall: AssistantToolCallPart,
+    approvalPlan: ToolApprovalPlan,
+    recordUsage: (usage: ModelUsage | undefined, fingerprint: string) => Promise<void>,
+  ): Promise<AgentLoopToolApproval> {
+    if (currentRun.abortController.signal.aborted)
+      return { toolApprovalRequestId: randomUUID(), decision: "aborted" };
+    const fingerprint = approvalPlan.actionFingerprint;
+    const reviewed = currentRun.reviewedToolActionFingerprints.has(fingerprint);
+    const denied = currentRun.deniedToolActionFingerprints.has(fingerprint);
+    // ToolCall ID 不是新授权；重提同一动作不能反复审核直到放行。
+    if (currentRun.permissionMode === "auto_allow" && (reviewed || denied)) {
+      const toolApprovalRequestId = randomUUID();
+      await saveToolAuthorization(currentRun, toolCall, {
+        source: "policy",
+        decision: denied ? "denied" : "needs_user",
+        reason: denied
+          ? "用户已在当前 Run 拒绝同一动作，重提调用不会重新放行。"
+          : "当前 Run 已审核同一动作，请人工确认本次执行。",
+        authorizationEntryIds: [],
+        actionFingerprint: fingerprint,
+        toolApprovalRequestId,
+      });
+      if (denied) return { toolApprovalRequestId, decision: "deny" };
+    } else if (currentRun.permissionMode === "auto_allow") {
+      currentRun.reviewedToolActionFingerprints.add(fingerprint);
+      const toolApprovalRequestId = randomUUID();
+      updateRunPhase(currentRun, "reviewing_tool");
+      publishEvent({
+        type: "tool_auto_review_start",
+        toolCallId: toolCall.toolCallId,
+        toolName: toolCall.toolName,
+      });
+      const reviewResult = await reviewToolApproval({
+        modelStream,
+        budget: contextBudget,
+        records: session.records,
+        workspaceRoot: session.workspaceRoot,
+        toolCall,
+        approvalPlan,
+        abortSignal: currentRun.abortController.signal,
+        onUsage: (usage) => recordUsage(usage, approvalPlan.actionFingerprint),
+      });
+      if (currentRun.sessionWriteFailed) throw new Error(SAFE_SESSION_ERROR);
+      if (reviewResult.decision === "aborted" || currentRun.abortController.signal.aborted)
+        return { toolApprovalRequestId, decision: "aborted" };
+      await saveToolAuthorization(currentRun, toolCall, {
+        source: "auto_review",
+        decision: reviewResult.decision === "allow" ? "allowed" : "needs_user",
+        reason: reviewResult.reason,
+        authorizationEntryIds: reviewResult.authorizationEntryIds,
+        actionFingerprint: approvalPlan.actionFingerprint,
+        toolApprovalRequestId,
+      });
+      if (reviewResult.decision === "allow") return { toolApprovalRequestId, decision: "approve" };
+    }
+    if (currentRun.abortController.signal.aborted)
+      return { toolApprovalRequestId: randomUUID(), decision: "aborted" };
+    updateRunPhase(currentRun, "awaiting_tool_approval");
+    const approval = await waitForToolApproval(currentRun, toolCall, approvalPlan);
+    if (approval.decision === "aborted" || currentRun.abortController.signal.aborted)
+      return { ...approval, decision: "aborted" };
+    await saveToolAuthorization(currentRun, toolCall, {
+      source: "user",
+      decision: approval.decision === "approve" ? "allowed" : "denied",
+      reason: approval.decision === "approve" ? "用户批准本次具体操作。" : "用户拒绝本次具体操作。",
+      authorizationEntryIds: [],
+      actionFingerprint: approvalPlan.actionFingerprint,
+      toolApprovalRequestId: approval.toolApprovalRequestId,
+    });
+    return approval;
+  }
+
   /** 在异步获取 lease 之前登记整个 prompt，关闭流程也能等待尚未开始的 Run。 */
   function prompt(promptText: string): Promise<PromptResult> {
     if (closeRequested) {
@@ -530,6 +671,9 @@ export function createAgentWithModelStream({
       permissionMode,
       visibleReasoningActive: false,
       sessionWriteFailed: false,
+      toolAuthorizations: new Map(),
+      reviewedToolActionFingerprints: new Set(),
+      deniedToolActionFingerprints: new Set(),
       terminalResultPromise: null,
     };
     activeRun = currentRun;
@@ -574,7 +718,7 @@ export function createAgentWithModelStream({
       });
       const loopResult = await runAgentLoop({
         messages: messageHistory,
-        modelStream: contextModelStream,
+        modelStream: contextModelStream.modelStream,
         systemPrompt: createCodingSystemPrompt(
           session.workspaceRoot,
           session.shell,
@@ -587,7 +731,7 @@ export function createAgentWithModelStream({
         emit: (event) => processAgentLoopEvent(currentRun, event),
         updatePhase: (phase) => updateRunPhase(currentRun, phase),
         requestToolApproval: (toolCall, approvalPlan) =>
-          waitForToolApproval(currentRun, toolCall, approvalPlan),
+          authorizeTool(currentRun, toolCall, approvalPlan, contextModelStream.recordApprovalUsage),
       });
       return finishRun(
         currentRun,
@@ -669,9 +813,35 @@ export function createAgentWithModelStream({
       case "tool_result":
         await appendCompletedMessage(currentRun, event.message, false);
         return;
+      case "tool_policy_denied":
+        await saveToolAuthorization(currentRun, event.toolCall, {
+          source: "policy",
+          decision: "denied",
+          reason: event.reason,
+          authorizationEntryIds: [],
+          actionFingerprint: createHash("sha256")
+            .update(JSON.stringify(event.toolCall))
+            .digest("hex"),
+          toolApprovalRequestId: randomUUID(),
+        });
+        return;
       case "tool_execution_start":
-        if (event.toolApprovalRequestId !== null) {
-          await appendToolExecutionStarted(currentRun, event.toolCall, event.toolApprovalRequestId);
+        if (["edit_file", "write_file", "execute_command"].includes(event.toolCall.toolName)) {
+          let approvalId = currentRun.toolAuthorizations.get(event.toolCall.toolCallId);
+          if (approvalId === undefined) {
+            approvalId = randomUUID();
+            await saveToolAuthorization(currentRun, event.toolCall, {
+              source: "policy",
+              decision: "allowed",
+              reason: "确定性策略允许本次准备动作。",
+              authorizationEntryIds: [],
+              toolApprovalRequestId: approvalId,
+              actionFingerprint: createHash("sha256")
+                .update(JSON.stringify(event.toolCall))
+                .digest("hex"),
+            });
+          }
+          await appendToolExecutionStarted(currentRun, event.toolCall, approvalId);
         }
         publishEvent({
           type: "tool_execution_start",
