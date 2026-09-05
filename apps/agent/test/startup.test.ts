@@ -93,6 +93,11 @@ describe("createAgentFromEnvironment", () => {
         sessionId: expect.any(String),
         workspaceRoot,
         permissionMode: "agent",
+        contextUsage: expect.objectContaining({
+          contextWindow: 128000,
+          inputTokens: null,
+          source: "unknown",
+        }),
         messageHistory: [],
         activeAssistantMessage: null,
         activeRun: null,
@@ -381,6 +386,7 @@ async function createValidEnvironment(sessionDirectory: string): Promise<NodeJS.
   return {
     ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
     ANTHIAS_MODEL_ID: "model-id",
+    ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
     ANTHIAS_MODEL_API_KEY: "local-key",
     ...(process.platform === "win32"
       ? { Path: shellDirectory }

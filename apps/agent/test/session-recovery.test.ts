@@ -299,7 +299,8 @@ describe("Session recovery storage", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const acquisition = await session.acquireRun(randomUUID());
+    const runId = randomUUID();
+    const acquisition = await session.acquireRun(runId);
     if (acquisition.status !== "acquired") {
       throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
     }
@@ -308,10 +309,14 @@ describe("Session recovery storage", () => {
       purpose: "response",
       requestEntryId: session.records.at(-1)?.entryId ?? null,
       contextVersion: "context-v1",
-      usage: { inputTokens: 12, outputTokens: 7, cachedInputTokens: null },
+      usage: {
+        inputTokens: 12,
+        outputTokens: 7,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: 3,
+      },
     });
     await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
     const userEntryId = session.records.find(
       (record) => record.type === "message" && record.message.type === "user",
     )?.entryId;
@@ -331,6 +336,7 @@ describe("Session recovery storage", () => {
       modelId: "deterministic-test-model",
       contextVersion: "context-v2",
     });
+    await acquisition.lease.appendRunFinished({ status: "completed" });
     await acquisition.lease.release();
 
     const journalBytes = await readFile(join(session.storageDirectory, "session.jsonl"));
@@ -346,7 +352,13 @@ describe("Session recovery storage", () => {
       retainedUserEntries: Array<{ entryId: string; byteOffset: number }>;
     };
     const compactionRecord = session.records.find((record) => record.type === "compaction");
-    expect(compactionRecord).toBeDefined();
+    const requestUsageRecord = session.records.find((record) => record.type === "request_usage");
+    expect(compactionRecord).toMatchObject({ type: "compaction", runId });
+    expect(requestUsageRecord).toMatchObject({
+      type: "request_usage",
+      runId,
+      usage: { cacheWriteInputTokens: 3 },
+    });
     expect(resumeIndex.latestCompaction).toMatchObject({
       entryId: compactionRecord?.entryId,
       byteOffset: expect.any(Number),
@@ -396,6 +408,66 @@ describe("Session recovery storage", () => {
     await reopenedSession.close();
   });
 
+  it("binds an approval decision appended by a lease to its active Run", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-approval-run-id-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    const session = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    const runId = randomUUID();
+    const toolCallId = randomUUID();
+    const acquisition = await session.acquireRun(runId);
+    if (acquisition.status !== "acquired") {
+      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
+    }
+    await acquisition.lease.appendMessage({ role: "user", content: "读取文件后回答" });
+    const authorizationEntryId = session.records.at(-1)?.entryId;
+    if (authorizationEntryId === undefined) {
+      throw new Error("expected a persisted authorization source");
+    }
+    await acquisition.lease.appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          toolCallId,
+          toolName: "read_file",
+          input: { path: "a.txt" },
+          invalid: false,
+        },
+      ],
+      status: "completed",
+    });
+    await acquisition.lease.appendApprovalDecision({
+      toolCallId,
+      toolName: "read_file",
+      permissionMode: "agent",
+      decisionSource: "policy",
+      decision: "allowed",
+      reason: "只读操作允许执行。",
+      authorizationEntryIds: [authorizationEntryId],
+    });
+    await acquisition.lease.appendMessage({
+      role: "tool",
+      toolCallId,
+      toolName: "read_file",
+      status: "completed",
+      content: "内容",
+      truncated: false,
+    });
+    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
+    await acquisition.lease.appendRunFinished({ status: "completed" });
+    await acquisition.lease.release();
+
+    expect(session.records.find((record) => record.type === "approval_decision")).toMatchObject({
+      type: "approval_decision",
+      runId,
+      toolCallId,
+    });
+    await session.close();
+  });
   it("falls back to the previous valid CompactionEntry while rejecting invalid new appends", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-compaction-fallback-");
     const sessionDirectory = join(fixtureRoot, "sessions");

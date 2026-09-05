@@ -8,7 +8,7 @@ import {
   createAgentWithModelStream,
   type ToolApprovalRequest,
 } from "../src/agent.js";
-import type { ModelRequest, ModelStream } from "../src/model-stream.js";
+import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import {
   createSession,
   openSession,

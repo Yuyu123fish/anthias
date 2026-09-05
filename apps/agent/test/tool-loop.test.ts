@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
-import type { ModelRequest, ModelStream } from "../src/model-stream.js";
+import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import { createSession, resolveSessionDirectory } from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
@@ -133,7 +133,7 @@ describe("read-only Agent Tool Loop", () => {
       .trimEnd()
       .split("\n")
       .map((line) => JSON.parse(line) as unknown);
-    expect(records).toHaveLength(10);
+    expect(records).toHaveLength(14);
     expect(records.at(-1)).toMatchObject({
       type: "run_finished",
       status: "completed",

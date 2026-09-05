@@ -70,6 +70,7 @@ export type PersistedUsage = Readonly<{
   inputTokens: number | null;
   outputTokens: number | null;
   cachedInputTokens: number | null;
+  cacheWriteInputTokens?: number | null;
 }>;
 
 /** 后续 Context 写入成功压缩所需的已确认事实。 */
@@ -182,6 +183,7 @@ export type SessionUseRecord = SessionEntryBase &
 export type CompactionRecord = SessionEntryBase &
   Readonly<{
     type: "compaction";
+    runId?: string;
     summary: string;
     coversThroughEntryId: string;
     firstKeptEntryId: string | null;
@@ -195,6 +197,7 @@ export type CompactionRecord = SessionEntryBase &
 export type RequestUsageRecord = SessionEntryBase &
   Readonly<{
     type: "request_usage";
+    runId?: string;
     purpose: RequestUsageDetails["purpose"];
     requestEntryId: string | null;
     contextVersion: string;
@@ -204,6 +207,7 @@ export type RequestUsageRecord = SessionEntryBase &
 export type ApprovalDecisionRecord = SessionEntryBase &
   Readonly<{
     type: "approval_decision";
+    runId?: string;
     toolCallId: string;
     toolName: string;
     permissionMode: ApprovalDecisionDetails["permissionMode"];
@@ -340,7 +344,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
   }
   if (value.type === "compaction") {
     if (
-      !hasExactKeys(value, [
+      !hasExactKeysWithOptionalRunId(value, [
         "type",
         "entryId",
         "seq",
@@ -355,6 +359,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
         "modelId",
         "contextVersion",
       ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
       typeof value.summary !== "string" ||
       !isUuid(value.coversThroughEntryId) ||
       !(value.firstKeptEntryId === null || isUuid(value.firstKeptEntryId)) ||
@@ -370,7 +375,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
   }
   if (value.type === "request_usage") {
     if (
-      !hasExactKeys(value, [
+      !hasExactKeysWithOptionalRunId(value, [
         "type",
         "entryId",
         "seq",
@@ -381,6 +386,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
         "contextVersion",
         "usage",
       ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
       !isRequestUsagePurpose(value.purpose) ||
       !(value.requestEntryId === null || isUuid(value.requestEntryId)) ||
       !isNonEmptyString(value.contextVersion) ||
@@ -392,7 +398,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
   }
   if (value.type === "approval_decision") {
     if (
-      !hasExactKeys(value, [
+      !hasExactKeysWithOptionalRunId(value, [
         "type",
         "entryId",
         "seq",
@@ -406,6 +412,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
         "reason",
         "authorizationEntryIds",
       ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
       !isUuid(value.toolCallId) ||
       !isNonEmptyString(value.toolName) ||
       !isPermissionMode(value.permissionMode) ||
@@ -503,6 +510,9 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
       throw new Error("Session entryId 或 parentEntryId 无效。");
     }
     validateFactReferences(record, entryIds, toolCalls);
+    if (isRunAssociatedFact(record) && record.runId !== undefined && record.runId !== activeRunId) {
+      throw new Error("Session 事实的 runId 不属于当前打开的 Run。");
+    }
     entryIds.add(record.entryId);
     expectedParentEntryId = record.entryId;
 
@@ -708,6 +718,16 @@ function validateFactReferences(
     }
   }
 }
+function isRunAssociatedFact(
+  record: SessionRecord,
+): record is CompactionRecord | RequestUsageRecord | ApprovalDecisionRecord {
+  return (
+    record.type === "compaction" ||
+    record.type === "request_usage" ||
+    record.type === "approval_decision"
+  );
+}
+
 function isRunRecord(
   record: SessionRecord,
 ): record is MessageRecord | ToolExecutionStartedRecord | RunFinishedRecord {
@@ -836,6 +856,13 @@ function snapshotArtifactReference(artifact: ToolArtifactReference): ToolArtifac
     incompleteReason: artifact.incompleteReason,
   });
 }
+function hasExactKeysWithOptionalRunId(
+  value: Record<string, unknown>,
+  requiredKeys: readonly string[],
+): boolean {
+  return hasExactKeys(value, requiredKeys) || hasExactKeys(value, [...requiredKeys, "runId"]);
+}
+
 function hasValidEntryIdentity(
   value: Record<string, unknown>,
   expectedSequence: number,
@@ -934,11 +961,17 @@ function isPersistedUsage(value: unknown): value is PersistedUsage {
     return false;
   }
   const usage = value as Record<string, unknown>;
+  const expectedKeys = Object.hasOwn(usage, "cacheWriteInputTokens")
+    ? ["inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens"]
+    : ["inputTokens", "outputTokens", "cachedInputTokens"];
   return (
-    hasExactKeys(usage, ["inputTokens", "outputTokens", "cachedInputTokens"]) &&
-    [usage.inputTokens, usage.outputTokens, usage.cachedInputTokens].every(
-      (tokenCount) => tokenCount === null || isNonNegativeSafeInteger(tokenCount),
-    )
+    hasExactKeys(usage, expectedKeys) &&
+    [
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.cachedInputTokens,
+      ...(Object.hasOwn(usage, "cacheWriteInputTokens") ? [usage.cacheWriteInputTokens] : []),
+    ].every((tokenCount) => tokenCount === null || isNonNegativeSafeInteger(tokenCount))
   );
 }
 

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAgentWithModelStream } from "../src/agent.js";
-import type { ModelStream, ModelStreamEvent } from "../src/model-stream.js";
+import type { ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import {
   createSession,
   resolveSessionDirectory,

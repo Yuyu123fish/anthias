@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import type { AssistantToolCallPart } from "../src/message.js";
-import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model-stream.js";
+import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import {
   createSession,
   resolveSessionDirectory,

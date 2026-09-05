@@ -120,6 +120,7 @@ describe("Anthias CLI", () => {
       ...process.env,
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
+      ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
       ANTHIAS_MODEL_API_KEY: "local-key",
       ANTHIAS_SESSION_DIR: sessionDirectory,
     };
@@ -228,6 +229,7 @@ describe("Anthias CLI", () => {
       ...process.env,
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
+      ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
       ANTHIAS_MODEL_API_KEY: "local-key",
       ANTHIAS_SESSION_DIR: sessionDirectory,
     };
@@ -250,6 +252,7 @@ describe("Anthias CLI", () => {
       ...process.env,
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
+      ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
       ANTHIAS_MODEL_API_KEY: "local-key",
       ANTHIAS_SESSION_DIR: sessionDirectory,
     });
@@ -313,6 +316,7 @@ function createModelEnvironment(sessionDirectory?: string): NodeJS.ProcessEnv {
     ...process.env,
     ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
     ANTHIAS_MODEL_ID: "model-id",
+    ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
     ANTHIAS_MODEL_API_KEY: "local-key",
     ...(sessionDirectory === undefined ? {} : { ANTHIAS_SESSION_DIR: sessionDirectory }),
   };

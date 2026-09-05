@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { type AgentLoopEvent, runAgentLoop } from "../src/agent-loop.js";
 import { estimateTextTokens } from "../src/context/budget.js";
 import type { AssistantToolCallPart } from "../src/message.js";
-import type { ModelStream } from "../src/model-stream.js";
+import type { ModelStream } from "../src/model/model-stream.js";
 import {
   createSessionArtifactStore,
   SESSION_ARTIFACT_BYTE_LIMIT,

@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
-import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
+import { ModelRequestError } from "../src/model/model-stream.js";
+import { createOpenAICompatibleModelStream } from "../src/model/openai-compatible-model.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -71,7 +72,7 @@ describe("createOpenAICompatibleModelStream", () => {
       { type: "reasoning_delta", delta: "the workspace" },
       { type: "reasoning_end" },
       { type: "text_delta", delta: "done" },
-      { type: "finish", finishReason: "stop" },
+      { type: "finish", finishReason: "stop", usage: UNKNOWN_USAGE },
     ]);
   });
 
@@ -113,6 +114,7 @@ describe("createOpenAICompatibleModelStream", () => {
           systemPrompt: "system rules",
           messages: [{ role: "user", content: "hello" }],
           tools: FIXED_TOOL_DEFINITIONS,
+          maxOutputTokens: 123,
         },
         new AbortController().signal,
       ),
@@ -124,6 +126,7 @@ describe("createOpenAICompatibleModelStream", () => {
       {
         type: "finish",
         finishReason: "stop",
+        usage: { ...UNKNOWN_USAGE, inputTokens: 3, outputTokens: 2 },
       },
     ]);
     expect(requestCount).toBe(1);
@@ -134,6 +137,8 @@ describe("createOpenAICompatibleModelStream", () => {
         { role: "user", content: "hello" },
       ],
       stream: true,
+      max_tokens: 123,
+      stream_options: { include_usage: true },
       tools: expect.arrayContaining([
         expect.objectContaining({ function: expect.objectContaining({ name: "read_file" }) }),
       ]),
@@ -167,7 +172,7 @@ describe("createOpenAICompatibleModelStream", () => {
             new AbortController().signal,
           ),
         ),
-      ).rejects.toBeDefined();
+      ).rejects.toMatchObject({ reason: "model_error", message: "模型请求失败。" });
       expect(requestCount).toBe(1);
       expect(consoleError).not.toHaveBeenCalled();
     } finally {
@@ -242,6 +247,7 @@ describe("createOpenAICompatibleModelStream", () => {
       {
         type: "finish",
         finishReason: "tool_calls",
+        usage: UNKNOWN_USAGE,
       },
     ]);
     expect(requestCount).toBe(1);
@@ -358,6 +364,7 @@ describe("createOpenAICompatibleModelStream", () => {
         status: "completed",
       });
     } finally {
+      await agent.close();
       await closeServer(server);
       servers.delete(server);
     }
@@ -414,6 +421,141 @@ describe("createOpenAICompatibleModelStream", () => {
     ).rejects.toThrow();
     expect((await readdir(workspaceRoot)).some((name) => name.startsWith(".anthias-"))).toBe(false);
   });
+
+  it.each([
+    {
+      name: "standard cached input as part of total input",
+      providerUsage: {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: 10 },
+      },
+      expectedUsage: {
+        inputTokens: 12,
+        outputTokens: 4,
+        cachedInputTokens: 10,
+        cacheWriteInputTokens: null,
+      },
+    },
+    {
+      name: "compatible cache counters without synthesizing missing output",
+      providerUsage: {
+        prompt_tokens: 10,
+        prompt_cache_hit_tokens: 7,
+        cache_creation_input_tokens: 2,
+      },
+      expectedUsage: {
+        inputTokens: 10,
+        outputTokens: null,
+        cachedInputTokens: 7,
+        cacheWriteInputTokens: 2,
+      },
+    },
+    {
+      name: "a known zero output with unknown input and cache",
+      providerUsage: { completion_tokens: 0 },
+      expectedUsage: {
+        inputTokens: null,
+        outputTokens: 0,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: null,
+      },
+    },
+    {
+      name: "explicit zero counters",
+      providerUsage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        prompt_tokens_details: { cached_tokens: 0 },
+      },
+      expectedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: null,
+      },
+    },
+  ])("normalizes $name from raw step usage", async ({ providerUsage, expectedUsage }) => {
+    let requestBody: unknown;
+    const server = await startServer(async (request, response) => {
+      requestBody = JSON.parse(await readBody(request));
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      writeChunk(response, "done");
+      response.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-usage",
+          created: 0,
+          model: "test-model",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: providerUsage,
+        })}\n\n`,
+      );
+      response.end("data: [DONE]\n\n");
+    });
+    const address = server.address() as AddressInfo;
+    const modelStream = createOpenAICompatibleModelStream({
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      modelId: "test-model",
+      apiKey: "test-key",
+    });
+    const modelEvents = await collect(
+      modelStream(
+        {
+          systemPrompt: "rules",
+          messages: [{ role: "user", content: "count" }],
+          tools: [],
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(modelEvents.at(-1)).toEqual({
+      type: "finish",
+      finishReason: "stop",
+      usage: expectedUsage,
+    });
+    expect(requestBody).toMatchObject({
+      max_tokens: 16_000,
+      stream_options: { include_usage: true },
+    });
+  });
+
+  it.each([
+    { code: "context_length_exceeded", message: "sensitive provider detail" },
+    {
+      code: "invalid_request_error",
+      message: "This model's maximum context length was exceeded: sensitive detail",
+    },
+  ])(
+    "classifies a context overflow without exposing Provider text: $code",
+    async (providerError) => {
+      const server = await startServer((_request, response) => {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: providerError }));
+      });
+      const address = server.address() as AddressInfo;
+      const modelStream = createOpenAICompatibleModelStream({
+        baseURL: `http://127.0.0.1:${address.port}/v1`,
+        modelId: "test-model",
+        apiKey: "test-key",
+      });
+      const outcome = await collect(
+        modelStream(
+          {
+            systemPrompt: "rules",
+            messages: [{ role: "user", content: "overflow" }],
+            tools: [],
+          },
+          new AbortController().signal,
+        ),
+      ).catch((error: unknown) => error);
+      expect(outcome).toBeInstanceOf(ModelRequestError);
+      expect(outcome).toMatchObject({
+        reason: "context_overflow",
+        message: "模型上下文容量不足。",
+      });
+      expect(String(outcome)).not.toContain("sensitive");
+    },
+  );
 });
 
 /** 启动只监听 loopback 随机端口的测试服务。 */
@@ -526,3 +668,10 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   }
   return chunks;
 }
+
+const UNKNOWN_USAGE = Object.freeze({
+  inputTokens: null,
+  outputTokens: null,
+  cachedInputTokens: null,
+  cacheWriteInputTokens: null,
+});

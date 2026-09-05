@@ -641,17 +641,17 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
           },
           appendCompaction(details) {
             return enqueueRecord((sequence, parentEntryId) =>
-              createCompactionRecord(sequence, parentEntryId, details),
+              createCompactionRecord(sequence, parentEntryId, details, runId),
             );
           },
           appendRequestUsage(details) {
             return enqueueRecord((sequence, parentEntryId) =>
-              createRequestUsageRecord(sequence, parentEntryId, details),
+              createRequestUsageRecord(sequence, parentEntryId, details, runId),
             );
           },
           appendApprovalDecision(details) {
             return enqueueRecord((sequence, parentEntryId) =>
-              createApprovalDecisionRecord(sequence, parentEntryId, details),
+              createApprovalDecisionRecord(sequence, parentEntryId, details, runId),
             );
           },
           async release() {
@@ -751,6 +751,7 @@ function createCompactionRecord(
   sequence: number,
   parentEntryId: string | null,
   details: CompactionDetails,
+  runId?: string,
 ): CompactionRecord {
   return Object.freeze({
     type: "compaction",
@@ -758,6 +759,7 @@ function createCompactionRecord(
     seq: sequence,
     timestamp: new Date().toISOString(),
     parentEntryId,
+    ...(runId === undefined ? {} : { runId }),
     summary: details.summary,
     coversThroughEntryId: details.coversThroughEntryId,
     firstKeptEntryId: details.firstKeptEntryId,
@@ -773,6 +775,7 @@ function createRequestUsageRecord(
   sequence: number,
   parentEntryId: string | null,
   details: RequestUsageDetails,
+  runId?: string,
 ): RequestUsageRecord {
   return Object.freeze({
     type: "request_usage",
@@ -780,6 +783,7 @@ function createRequestUsageRecord(
     seq: sequence,
     timestamp: new Date().toISOString(),
     parentEntryId,
+    ...(runId === undefined ? {} : { runId }),
     purpose: details.purpose,
     requestEntryId: details.requestEntryId,
     contextVersion: details.contextVersion,
@@ -791,6 +795,7 @@ function createApprovalDecisionRecord(
   sequence: number,
   parentEntryId: string | null,
   details: ApprovalDecisionDetails,
+  runId?: string,
 ): ApprovalDecisionRecord {
   return Object.freeze({
     type: "approval_decision",
@@ -798,6 +803,7 @@ function createApprovalDecisionRecord(
     seq: sequence,
     timestamp: new Date().toISOString(),
     parentEntryId,
+    ...(runId === undefined ? {} : { runId }),
     toolCallId: details.toolCallId,
     toolName: details.toolName,
     permissionMode: details.permissionMode,
@@ -813,15 +819,20 @@ function snapshotUsage(
     inputTokens: number | null;
     outputTokens: number | null;
     cachedInputTokens: number | null;
+    cacheWriteInputTokens?: number | null;
   }>,
 ): Readonly<{
   inputTokens: number | null;
   outputTokens: number | null;
   cachedInputTokens: number | null;
+  cacheWriteInputTokens?: number | null;
 }> {
   return Object.freeze({
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     cachedInputTokens: usage.cachedInputTokens,
+    ...(usage.cacheWriteInputTokens === undefined
+      ? {}
+      : { cacheWriteInputTokens: usage.cacheWriteInputTokens }),
   });
 }

@@ -4,8 +4,8 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Agent, createAgentWithModelStream } from "./agent.js";
-import { readModelConfig } from "./model-config.js";
-import { createOpenAICompatibleModelStream } from "./openai-compatible-model.js";
+import { readModelConfig } from "./model/model-config.js";
+import { createOpenAICompatibleModelStream } from "./model/openai-compatible-model.js";
 import type { PermissionMode } from "./permission-mode.js";
 import type { SessionCleanupResult } from "./session/cleanup.js";
 import {
@@ -99,6 +99,10 @@ export async function createAgentFromEnvironment({
         ok: true,
         agent: createAgentWithModelStream({
           modelStream,
+          modelContext: {
+            modelId: modelConfigResult.config.modelId,
+            budget: modelConfigResult.config.contextBudget,
+          },
           session,
           permissionMode,
           startCleanup: (report) => startSessionCleanup(normalizedSessionDirectory, report),

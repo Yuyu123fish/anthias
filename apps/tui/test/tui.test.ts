@@ -35,6 +35,39 @@ type FakeAgentBehavior = Readonly<{
 }>;
 
 describe("runTui", () => {
+  it("renders compaction progress and keeps usage inspection separate from prompts", async () => {
+    const agent = createFakeAgent({
+      prompt: async (_text, controls) => {
+        controls.publish({ type: "compaction_start", runId: TEST_RUN_ID });
+        controls.publish({
+          type: "compaction_end",
+          runId: TEST_RUN_ID,
+          inputTokensBefore: 90000,
+          inputTokensAfter: 12000,
+        });
+        controls.publish({ type: "compaction_failed", runId: TEST_RUN_ID, error: "保留原历史" });
+        return { status: "completed" };
+      },
+    });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let rendered = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      rendered += chunk;
+    });
+    const exit = runTui({ agent, input, output, signalSource: new EventEmitter() });
+    input.write("/context\n");
+    await vi.waitFor(() => expect(rendered).toContain("上下文 未知/128000 token"));
+    expect(rendered).toContain("累计 response: 0 次");
+    input.write("continue\n");
+    await vi.waitFor(() => expect(rendered).toContain("90000 → 12000 token，继续原任务"));
+    expect(rendered).toContain("正在压缩历史上下文");
+    expect(rendered).toContain("保留原历史");
+    input.write("/exit\n");
+    expect(await exit).toBe(0);
+  });
+
   it("waits for Agent close before resolving terminal exit", async () => {
     const closeStarted = Promise.withResolvers<void>();
     const closeGate = Promise.withResolvers<void>();
@@ -1330,6 +1363,26 @@ function createFakeAgent(
         sessionId: "00000000-0000-4000-8000-000000000001",
         workspaceRoot,
         permissionMode,
+        contextUsage: {
+          contextWindow: 128000,
+          inputTokens: null,
+          source: "unknown" as const,
+          responseOutputTokens: 16000,
+          summaryOutputTokens: 8000,
+          compactions: 0,
+          requests: Object.fromEntries(
+            ["response", "compaction", "approval"].map((purpose) => [
+              purpose,
+              {
+                requests: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedInputTokens: 0,
+                cacheWriteInputTokens: 0,
+              },
+            ]),
+          ) as AgentState["contextUsage"]["requests"],
+        },
         messageHistory: Object.freeze([...messageHistory]),
         activeAssistantMessage: null,
         activeRun: running

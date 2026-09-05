@@ -1,3 +1,95 @@
+import type { ModelInputMessage, ModelRequest } from "../model/model-stream.js";
+
+/** 区分模型容量与普通回复、摘要和保留原文的应用策略。 */
+export type ContextBudget = Readonly<{
+  contextWindow: number;
+  safetyTokens: number;
+  responseOutputTokens: number;
+  summaryOutputTokens: number;
+  retainedTokens: number;
+}>;
+
+/** 只在默认策略时收窄输出；显式超出模型能力的配置必须拒绝。 */
+export function createContextBudget(
+  capabilities: Readonly<{ contextWindow: number; maxOutputTokens?: number }>,
+  overrides: Readonly<{
+    responseOutputTokens?: number;
+    summaryOutputTokens?: number;
+    retainedTokens?: number;
+  }> = {},
+): ContextBudget {
+  requirePositiveTokenCount(capabilities.contextWindow, "模型上下文窗口");
+  if (capabilities.maxOutputTokens !== undefined) {
+    requirePositiveTokenCount(capabilities.maxOutputTokens, "模型输出能力");
+  }
+  const responseOutputTokens = resolveOutputBudget(
+    overrides.responseOutputTokens,
+    16_000,
+    capabilities.maxOutputTokens,
+  );
+  const summaryOutputTokens = resolveOutputBudget(
+    overrides.summaryOutputTokens,
+    8_000,
+    capabilities.maxOutputTokens,
+  );
+  const retainedTokens = overrides.retainedTokens ?? 32_000;
+  requirePositiveTokenCount(retainedTokens, "原文保留目标");
+  if (capabilities.contextWindow <= 20_000 + Math.max(responseOutputTokens, summaryOutputTokens)) {
+    throw new Error("模型窗口无法同时容纳 20,000 token 安全余量、输出预算和请求输入。");
+  }
+  return Object.freeze({
+    contextWindow: capabilities.contextWindow,
+    safetyTokens: 20_000,
+    responseOutputTokens,
+    summaryOutputTokens,
+    retainedTokens,
+  });
+}
+
+/** 估算实际重发的消息内容，不将本地工具产物元数据当作 Provider 输入。 */
+export function estimateModelMessageTokens(message: ModelInputMessage): number {
+  if (message.role === "tool") {
+    return estimateJsonTokens({
+      role: "tool",
+      tool_call_id: message.toolCallId,
+      name: message.toolName,
+      content: message.content,
+    });
+  }
+  return estimateJsonTokens(message);
+}
+
+/** 覆盖固定指令、消息封装、完整工具 Schema 与生成回复的封装余量。 */
+export function estimateModelRequestTokens(
+  request: Pick<ModelRequest, "systemPrompt" | "messages" | "tools">,
+): number {
+  return (
+    estimateJsonTokens({ role: "system", content: request.systemPrompt }) +
+    request.messages.reduce((tokens, message) => tokens + estimateModelMessageTokens(message), 0) +
+    (request.tools.length === 0 ? 0 : estimateJsonTokens(request.tools)) +
+    3
+  );
+}
+
+function resolveOutputBudget(
+  requested: number | undefined,
+  defaultValue: number,
+  capability: number | undefined,
+): number {
+  const value = requested ?? Math.min(defaultValue, capability ?? defaultValue);
+  requirePositiveTokenCount(value, "模型输出预算");
+  if (capability !== undefined && value > capability) {
+    throw new Error("显式模型输出预算超过已声明的模型输出能力。");
+  }
+  return value;
+}
+
+function requirePositiveTokenCount(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label}必须是正整数 token 数。`);
+  }
+}
+
 /** Tool 结果在模型上下文中的首期单项上限。 */
 export const TOOL_RESULT_TOKEN_LIMIT = 4_000;
 

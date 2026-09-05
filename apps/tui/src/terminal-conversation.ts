@@ -4,6 +4,7 @@ import type {
   Agent,
   AgentEvent,
   AssistantMessage,
+  ContextUsage,
   PermissionMode,
   PromptResult,
   RunPhase,
@@ -386,6 +387,12 @@ export function runTui({
       });
       return;
     }
+    if (trimmedLine === "/context") {
+      void enqueueRender(() =>
+        terminalDriver.writeStable(renderContextUsage(agent.state.contextUsage) + "\n"),
+      );
+      return;
+    }
     if (trimmedLine === "/mode" || trimmedLine.startsWith("/mode ")) {
       await enqueueRender(() => {
         const modeResult = handleModeCommand(trimmedLine, agent);
@@ -522,6 +529,21 @@ async function renderEvent(
   eventTimestamp: number,
 ): Promise<void> {
   switch (event.type) {
+    case "context_usage":
+      if (terminalDriver.kind === "plain")
+        terminalDriver.writeStable(renderContextUsage(event.usage) + "\n");
+      return;
+    case "compaction_start":
+      terminalDriver.writeStable("正在压缩历史上下文…\n");
+      return;
+    case "compaction_end":
+      terminalDriver.writeStable(
+        `上下文压缩完成：约 ${event.inputTokensBefore} → ${event.inputTokensAfter} token，继续原任务。\n`,
+      );
+      return;
+    case "compaction_failed":
+      terminalDriver.writeStable(sanitizeTerminalText(event.error) + "\n");
+      return;
     case "session_cleanup": {
       if (event.result.deleted > 0)
         terminalDriver.writeStable(
@@ -789,6 +811,10 @@ async function renderInitialState(
   terminalDriver.writeStable(`Session: ${state.sessionId}\n`);
   terminalDriver.writeStable(`Workspace: ${sanitizeTerminalText(state.workspaceRoot)}\n`);
   terminalDriver.writeStable(`Mode: ${renderPermissionMode(state.permissionMode)}\n`);
+  if (state.contextUsage.compactions > 0)
+    terminalDriver.writeStable(
+      `已恢复压缩后的模型上下文（${state.contextUsage.compactions} 次压缩）；下方显示完整历史。\n`,
+    );
   let historicalAssistantHeadingCommitted = false;
   for (const message of state.messageHistory) {
     if (message.role === "user") {
@@ -1020,7 +1046,10 @@ function createDynamicFrame(
     ...wrapTerminalText(visibleInput.line, layoutWidth),
     ...wrapTerminalText(`cwd: ${agentState.workspaceRoot}`, layoutWidth),
     ...wrapTerminalText(
-      createStatusLine(presentationState, agentState, terminalCapabilities),
+      createStatusLine(presentationState, agentState, terminalCapabilities) +
+        (agentState.contextUsage.inputTokens === null
+          ? ""
+          : ` · ${renderContextUsage(agentState.contextUsage).split("；累计")[0]}`),
       layoutWidth,
     ),
   ];
@@ -1500,10 +1529,24 @@ function renderPermissionMode(permissionMode: PermissionMode): "Agent" | "Plan" 
   return permissionMode === "agent" ? "Agent" : "Plan";
 }
 
+function renderContextUsage(usage: ContextUsage): string {
+  const input =
+    usage.inputTokens === null
+      ? "未知"
+      : `${usage.source === "estimated" ? "约 " : ""}${usage.inputTokens}`;
+  const requests = (["response", "compaction", "approval"] as const).map((purpose) => {
+    const total = usage.requests[purpose];
+    return `${purpose}: ${total.requests} 次/${total.inputTokens ?? "未知"} 入/${total.outputTokens ?? "未知"} 出`;
+  });
+  return `上下文 ${input}/${usage.contextWindow} token；累计 ${requests.join("，")}`;
+}
+
 function renderRunPhase(phase: RunPhase): string {
   switch (phase) {
     case "requesting_model":
       return "正在请求模型";
+    case "compacting":
+      return "正在压缩上下文";
     case "awaiting_tool_approval":
       return "等待确认";
     case "executing_tool":

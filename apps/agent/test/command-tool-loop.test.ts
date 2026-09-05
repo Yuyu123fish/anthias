@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
-import type { ModelRequest, ModelStream } from "../src/model-stream.js";
+import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -124,9 +124,11 @@ describe("execute_command Agent Tool Loop", () => {
     expect(sessionRecords.map((record) => record.type)).toEqual([
       "session_header",
       "message",
+      "request_usage",
       "message",
       "tool_execution_started",
       "message",
+      "request_usage",
       "message",
       "run_finished",
     ]);

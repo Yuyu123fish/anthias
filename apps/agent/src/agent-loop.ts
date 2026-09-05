@@ -19,7 +19,7 @@ import {
   type ModelStream,
   streamAssistantMessage,
   toModelInputMessage,
-} from "./model-stream.js";
+} from "./model/model-stream.js";
 import type { PermissionMode } from "./permission-mode.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 import type {

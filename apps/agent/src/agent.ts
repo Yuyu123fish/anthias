@@ -5,8 +5,10 @@ import {
   type AgentLoopToolApproval,
   runAgentLoop,
 } from "./agent-loop.js";
+import { type ContextBudget, createContextBudget } from "./context/budget.js";
+import { type ContextUsage, createContextController } from "./context/index.js";
 import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
-import type { ModelStream } from "./model-stream.js";
+import type { ModelStream } from "./model/model-stream.js";
 import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission-mode.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import { createSessionArtifactStore } from "./session/artifacts.js";
@@ -18,7 +20,11 @@ import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool
 export type { PermissionMode } from "./permission-mode.js";
 
 /** 枚举 Run 对外交付的活动阶段。 */
-export type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
+export type RunPhase =
+  | "requesting_model"
+  | "compacting"
+  | "awaiting_tool_approval"
+  | "executing_tool";
 
 /** 描述公开状态中当前 Run 的身份与阶段。 */
 export type ActiveRun = Readonly<{
@@ -60,6 +66,7 @@ export type AgentState = Readonly<{
   sessionId: string;
   workspaceRoot: string;
   permissionMode: PermissionMode;
+  contextUsage: ContextUsage;
   messageHistory: readonly Message[];
   activeAssistantMessage: AssistantMessage | null;
   activeRun: ActiveRun | null;
@@ -84,6 +91,15 @@ export type PromptResult =
 
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
 export type AgentEvent =
+  | Readonly<{ type: "context_usage"; usage: ContextUsage }>
+  | Readonly<{ type: "compaction_start"; runId: string }>
+  | Readonly<{
+      type: "compaction_end";
+      runId: string;
+      inputTokensBefore: number;
+      inputTokensAfter: number;
+    }>
+  | Readonly<{ type: "compaction_failed"; runId: string; error: string }>
   | Readonly<{ type: "session_cleanup"; result: SessionCleanupResult }>
   | Readonly<{ type: "run_start"; runId: string }>
   | Readonly<{ type: "run_phase_changed"; runId: string; phase: RunPhase }>
@@ -141,6 +157,7 @@ export type Agent = Readonly<{
 /** 配置内部 Model Stream 与已打开 Session 的 Agent 运行宿主。 */
 export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
+  modelContext?: Readonly<{ modelId: string; budget: ContextBudget }>;
   session: Session;
   permissionMode?: PermissionMode | undefined;
   toolRunner?: ToolRunner | undefined;
@@ -196,12 +213,19 @@ const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
 /** 使用内部 Model Stream 与已打开 Session 创建 Agent 运行宿主。 */
 export function createAgentWithModelStream({
   modelStream,
+  modelContext,
   session,
   permissionMode: initialPermissionMode = DEFAULT_PERMISSION_MODE,
   toolRunner: providedToolRunner,
   startCleanup,
 }: CreateAgentWithModelStreamOptions): Agent {
   const messageHistory: Message[] = [...session.messageHistory];
+  const contextController = createContextController({
+    session,
+    modelStream,
+    modelId: modelContext?.modelId ?? "deterministic-local",
+    budget: modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 }),
+  });
   const artifactStore = createSessionArtifactStore({
     sessionId: session.sessionId,
     storageDirectory: session.storageDirectory,
@@ -239,6 +263,7 @@ export function createAgentWithModelStream({
       sessionId: session.sessionId,
       workspaceRoot: session.workspaceRoot,
       permissionMode,
+      contextUsage: contextController.snapshot(),
       messageHistory: Object.freeze([...messageHistory]),
       activeAssistantMessage,
       activeRun: activeRun
@@ -526,9 +551,30 @@ export function createAgentWithModelStream({
       if (closeRequested || currentRun.abortController.signal.aborted) {
         return finishRun(currentRun, ABORTED_PROMPT_RESULT);
       }
+      let contextFailure: string | null = null;
+      const contextModelStream = contextController.wrapRun({
+        lease: currentRun.sessionLease,
+        emit: (event) => {
+          if (event.type === "context_usage") publishEvent(event);
+          else {
+            updateRunPhase(
+              currentRun,
+              event.type === "compaction_start" ? "compacting" : "requesting_model",
+            );
+            publishEvent({ ...event, runId: currentRun.runId });
+          }
+        },
+        onFailure: (error) => {
+          contextFailure = error;
+        },
+        onStorageFailure: () => {
+          currentRun.sessionWriteFailed = true;
+          sessionUnavailableResult = SESSION_FAILED_RESULT;
+        },
+      });
       const loopResult = await runAgentLoop({
         messages: messageHistory,
-        modelStream,
+        modelStream: contextModelStream,
         systemPrompt: createCodingSystemPrompt(
           session.workspaceRoot,
           session.shell,
@@ -543,7 +589,14 @@ export function createAgentWithModelStream({
         requestToolApproval: (toolCall, approvalPlan) =>
           waitForToolApproval(currentRun, toolCall, approvalPlan),
       });
-      return finishRun(currentRun, toFinishedPromptResult(loopResult));
+      return finishRun(
+        currentRun,
+        currentRun.sessionWriteFailed
+          ? SESSION_FAILED_RESULT
+          : loopResult.status === "failed" && contextFailure !== null
+            ? { status: "failed", error: contextFailure }
+            : toFinishedPromptResult(loopResult),
+      );
     } catch {
       const requestedResult = currentRun.sessionWriteFailed
         ? SESSION_FAILED_RESULT

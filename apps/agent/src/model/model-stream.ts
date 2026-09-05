@@ -7,8 +7,8 @@ import {
   type JsonValue,
   type Message,
   type ToolResultMessage,
-} from "./message.js";
-import type { ModelToolDefinition } from "./tool/definitions.js";
+} from "../message.js";
+import type { ModelToolDefinition } from "../tool/definitions.js";
 
 /** 表示只在当前 Run 的 Provider continuation 中存活的 Reasoning 文本。 */
 type ModelReasoningPart = Readonly<{
@@ -28,11 +28,32 @@ export type ModelInputMessage =
   | ModelAssistantInputMessage
   | ToolResultMessage;
 
+/** 保存 Provider 明确提供的调用用量；缺失字段保持未知，缓存是输入子集。 */
+export type ModelUsage = Readonly<{
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+}>;
+
+/** 将 Provider 失败收窄为 Context 可判断的安全原因，不携带原始响应。 */
+export class ModelRequestError extends Error {
+  readonly reason: "context_overflow" | "model_error";
+
+  constructor(reason: "context_overflow" | "model_error") {
+    super(reason === "context_overflow" ? "模型上下文容量不足。" : "模型请求失败。");
+    this.name = "ModelRequestError";
+    this.reason = reason;
+  }
+}
+
 /** 描述一次 Model Adapter 调用需要的完整 Agent 自有输入。 */
 export type ModelRequest = Readonly<{
   systemPrompt: string;
   messages: readonly ModelInputMessage[];
   tools: readonly ModelToolDefinition[];
+  purpose?: "response" | "compaction" | "approval";
+  maxOutputTokens?: number;
 }>;
 
 /** 枚举 Agent 理解的模型完成原因。 */
@@ -70,6 +91,7 @@ export type ModelStreamEvent =
   | Readonly<{
       type: "finish";
       finishReason: ModelFinishReason;
+      usage?: ModelUsage;
     }>;
 
 /** 枚举流式组装边界交给 Agent Loop 的当前 AssistantMessage。 */

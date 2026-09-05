@@ -9,7 +9,7 @@ import {
   type ModelStream,
   type ModelStreamEvent,
   streamAssistantMessage,
-} from "../src/model-stream.js";
+} from "../src/model/model-stream.js";
 import {
   createSession,
   openSession,
@@ -279,8 +279,9 @@ describe("Agent", () => {
       sessionId: expect.any(String),
       workspaceRoot: expect.any(String),
       permissionMode: "agent",
+      contextUsage: expect.objectContaining({ contextWindow: 128000, source: "estimated" }),
     });
-    expect(events).toEqual([
+    expect(events.filter((type) => type !== "context_usage")).toEqual([
       "run_start",
       "message_start",
       "message_end",
@@ -424,7 +425,7 @@ describe("Agent", () => {
     await expect(reentrantPromptResult).resolves.toEqual({ status: "rejected", reason: "busy" });
     await expect(lockObservedDuringRunEnd).resolves.toBeUndefined();
     await expect(access(getSessionLockPath(agent))).rejects.toThrow();
-    expect(eventTypes).toEqual([
+    expect(eventTypes.filter((type) => type !== "context_usage")).toEqual([
       "run_start",
       "message_start",
       "message_end",
