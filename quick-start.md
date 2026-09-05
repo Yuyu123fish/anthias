@@ -88,12 +88,15 @@ notepad $PROFILE
 
 | 操作 | 用法 |
 | --- | --- |
-| 提交任务 | 输入文字并回车 |
+| 命令发现 | 输入 `/` 查看菜单，`Tab` 补全；`/help` 查看完整帮助 |
+| 提交任务 | `Enter` 提交；`Alt+Enter` 或支持的 `Shift+Enter` 换行，多行粘贴保持一条输入 |
+| 新建或恢复会话 | `/new`；`/resume` 列出 ID，`/resume <id>` 打开 |
+| 主动压缩 | `/compact`，只压缩历史投影，不产生额外普通回复 |
 | 查询或切换模式 | `/mode`、`/mode plan`、`/mode agent`、`/mode auto_allow`；只能在空闲时切换 |
 | 查看上下文用量 | `/context`，当前窗口与各用途累计用量分别显示 |
-| 查看详情 | `/details` 开关详情；`/details prev`、`/details next` 翻页 |
-| 批准当前副作用 | 确认目标、预览和边界后输入 `y` 或 `yes` |
-| 拒绝当前副作用 | 输入 `n`、`no` 或空行 |
+| 阅读与详情 | `PageUp/PageDown` 滚动，`Ctrl+Home/End` 到顶部/末尾；`/details` 或 `Ctrl+T` 查看详情 |
+| 批准当前副作用 | 完整阅读审批详情后输入 `approve`；详情未读完时阻止确认 |
+| 拒绝当前副作用 | 输入 `deny` |
 | 停止当前 Run | 运行中按 `Ctrl+C`，停止后可以继续输入 |
 | 退出 | `/exit`，或空闲时按 `Ctrl+C` |
 
@@ -116,6 +119,55 @@ $env:ANTHIAS_SESSION_DIR = 'D:\AnthiasData\conversation'
 会话以 UTC 日期和创建时间戳分目录保存；日志、索引与工具产物归属于同一个 Session。每次启动会在后台检查最近使用时间，两周未使用且没有活动使用者的会话及其产物会被清理。压缩保留完整历史，只缩减模型输入；TUI 显示过程和结果，成功后自动继续。
 
 Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬拒绝规则的命令无法通过确认放行。命令以当前用户权限运行，没有 OS 沙箱，Workspace 和命令 `cwd` 不代表文件或网络隔离。
+
+## 6. 接入外部 Skill
+
+把已有 Skill 目录放到项目或用户的 `.agents/skills`，每个直接子目录包含自己的 `SKILL.md`。名称需与目录名一致，正文使用 Agent Skills 的 YAML frontmatter：
+
+```markdown
+---
+name: review-guide
+description: 检查项目的接口兼容性与错误处理
+---
+先阅读项目约定，再检查本次变更的公开接口和失败路径。
+需要时读取 references/checklist.md。
+```
+
+`/skills` 显示来源与诊断；`/skill:review-guide 检查当前变更` 激活并提交任务。模型也可按目录调用 `load_skill`、`read_skill`。启动只读取元数据，正文最多 64 KiB，单次参考文本最多 32 KiB；目录重名时按列表里的稳定 ID 选择。脚本执行仍经过正常 Tool 权限。
+
+额外根目录用 `ANTHIAS_SKILL_DIRS`，Windows 以分号分隔。`/skills reload` 重新发现并核对版本；`/skills clear` 清除当前会话的 Skill 激活。恢复保留已保存的正文和参考版本，文件变化会提示；显式再次 `/skill:<id>` 才替换正文，并清除旧正文关联的参考资料。新 Session 不继承激活内容。
+
+## 7. 接入 MCP
+
+配置读取用户 `~/.anthias/mcp.json`、项目 `.anthias/mcp.json`，也可用 `ANTHIAS_MCP_CONFIG` 添加一个文件。示例中的路径与地址需替换为你的服务；配置发现不会自动连接或安装程序：
+
+```json
+{
+  "mcpServers": {
+    "local-tools": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["C:/tools/my-mcp/server.js"],
+      "env": { "SERVICE_TOKEN": "MY_SERVICE_TOKEN" }
+    },
+    "remote-tools": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "MY_MCP_AUTHORIZATION" }
+    }
+  }
+}
+```
+
+`env` 和 `headers` 的值都是**当前进程的环境变量名**。例如 `MY_MCP_AUTHORIZATION` 保存完整 Authorization header 值；配置文件只存变量名。无需认证的服务可省略对应字段。
+
+`/mcp` 查看状态，`/mcp connect project:local-tools` 显式连接，`/mcp inspect project:local-tools` 查看工具、资源、模板及诊断。同名服务保留来源，唯一短名也可使用。
+
+- `/mcp read <id> <uri>`：读取目录中已列出的文本资源。
+- `/mcp prompt <id> <name> {"参数":"值"}`：选用模板，保存为外部上下文，然后自行输入任务。
+- `/mcp disconnect <id>`：断开并关闭 Anthias 启动的进程；退出会关闭全部连接。
+
+模型只获得已连接且符合预算的工具定义。MCP 工具经过当前模式的审批；Plan 拒绝未知外部工具。资源和模板不是新的用户授权。工具预览最多 32 KiB，原文产物最多保留 256 KiB，完整性单独标记；当前不支持 OAuth 登录、自动安装、二进制呈现及 MCP Apps。
 
 ## 启动遇到问题
 

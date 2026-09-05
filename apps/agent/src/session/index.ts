@@ -41,6 +41,8 @@ import {
   areSameWorkspace,
   type CompactionDetails,
   type CompactionRecord,
+  type ContextSourceDetails,
+  type ContextSourceRecord,
   fromDurableMessage,
   isSideEffectToolName,
   isUuid,
@@ -94,6 +96,7 @@ export class SessionShellUnavailableError extends Error {}
 
 /** 持有单个已接受 Run 的 Session 写锁与串行追加能力。 */
 export type SessionRunLease = Readonly<{
+  appendContextSource(details: ContextSourceDetails): Promise<void>;
   appendMessage(message: Message): Promise<void>;
   appendToolExecutionStarted(details: ToolExecutionStartedDetails): Promise<void>;
   appendRunFinished(details: RunFinishedDetails): Promise<void>;
@@ -118,6 +121,7 @@ export type Session = Readonly<{
   readonly messageHistory: readonly Message[];
   readonly records: readonly SessionRecord[];
   acquireRun(runId: string): Promise<SessionRunAcquisition>;
+  appendContextSource(details: ContextSourceDetails): Promise<void>;
   appendCompaction(details: CompactionDetails): Promise<void>;
   appendRequestUsage(details: RequestUsageDetails): Promise<void>;
   appendApprovalDecision(details: ApprovalDecisionDetails): Promise<void>;
@@ -639,6 +643,11 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
               },
             );
           },
+          appendContextSource(details) {
+            return enqueueRecord((sequence, parentEntryId) =>
+              createContextSourceRecord(sequence, parentEntryId, details, runId),
+            );
+          },
           appendCompaction(details) {
             return enqueueRecord((sequence, parentEntryId) =>
               createCompactionRecord(sequence, parentEntryId, details, runId),
@@ -686,6 +695,11 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
           pendingRunAcquisitionCompletions.delete(acquisitionCompletion);
         }
       }
+    },
+    appendContextSource(details) {
+      return appendStandaloneRecord((sequence, parentEntryId) =>
+        createContextSourceRecord(sequence, parentEntryId, details),
+      );
     },
     appendCompaction(details) {
       return appendStandaloneRecord((sequence, parentEntryId) =>
@@ -840,5 +854,22 @@ function snapshotUsage(
     ...(usage.cacheWriteInputTokens === undefined
       ? {}
       : { cacheWriteInputTokens: usage.cacheWriteInputTokens }),
+  });
+}
+
+function createContextSourceRecord(
+  seq: number,
+  parentEntryId: string | null,
+  details: ContextSourceDetails,
+  runId?: string,
+): ContextSourceRecord {
+  return Object.freeze({
+    type: "context_source",
+    entryId: randomUUID(),
+    seq,
+    timestamp: new Date().toISOString(),
+    parentEntryId,
+    ...details,
+    ...(runId === undefined ? {} : { runId }),
   });
 }

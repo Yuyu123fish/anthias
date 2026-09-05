@@ -4,6 +4,7 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Agent, createAgentWithModelStream } from "./agent.js";
+import { createMcpConnections } from "./mcp/index.js";
 import { readModelConfig } from "./model/model-config.js";
 import { createOpenAICompatibleModelStream } from "./model/openai-compatible-model.js";
 import type { PermissionMode } from "./permission/permission-mode.js";
@@ -18,6 +19,7 @@ import {
   SessionShellUnavailableError,
   SessionWorkspaceMismatchError,
 } from "./session/index.js";
+import { createSkillLibrary } from "./skill/index.js";
 
 /** 表示生产 Agent 已成功装配或以安全文本启动失败。 */
 export type AgentCreationFailureReason =
@@ -95,19 +97,24 @@ export async function createAgentFromEnvironment({
 
     try {
       const modelStream = createOpenAICompatibleModelStream(modelConfigResult.config);
-      return Object.freeze({
-        ok: true,
-        agent: createAgentWithModelStream({
-          modelStream,
-          modelContext: {
-            modelId: modelConfigResult.config.modelId,
-            budget: modelConfigResult.config.contextBudget,
-          },
-          session,
-          permissionMode,
-          startCleanup: (report) => startSessionCleanup(normalizedSessionDirectory, report),
-        }),
+      const [skills, mcp] = await Promise.all([
+        createSkillLibrary({ workspaceRoot: normalizedWorkspaceRoot, environment }),
+        createMcpConnections({ workspaceRoot: normalizedWorkspaceRoot, environment }),
+      ]);
+      const agent = createAgentWithModelStream({
+        modelStream,
+        skills,
+        mcp,
+        modelContext: {
+          modelId: modelConfigResult.config.modelId,
+          budget: modelConfigResult.config.contextBudget,
+        },
+        session,
+        permissionMode,
+        startCleanup: (report) => startSessionCleanup(normalizedSessionDirectory, report),
       });
+      if (sessionId !== undefined) await agent.skills.reload();
+      return Object.freeze({ ok: true, agent });
     } catch (error) {
       await session.close();
       throw error;

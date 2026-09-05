@@ -1,240 +1,159 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createAssistantContentRenderer,
-  renderAssistantContent,
+  resetCapabilitiesCache,
+  setCapabilities,
+  stripTerminalSequences,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createMarkdownContent, type MarkdownContent } from "../src/content/markdown.js";
+import {
+  type CodeHighlighter,
+  sanitizeTerminalText,
   type TerminalCapabilities,
 } from "../src/content-renderer.js";
 
-const temporaryDirectories = new Set<string>();
-const PLAIN_CAPABILITIES: TerminalCapabilities = Object.freeze({
-  colorDepth: "none",
-  hyperlinks: false,
-  unicode: true,
-});
+import { highlightCodeWithShiki } from "../src/syntax-highlighter.js";
 
+const roots = new Set<string>();
+const contents = new Set<MarkdownContent>();
 afterEach(async () => {
-  await Promise.all(
-    [...temporaryDirectories].map((directory) => rm(directory, { recursive: true, force: true })),
-  );
-  temporaryDirectories.clear();
+  for (const content of contents) content.close();
+  contents.clear();
+  await Promise.all([...roots].map((root) => rm(root, { recursive: true, force: true })));
+  roots.clear();
+  resetCapabilitiesCache();
 });
+async function workspace() {
+  const root = await mkdtemp(join(tmpdir(), "anthias-markdown-"));
+  roots.add(root);
+  return root;
+}
+function renderer(
+  workspaceRoot: string,
+  capabilities: TerminalCapabilities = { colorDepth: "truecolor", hyperlinks: true, unicode: true },
+  highlighter?: CodeHighlighter,
+) {
+  setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+  const content = createMarkdownContent({
+    workspaceRoot,
+    capabilities,
+    requestRender() {},
+    ...(highlighter === undefined ? {} : { codeHighlighter: highlighter }),
+  });
+  contents.add(content);
+  return content;
+}
+const plain = (content: MarkdownContent, width = 80) =>
+  content.render(width).map(stripTerminalSequences).join("\n");
 
-describe("Assistant Content Renderer", () => {
-  it("commits complete lines and closed fences without overtaking pending content", async () => {
-    const workspaceRoot = await createWorkspace();
-    await mkdir(join(workspaceRoot, "src"));
-    await writeFile(join(workspaceRoot, "src", "example.ts"), "export {};\n", "utf8");
-    const renderer = createAssistantContentRenderer({
-      workspaceRoot,
-      capabilities: PLAIN_CAPABILITIES,
-    });
-
-    await expect(renderer.push("Before `src/ex")).resolves.toBe("");
-    expect(renderer.preview()).toBe("Before `src/ex");
-    await expect(renderer.push("ample.ts:1`\n```ts\nconst value")).resolves.toBe(
-      "Before ▧ src/example.ts:1\n",
+describe("streaming Markdown", () => {
+  it("renders headings, emphasis, tables and unfinished code without waiting for a fence", async () => {
+    const content = renderer(await workspace());
+    content.setText(
+      "# Heading\n\nA **bold** and `inline` value.\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n```ts\nconst value = 42;",
     );
-    expect(renderer.preview()).toBe("```ts\nconst value");
-    await expect(renderer.push(": number = 42;\n```\nAfter")).resolves.toBe(
-      "╭─ ts\nconst value: number = 42;\n╰─\n",
-    );
-    expect(renderer.preview()).toBe("After");
-    await expect(renderer.finish()).resolves.toBe("After");
-    expect(renderer.preview()).toBe("");
+    expect(plain(content)).toContain("Heading");
+    expect(plain(content)).not.toContain("**bold**");
+    expect(plain(content)).toContain("const value = 42;");
+    expect(content.render(25).every((line) => visibleWidth(line) <= 25)).toBe(true);
   });
 
-  it("links only real local files inside the Workspace and keeps line data in the label", async () => {
-    const workspaceRoot = await createWorkspace();
-    const outsideRoot = await createWorkspace();
-    const relativePath = "目录/file name#%.ts";
-    const filePath = join(workspaceRoot, "目录", "file name#%.ts");
-    await mkdir(join(workspaceRoot, "目录"));
-    await writeFile(filePath, "export {};\n", "utf8");
-    await mkdir(join(workspaceRoot, "folder"));
-    const outsideFilePath = join(outsideRoot, "outside.ts");
-    await writeFile(outsideFilePath, "outside\n", "utf8");
-    const capabilities: TerminalCapabilities = Object.freeze({
-      colorDepth: "none",
-      hyperlinks: true,
-      unicode: true,
-    });
-
-    const rendered = await renderAssistantContent(
-      [
-        `inline \`${relativePath}:12:3\``,
-        `[source](${relativePath}:8)`,
-        `\`${outsideFilePath}:2\``,
-        "`folder` `missing.ts` [remote](ssh://host/file.ts) [unc](\\\\server\\share\\file.ts)",
-      ].join("\n"),
-      { workspaceRoot, capabilities },
+  it("links only real workspace files and retains line labels", async () => {
+    const root = await workspace();
+    const outside = await workspace();
+    await mkdir(join(root, "目录"));
+    const file = join(root, "目录", "file name#%.ts");
+    await writeFile(file, "export {};\n");
+    await writeFile(join(outside, "outside.ts"), "outside");
+    const content = renderer(root);
+    content.setText(
+      `\`目录/file name#%.ts:12:3\`\n\n[source](目录/file name#%.ts:8)\n\n[outside](${join(outside, "outside.ts")})\n\n[unsafe](javascript:alert) [remote](ssh://host/file)`,
     );
-
-    expect(rendered).toContain(`▧ ${relativePath}:12:3`);
-    expect(rendered).toContain(`▧ ${relativePath}:8`);
-    expect(rendered).toContain(`\u001B]8;;${pathToFileURL(filePath).href}\u001B\\`);
-    expect(rendered).not.toContain(`${pathToFileURL(filePath).href}:12`);
-    expect(rendered).toContain(`\`${outsideFilePath}:2\``);
-    expect(rendered).toContain("`folder` `missing.ts`");
-    expect(rendered).toContain("[remote](ssh://host/file.ts)");
-    expect(rendered).toContain("[unc](\\\\server\\share\\file.ts)");
-    expect(rendered.split("\u001B]8;;")).toHaveLength(5);
+    await vi.waitFor(() => expect(plain(content)).toContain("▧ 目录/file name#%.ts:12:3"));
+    const styled = content.render(100).join("\n");
+    expect(styled).toContain(`\u001b]8;;${pathToFileURL(file).href}`);
+    expect(styled).not.toContain(`\u001b]8;;${pathToFileURL(join(outside, "outside.ts")).href}`);
+    expect(styled).not.toContain("\u001b]8;;javascript:");
+    expect(styled).not.toContain("\u001b]8;;ssh:");
   });
 
-  it("uses an ASCII file marker without requiring color or hyperlinks", async () => {
-    const workspaceRoot = await createWorkspace();
-    await writeFile(join(workspaceRoot, "README.md"), "hello\n", "utf8");
-
-    await expect(
-      renderAssistantContent("`README.md:3`", {
-        workspaceRoot,
-        capabilities: { colorDepth: "none", hyperlinks: false, unicode: false },
-      }),
-    ).resolves.toBe("[file] README.md:3");
+  it("rejects a file link through a directory junction outside the workspace", async () => {
+    const root = await workspace();
+    const outside = await workspace();
+    await writeFile(join(outside, "outside.ts"), "outside");
+    await symlink(outside, join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+    const content = renderer(root);
+    content.setText("[outside](linked/outside.ts)");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(content.render(80).join("\n")).not.toContain("\u001b]8;;file:");
   });
 
-  it("removes model-provided terminal controls before plain or styled output", async () => {
-    const workspaceRoot = await createWorkspace();
-    const malicious = "safe\u001B]8;;https://evil.example\u0007linked\u001B[31m red\u0000 end";
-
-    const plain = await renderAssistantContent(malicious, {
-      workspaceRoot,
-      capabilities: PLAIN_CAPABILITIES,
-    });
-    const styled = await renderAssistantContent(`\`\`\`ts\nconst value = "${malicious}";\n\`\`\``, {
-      workspaceRoot,
-      capabilities: { colorDepth: "truecolor", hyperlinks: false, unicode: true },
-    });
-
-    expect([...plain].every(isAllowedTerminalCharacter)).toBe(true);
-    expect(plain).not.toContain("\u001B");
-    expect(stripAnsi(styled)).not.toContain("\u001B");
-    expect(stripAnsi(styled)).toContain("safe�]8;;https://evil.example�linked�[31m red� end");
+  it("keeps an old async highlight from replacing newer streaming text", async () => {
+    const pending = Promise.withResolvers<Awaited<ReturnType<CodeHighlighter>>>();
+    const highlighter = vi
+      .fn<CodeHighlighter>()
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(null);
+    const content = renderer(await workspace(), undefined, highlighter);
+    content.setText("```ts\nconst old = 1;");
+    expect(plain(content)).toContain("const old = 1;");
+    await vi.waitFor(() => expect(highlighter).toHaveBeenCalledOnce());
+    content.setText("```ts\nconst newer = 2;");
+    expect(plain(content)).toContain("const newer = 2;");
+    pending.resolve([[{ text: "const old = 1;", color: "anthiasCoral", dim: false }]]);
+    await Promise.resolve();
+    expect(plain(content)).toContain("const newer = 2;");
+    expect(plain(content)).not.toContain("const old = 1;");
   });
 
   it.each([
-    ["ts", "const value: number = 42; // note"],
-    ["powershell", '$value = "hello"\nWrite-Output $value'],
-    ["java", 'public class Demo { String value = "hello"; }'],
-    ["markdown", "# Heading\n`inline`"],
-  ])("highlights supported %s fences while preserving source text", async (language, source) => {
-    const workspaceRoot = await createWorkspace();
-    const rendered = await renderAssistantContent(`\`\`\`${language}\n${source}\n\`\`\``, {
-      workspaceRoot,
-      capabilities: { colorDepth: "truecolor", hyperlinks: false, unicode: true },
-    });
-
-    expect(rendered).toContain("\u001B[38;2;");
-    expect(stripCodeFrame(stripAnsi(rendered))).toBe(`${source}\n`);
+    ["typescript", "const value = 42;"],
+    ["powershell", '$value = "hello"'],
+    ["java", "public class Demo {}"],
+    ["markdown", "# source"],
+  ])("loads Shiki lazily for %s and preserves source", async (language, source) => {
+    const highlighter = vi.fn(highlightCodeWithShiki);
+    const content = renderer(await workspace(), undefined, highlighter);
+    expect(highlighter).not.toHaveBeenCalled();
+    content.setText(`\`\`\`${language}\n${source}\n\`\`\``);
+    content.render(100);
+    await vi.waitFor(() => expect(highlighter).toHaveBeenCalledWith(source, language));
+    const tokens: Awaited<ReturnType<CodeHighlighter>> | undefined =
+      await highlighter.mock.results[0]?.value;
+    expect(tokens?.map((line) => line.map((token) => token.text).join("")).join("\n")).toBe(source);
+    expect(plain(content)).toContain(source);
   });
 
-  it("maps the Anthias theme to truecolor, 256-color, and 16-color writers", async () => {
-    const workspaceRoot = await createWorkspace();
-    const source = "const value = 42; // note";
-    const renderAt = (colorDepth: TerminalCapabilities["colorDepth"]) =>
-      renderAssistantContent(`\`\`\`ts\n${source}\n\`\`\``, {
-        workspaceRoot,
-        capabilities: { colorDepth, hyperlinks: false, unicode: true },
-      });
+  it("highlights multiple code blocks without cancelling another block", async () => {
+    const highlighter = vi.fn<CodeHighlighter>(async (code) => [
+      [{ text: code, color: "anthiasCoral", dim: false }],
+    ]);
+    const content = renderer(await workspace(), undefined, highlighter);
+    content.setText("```ts\nfirst\n```\n\n```ts\nsecond\n```");
+    content.render(100);
+    await vi.waitFor(() => expect(highlighter).toHaveBeenCalledTimes(2));
+    expect(highlighter).toHaveBeenCalledWith("first", "ts");
+    expect(highlighter).toHaveBeenCalledWith("second", "ts");
+  });
 
-    await expect(renderAt("truecolor")).resolves.toContain("\u001B[38;2;");
-    await expect(renderAt("ansi256")).resolves.toContain("\u001B[38;5;");
-    const ansi16 = await renderAt("ansi16");
-    expect(["\u001B[95m", "\u001B[91m", "\u001B[90;2m"].some((code) => ansi16.includes(code))).toBe(
-      true,
+  it("sanitizes controls and falls back safely after a highlighter failure", async () => {
+    const failing = vi.fn<CodeHighlighter>(async () => {
+      throw new Error("no grammar");
+    });
+    const content = renderer(
+      await workspace(),
+      { colorDepth: "truecolor", hyperlinks: false, unicode: true },
+      failing,
     );
-    await expect(renderAt("none")).resolves.not.toContain("\u001B");
-  });
-
-  it("falls back to uncolored source for unknown, unmarked, oversized, unclosed, or failed highlighting", async () => {
-    const workspaceRoot = await createWorkspace();
-    const failingHighlighter = vi.fn(async () => {
-      throw new Error("highlight failed");
-    });
-    const capabilities: TerminalCapabilities = Object.freeze({
-      colorDepth: "truecolor",
-      hyperlinks: false,
-      unicode: true,
-    });
-
-    const unknown = await renderAssistantContent("```unknown\nconst x = 1;\n```", {
-      workspaceRoot,
-      capabilities,
-    });
-    const unmarked = await renderAssistantContent("```\nconst x = 1;\n```", {
-      workspaceRoot,
-      capabilities,
-    });
-    const oversizedSource = "x".repeat(64 * 1024 + 1);
-    const oversized = await renderAssistantContent(`\`\`\`ts\n${oversizedSource}\n\`\`\``, {
-      workspaceRoot,
-      capabilities,
-    });
-    const unclosed = await renderAssistantContent("```ts\nconst x = 1;", {
-      workspaceRoot,
-      capabilities,
-    });
-    const failed = await renderAssistantContent("```ts\nconst x = 1;\n```", {
-      workspaceRoot,
-      capabilities,
-      codeHighlighter: failingHighlighter,
-    });
-
-    for (const rendered of [unknown, unmarked, failed]) {
-      expect(rendered).not.toContain("\u001B");
-      expect(stripCodeFrame(rendered)).toContain("const x = 1;");
-    }
-    expect(oversized).not.toContain("\u001B");
-    expect(oversized).toContain(oversizedSource);
-    expect(unclosed).toBe("```ts\nconst x = 1;");
-    expect(failingHighlighter).toHaveBeenCalledOnce();
+    content.setText('```ts\nconst x = "safe\u001b[2J";\n```');
+    content.render(80);
+    await vi.waitFor(() => expect(failing).toHaveBeenCalledOnce());
+    expect(plain(content)).toContain('const x = "safe�[2J";');
+    expect(content.render(80).join("\n")).not.toContain("\u001b[2J");
+    expect(sanitizeTerminalText("\u0000\ud800\r\n")).toBe("��\n");
   });
 });
-
-async function createWorkspace(): Promise<string> {
-  const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-content-renderer-"));
-  temporaryDirectories.add(workspaceRoot);
-  return workspaceRoot;
-}
-
-function stripAnsi(value: string): string {
-  let plain = "";
-  let index = 0;
-  while (index < value.length) {
-    if (value.startsWith("\u001B]8;;", index)) {
-      const endIndex = value.indexOf("\u001B\\", index + 5);
-      if (endIndex >= 0) {
-        index = endIndex + 2;
-        continue;
-      }
-    }
-    if (value.startsWith("\u001B[", index)) {
-      const endIndex = value.indexOf("m", index + 2);
-      if (endIndex >= 0) {
-        index = endIndex + 1;
-        continue;
-      }
-    }
-    plain += value[index] ?? "";
-    index += 1;
-  }
-  return plain;
-}
-
-function stripCodeFrame(value: string): string {
-  const lines = value.split("\n");
-  return `${lines.slice(1, -2).join("\n")}\n`;
-}
-
-function isAllowedTerminalCharacter(character: string): boolean {
-  const codePoint = character.codePointAt(0) ?? 0;
-  return (
-    character === "\n" ||
-    character === "\t" ||
-    (codePoint >= 0x20 && codePoint < 0x7f) ||
-    codePoint > 0x9f
-  );
-}

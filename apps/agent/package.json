@@ -19,8 +19,10 @@
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "3.0.41",
+    "@modelcontextprotocol/client": "2.0.0",
     "ai": "7.0.85",
-    "diff": "9.0.0"
+    "diff": "9.0.0",
+    "yaml": "2.9.0"
   },
   "engines": {
     "node": ">=24 <25"

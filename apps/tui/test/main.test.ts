@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   cp,
   glob,
@@ -168,6 +168,55 @@ describe("Anthias CLI", () => {
     expect(await findSessionFiles(sessionDirectory)).toEqual(sessionFiles);
   });
 
+  it("exits after /exit while the parent keeps the input pipe open", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-cli-open-input-");
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../dist/main.js", import.meta.url))],
+      {
+        cwd: workspaceRoot,
+        env: createModelEnvironment(join(workspaceRoot, "sessions")),
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    let sentExit = false;
+    let timedOut = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (!sentExit && stdout.includes("/help")) {
+        sentExit = true;
+        // 父进程持续持有管道，避免 EOF 替 /exit 释放输入资源而掩盖泄漏。
+        child.stdin.write("/exit\n");
+      }
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, 5_000);
+    try {
+      const exitStatus = await new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
+      });
+      expect(sentExit).toBe(true);
+      expect(timedOut).toBe(false);
+      expect(exitStatus).toBe(0);
+      expect(stderr).toBe("");
+    } finally {
+      clearTimeout(deadline);
+      child.stdin.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  }, 8_000);
+
   it("exits before Session creation when model configuration is missing", async () => {
     const sessionDirectory = join(
       await createTemporaryDirectory("anthias-cli-missing-config-"),
@@ -293,16 +342,9 @@ async function createIsolatedAnthiasProject(): Promise<string> {
     `${JSON.stringify({ name: "anthias", private: true, type: "module" })}\n`,
     "utf8",
   );
-  const isolatedPackageScope = join(isolatedTuiRoot, "node_modules", "@anthias");
-  await mkdir(isolatedPackageScope, { recursive: true });
   await symlink(
-    fileURLToPath(new URL("../../agent", import.meta.url)),
-    join(isolatedPackageScope, "agent"),
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  await symlink(
-    fileURLToPath(new URL("../node_modules/string-width", import.meta.url)),
-    join(isolatedTuiRoot, "node_modules", "string-width"),
+    fileURLToPath(new URL("../node_modules", import.meta.url)),
+    join(isolatedTuiRoot, "node_modules"),
     process.platform === "win32" ? "junction" : "dir",
   );
   return anthiasProjectRoot;

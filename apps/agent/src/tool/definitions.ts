@@ -27,7 +27,7 @@ export type FixedToolName = ReadOnlyToolName | SideEffectToolName;
 
 /** 描述 Model Adapter 所需且不含 execute 回调的固定 Tool。 */
 export type ModelToolDefinition = Readonly<{
-  name: FixedToolName;
+  name: string;
   description: string;
   inputSchema: JSONSchema7;
 }>;

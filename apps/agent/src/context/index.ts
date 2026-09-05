@@ -27,6 +27,8 @@ export type RequestUsageTotals = Readonly<{
 
 /** 当前请求窗口与累计调用用量分别呈现，未知用量不会被计为零。 */
 export type ContextUsage = Readonly<{
+  externalTokens?: number;
+  toolDefinitionTokens?: number;
   contextWindow: number;
   inputTokens: number | null;
   source: "estimated" | "calibrated" | "unknown";
@@ -93,8 +95,12 @@ export function createContextController(options: {
     if (record.type === "request_usage")
       totals[record.purpose] = addUsage(totals[record.purpose], record.usage);
   }
+  let externalTokens = 0;
+  let toolDefinitionTokens = 0;
   function snapshot(): ContextUsage {
     return Object.freeze({
+      externalTokens,
+      toolDefinitionTokens,
       contextWindow: budget.contextWindow,
       inputTokens,
       source,
@@ -106,7 +112,9 @@ export function createContextController(options: {
   }
 
   function wrapRun(run: {
-    lease: SessionRunLease;
+    lease: Pick<SessionRunLease, "appendCompaction" | "appendRequestUsage">;
+    manual?: boolean;
+    extendRequest?: (request: ModelRequest) => ModelRequest;
     emit: (event: ContextEvent) => void;
     onFailure: (error: string) => void;
     onStorageFailure: () => void;
@@ -134,6 +142,14 @@ export function createContextController(options: {
     }
 
     const requestWithContext: ModelStream = async function* (rawRequest, abortSignal) {
+      const originalRequest = rawRequest;
+      rawRequest = run.extendRequest?.(rawRequest) ?? rawRequest;
+      externalTokens =
+        estimateModelRequestTokens({ ...rawRequest, messages: [], tools: [] }) -
+        estimateModelRequestTokens({ ...originalRequest, messages: [], tools: [] });
+      toolDefinitionTokens =
+        estimateModelRequestTokens({ ...rawRequest, messages: [], systemPrompt: "" }) -
+        estimateModelRequestTokens({ ...rawRequest, messages: [], systemPrompt: "", tools: [] });
       let projection = projectContextHistory(session.records ?? [], rawRequest.messages);
       let request: ModelRequest = {
         ...rawRequest,
@@ -187,7 +203,7 @@ export function createContextController(options: {
         const retainedTarget = Math.max(
           0,
           Math.min(
-            force ? Math.floor(budget.retainedTokens / 2) : budget.retainedTokens,
+            run.manual ? 0 : force ? Math.floor(budget.retainedTokens / 2) : budget.retainedTokens,
             threshold - fixedTokens - budget.summaryOutputTokens,
           ),
         );
@@ -259,6 +275,11 @@ export function createContextController(options: {
       }
 
       try {
+        if (run.manual) {
+          measure();
+          await compact(true);
+          return;
+        }
         if (measure().inputTokens >= threshold) await compact(false);
         let overflowRecoveryAttempted = false;
         for (;;) {
@@ -336,5 +357,27 @@ export function createContextController(options: {
         ),
     });
   }
-  return Object.freeze({ snapshot, wrapRun });
+  return Object.freeze({
+    snapshot,
+    wrapRun,
+    async compact(
+      request: ModelRequest,
+      signal: AbortSignal,
+      emit: (event: ContextEvent) => void,
+      onStorageFailure: () => void,
+    ) {
+      const wrapper = wrapRun({
+        lease: session,
+        manual: true,
+        emit,
+        onFailure: () => undefined,
+        onStorageFailure,
+      });
+      const iterator = wrapper.modelStream(request, signal);
+      // 手动压缩只消费摘要，沿用事实写锁；不会生成普通回复或虚构用户消息。
+      for await (const event of iterator) {
+        void event;
+      }
+    },
+  });
 }

@@ -1,0 +1,22 @@
+# Feature 006 Plan 01：全屏 TUI 与命令入口
+
+状态：已实现，待开发者验收
+
+## 开发者速览
+
+> **一句话**：用全屏、固定输入与稳定流式正文完成新的终端交互入口。<br>
+> **核心做法**：复用 pi TUI，命令定义与帮助/补全同源，保留纯文本降级。<br>
+> **边界**：只改 TUI；Session、Skill、MCP 通过 Spec 的 Agent 行为使用。<br>
+> **风险 / 未验证**：本地终端夹具和真实 CLI 验证通过；原生终端主观视觉、输入法与复制仍待验收。<br>
+> **当前 / 请审阅**：全屏、命令及实际 CLI 集成已完成，证据见 [Report](report.md)。
+
+对应 [Spec](spec.md) 与 [Tasks](tasks.md)。依赖锁定 `@earendil-works/pi-tui@0.84.1`，保留当前 Shiki。先核对实际发布包的 full-screen、Editor、Markdown、滚动和关闭行为。
+
+1. 拆出 terminal 生命周期、view 布局/呈现、content 与 command；复用旧安全文件引用与无颜色降级，不并行保留两套交互循环。
+2. 命令统一解析与参数校验；菜单使用同一目录，`//` 字面发送，普通 prompt 保持原文；接通 Spec 中 Agent 新行为。
+3. 完成流式 Markdown、未闭合代码、滚动跟随/停留、详情、完整 Workspace、多行输入与粘贴。
+4. 保留 Ctrl+C、EOF、审批和渲染失败关闭合同，按真实视口适配窄/矮窗口。
+
+验证由 TUI 执行 Agent 负责：运行其修改的 `apps/tui/test`，新增聚焦的 command/fullscreen 行为用例，记录实际命令与数量；使用 fake terminal 检查 same frame、单行变化、未闭合代码与滚动位置。根 Agent 再补真实编译 CLI 与本地模型/MCP 集成，不重复相同单元结果。
+
+若依赖不能可靠支持 Node 24、中文/窗口合同或终端资源关闭，先报告具体证据；不静默迁移 Bun 或放弃全屏。完成报告说明变更、验证、限制，后续材料汇入唯一 Report，不提交。

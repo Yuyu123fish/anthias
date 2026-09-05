@@ -45,7 +45,8 @@ Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复�
 - 首个模型接入继续使用通用 OpenAI-compatible 接口；DeepSeek V4 Flash 只是日常使用与联调的参考模型。
 - Electron 不再是产品前提；Desktop 的框架、进程模型和传输方式留给未来 Feature 决定。
 - [Feature 004](specs/feature004-tui-workspace-experience/spec.md) 的四个 Plan 已完成本地实现：可从任意目录或 `--workspace` 启动，Session 集中保存到 Anthias `data/conversation`；TUI 使用 `><°>` 分叉尾鱼标识、稳定 scrollback、动态运行区和常驻完整工作路径，并呈现 Visible Reasoning、可分页详情、Tool 活动、安全文件引用及 Shiki 代码高亮。自动门禁与 Windows ConPTY loopback 已通过；真实 DeepSeek 冒烟和 Windows Terminal 主观视觉检查仍是验收边界，因此 Feature 暂保持“实施中”。
-- [Feature 005](specs/feature005-context-engineering/spec.md) 已实现请求前预算、自动 Compaction、历史与模型上下文分离、Schema 2 恢复索引、按 UTC 时间归档、工具原文及 `read_artifact`、启动时清理两周未使用的会话，以及 AutoAllow 独立审核。`/context` 查看窗口与累计用量；[实施报告](specs/feature005-context-engineering/report.md) 记录实际验证边界。
+- [Feature 005](specs/feature005-context-engineering/spec.md) 已于 2026-09-05 由开发者验收，包含请求前预算、自动 Compaction、历史与模型上下文分离、Schema 2 恢复索引、按 UTC 时间归档、工具原文及 `read_artifact`、启动时清理两周未使用的会话，以及 AutoAllow 独立审核。`/context` 查看窗口与累计用量；[实施报告](specs/feature005-context-engineering/report.md) 记录实际验证边界。
+- [Feature 006](specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏固定面板与应用内滚动、流式 Markdown、统一 `/` 命令、会话切换与手动压缩、按需加载外部 Skill、显式连接 MCP。当前全屏交互替代 Feature 004 的 scrollback 方案；[实施报告](specs/feature006-command-skill-mcp-tui/report.md) 记录本地验证，等待开发者终端体验验收。
 - 可用的对话 fork、执行分叉、候选比较和 Desktop 尚未实现。
 
 ## 文档入口

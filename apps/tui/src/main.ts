@@ -73,7 +73,12 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  return runTui({ agent: agentCreationResult.agent });
+  try {
+    return await runTui({ agent: agentCreationResult.agent });
+  } finally {
+    // 暂停输入仍可能保留 Windows 管道引用；业务与终端关闭后再释放，避免提前结束清理。
+    process.stdin.unref?.();
+  }
 }
 
 try {

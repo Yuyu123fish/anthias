@@ -13,6 +13,14 @@ export type {
   ToolApprovalRequest,
   ToolApprovalResponse,
 } from "./agent.js";
+export type {
+  ActionResult,
+  AgentOperation,
+  McpCapabilities,
+  McpServerSummary,
+  SessionSummary,
+  SkillSummary,
+} from "./agent-controls.js";
 export type { ContextUsage, RequestUsageTotals } from "./context/index.js";
 export type {
   AssistantContentPart,

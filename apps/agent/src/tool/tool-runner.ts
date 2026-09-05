@@ -53,7 +53,7 @@ type ToolExecutionUpdate = Readonly<{
 
 /** 描述副作用 Tool 在执行前必须展示的一次性确认。 */
 export type ToolApprovalPlan = Readonly<{
-  toolName: "edit_file" | "write_file" | "execute_command";
+  toolName: string;
   target: string;
   preview: string;
   ruleId: string;

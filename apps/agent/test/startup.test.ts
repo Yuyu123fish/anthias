@@ -90,6 +90,7 @@ describe("createAgentFromEnvironment", () => {
     expect(creationResult.ok).toBe(true);
     if (creationResult.ok) {
       expect(creationResult.agent.state).toEqual({
+        operation: null,
         sessionId: expect.any(String),
         workspaceRoot,
         permissionMode: "agent",

@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003 已验收；Feature 004 的主观终端视觉仍待验收；Feature 005 已实现，有限真实模型证据见其 Report。
+状态：Feature 003、005 已验收；Feature 006 已实现并完成本地验证，主观终端体验待验收；真实外部调用证据按各 Feature Report 区分。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -42,7 +42,9 @@ Agent 持有消息 transcript、当前流式消息、是否正在运行以及取
 - 在空闲时查看或切换 Agent / Plan / AutoAllow 权限模式；
 - 响应当前待决的 Tool approval；
 - 取消当前运行，或关闭 Agent 并等待资源释放；
-- 订阅 AgentEvent，并能取消订阅。
+- 订阅 AgentEvent，并能取消订阅；
+- 通过 `sessions.list/create/open` 切换同 Workspace 会话，使用 `compact()` 主动压缩；
+- 通过 `skills.list/reload/activate` 与 `mcp.list/connect/disconnect/inspect/readResource/getPrompt` 管理外部能力；这些普通函数对象返回安全摘要，不暴露 SDK 或持久化句柄。
 
 Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。生产启动工厂隐藏模型配置解析与 Adapter 构造；Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
 
@@ -54,9 +56,9 @@ Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 Ab
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
-当前 TUI 继续复用 Node.js `readline` 的单行编辑能力，但输出由内部 Terminal Conversation Module 管理：interactive Terminal Driver 提交稳定 scrollback 并原位替换底部动态区，plain Driver 只做无控制序列的确定性追加。动态区持续显示输入、完整 Workspace、模式、Session 与 Run 状态；Visible Reasoning 默认保留最近四行并在结束后折叠，`/details` 可查看本进程内的完整 Reasoning 和按 `toolCallId` 归属的 Tool 输出，内容超过可用高度时用 `/details prev|next` 分页。resize 不重写历史；运行中低于安全尺寸或无法容纳完整底栏时，把完整上下文提交到稳定区并暂停 prompt / approval，放大后恢复。关闭路径恢复 raw mode、光标与监听器。
+当前 TUI 复用 `@earendil-works/pi-tui` 的 `TuiAltScreen`、Editor、ScrollView 与 Markdown。全屏固定 Workspace、输入和状态，正文由应用内滚动；模型事件按顺序更新呈现状态，合并到差量同步帧，未闭合代码块立即显示。用户向上阅读时保留位置，回到末尾才恢复跟随；宽屏详情与正文并列，窄屏覆盖。退出恢复终端模式、光标与监听器。
 
-Feature 004 同时让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。单一 Content Renderer 会安全化模型文本，经 Workspace 校验的文件引用使用可降级标识与 OSC 8，已标记 fenced code 由 lazy Shiki Core 着色。Unicode 显示宽度由 `string-width@8.2.2` 处理；终端能力在 TUI 边界显式探测或注入，非 TTY 强制关闭颜色与 hyperlink。
+文件引用继续经过 Workspace 校验；外部文本先安全化，lazy Shiki 失败或延迟不阻塞输入。Unicode 宽度使用 pi TUI 的实现，非 TTY 仍为无控制序列的纯文本路径。CLI 从任意 cwd 或 --workspace 启动，Agent 的 Workspace 与 Anthias data/conversation 分别装配。
 
 ### 未来 Desktop 适配器
 
@@ -64,9 +66,9 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 ## 事件方向
 
-AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 通过自己的串行 render queue 保留该顺序，不通过事件反向控制 Agent。
+AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed。
 
-Session 使用 Schema 2 JSONL，持久化完整消息、压缩、调用用量、审批、副作用开始事实、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
+Session 使用 Schema 2 JSONL，持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
 ## 模型配置方向
 
@@ -82,6 +84,12 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 已知 deepseek-v4-flash 使用内置模型能力数据，不需要手工配置安全余量。自定义模型还必须声明 ANTHIAS_MODEL_CONTEXT_WINDOW；ANTHIAS_MODEL_MAX_OUTPUT_TOKENS 可声明输出能力。ANTHIAS_RESPONSE_MAX_TOKENS、ANTHIAS_COMPACTION_MAX_TOKENS、ANTHIAS_CONTEXT_KEEP_TOKENS 分别控制普通输出、摘要输出和保留原文目标，默认 16,000 / 8,000 / 32,000；安全余量固定 20,000。所有数值在 Agent 启动时校验，TUI 不读取这些配置。
 
 上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史。恢复索引与 JSONL 分开，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 的审核是同一模型的独立请求，最多 8,000 输入 / 2,000 输出，不能调用工具或把摘要、工具结果当成授权。
+
+## 外部能力
+
+Skill 使用用户和项目 `.agents/skills`，扩展路径通过 `ANTHIAS_SKILL_DIRS` 传入。目录只保留有界元数据，正文与引用分别按需读取；实际内容作为 Session 来源事实保存，恢复保留已保存版本，文件变化给出诊断。外部指令和参考资料始终计入后续请求预算，压缩不把它们变为真实用户授权。
+
+MCP 使用官方 TypeScript 客户端。配置发现与连接分开，`/mcp connect` 才启动 stdio 进程或 HTTP 连接。工具经 schema 与连接版本校验、现有权限/AutoAllow、开始事实和产物链执行；Plan 拒绝未知外部工具。资源按 URI 读取，模板由用户选择，其内容保持外部来源。配置格式及环境变量引用见 [Quick Start](../quick-start.md)，协议验证范围见 [Feature 006 Report](../specs/feature006-command-skill-mcp-tui/report.md)。
 
 ## 设计约束
 

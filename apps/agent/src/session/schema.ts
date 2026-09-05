@@ -22,7 +22,7 @@ export type RunFinishedDetails = Readonly<{
 /** 描述一个已经批准、即将在本地发生副作用的 ToolCall。 */
 export type ToolExecutionStartedDetails = Readonly<{
   toolCallId: string;
-  toolName: "edit_file" | "write_file" | "execute_command";
+  toolName: string;
   toolApprovalRequestId: string;
 }>;
 
@@ -222,7 +222,19 @@ export type ApprovalDecisionRecord = SessionEntryBase &
   }>;
 
 /** 枚举 Schema 2 允许出现在 Header 之后的持久记录。 */
+export type ContextSourceDetails = Readonly<{
+  sourceId: string;
+  kind: "skill" | "skill_reference" | "mcp_resource" | "mcp_prompt";
+  label: string;
+  fingerprint: string;
+  content: string | null;
+}>;
+/** 外部内容不属于用户消息，恢复和压缩均不能将其提升为授权来源。 */
+export type ContextSourceRecord = SessionEntryBase &
+  ContextSourceDetails &
+  Readonly<{ type: "context_source"; runId?: string }>;
 export type SessionRecord =
+  | ContextSourceRecord
   | MessageRecord
   | ToolExecutionStartedRecord
   | RunFinishedRecord
@@ -278,6 +290,36 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
   const value = parseJsonObject(line);
   if (!hasValidEntryIdentity(value, expectedSequence, true)) {
     throw new Error("Session record identity 无效。");
+  }
+  if (value.type === "context_source") {
+    if (
+      !hasExactKeysWithOptionalRunId(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "sourceId",
+        "kind",
+        "label",
+        "fingerprint",
+        "content",
+      ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
+      !isNonEmptyString(value.sourceId) ||
+      value.sourceId.length > 2048 ||
+      !["skill", "skill_reference", "mcp_resource", "mcp_prompt"].includes(String(value.kind)) ||
+      typeof value.label !== "string" ||
+      value.label.length > 2048 ||
+      typeof value.fingerprint !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.fingerprint) ||
+      !(
+        value.content === null ||
+        (typeof value.content === "string" && Buffer.byteLength(value.content) <= 128 * 1024)
+      )
+    )
+      throw new Error("ContextSourceRecord 无效。");
+    return value as ContextSourceRecord;
   }
   if (value.type === "message") {
     if (
@@ -776,8 +818,9 @@ function validateToolExecutionApproval(
 
 function isRunAssociatedFact(
   record: SessionRecord,
-): record is CompactionRecord | RequestUsageRecord | ApprovalDecisionRecord {
+): record is CompactionRecord | RequestUsageRecord | ApprovalDecisionRecord | ContextSourceRecord {
   return (
+    record.type === "context_source" ||
     record.type === "compaction" ||
     record.type === "request_usage" ||
     record.type === "approval_decision"
@@ -1091,7 +1134,12 @@ function isToolResultStatus(value: unknown): boolean {
 export function isSideEffectToolName(
   value: unknown,
 ): value is ToolExecutionStartedDetails["toolName"] {
-  return value === "edit_file" || value === "write_file" || value === "execute_command";
+  return (
+    value === "edit_file" ||
+    value === "write_file" ||
+    value === "execute_command" ||
+    (typeof value === "string" && /^mcp_[a-zA-Z0-9_-]+$/.test(value))
+  );
 }
 
 function isJsonValue(value: unknown): value is JsonValue {

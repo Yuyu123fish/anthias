@@ -263,6 +263,7 @@ describe("Agent", () => {
 
     expect(promptResult).toEqual({ status: "completed" });
     expect(agent.state).toEqual({
+      operation: null,
       messageHistory: [
         { role: "user", content: "你好" },
         {
@@ -542,6 +543,7 @@ describe("Agent", () => {
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
+      appendContextSource: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -558,6 +560,7 @@ describe("Agent", () => {
               }
             },
             async appendToolExecutionStarted() {},
+            async appendContextSource() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -605,6 +608,7 @@ describe("Agent", () => {
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
+      appendContextSource: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -622,6 +626,7 @@ describe("Agent", () => {
             async appendToolExecutionStarted() {
               throw new Error("must not append ToolExecutionStarted");
             },
+            async appendContextSource() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -674,6 +679,7 @@ describe("Agent", () => {
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
+      appendContextSource: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -688,6 +694,7 @@ describe("Agent", () => {
               appendedMessageCount += 1;
             },
             async appendToolExecutionStarted() {},
+            async appendContextSource() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -736,6 +743,7 @@ describe("Agent", () => {
         sessionDirectory: "C:\\workspace\\data\\conversation",
         storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
         records: Object.freeze([]),
+        appendContextSource: async () => undefined,
         appendCompaction: async () => undefined,
         appendRequestUsage: async () => undefined,
         appendApprovalDecision: async () => undefined,

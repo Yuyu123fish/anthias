@@ -1,25 +1,26 @@
 # Feature 005：上下文工程与自主审批
 
-状态：已实现
+状态：已验收
 
 ## 开发者速览
 
 > **一句话**：让长任务能够压缩上下文后继续，减少重复确认，并有序保存和清理会话数据。<br>
 > **核心做法**：发送前检查预算，历史与模型上下文分离，工具大输出落盘，AutoAllow 独立审核。<br>
 > **边界**：按创建时间组织 Session；本次只扩展分叉所需的存储基础，不提供 fork 功能或 OS 沙箱。<br>
-> **风险 / 未验证**：token 估算、摘要质量和自动审核仍需验证，已有会话迁移与清理必须可恢复。<br>
-> **当前 / 请审阅**：开发者已授权按三个 Plan 连续实施并分阶段提交，当前进入 Plan 01。
+> **风险 / 未验证**：限量冒烟不证明长期摘要与审核质量，Feature 004 主观终端体验仍待验收。<br>
+> **当前 / 请审阅**：三个 Plan 已完成，开发者于 2026-09-05 接受 Feature 005 实现。
 
 - 文档类型：Spec
 - Feature 目录：`feature005-context-engineering`
 - 核验日期：2026-09-05
 - 开发者确认日期：2026-09-05
+- 开发者验收日期：2026-09-05；验收范围与验证边界见 [Report](report.md)。
 - 代码基线：`main`，`2eb5ab9f8100d9d9349b231fe61ee2a4f5cf52b8`
 - 关联基线：[产品定义](../../docs/product-definition.md)、[技术基线](../../docs/technical-baseline.md)、[Feature 003](../feature003-tool-execution-safety/spec.md)、[Feature 004](../feature004-tui-workspace-experience/spec.md)
 - 执行授权：2026-09-05，开发者要求逐 Plan 编写文档与 Tasks、文档提交、实施验收和实现提交，连续完成 Feature；该授权覆盖本 Feature 的实施与上述提交，不包含推送或 PR。
 - 真实模型授权：使用环境变量 DEEPSEEK_API_KEY 与 deepseek-v4-flash 做必要、少量验证；整个 Feature 最多 6 次真实模型请求（含失败尝试），优先使用确定性本地测试，密钥不进入输出或文件。
 - 本 Feature 不改变 Feature 004 的主观终端验收状态。
-- 当前计划：[Plan 01](plan-01-session-and-artifact-lifecycle.md)；统一任务：[tasks.md](tasks.md)。
+- 已完成计划：[Plan 01](plan-01-session-and-artifact-lifecycle.md)、[Plan 02](plan-02-context-budget-and-compaction.md)、[Plan 03](plan-03-auto-allow.md)；统一任务：[tasks.md](tasks.md)。
 
 ## 1. 问题与目标
 
