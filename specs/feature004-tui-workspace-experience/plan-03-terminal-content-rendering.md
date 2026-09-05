@@ -8,7 +8,7 @@
 > **核心做法**：建立内部 Content Renderer，以 Shiki Core 按需着色，并在校验后生成文件标识和链接。<br>
 > **边界**：只支持 Spec 的 Markdown 子集，不做完整 CommonMark、自动语言猜测或 LSP。<br>
 > **风险 / 未验证**：异步顺序、控制序列注入、Unicode 宽度与 Shiki 首次加载最易出错。<br>
-> **当前 / 请审阅**：已实现；内容、文件与代码渲染门禁通过，提交后连续进入 Plan 04。
+> **当前 / 请审阅**：已实现并提交为 `83d2bba`；内容、文件与代码渲染门禁通过。
 
 - 对应 Spec：[spec.md](spec.md)
 - 技术依据：[终端内容渲染 Research](research-terminal-rendering.md)

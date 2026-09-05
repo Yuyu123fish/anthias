@@ -8,7 +8,7 @@
 > **核心做法**：CLI 分别解析 Workspace、Anthias Project Root 和 Session Directory，再显式装配 Agent。<br>
 > **边界**：保留现有行式 TUI，不提前实现 Reasoning、Shiki 或动态终端布局。<br>
 > **风险 / 未验证**：模块位置解析、Windows 路径、Session mismatch 和旧目录兼容最易出错。<br>
-> **当前 / 请审阅**：已实现；T001–T003 与完整门禁通过，等待开发者审查。
+> **当前 / 请审阅**：已实现并提交为 `8b2f2f8`；T001–T003 与完整门禁通过。
 
 - 对应 Spec：[spec.md](spec.md)
 - 任务事实源：[tasks.md](tasks.md)
@@ -99,5 +99,4 @@ pnpm check
 ## 6. 汇报与停止
 
 - Report 记录已成立的路径语义、调用链、错误与验证，不声称新 TUI 已完成。
-- 本 Plan 完成后必须停止，等待开发者检查，再进入 Plan 02。
-- 本轮文档提交已授权；本 Plan 的代码提交、推送和 PR 未授权。
+- 本 Plan 已按开发者后续连续实施授权完成独立提交；推送和 PR 未授权。

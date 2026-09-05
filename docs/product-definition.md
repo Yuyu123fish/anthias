@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 实施中，Plan 01–03 已实现。
+状态：产品路线与 Coding Harness 方向已确认；Feature 003 已验收，Feature 004 四个 Plan 已完成本地实现、外部验收待补。
 
 2026-08-30，开发者撤销了此前围绕 Java/JVM 形成的产品与技术决定，并确认 Anthias 的长期路线是做一个可分叉的 Coding Agent。
 
@@ -52,11 +52,12 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 
 ## 当前实现状态
 
-- 仓库已有可构建、可启动的 Agent 与行式 TUI；生产 OpenAI-compatible Model Adapter、线性 Session、Tool 和运行生命周期位于 Agent Module 内部，TUI 不持有这些行为权威。
+- 仓库已有可构建、可启动的 Agent 与对话式 TUI；生产 OpenAI-compatible Model Adapter、线性 Session、Tool 和运行生命周期位于 Agent Module 内部，TUI 不持有这些行为权威。
 - 旧的 Electron Desktop、Utility Process Host、JSON-RPC、Protocol DTO 和 Renderer 状态投影已经撤销。
 - Feature 001–003 已累计实现多轮模型与 Tool 循环、六个固定 Tool、线性 JSONL Session、工作区文件和命令能力、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策与只读 Tool 四并发；Feature 003 已由开发者验收。
 - 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider、外部网络和长期人工终端体验尚未验证。
-- 当前 TUI 仍是追加文本的行式界面。[Feature 004](../specs/feature004-tui-workspace-experience/spec.md) 正在实施：Plan 01 已实现任意工作目录启动、显式 Workspace 选择、Workspace Root 与默认 Anthias `data/conversation` 分离，以及输入旁完整工作路径呈现，等待开发者审查。新的视觉层级、Reasoning、Tool 活动、文件标识和 Shiki 高亮仍未实现。
+- [Feature 004](../specs/feature004-tui-workspace-experience/spec.md) 已在本地实现现代对话层级：稳定 scrollback 与底部动态区域并存，完整 Workspace、模式、Session 和 Run 状态持续可见；Visible Reasoning 自动折叠并可用 `/details` 回看，超出终端高度时通过 `/details prev|next` 分页；Tool 按 `toolCallId` 呈现摘要与详情，Assistant 文件引用经 Workspace 校验，已标记代码块由 Shiki 按需着色。运行中窗口小到无法安全保留上下文时会暂停提交和确认，放大后恢复；非 TTY、无颜色和无 Unicode 均有等价降级。
+- Feature 004 的自动门禁和 Windows ConPTY loopback 已通过；真实 DeepSeek V4 Flash 冒烟与 Windows Terminal 主观视觉检查尚未完成，因此尚未进入“已实现”状态。
 - Compaction、Desktop、检查点、执行分支和候选比较尚未实现。
 
 ## 核心产品术语
@@ -101,7 +102,6 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 ## 仍需回答的问题
 
 - Anthias 首先聚焦哪一种具体编码任务和用户工作流；
-- 新 TUI 的具体交互方式、终端渲染技术、输入能力与降级策略；
 - 是否为旧 Workspace 内 Session 提供单独迁移能力；当前合同是不扫描、不迁移、不删除；
 - 何时需要 Desktop，以及 Desktop 是否需要独立本地进程；
 - 哪个场景最能证明分叉比线性执行更有价值；
@@ -114,5 +114,5 @@ Coding Harness 是 Anthias 在执行分叉之前需要建立的运行基础，�
 - 当前确认的是产品路线、Coding Harness 近期目标、交互形态无关原则和 TUI 优先顺序。
 - TypeScript、`apps/agent` 与 `apps/tui` 布局、Agent 内部 Model Adapter、线性 Session、固定 Tool、Permission Mode 与安全策略已经由 Feature 001–003 和 lockfile 形成当前基线。
 - Feature 003 已于 2026-09-04 由开发者验收；没有 OS 沙箱、未调用真实 Provider，以及未进行长期人工终端体验仍是明确边界。
-- Feature 004 的 Spec、四个 Plan 与 Tasks 已由开发者确认。Plan 01 已完成实现与约定验证、等待审查；Shiki 已确定为后续 TUI 代码高亮方案，但新的视觉、Reasoning、Tool 活动和内容渲染在对应 Plan 完成前不能写成已实现能力。
+- Feature 004 的 Spec、四个 Plan 与 Tasks 已由开发者确认，四个 Plan 的本地实现与约定验证均已完成。Shiki 是唯一代码高亮实现；真实 Provider 与主观终端视觉没有证据前，Feature 仍保持“实施中”。
 - 归档 Research 和历史实现可以提供反例与证据，但不能自动恢复旧决定。

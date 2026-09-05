@@ -34,13 +34,17 @@ describe("Assistant Content Renderer", () => {
     });
 
     await expect(renderer.push("Before `src/ex")).resolves.toBe("");
+    expect(renderer.preview()).toBe("Before `src/ex");
     await expect(renderer.push("ample.ts:1`\n```ts\nconst value")).resolves.toBe(
       "Before ▧ src/example.ts:1\n",
     );
+    expect(renderer.preview()).toBe("```ts\nconst value");
     await expect(renderer.push(": number = 42;\n```\nAfter")).resolves.toBe(
       "╭─ ts\nconst value: number = 42;\n╰─\n",
     );
+    expect(renderer.preview()).toBe("After");
     await expect(renderer.finish()).resolves.toBe("After");
+    expect(renderer.preview()).toBe("");
   });
 
   it("links only real local files inside the Workspace and keeps line data in the label", async () => {

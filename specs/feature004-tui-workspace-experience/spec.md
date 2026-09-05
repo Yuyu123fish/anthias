@@ -7,8 +7,8 @@
 > **一句话**：从任意项目启动 Anthias，呈现文件、代码、Reasoning 与 Tool 周期。<br>
 > **核心做法**：Session 归 Anthias `data`；TUI 常驻路径，Shiki 高亮代码并收起思考。<br>
 > **边界**：只显示 Provider 给出的 Reasoning；不含完整 Markdown、Session 管理器或 OS 沙箱。<br>
-> **风险 / 未验证**：终端能力、Shiki 性能、Provider 差异和 Windows 清理待验证。<br>
-> **当前 / 请审阅**：实施中；Plan 01–02 已提交，Plan 03 已完成并准备提交，随后连续实施 Plan 04。
+> **风险 / 未验证**：真实 DeepSeek Provider 与 Windows Terminal 主观视觉仍待授权或人工验收。<br>
+> **当前 / 请审阅**：四个 Plan 的本地实现、自动门禁与 Windows ConPTY loopback 已完成；外部验收未齐，暂不标为“已实现”。
 
 - 文档类型：Spec
 - Feature 目录：`feature004-tui-workspace-experience`
@@ -328,6 +328,7 @@ Session 7b4c2a91 │ Ctrl+C 退出
 - 模型正文、Reasoning、Tool 输出、路径和命令中的 ESC、OSC 及其他可执行终端控制序列必须在测量与渲染前移除或转义；只有 TUI renderer 可以产生 ANSI 样式与 OSC 8。
 - 语法高亮器不支持语言、输入超过安全上限或自身失败时，代码块原样降级为无配色文本，不能导致 Assistant 消息或整个 TUI 失败。
 - 调整终端宽度时只重排当前动态区域，不重复历史消息、不覆盖 prompt、不破坏正在输入的文本。
+- 运行中窗口小到无法安全容纳完整上下文时，必须重新显示完整 Workspace、模式、Session 与状态并暂停 prompt / approval；不能隐藏决策上下文后继续执行，放大后自动恢复。
 - TUI 初始化或渲染失败时必须恢复 raw mode、光标、监听器和订阅；不得留下无法输入的终端。
 - 模型配置、Workspace、Session Directory 或 Session Header 失败时，显示具体可操作原因，返回非零退出码，并且不发起模型请求或 Tool 副作用。
 - Session busy、Session changed 和 Workspace mismatch 保持不同错误，不合并成无法判断原因的“启动失败”。
@@ -379,7 +380,7 @@ Session 7b4c2a91 │ Ctrl+C 退出
 14. 并发 Tool 乱序结束时，每个 update、end 与 ToolResult 仍显示在正确 Tool 下，Reasoning 或正文刷新也不能覆盖其他条目。
 15. approval 完整展示 Feature 003 已有模式、目标、预览、风险与执行边界；无效、重复或过期响应不能执行 Tool。
 16. activeRun 与 idle 下的 `Ctrl+C`、`/exit`、EOF 和模式命令保持既有行为，退出后没有监听器、隐藏光标、raw mode 或活动资源残留。
-17. 调整到窄终端再恢复宽度时，不重复历史、不丢输入，完整 Workspace 路径仍然可见，活动 Reasoning 仍受高度上限约束。
+17. 调整到窄终端再恢复宽度时，不重复历史、不丢输入，完整 Workspace 路径仍然可见，活动 Reasoning 仍受高度上限约束；低于安全尺寸时暂停提交 / approval，放大后恢复。
 18. 无颜色、无 Unicode 和非 TTY 三种降级模式都保留等价状态；非 TTY 输出不含 ANSI 或 OSC 控制序列。
 19. TUI 仍只依赖 Agent 公共 Interface；Session Schema 1 保持兼容，Model Stream、Provider、Policy 和 ToolRunner 不从 package 入口泄漏。
 20. `pnpm verify` 通过；人工 Windows Terminal 验收先使用确定性本地 Agent 或 loopback，再以 Plan 模式运行一次已授权的 DeepSeek V4 Flash 冒烟。真实凭据只从 `DEEPSEEK_API_KEY` 临时映射给通用 Adapter，不进入输出、日志、Session 或仓库。
@@ -399,7 +400,7 @@ Session 7b4c2a91 │ Ctrl+C 退出
 
 ## 16. 确认边界
 
-- 本 Spec 与四个 Plan 已由开发者确认，Feature 进入“已计划”；开发者同时授权提交本轮文档，并在提交后直接实施 Plan 01。
+- 本 Spec 与四个 Plan 已由开发者确认并完成本地实现；Feature 仍等待真实 Provider 与 Windows Terminal 主观视觉验收，当前保持“实施中”。
 - Shiki 已经确定为唯一语法高亮库。其 package 入口、首批 grammar 的具体导入、主题映射、缓存生命周期与性能预算，以及内部组件拆分、统一详情快捷键和本地 link 命令，由 Plan 根据 Research 固定，但不能改用其他 highlighter，也不能改变本 Spec 的路径、Reasoning、所有权、用户流程和失败合同。
 - 如果实现需要持久化 Reasoning、改变 Session Schema、自动切换 Session Workspace、增加 Session 管理器或扩展 Tool/Permission Policy，必须停止并回到 Spec。
 - 开发者最新授权要求连续实施完整 Feature，并在每个 Plan 完成后各做一次本地提交；推送和 PR 仍不在授权范围内。

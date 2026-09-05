@@ -79,92 +79,180 @@ export function classifyCommandSafety(commandText: string): ToolPolicyDecision {
   );
 }
 
-/** 在有限递归内检查直接命令与字面量 Shell wrapper。 */
+/** 在有限递归内检查真正的命令位置与字面量 Shell wrapper。 */
 function findHardDanger(commandText: string, wrapperDepth: number): HardDanger | null {
-  const directDanger = findDirectHardDanger(commandText);
-  if (directDanger !== null) {
-    return directDanger;
+  const { commands, unquotedText } = scanLiteralCommands(commandText);
+  if (/:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/u.test(unquotedText)) {
+    return danger("danger.fork_bomb", "命令是会耗尽进程资源的 fork bomb。");
   }
-  const wrappedCommand = extractLiteralWrappedCommand(commandText);
-  if (wrappedCommand === null) {
-    return null;
+  for (const redirection of unquotedText.matchAll(/>{1,2}/gu)) {
+    if (/^>{1,2}\s*["']?\/dev\/sd[a-z0-9]*/iu.test(commandText.slice(redirection.index))) {
+      return danger("danger.device_overwrite", "命令会通过重定向覆盖磁盘设备。");
+    }
   }
-  if (wrapperDepth >= 3) {
-    return Object.freeze({
-      ruleId: "danger.opaque_command",
-      riskSummary: "Shell wrapper 嵌套过深，无法向用户提供可信的待执行文本。",
-    });
+
+  let carriesRemoteOutput = false;
+  for (const command of commands) {
+    const literalCommand = normalizeCommandPosition(command.commandText);
+    if (!command.followsPipe) {
+      carriesRemoteOutput = false;
+    }
+    if (
+      carriesRemoteOutput &&
+      /^(?:sh|bash|pwsh|powershell|iex|invoke-expression)(?:\.exe)?\b/iu.test(literalCommand)
+    ) {
+      return danger("danger.remote_script_execution", "命令会把远程脚本内容直接交给解释器执行。");
+    }
+    carriesRemoteOutput ||= /^(?:curl|wget|iwr|invoke-webrequest)(?:\.exe)?\b/iu.test(
+      literalCommand,
+    );
+
+    const directDanger = findDirectHardDanger(literalCommand);
+    if (directDanger !== null) {
+      return directDanger;
+    }
+    const wrappedCommand = extractLiteralWrappedCommand(literalCommand);
+    if (wrappedCommand === null) {
+      continue;
+    }
+    if (wrapperDepth >= 3) {
+      return danger(
+        "danger.opaque_command",
+        "Shell wrapper 嵌套过深，无法向用户提供可信的待执行文本。",
+      );
+    }
+    const wrappedDanger = findHardDanger(unwrapLiteral(wrappedCommand), wrapperDepth + 1);
+    if (wrappedDanger !== null) {
+      return wrappedDanger;
+    }
   }
-  return findHardDanger(unwrapLiteral(wrappedCommand), wrapperDepth + 1);
+  return null;
 }
 
-/** 检查无需执行或解释脚本即可确认的危险文本类别。 */
+/** 只识别引号外的语句与管道边界；不展开变量，也不解释脚本语法。 */
+function scanLiteralCommands(commandText: string): Readonly<{
+  commands: readonly Readonly<{ commandText: string; followsPipe: boolean }>[];
+  unquotedText: string;
+}> {
+  const commands: { commandText: string; followsPipe: boolean }[] = [];
+  const syntaxCharacters = commandText.split("");
+  let quote: string | null = null;
+  let commandStartIndex = 0;
+  let followsPipe = false;
+  for (let index = 0; index < commandText.length; index += 1) {
+    const character = commandText[index];
+    if (
+      quote !== "'" &&
+      (character === "`" || (character === "\\" && quote === '"' && commandText[index + 1] === '"'))
+    ) {
+      syntaxCharacters[index] = " ";
+      if (index + 1 < commandText.length) {
+        syntaxCharacters[++index] = " ";
+      }
+      continue;
+    }
+    if (quote !== null) {
+      syntaxCharacters[index] = " ";
+      if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      syntaxCharacters[index] = " ";
+      continue;
+    }
+    if (character !== undefined && /[;&|\r\n]/u.test(character)) {
+      const literalCommand = commandText.slice(commandStartIndex, index).trim();
+      if (literalCommand.length > 0) {
+        commands.push({ commandText: literalCommand, followsPipe });
+      }
+      if (literalCommand.length > 0 || (character !== "\r" && character !== "\n")) {
+        followsPipe =
+          character === "|" && commandText[index - 1] !== "|" && commandText[index + 1] !== "|";
+      }
+      commandStartIndex = index + 1;
+    }
+  }
+  const lastCommand = commandText.slice(commandStartIndex).trim();
+  if (lastCommand.length > 0) {
+    commands.push({ commandText: lastCommand, followsPipe });
+  }
+  return { commands, unquotedText: syntaxCharacters.join("") };
+}
+
+/** 只还原命令首个字面量名称，参数中的危险词仍保持普通文本。 */
+function normalizeCommandPosition(commandText: string): string {
+  const executableText = commandText.replace(/^sudo\s+(?:--\s+)?/iu, "");
+  const commandMatch = /^(?:"([^"]+)"|'([^']+)'|([^\s]+))([\s\S]*)$/u.exec(executableText);
+  const commandPath = commandMatch?.[1] ?? commandMatch?.[2] ?? commandMatch?.[3];
+  if (commandPath === undefined) {
+    return commandText;
+  }
+  const commandName = commandPath.replaceAll("\\", "/").split("/").at(-1) ?? commandPath;
+  return /\s/u.test(commandName) ? commandText : `${commandName}${commandMatch?.[4] ?? ""}`;
+}
+
+/** 检查无需执行或解释脚本即可确认的危险命令与参数组合。 */
 function findDirectHardDanger(commandText: string): HardDanger | null {
+  // -Command / -File 后属于脚本参数，不能把内部 node -e 等误判为 Shell 编码选项。
+  const shellOptions = commandText.split(/\s-(?:command|c|file|f)\s/iu, 1)[0] ?? commandText;
   if (
-    /\b(?:pwsh|powershell)(?:\.exe)?\b[^\r\n]*(?:-(?:enc|encodedcommand|encodedarguments))\b/iu.test(
-      commandText,
+    /^(?:pwsh|powershell)(?:\.exe)?\b[^\r\n]*\s-(?:e|en|enc|encodedcommand|encodedarguments)\b/iu.test(
+      shellOptions,
     ) ||
-    /(?:^|[;&|]\s*)(?:invoke-expression|iex)\b/iu.test(commandText)
+    /^(?:invoke-expression|iex|eval)\b/iu.test(commandText)
   ) {
     return danger("danger.opaque_command", "命令使用编码载荷或动态求值，无法进行可信人工审阅。");
   }
   if (
-    /\b(?:curl|wget)(?:\.exe)?\b[\s\S]*\|\s*(?:ba)?sh\b/iu.test(commandText) ||
-    /\b(?:curl|wget|iwr|invoke-webrequest)(?:\.exe)?\b[\s\S]*\|\s*(?:pwsh|powershell|iex|invoke-expression)\b/iu.test(
+    /^rm(?:\.exe)?\b(?=[\s\S]*\s(?:-[a-z]*r[a-z]*|--recursive)\b)[\s\S]*\s["']?\/["']?(?=\s|$)/iu.test(
       commandText,
     )
   ) {
-    return danger("danger.remote_script_execution", "命令会把远程脚本内容直接交给解释器执行。");
+    return danger("danger.unix_root_recursive_delete", "命令会递归删除 Unix 根目录。");
   }
-  if (
-    /\brm(?:\.exe)?\b(?=[^;\r\n|]*\s(?:-[a-z]*r[a-z]*|--recursive)\b)(?=[^;\r\n|]*\s(?:-[a-z]*f[a-z]*|--force)\b)[^;\r\n|]*\s(?:--\s+)?["']?\/["']?(?:\s*(?:$|[;&|]))/iu.test(
-      commandText,
-    )
-  ) {
-    return danger("danger.unix_root_recursive_delete", "命令会递归强制删除 Unix 根目录。");
-  }
-  if (/\bmkfs\.[a-z0-9_-]+\b/iu.test(commandText)) {
+  if (/^mkfs(?:\.[a-z0-9_-]+)?(?:\s|$)/iu.test(commandText)) {
     return danger("danger.disk_format", "命令会格式化磁盘或分区。");
   }
-  if (/\bdd\b(?=[\s\S]*\bif\s*=)(?=[\s\S]*\bof\s*=\s*["']?\/dev\/)/iu.test(commandText)) {
+  if (/^dd\b[\s\S]*\bof\s*=\s*["']?\/dev\//iu.test(commandText)) {
     return danger("danger.raw_disk_write", "命令会直接写入磁盘设备。");
   }
-  if (/\bchmod\s+-R\s+777\s+["']?\/["']?(?:\s*(?:$|[;&|]))/iu.test(commandText)) {
+  if (/^chmod\s+-R\s+777\s+["']?\/["']?(?=\s|$)/iu.test(commandText)) {
     return danger("danger.root_permission_change", "命令会递归放开 Unix 根目录权限。");
   }
-  if (/:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/u.test(commandText)) {
-    return danger("danger.fork_bomb", "命令是会耗尽进程资源的 fork bomb。");
-  }
-  if (/(?:^|[^>])>{1,2}\s*["']?\/dev\/sd[a-z0-9]*/iu.test(commandText)) {
-    return danger("danger.device_overwrite", "命令会通过重定向覆盖磁盘设备。");
-  }
   if (
-    /\b(?:format-volume|clear-disk|initialize-disk|diskpart(?:\.exe)?|bcdedit(?:\.exe)?|bootrec(?:\.exe)?)\b/iu.test(
+    /^(?:format-volume|clear-disk|initialize-disk|diskpart(?:\.exe)?|bcdedit(?:\.exe)?|bootrec(?:\.exe)?)\b/iu.test(
       commandText,
     ) ||
-    /\bformat(?:\.com|\.exe)?\b[^;\r\n|]*\s["']?[a-z]:/iu.test(commandText)
+    /^format(?:\.com|\.exe)?\b[\s\S]*\s["']?[a-z]:/iu.test(commandText)
   ) {
     return danger("danger.windows_system_destructive", "命令会修改磁盘、分区或系统启动配置。");
   }
   if (
-    /\b(?:remove-item|rm|ri|rmdir|rd|del)\b(?=[^;\r\n|]*(?:-recurse|-r|\/s)\b)(?=[^;\r\n|]*(?:-force|-f|\/q)\b)[^;\r\n|]*["']?[a-z]:[\\/]["']?(?:\s|$)/iu.test(
+    /^(?:remove-item|rm|ri|rmdir|rd|del)\b(?=[\s\S]*(?:-recurse|-r|\/s)\b)[\s\S]*["']?[a-z]:[\\/]["']?(?=\s|$)/iu.test(
       commandText,
     )
   ) {
-    return danger("danger.windows_root_recursive_delete", "命令会递归强制删除 Windows 卷根目录。");
+    return danger("danger.windows_root_recursive_delete", "命令会递归删除 Windows 卷根目录。");
   }
-  if (/\breg(?:\.exe)?\s+delete\s+(?:hklm|hkey_local_machine)\\[^\r\n]*\/f\b/iu.test(commandText)) {
+  if (
+    /^reg(?:\.exe)?\s+delete\s+["']?(?:hklm|hkey_local_machine)(?:\\|["']?\s)[\s\S]*\/f\b/iu.test(
+      commandText,
+    )
+  ) {
     return danger("danger.windows_registry_delete", "命令会强制删除机器级注册表内容。");
   }
   return null;
 }
 
-/** 提取可见文本中的第一层常见 Shell 命令参数，不运行任何解析器。 */
+/** 只从当前命令位置提取常见 Shell 的字面量命令参数。 */
 function extractLiteralWrappedCommand(commandText: string): string | null {
   const wrapperPatterns = [
-    /\b(?:pwsh|powershell)(?:\.exe)?\b[\s\S]*?\s-(?:command|c)\s+([\s\S]+)$/iu,
-    /\bcmd(?:\.exe)?\b[\s\S]*?\s\/c\s+([\s\S]+)$/iu,
-    /\b(?:bash|sh)(?:\.exe)?\b[\s\S]*?\s-c\s+([\s\S]+)$/iu,
+    /^(?:pwsh|powershell)(?:\.exe)?\b[\s\S]*?\s-(?:command|c)\s+([\s\S]+)$/iu,
+    /^cmd(?:\.exe)?\b[\s\S]*?\s\/c\s+([\s\S]+)$/iu,
+    /^(?:bash|sh)(?:\.exe)?\b[\s\S]*?\s-c\s+([\s\S]+)$/iu,
   ];
   for (const pattern of wrapperPatterns) {
     const match = pattern.exec(commandText);
@@ -181,9 +269,14 @@ function unwrapLiteral(commandText: string): string {
     return commandText;
   }
   const firstCharacter = commandText[0];
-  return (firstCharacter === '"' || firstCharacter === "'") && commandText.at(-1) === firstCharacter
-    ? commandText.slice(1, -1)
-    : commandText;
+  if ((firstCharacter !== '"' && firstCharacter !== "'") || commandText.at(-1) !== firstCharacter) {
+    return commandText;
+  }
+  const literalContent = commandText.slice(1, -1);
+  // 每层只还原字面量引号转义，嵌套命令仍受同一个三层上限约束。
+  return firstCharacter === '"'
+    ? literalContent.replace(/\\(["\\])/gu, "$1").replace(/`(["`])/gu, "$1")
+    : literalContent.replaceAll("''", "'");
 }
 
 function danger(ruleId: string, riskSummary: string): HardDanger {

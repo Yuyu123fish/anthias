@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003 已验收；Feature 004 Plan 01–03 已实现启动分离、Agent 可观察性与终端内容渲染。
+状态：Feature 003 已验收；Feature 004 四个 Plan 已完成本地实现，真实 Provider 与主观终端视觉验收待补。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -54,7 +54,9 @@ Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 Ab
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
-当前 TUI 仍使用 Node.js `readline` 的行式输入，已经能够呈现模式、Tool 归属、approval 风险边界、Run 终态，并在普通输入前显示完整 Workspace、模式、Session 短 ID 与运行状态。Feature 004 Plan 01 已让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。Plan 02 已增加真实 Run phase、瞬时 Visible Reasoning 与安全 ToolActivity。Plan 03 在 TUI 内加入单一 Content Renderer：经 Workspace 校验的文件引用使用可降级标识与 OSC 8，已标记 fenced code 由 lazy Shiki Core 着色，普通和异步输出按 AgentEvent 顺序写出。Plan 04 才会完成动态区、输入区、详情与 resize。
+当前 TUI 继续复用 Node.js `readline` 的单行编辑能力，但输出由内部 Terminal Conversation Module 管理：interactive Terminal Driver 提交稳定 scrollback 并原位替换底部动态区，plain Driver 只做无控制序列的确定性追加。动态区持续显示输入、完整 Workspace、模式、Session 与 Run 状态；Visible Reasoning 默认保留最近四行并在结束后折叠，`/details` 可查看本进程内的完整 Reasoning 和按 `toolCallId` 归属的 Tool 输出，内容超过可用高度时用 `/details prev|next` 分页。resize 不重写历史；运行中低于安全尺寸或无法容纳完整底栏时，把完整上下文提交到稳定区并暂停 prompt / approval，放大后恢复。关闭路径恢复 raw mode、光标与监听器。
+
+Feature 004 同时让 CLI 从任意 `cwd` 或 `--workspace` 启动，把 Workspace Root 和默认 Anthias `data/conversation` 分别装配给 Agent；生产工厂不再从 Workspace 推导 Session Directory。单一 Content Renderer 会安全化模型文本，经 Workspace 校验的文件引用使用可降级标识与 OSC 8，已标记 fenced code 由 lazy Shiki Core 着色。Unicode 显示宽度由 `string-width@8.2.2` 处理；终端能力在 TUI 边界显式探测或注入，非 TTY 强制关闭颜色与 hyperlink。
 
 ### 未来 Desktop 适配器
 
@@ -87,7 +89,6 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 
 ## 仍待后续 Feature 决定
 
-- 新 TUI 的渲染框架、输入行为、视觉系统和终端降级策略；
 - 旧 Workspace 内 Session 的可选迁移能力；当前实现明确不自动扫描或迁移；
 - Session Compaction、检索和后续分叉所需的持久化扩展；
 - 可复用授权、OS 沙箱、低权限执行和网络隔离；

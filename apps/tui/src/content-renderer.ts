@@ -39,6 +39,7 @@ export type AssistantContentRendererOptions = Readonly<{
 
 export type AssistantContentRenderer = Readonly<{
   push(delta: string): Promise<string>;
+  preview(): string;
   finish(): Promise<string>;
 }>;
 
@@ -200,6 +201,9 @@ export function createAssistantContentRenderer({
         pendingText += delta;
         return consumeCompleteLines();
       });
+    },
+    preview() {
+      return sanitizeModelText(`${openFence?.raw ?? ""}${pendingText}`);
     },
     finish() {
       return enqueue(async () => {
@@ -629,6 +633,16 @@ function sanitizeModelText(value: string): string {
 /** 清理所有即将写入终端的非受控文本，不生成任何终端控制序列。 */
 export function sanitizeTerminalText(value: string): string {
   return sanitizeModelText(value);
+}
+
+/** 使用 Content Renderer 的同一调色板呈现 TUI 固定标签。 */
+export function styleTerminalText(
+  value: string,
+  color: TerminalPaletteColor,
+  capabilities: TerminalCapabilities,
+  dim = false,
+): string {
+  return writeStyledText(sanitizeModelText(value), color, dim, capabilities.colorDepth);
 }
 
 /** 普通启动与纯文本消息不加载 Shiki；首次合格代码块才解析高亮 Module。 */

@@ -7,8 +7,8 @@
 > **一句话**：十五项任务按四个 Plan 交付工作区启动、Agent 可观察性、内容渲染和完整 TUI。<br>
 > **核心做法**：每项任务形成可验证 tracer，按依赖顺序推进，每个 Plan 完成后独立提交。<br>
 > **边界**：不改变 Session Schema、Tool Policy 或 Agent 核心操作 Interface；不推送或创建 PR。<br>
-> **风险 / 未验证**：动态终端重绘、resize、Windows Terminal 人工体验与真实 Provider 仍待 Plan 04 证明。<br>
-> **当前 / 请审阅**：实施中；T001–T011 已完成，Plan 03 提交后连续推进 T012。
+> **风险 / 未验证**：Windows Terminal 主观视觉与真实 DeepSeek Provider 仍待外部验收。<br>
+> **当前 / 请审阅**：T001–T014 已完成；T015 的本地门禁和报告已完成，外部验收项待补。
 
 - 对应 Spec：[spec.md](spec.md)
 - 实施计划：[Plan 01](plan-01-workspace-and-data-root.md)、[Plan 02](plan-02-agent-observability.md)、[Plan 03](plan-03-terminal-content-rendering.md)、[Plan 04](plan-04-interactive-tui-and-closeout.md)
@@ -154,48 +154,52 @@ Blocked by：T009、T010
 
 ### T012：Terminal Conversation 基础 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T011
 
-- [ ] 保持 `runTui()` 唯一入口，内部 Module 持有 presentation state、render queue、时钟与关闭状态。
-- [ ] interactive writer 提交稳定 scrollback 并替换动态区；plain writer 确定性追加。
-- [ ] 用户、Anthias、活动区、approval、输入和完整 cwd 底栏形成 Spec 效果层级。
-- [ ] 终端字体和背景不变，Anthias 图标与颜色不复制 Claude Code。
+- [x] 保持 `runTui()` 唯一入口，内部 Module 持有 presentation state、render queue、时钟与关闭状态。
+- [x] interactive writer 提交稳定 scrollback 并替换动态区；plain writer 确定性追加。
+- [x] 用户、Anthias、活动区、approval、输入和完整 cwd 底栏形成 Spec 效果层级。
+- [x] 终端字体和背景不变，Anthias 图标与颜色不复制 Claude Code。
 
 ### T013：完整对话周期 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T012
 
-- [ ] 请求模型、Reasoning、Assistant streaming、并发 Tool、approval 与 Run 终态由真实事件驱动。
-- [ ] Reasoning 活动窗口最多四行，结束自动折叠；`/details` 显示进程内完整瞬时内容。
-- [ ] Tool 默认显示名称、summary、状态和耗时，详情归属于正确 `toolCallId`。
-- [ ] active Run、approval、`/mode`、`/exit`、Ctrl+C 与 EOF 保持既有控制语义。
+- [x] 请求模型、Reasoning、Assistant streaming、并发 Tool、approval 与 Run 终态由真实事件驱动。
+- [x] Reasoning 活动窗口最多四行，结束自动折叠；`/details` 显示进程内完整瞬时内容，超过可用高度时由 `prev|next` 分页。
+- [x] Tool 默认显示名称、summary、状态和耗时，详情归属于正确 `toolCallId`。
+- [x] approval 的完整决策依据进入稳定 scrollback，动态区只保留短焦点，矮窗口不会把操作键与风险、目标分离。
+- [x] active Run、approval、`/mode`、`/exit`、Ctrl+C 与 EOF 保持既有控制语义。
 
 ### T014：终端降级与资源清理 tracer
 
-状态：待开始
+状态：已完成
 
 Blocked by：T012、T013
 
-- [ ] 正常、窄终端和 resize 后输入不丢失、历史不重复、完整 cwd 仍可见。
-- [ ] `NO_COLOR`、无 Unicode 与非 TTY 保留等价文本；plain 输出没有 ANSI / OSC。
-- [ ] Unicode 测宽覆盖中文、组合字符和宽字符。
-- [ ] abort、failure、EOF 和退出后无 timer、listener、raw mode、隐藏光标或晚到 frame。
-- [ ] 少量结构快照与 terminal driver 操作测试通过，不建立大面积 ANSI 快照。
+- [x] 正常、窄终端、矮终端和 resize 后输入不丢失、历史不重复、完整 cwd 仍可见。
+- [x] 运行中低于安全尺寸时按当前物理宽度清除旧 frame，稳定显示完整上下文并暂停提交 / approval，放大后恢复。
+- [x] `NO_COLOR`、无 Unicode 与非 TTY 保留等价文本；plain 输出没有 ANSI / OSC。
+- [x] Unicode 测宽覆盖中文、组合字符和宽字符。
+- [x] abort、failure、EOF 和退出后无 timer、listener、raw mode、隐藏光标或晚到 frame。
+- [x] 少量结构快照与 terminal driver 操作测试通过，不建立大面积 ANSI 快照。
 
 ### T015：完整门禁、真实冒烟与 Feature 收口
 
-状态：待开始
+状态：进行中
 
 Blocked by：T014
 
-- [ ] `pnpm verify` 通过，Windows Terminal 人工覆盖 Spec 的启动、内容、Tool、approval、resize、停止和退出。
+- [x] `pnpm verify` 通过：18 个测试文件、168 个测试全部通过。
+- [x] Windows ConPTY loopback 覆盖启动、流式回复、文件与代码、Reasoning 详情及分页、停止、继续输入、详情擦除和退出清理。
+- [ ] Windows Terminal 人工覆盖 Tool、approval、resize 与主观视觉质量。
 - [ ] 在临时 Workspace 和 Plan 模式运行一次 DeepSeek V4 Flash；只把 `DEEPSEEK_API_KEY` 临时映射给通用 Adapter。
-- [ ] 冒烟不回显、记录或持久化 Key，不执行副作用 Tool，并说明时点与证明边界。
-- [ ] 唯一 Report 汇总四个 Plan 的成立能力、调用链、验证、限制和 Git 状态。
+- [x] 当前本地与 loopback 验证没有读取、回显、记录或持久化 Key，也没有执行副作用 Tool；真实冒烟的证明边界已记录。
+- [x] 唯一 Report 汇总四个 Plan 的成立能力、调用链、验证、限制和 Git 状态。
 - [ ] 全部门禁通过后把 Spec、Plans、Tasks 与 Report 标为“已实现”，等待开发者验收。
 
 ## 授权

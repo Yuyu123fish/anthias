@@ -1,14 +1,14 @@
 # Feature 004 Plan 04：交互式 TUI 与整体验收
 
-状态：已计划
+状态：实施中
 
 ## 开发者速览
 
 > **一句话**：把既有启动、Agent 事实和 Content Renderer 收敛为现代 Anthias 对话终端。<br>
 > **核心做法**：用一个深 Terminal Conversation Module 管理 scrollback、动态区、输入、底栏与清理。<br>
 > **边界**：不进入 alternate screen，不加入多行编辑器、Session 管理器、Desktop 或新 Tool。<br>
-> **风险 / 未验证**：readline 光标、窄终端、异步重绘、退出清理和真实 Provider 表现最易出错。<br>
-> **当前 / 请审阅**：已计划；Plan 03 已完成，按连续授权在独立提交后立即实施。
+> **风险 / 未验证**：真实 DeepSeek Provider 与 Windows Terminal 主观视觉尚无完成证据。<br>
+> **当前 / 请审阅**：本地实现、48 项 TUI 定向测试、168 项完整测试与 Windows ConPTY loopback 已通过；外部验收待补。
 
 - 对应 Spec：[spec.md](spec.md)
 - 前置 Plan：[Plan 03](plan-03-terminal-content-rendering.md)
@@ -32,7 +32,7 @@
 
 动态区域
   当前 Reasoning 或 Tool
-  approval（仅待确认时）
+  approval 短焦点（完整决策依据已提交到稳定 scrollback）
   > 输入
   cwd <完整路径> | mode <模式> | session <短 ID> | <Run 状态>
 ```
@@ -59,10 +59,11 @@
 ## 3. 输入、详情与生命周期
 
 - stdin 和 stdout 都是 TTY 时启用 interactive writer；否则使用 plain writer 与现有行式输入。
+- 运行中缩到安全尺寸以下或完整底栏无法容纳时，先按新物理宽度清除旧 frame，再把完整 Workspace、模式、Session 与状态提交到稳定区；紧凑态暂停 prompt 与 approval，放大后自动恢复。
 - 继续使用 Node.js readline 的单行编辑能力，不自制多行编辑器。
-- `/details` 是统一详情命令，在 active Run 期间也只切换 TUI Presentation State，不提交给 Agent。
-- active Run 拒绝普通 prompt；approval 期间只接收 y / yes、n / no 或空行，现有一次性绑定保持不变。
-- Reasoning 活动时显示最近四个可见行和单调耗时；结束后提交 `▸ 思考了 <duration>`，详情打开时可以查看进程内完整瞬时文本。
+- `/details` 是统一详情命令，在 active Run 期间也只切换 TUI Presentation State，不提交给 Agent；详情超过动态区高度时以 `/details prev|next` 在有界页面间移动。
+- active Run 拒绝普通 prompt；approval 的完整决策依据先进入稳定 scrollback，动态区只保留不会与依据分离的短焦点；期间只接收 y / yes、n / no 或空行，现有一次性绑定保持不变。
+- Reasoning 活动时显示最近四个可见行和单调耗时；结束后提交 `▸ 思考了 <duration>`，详情打开时可以分页查看进程内完整瞬时文本。
 - Tool 按 `toolCallId` 更新；默认显示名称、summary、状态和耗时，详情显示已安全化的 stdout / stderr 与 ToolResult。
 - `Ctrl+C`、`/exit`、EOF、failure 与 abort 都等待 render queue 收口，并释放 readline、resize / signal listener、timer、raw mode 与光标状态。
 - 使用可靠的 Unicode 显示宽度实现处理中文、组合字符和宽字符；依赖在实施时固定版本并只进入 `apps/tui`。
@@ -79,13 +80,13 @@
 ## 5. 自动验证
 
 ```text
-pnpm exec vitest run apps/tui/test/tui.test.ts apps/tui/test/main.test.ts apps/tui/test/content-renderer.test.ts
+pnpm exec vitest run apps/tui/test/tui.test.ts apps/tui/test/terminal-driver.test.ts apps/tui/test/main.test.ts apps/tui/test/content-renderer.test.ts
 pnpm verify
 ```
 
 测试重点：
 
-- 正常宽度、窄宽度、无颜色、无 Unicode 与非 TTY；
+- 正常宽度、窄宽度、矮终端、运行中缩到安全阈值以下、旧 frame 物理重排、紧凑态提交阻断、无颜色、无 Unicode 与非 TTY；
 - streaming、Reasoning、并发 Tool、approval、failed、aborted 和再次输入；
 - 输入缓冲在事件与 resize 后不丢失，历史不重复；
 - plain 输出不含 ANSI / OSC，关闭后没有 timer、listener、隐藏光标或 raw mode；
@@ -98,6 +99,8 @@ pnpm verify
 - 冒烟只在目标进程环境中把 `DEEPSEEK_API_KEY` 映射给 `ANTHIAS_MODEL_API_KEY`，不读取、回显、记录或持久化值。
 - 使用 Plan 模式和临时 Workspace，只允许只读 Tool；失败也只报告安全阶段与恢复建议。
 - 真实冒烟证明该时点的 Provider 连通和用户可见行为，不替代确定性回归，也不外推长期可用性。
+
+当前验证边界：实际 Windows ConPTY 会话已覆盖启动、两次流式回复、Reasoning 折叠与 `/details`、文件标识、代码块、Ctrl+C 停止、继续输入和 `/exit` 清理；复核会话另以 30 行 Reasoning 验证了 `3/3 → 2/3` 翻页、关闭详情后的旧行擦除、底栏留存和 0 退出。两次 loopback 均已停止并关闭端口，但这仍不是 Windows Terminal 主观视觉验收。目标进程没有继承 `DEEPSEEK_API_KEY`，而读取 User / Machine 级环境变量并向外部 API 发送需要额外明确授权，因此真实 Provider 冒烟尚未执行。
 
 ## 7. 风险与停止条件
 

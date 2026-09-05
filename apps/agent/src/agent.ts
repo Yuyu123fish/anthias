@@ -118,12 +118,6 @@ type PlannedToolCall = Readonly<{
   plan: ToolCallPlan;
 }>;
 
-/** 保存尚未提交到 Session 的一个完整 Tool 结果。 */
-type ToolOutcome = Readonly<{
-  sourceIndex: number;
-  message: ToolResultMessage;
-}>;
-
 /** 表示 Tool 预检已返回、失败，或因 Run 停止而不再等待。 */
 type ToolPreparationWaitResult =
   | Readonly<{ status: "prepared"; preparation: Awaited<ReturnType<ToolCallPlan["prepare"]>> }>
@@ -222,9 +216,9 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       ({ plan }) => plan.scheduling === "parallel_read_only",
     );
     if (parallelReadOnlyBatch) {
-      const outcomes = await executeParallelReadOnlyBatch(plannedToolCalls, options);
-      for (const outcome of outcomes) {
-        await appendToolOutcome(outcome, messageHistory, options);
+      const toolResultMessages = await executeParallelReadOnlyBatch(plannedToolCalls, options);
+      for (const toolResultMessage of toolResultMessages) {
+        await appendToolResultMessage(toolResultMessage, messageHistory, options);
       }
       if (options.abortController.signal.aborted) {
         return ABORTED_LOOP_RESULT;
@@ -237,8 +231,8 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       if (plannedToolCall === undefined) {
         throw new Error("ToolCall 顺序状态缺失。");
       }
-      const outcome = await formToolOutcome(plannedToolCall, options, null);
-      await appendToolOutcome(outcome, messageHistory, options);
+      const toolResultMessage = await formToolResultMessage(plannedToolCall, options, null);
+      await appendToolResultMessage(toolResultMessage, messageHistory, options);
       if (options.abortController.signal.aborted) {
         await appendToolResults(
           plannedToolCalls.slice(toolIndex + 1).map(({ toolCall }) => toolCall),
@@ -327,12 +321,12 @@ async function streamAssistantResponse(
   });
 }
 
-/** 使用固定 worker 数执行纯只读批次，并为未领取调用补齐 aborted outcome。 */
+/** 按源索引保存并发结果，并为未领取调用补齐 aborted 消息。 */
 async function executeParallelReadOnlyBatch(
   plannedToolCalls: readonly PlannedToolCall[],
   options: RunAgentLoopOptions,
-): Promise<readonly ToolOutcome[]> {
-  const outcomes: Array<ToolOutcome | undefined> = Array.from({
+): Promise<readonly ToolResultMessage[]> {
+  const toolResultMessages: Array<ToolResultMessage | undefined> = Array.from({
     length: plannedToolCalls.length,
   });
   const startGate = createSourceOrderStartGate(plannedToolCalls.length);
@@ -350,46 +344,50 @@ async function executeParallelReadOnlyBatch(
       if (plannedToolCall === undefined) {
         throw new Error("ToolCall 并发队列状态缺失。");
       }
-      outcomes[sourceIndex] = await formToolOutcome(plannedToolCall, options, startGate);
+      toolResultMessages[sourceIndex] = await formToolResultMessage(
+        plannedToolCall,
+        options,
+        startGate,
+      );
     }
   }
 
   const workerCount = Math.min(READ_ONLY_TOOL_CONCURRENCY_LIMIT, plannedToolCalls.length);
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
   for (const plannedToolCall of plannedToolCalls) {
-    outcomes[plannedToolCall.sourceIndex] ??= createAbortedOutcome(
-      plannedToolCall,
+    toolResultMessages[plannedToolCall.sourceIndex] ??= createAbortedToolResultMessage(
+      plannedToolCall.toolCall,
       "Run 已停止，调用未执行。",
     );
   }
   return Object.freeze(
-    outcomes.map((outcome) => {
-      if (outcome === undefined) {
-        throw new Error("ToolCall outcome 缺失。");
+    toolResultMessages.map((toolResultMessage) => {
+      if (toolResultMessage === undefined) {
+        throw new Error("ToolCall 结果缺失。");
       }
-      return outcome;
+      return toolResultMessage;
     }),
   );
 }
 
-/** 通过统一 Tool Module 预检、确认并形成一个尚未提交的 outcome。 */
-async function formToolOutcome(
+/** 通过统一 Tool Module 预检、确认并形成一条尚未提交的结果消息。 */
+async function formToolResultMessage(
   plannedToolCall: PlannedToolCall,
   options: RunAgentLoopOptions,
   startGate: SourceOrderStartGate | null,
-): Promise<ToolOutcome> {
-  const { plan } = plannedToolCall;
+): Promise<ToolResultMessage> {
+  const { plan, toolCall } = plannedToolCall;
   const preparationWaitResult = await waitForPreparationOrAbort(
     plan,
     options.abortController.signal,
   );
   if (preparationWaitResult.status === "aborted") {
     await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createAbortedOutcome(plannedToolCall, plan.abortedPreparationContent);
+    return createAbortedToolResultMessage(toolCall, plan.abortedPreparationContent);
   }
   if (preparationWaitResult.status === "failed") {
     await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createOutcome(plannedToolCall, {
+    return createToolResultMessage(toolCall, {
       status: "failed",
       content: "Tool 预检失败。",
       truncated: false,
@@ -398,12 +396,12 @@ async function formToolOutcome(
   const { preparation } = preparationWaitResult;
   if (options.abortController.signal.aborted) {
     await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createAbortedOutcome(plannedToolCall, plan.abortedPreparationContent);
+    return createAbortedToolResultMessage(toolCall, plan.abortedPreparationContent);
   }
 
   if (!preparation.ok) {
     await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createOutcome(plannedToolCall, preparation.result);
+    return createToolResultMessage(toolCall, preparation.result);
   }
   return executePreparedToolCall(
     plannedToolCall,
@@ -419,14 +417,14 @@ async function executePreparedToolCall(
   preparedExecution: PreparedToolExecution,
   options: RunAgentLoopOptions,
   startGate: SourceOrderStartGate | null,
-): Promise<ToolOutcome> {
+): Promise<ToolResultMessage> {
   const { toolCall, sourceIndex } = plannedToolCall;
   let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
     if (startGate !== null) {
       await skipExecutionStart(sourceIndex, startGate);
-      return createOutcome(plannedToolCall, {
+      return createToolResultMessage(toolCall, {
         status: "failed",
         content: "只读并发计划不能请求副作用确认。",
         truncated: false,
@@ -437,7 +435,7 @@ async function executePreparedToolCall(
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
     toolApprovalRequestId = approval.toolApprovalRequestId;
     if (approval.decision !== "approve" || options.abortController.signal.aborted) {
-      return createOutcome(plannedToolCall, {
+      return createToolResultMessage(toolCall, {
         status: approval.decision === "deny" ? "denied" : "aborted",
         content:
           approval.decision === "deny"
@@ -450,7 +448,7 @@ async function executePreparedToolCall(
 
   if (options.abortController.signal.aborted) {
     await skipExecutionStart(sourceIndex, startGate);
-    return createAbortedOutcome(plannedToolCall, preparedExecution.executionUnavailableContent);
+    return createAbortedToolResultMessage(toolCall, preparedExecution.executionUnavailableContent);
   }
 
   options.updatePhase("executing_tool");
@@ -462,7 +460,7 @@ async function executePreparedToolCall(
     startGate,
   );
   if (!executionStarted) {
-    return createAbortedOutcome(plannedToolCall, preparedExecution.executionUnavailableContent);
+    return createAbortedToolResultMessage(toolCall, preparedExecution.executionUnavailableContent);
   }
 
   let executionResult: Awaited<ReturnType<PreparedToolExecution["execute"]>>;
@@ -487,7 +485,7 @@ async function executePreparedToolCall(
     });
   }
 
-  const outcome = createOutcome(plannedToolCall, {
+  const toolResultMessage = createToolResultMessage(toolCall, {
     status:
       executionResult.status === "completed"
         ? "completed"
@@ -501,10 +499,10 @@ async function executePreparedToolCall(
     type: "tool_execution_end",
     toolCallId: toolCall.toolCallId,
     toolName: toolCall.toolName,
-    result: outcome.message,
+    result: toolResultMessage,
     cleanupUncertain: executionResult.cleanupUncertain,
   });
-  return outcome;
+  return toolResultMessage;
 }
 
 /** abort 后立即结束对无副作用预检的等待，迟到的预检结果不会进入执行。 */
@@ -540,53 +538,21 @@ function waitForPreparationOrAbort(
   });
 }
 
-/** 按源位置创建一条尚未持久化的 ToolResultMessage。 */
-function createOutcome(
-  plannedToolCall: PlannedToolCall,
-  result: Readonly<{
-    status: ToolResultMessage["status"];
-    content: string;
-    truncated: boolean;
-  }>,
-): ToolOutcome {
-  return Object.freeze({
-    sourceIndex: plannedToolCall.sourceIndex,
-    message: createToolResultMessage(plannedToolCall.toolCall, result),
-  });
+function createAbortedToolResultMessage(
+  toolCall: AssistantToolCallPart,
+  content: string,
+): ToolResultMessage {
+  return createToolResultMessage(toolCall, { status: "aborted", content, truncated: false });
 }
 
-function createAbortedOutcome(plannedToolCall: PlannedToolCall, content: string): ToolOutcome {
-  return createOutcome(plannedToolCall, { status: "aborted", content, truncated: false });
-}
-
-/** 串行提交已经形成的 outcome，再把它加入下一轮模型上下文。 */
-async function appendToolOutcome(
-  outcome: ToolOutcome,
+/** 串行提交已经形成的结果消息，再把它加入下一轮模型上下文。 */
+async function appendToolResultMessage(
+  toolResultMessage: ToolResultMessage,
   messageHistory: Message[],
   options: RunAgentLoopOptions,
 ): Promise<void> {
-  await options.emit({ type: "tool_result", message: outcome.message });
-  messageHistory.push(outcome.message);
-}
-
-/** 形成并立即交付一条 ToolResultMessage。 */
-async function appendToolResult(
-  toolCall: AssistantToolCallPart,
-  result: Readonly<{
-    status: ToolResultMessage["status"];
-    content: string;
-    truncated: boolean;
-  }>,
-  messageHistory: Message[],
-  options: RunAgentLoopOptions,
-): Promise<ToolResultMessage> {
-  const resultMessage = createToolResultMessage(toolCall, result);
-  await appendToolOutcome(
-    Object.freeze({ sourceIndex: 0, message: resultMessage }),
-    messageHistory,
-    options,
-  );
-  return resultMessage;
+  await options.emit({ type: "tool_result", message: toolResultMessage });
+  messageHistory.push(toolResultMessage);
 }
 
 function createToolResultMessage(
@@ -669,12 +635,12 @@ async function appendToolResults(
   options: RunAgentLoopOptions,
 ): Promise<void> {
   for (const toolCall of toolCalls) {
-    await appendToolResult(
-      toolCall,
-      { status, content, truncated: false },
-      messageHistory,
-      options,
-    );
+    const toolResultMessage = createToolResultMessage(toolCall, {
+      status,
+      content,
+      truncated: false,
+    });
+    await appendToolResultMessage(toolResultMessage, messageHistory, options);
   }
 }
 

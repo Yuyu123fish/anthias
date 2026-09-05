@@ -26,7 +26,7 @@
 - TUI 与 Agent 首期在同一进程直接协作。Agent 以有序 AgentEvent 发布变化；未来 Desktop Adapter 可以转发同一事件，不要求现在创建 Electron、Host 或协议层。
 - Model Stream 是 Agent Module 的内部 seam：生产 Adapter 使用通用 OpenAI-compatible 接口，Agent 内部测试 Adapter 使用确定性本地流；Model Stream、模型消息、AI SDK 和 Provider 类型不得从 Agent package 入口导出。
 - TUI 不读取模型配置，不构造 Provider 或 Model Stream，也不依赖 AI SDK；它只接收已创建的 Agent，负责输入、呈现、停止和退出。
-- 当前 TUI 仍是 Node.js `readline` 行式界面。[Feature 004](specs/feature004-tui-workspace-experience/spec.md) 正在实施：Plan 01 已实现任意 Workspace 启动、显式路径装配和默认 Anthias `data/conversation`，等待开发者审查；Reasoning、文件标识、Shiki 与动态终端布局仍未实现。
+- 当前 TUI 复用 Node.js `readline` 的单行编辑，由内部 Terminal Conversation 管理稳定 scrollback、动态区、输入与完整 Workspace 底栏；Visible Reasoning、可分页 Tool / Reasoning 详情、安全文件标识、lazy Shiki 高亮和非 TTY 降级已由 Feature 004 本地实现。真实 Provider 与 Windows Terminal 主观视觉完成前，Feature 004 仍保持“实施中”。
 - DeepSeek V4 Flash 只是 OpenAI-compatible 日常参考配置，不得产生模型专用 Provider、枚举或条件分支。
 - 普通函数和判别联合足以表达的行为不增加类层级、Registry、Manager 或为未来变化预建的 Interface。
 - 终端状态、AbortController、模型流以及后续线程、进程、文件句柄和网络请求必须有明确持有者、取消方式和关闭时机。

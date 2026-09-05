@@ -293,6 +293,11 @@ async function createIsolatedAnthiasProject(): Promise<string> {
     join(isolatedPackageScope, "agent"),
     process.platform === "win32" ? "junction" : "dir",
   );
+  await symlink(
+    fileURLToPath(new URL("../node_modules/string-width", import.meta.url)),
+    join(isolatedTuiRoot, "node_modules", "string-width"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
   return anthiasProjectRoot;
 }
 

@@ -5,14 +5,14 @@
 
 ## 开发者速览
 
-> **一句话**：Plan 01–03 已交付路径分离、可观察 Agent 周期，以及安全文件引用和 Shiki 代码呈现。<br>
-> **核心做法**：Agent 发布真实生命周期，TUI 用串行 Content Renderer 校验文件、清理控制字符并按需加载 Shiki。<br>
-> **边界**：当前仍为行式 scrollback；动态区、Reasoning 折叠、详情、resize 和完整输入壳由 Plan 04 实现。<br>
-> **风险 / 未验证**：旧 Session 未迁移；真实 Provider、最终视觉、交互式清理和 resize 尚未验证。<br>
-> **当前 / 请审阅**：Plan 01–02 已提交，Plan 03 定向与完整门禁通过并准备提交；随后连续实施 Plan 04。
+> **一句话**：四个 Plan 已在本地交付路径分离、可观察 Agent 周期、安全内容渲染和现代对话式 TUI。<br>
+> **核心做法**：Agent 发布真实生命周期，Terminal Conversation 串行投影为稳定 scrollback、动态运行区、输入和常驻 Workspace。<br>
+> **边界**：不使用 alternate screen；旧 Session 不迁移，真实 DeepSeek 和 Windows Terminal 主观视觉仍待外部验收。<br>
+> **风险 / 未验证**：当前缺少真实 Provider 差异证据，也没有把 Windows ConPTY 功能检查外推为长期终端体验。<br>
+> **当前 / 请审阅**：T001–T014、本地 T015 门禁与报告已完成；外部验收项受凭据权限和人工检查约束。
 
 - 对应 Spec：[spec.md](spec.md)
-- 当前 Plan：[Plan 03](plan-03-terminal-content-rendering.md)
+- 当前 Plan：[Plan 04](plan-04-interactive-tui-and-closeout.md)
 - 任务事实源：[tasks.md](tasks.md)
 
 ## 1. Plan 01 已成立结果
@@ -25,7 +25,7 @@
 - 当前行式 TUI 在每次普通输入前显示完整 `cwd`、Permission Mode、Session 短 ID 与 `idle | active`，作为后续动态底栏的文案基线。
 - 根 `.gitignore` 已加入 `/data/`；Session Directory 内原有 `*` 忽略规则保持不变。
 
-尚未完成的范围：Plan 04 的动态 TUI、Windows Terminal 人工验收和真实 DeepSeek V4 Flash 冒烟。
+该阶段保留的动态 TUI 范围已由 Plan 04 完成；旧目录仍按合同不扫描、不迁移、不删除。
 
 ## 2. Plan 02 已成立结果
 
@@ -68,7 +68,20 @@ run_end
 - 支持 TypeScript / TSX、JavaScript / JSX、JSON / JSONC、Markdown、Bash / shell、PowerShell、Java、Python、YAML 与 SQL 的固定别名。未知、未标、未闭合、超过 64 KiB / 2,000 行或 Shiki 失败时保持安全 plain 内容。
 - 普通 CLI 启动不会解析 Shiki package；只有首个合格且需要颜色的代码块才动态载入高亮 Module。
 
-## 4. 入口与调用链
+## 4. Plan 04 已成立结果
+
+- `runTui()` 仍是 TUI 唯一包入口；内部 Terminal Conversation 集中持有 presentation state、串行 render queue、Reasoning / Tool 投影、输入状态、单调时钟和关闭流程，没有向 Agent 反向泄漏终端类型。
+- interactive Terminal Driver 只把已经完成的内容提交到稳定 scrollback，并原位替换底部动态区；plain Driver 确定性追加文本，强制关闭颜色、OSC 8 和光标控制。
+- 界面以 `><°> Anthias` 为静态分叉尾鱼标识，正文保持对话优先；动态区依次容纳活动 Assistant 预览、最近四行 Visible Reasoning、运行中 Tool、approval、输入、完整 `cwd` 与模式 / Session / Run 状态。
+- Assistant streaming 在异步 Content Renderer 未形成稳定块时仍有安全预览；同一 Run 的 Model continuation 只提交一个 Anthias 标题，空 Assistant Message 不制造重复标题。
+- Reasoning 结束后收为耗时行；`/details` 可以回看本进程内所有 span，并在 Run 进行中继续接收后续 delta。详情超过动态区可用高度时由 `/details prev|next` 分页，该文本仍不进入 Message、AgentState 或 Session。
+- Tool 按 `toolCallId` 保存运行状态、耗时、stdout / stderr 与 ToolResult；并发乱序结束不会串线，没有 execution start 的 denied / invalid ToolResult 也能在详情中回看。
+- approval 的完整模式、目标、风险、边界和预览先提交到稳定 scrollback，动态区只保留短焦点，因此矮窗口不会留下操作键却裁掉决策依据；处理后提交标题为“确认结果”的稳定卡。
+- `string-width@8.2.2` 只进入 `apps/tui`，用于中文、组合字符和宽字符的显示宽度。resize 只重算动态区域，不重放历史；窄窗口下输入保留光标两侧上下文，tab 在动态测宽边界展开；启动时低于 20 列或 12 行则安全降级为 plain 输出。
+- interactive 会按 resize 后的真实列宽重算旧 frame 的物理行位再清除。运行中低于 20 列 / 12 行，或完整底栏超过可用高度时，TUI 把完整 cwd、模式、Session 与状态重新提交到稳定区，暂停 prompt 与 approval，并在放大后恢复完整动态布局。
+- readline 的内部回显写入受控 sink，Terminal Driver 是 stdout 的唯一拥有者。退出、EOF、失败与 Ctrl+C 路径会取消订阅和 timer、移除 resize / signal listener、恢复 raw mode 与光标。
+
+## 5. 入口与调用链
 
 ```text
 编译后 anthias bin
@@ -83,12 +96,15 @@ run_end
       → createSession | openSession
       → 创建 Agent
   → runTui({ agent })
-      → 从 AgentState 呈现历史和输入上下文行
-      → 串行消费 AgentEvent
-      → AssistantContentRenderer
-          → 稳定块与控制字符清理
-          → Workspace 文件 realpath / containment
-          → lazy Shiki token → TerminalCapabilities writer
+      → TerminalConversation
+          → 从 AgentState 呈现历史
+          → 串行消费 AgentEvent，不推断 Agent 生命周期
+          → AssistantContentRenderer
+              → 稳定块与控制字符清理
+              → Workspace 文件 realpath / containment
+              → lazy Shiki token → TerminalCapabilities
+          → interactive Terminal Driver：稳定 scrollback + 动态区
+          → plain Terminal Driver：确定性追加
 ```
 
 - `apps/tui` 的启动 Module 只拥有 CLI 路径语义；它不读取 Provider 专属配置，也不推进 Agent 生命周期。
@@ -96,7 +112,7 @@ run_end
 - Session Module 仍拥有 Schema 1、Workspace 绑定、锁、checkpoint、恢复与持久化。
 - `runTui()` 仍是唯一公开 TUI 入口，只读取 Agent state 和事件。
 
-## 5. 失败表现与兼容性
+## 6. 失败表现与兼容性
 
 | reason | 用户可操作结果 |
 | --- | --- |
@@ -114,7 +130,7 @@ run_end
 - 路径进入启动错误或上下文行前会替换 C0 / C1 控制字符，普通路径内容保持可辨认。
 - 旧调用方若直接使用生产工厂，必须补充显式 `workspaceRoot` 与 `sessionDirectory`；这是本 Plan 有意收窄的装配合同，Agent 的运行操作与事件接口没有变化。
 
-## 6. 验证证据
+## 7. 验证证据
 
 验证环境：Windows，Node.js `v24.13.1`，pnpm `10.33.0`，PowerShell `7.5.4`。
 
@@ -176,10 +192,32 @@ pnpm verify
 
 本机同一 Node.js 进程对 TypeScript 样例测量：首块冷加载 `325.56 ms`，同语言热加载 `1.21 ms`。该数据只记录本机时点，不是 CI 阈值或性能承诺。
 
-## 7. 证据边界与 Git 状态
+### Plan 04 定向与完整门禁
 
-- 没有使用真实 Provider、外部网络、付费 API 或真实凭据；`DEEPSEEK_API_KEY` 未读取、未映射、未输出，也未进入文件。
+```text
+pnpm check
+pnpm exec vitest run apps/tui/test/tui.test.ts apps/tui/test/terminal-driver.test.ts apps/tui/test/content-renderer.test.ts apps/tui/test/main.test.ts
+pnpm verify
+```
+
+结果：静态检查通过；TUI 定向 4 个测试文件、48 个测试通过；最终完整门禁完成静态检查、构建以及 18 个测试文件、168 个测试，全部通过。
+
+审查后第一次完整复跑中，既有 `command-tool-loop.test.ts` 的 Windows command timeout 用例一次超过 5 秒并出现临时目录 `EBUSY`；该文件随即单独运行 4 项全部通过，之后的完整门禁通过。增加详情分页用例后的最终完整门禁再次通过上述 168 项。
+
+新增证据覆盖稳定区与动态区分离、首个 Assistant token 前保持“正在请求模型”、pending Assistant 预览、Reasoning 折叠和运行中详情分页、并发 Tool 与 orphan ToolResult、超长 approval 决策依据和终态卡、窄 / 矮窗口输入、旧 frame 物理重排、紧凑态完整上下文与提交阻断、中文 / 组合字符 / 宽字符 / tab 测宽、非 TTY 强制降级、事件到达时计时、渲染失败后的非零退出与资源清理，以及 EOF / abort / exit 的终端资源释放。
+
+### Windows 实际 PTY 与 loopback
+
+第一次在 Windows ConPTY 中启动真实编译后 TUI，并连接临时本地 OpenAI-compatible SSE server。实际交互覆盖 Plan 模式启动、完整 `cwd`、ASCII 能力降级、Reasoning 活动卡与折叠、`/details`、`[file] package.json:1`、TypeScript fenced code、第二次流式回复、Ctrl+C 停止后继续输入以及 `/exit` 正常退出。
+
+审查修正详情高度后，第二次 ConPTY 会话使用临时 Session Directory 与 30 行 Reasoning fixture：详情先显示最新 `3/3` 页，`/details prev` 切换到 `2/3`，`/details` 关闭后所有旧详情行均被擦除，完整 `cwd` 与状态栏始终保留，`/exit` 以 0 退出。两次 loopback server 均已停止，临时 QA 目录已删除，监听端口已关闭。
+
+第一次运行在 Anthias 根 `data/conversation` 产生一份被忽略的新 Session，符合 Data Root 合同；第二次运行改用系统临时目录。没有读取 Session 内容，也没有扫描、迁移或删除旧目录。由于终端自动化安全规则禁止把 Windows Terminal 当作可操作应用，本证据只证明真实 Windows PTY 行为，不声称完成主观视觉验收。
+
+## 8. 证据边界与 Git 状态
+
+- 没有使用真实 Provider、外部网络、付费 API 或真实凭据；当前进程环境没有可用的 `DEEPSEEK_API_KEY`。尝试申请读取 User / Machine 级变量并发送到 `api.deepseek.com` 时，宿主要求额外明确授权，命令在执行前被拒绝；因此没有取得、映射、输出或持久化 Key。
 - `session_changed` 有稳定公开 reason 和真实 checkpoint 变化映射；自动测试覆盖既有 Run 期 checkpoint 变化，但没有用非确定性并发写入强制制造启动瞬间竞态。
-- 自动测试证明路径、持久化位置和文本合同，不证明 Plan 04 的最终视觉质量、resize 或 Windows Terminal 交互体验。
-- 文档提交为 `0cbb45e`，Plan 01 提交为 `8b2f2f8`，Plan 02 提交为 `95611c8`。Plan 03 当前是 `main` 上准备提交的单一增量；没有推送或创建 PR。
-- 开发者已授权连续完成整个 Feature，并要求每个 Plan 独立提交；真实 Provider 仍只在 Plan 04 冒烟时使用。
+- 自动测试与真实 PTY 证明路径、持久化位置、resize 机械行为和文本合同；它们不证明 Windows Terminal 的主观视觉质量或长期交互稳定性。
+- 文档提交为 `0cbb45e`，Plan 01 为 `8b2f2f8`，Plan 02 为 `95611c8`，Plan 03 为 `83d2bba`。2026-09-05，开发者授权把 Plan 04 本地实现与命令安全修复、启动文档一并做成一次完整本地提交；外部验收仍待补，Feature 保持“实施中”。没有推送或创建 PR。
+- 开发者已授权连续完成整个 Feature，并要求每个 Plan 独立提交；读取未继承到进程的 User / Machine 级密钥并向外部 Provider 发送仍需精确授权。
