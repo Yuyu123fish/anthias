@@ -1,5 +1,10 @@
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
 import type { PermissionMode } from "../permission-mode.js";
+import type {
+  ArtifactSourceStatus,
+  ArtifactWriter,
+  SessionArtifactStore,
+} from "../session/artifacts.js";
 import type { SessionShell } from "../session/index.js";
 import { prepareEditFileTool, validateEditFileToolCallInput } from "./basetool/edit-file.js";
 import {
@@ -10,6 +15,10 @@ import {
 import { executePreparedFileTool, type PreparedFileResult } from "./basetool/file-change.js";
 import { executeGlobTool, validateGlobToolCallInput } from "./basetool/glob.js";
 import { executeGrepTool, validateGrepToolCallInput } from "./basetool/grep.js";
+import {
+  executeReadArtifactTool,
+  validateReadArtifactToolCallInput,
+} from "./basetool/read-artifact.js";
 import { executeReadFileTool, validateReadFileToolCallInput } from "./basetool/read-file.js";
 import { prepareWriteFileTool, validateWriteFileToolCallInput } from "./basetool/write-file.js";
 import type { ReadOnlyToolName } from "./definitions.js";
@@ -22,6 +31,7 @@ import type { ToolWorkspace } from "./workspace-path.js";
 export type CreateToolRunnerOptions = Readonly<{
   workspace: ToolWorkspace;
   shell: SessionShell;
+  artifactStore?: SessionArtifactStore;
 }>;
 
 /** 隐藏 Tool 分派细节，只向 Agent Loop 提供统一计划入口。 */
@@ -54,6 +64,7 @@ export type PreparedToolExecution = Readonly<{
   execute(
     abortSignal: AbortSignal,
     publishUpdate: (update: ToolExecutionUpdate) => void,
+    resultTokenBudget?: number,
   ): Promise<
     ToolExecutionResult &
       Readonly<{
@@ -68,6 +79,11 @@ type ImmediateToolResult = Readonly<{
   content: string;
   truncated: boolean;
 }>;
+
+type ToolExecutionOutcome = ToolExecutionResult &
+  Readonly<{
+    cleanupUncertain?: boolean;
+  }>;
 
 /** 表示 ToolCall 已形成可执行计划，或可以立即返回安全结果。 */
 export type ToolCallPreparation =
@@ -89,6 +105,7 @@ export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
   const runnerOptions = Object.freeze({
     workspace: options.workspace,
     shell: options.shell,
+    ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
   });
   return Object.freeze({
     createPlan: (toolCall, permissionMode) =>
@@ -110,6 +127,7 @@ function createToolCallPlan(
           "read_file",
           permissionMode,
           options.workspace,
+          options.artifactStore,
           executeReadFileTool,
         )
       : createRejectedToolCallPlan(validationError);
@@ -122,6 +140,7 @@ function createToolCallPlan(
           "glob",
           permissionMode,
           options.workspace,
+          options.artifactStore,
           executeGlobTool,
         )
       : createRejectedToolCallPlan(validationError);
@@ -134,9 +153,17 @@ function createToolCallPlan(
           "grep",
           permissionMode,
           options.workspace,
+          options.artifactStore,
           executeGrepTool,
         )
       : createRejectedToolCallPlan(validationError);
+  }
+  if (toolCall.toolName === "read_artifact") {
+    const validationError = validateReadArtifactToolCallInput(toolCall);
+    if (validationError !== null) {
+      return createRejectedToolCallPlan(validationError);
+    }
+    return createReadArtifactToolCallPlan(toolCall, permissionMode, options.artifactStore);
   }
   if (toolCall.toolName === "execute_command") {
     const validationError = validateCommandToolCallInput(toolCall);
@@ -188,10 +215,12 @@ function createReadOnlyToolCallPlan(
   toolName: ReadOnlyToolName,
   permissionMode: PermissionMode,
   workspace: ToolWorkspace,
+  artifactStore: SessionArtifactStore | undefined,
   executeTool: (
     toolCall: AssistantToolCallPart,
     workspace: ToolWorkspace,
     abortSignal: AbortSignal,
+    artifactWriter?: ArtifactWriter,
   ) => Promise<ToolExecutionResult>,
 ): ToolCallPlan {
   const policyDecision = decideToolPolicy({ permissionMode, toolName });
@@ -210,10 +239,32 @@ function createReadOnlyToolCallPlan(
             activitySummary: createReadOnlyToolActivitySummary(toolCall, toolName),
             executionUnavailableContent: "Run 已停止，Tool 未执行。",
             async execute(abortSignal: AbortSignal) {
-              return Object.freeze({
-                ...(await executeTool(toolCall, workspace, abortSignal)),
-                cleanupUncertain: false,
-              });
+              let artifactWriter: ArtifactWriter | undefined;
+              try {
+                artifactWriter = artifactStore?.createWriter(toolCall.toolCallId);
+              } catch {
+                artifactWriter = undefined;
+              }
+              let executionResult: ToolExecutionResult;
+              try {
+                executionResult = await executeTool(
+                  toolCall,
+                  workspace,
+                  abortSignal,
+                  artifactWriter,
+                );
+              } catch {
+                executionResult = Object.freeze({
+                  status: "failed",
+                  content: "Tool 执行失败。",
+                  truncated: false,
+                });
+              }
+              return attachArtifactResult(
+                executionResult,
+                artifactWriter,
+                toArtifactSourceStatus(executionResult.status, abortSignal),
+              );
             },
           }),
         }),
@@ -318,10 +369,30 @@ function createCommandToolCallPlan(
             abortSignal: AbortSignal,
             publishUpdate: (update: ToolExecutionUpdate) => void,
           ) {
+            let artifactWriter: ArtifactWriter | undefined;
             try {
-              return await executePreparedCommand(preparedTool, abortSignal, publishUpdate);
+              artifactWriter = options.artifactStore?.createWriter(toolCall.toolCallId);
             } catch {
-              return failedExecution(true);
+              artifactWriter = undefined;
+            }
+            try {
+              const executionResult = await executePreparedCommand(
+                preparedTool,
+                abortSignal,
+                publishUpdate,
+                artifactWriter,
+              );
+              return attachArtifactResult(
+                executionResult,
+                artifactWriter,
+                toArtifactSourceStatus(executionResult.status, abortSignal),
+              );
+            } catch {
+              return attachArtifactResult(
+                failedExecution(true),
+                artifactWriter,
+                toArtifactSourceStatus("failed", abortSignal),
+              );
             }
           },
         }),
@@ -355,11 +426,58 @@ function createReadOnlyToolActivitySummary(
       `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}`,
     );
   }
+  if (toolName === "read_artifact") {
+    if (!isRecord(toolCall.input)) {
+      throw new Error("已校验 ToolCall 缺少对象输入。");
+    }
+    return createToolActivitySummary(`artifactId: ${String(toolCall.input.artifactId)}`);
+  }
   return createToolActivitySummary(
     `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}; files: ${
       typeof input.filePattern === "string" ? input.filePattern : "**/*"
     }`,
   );
+}
+
+function createReadArtifactToolCallPlan(
+  toolCall: AssistantToolCallPart,
+  permissionMode: PermissionMode,
+  artifactStore: SessionArtifactStore | undefined,
+): ToolCallPlan {
+  const policyDecision = decideToolPolicy({ permissionMode, toolName: "read_artifact" });
+  if (policyDecision.kind !== "allow") {
+    return createPolicyDeniedPlan(policyDecision);
+  }
+  return Object.freeze({
+    scheduling: "parallel_read_only",
+    abortedPreparationContent: "Tool 执行已停止。",
+    prepare: () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true,
+          preparedExecution: Object.freeze({
+            approval: null,
+            activitySummary: createReadOnlyToolActivitySummary(toolCall, "read_artifact"),
+            executionUnavailableContent: "Run 已停止，Tool 未执行。",
+            async execute(
+              abortSignal: AbortSignal,
+              _publishUpdate: (update: ToolExecutionUpdate) => void,
+              resultTokenBudget?: number,
+            ) {
+              return Object.freeze({
+                ...(await executeReadArtifactTool(
+                  toolCall,
+                  artifactStore,
+                  abortSignal,
+                  resultTokenBudget,
+                )),
+                cleanupUncertain: false,
+              });
+            },
+          }),
+        }),
+      ),
+  });
 }
 
 /** 删除终端控制字符、折叠换行，并以 Unicode code point 限制展示长度。 */
@@ -438,4 +556,44 @@ function failedExecution(
     truncated: false,
     cleanupUncertain,
   });
+}
+
+/** 在 Agent Loop 预算收口前统一保留已产生的原文，小产物仍受 Session 配额和清理约束。 */
+async function attachArtifactResult(
+  executionResult: ToolExecutionOutcome,
+  artifactWriter: ArtifactWriter | undefined,
+  sourceStatus: ArtifactSourceStatus,
+): Promise<ToolExecutionOutcome & Readonly<{ cleanupUncertain: boolean }>> {
+  const cleanupUncertain = executionResult.cleanupUncertain === true;
+  if (artifactWriter === undefined) {
+    return Object.freeze({ ...executionResult, cleanupUncertain });
+  }
+  const pendingOrWrittenByteLength = artifactWriter.byteLength + artifactWriter.pendingByteLength;
+  const retainArtifact =
+    pendingOrWrittenByteLength > 0 || executionResult.truncated || artifactWriter.hasIncomplete;
+  let artifactReference: Awaited<ReturnType<ArtifactWriter["finish"]>>;
+  try {
+    artifactReference = await artifactWriter.finish(sourceStatus, retainArtifact);
+  } catch {
+    artifactReference = null;
+  }
+  if (artifactReference === null) {
+    return Object.freeze({
+      ...executionResult,
+      content:
+        retainArtifact && artifactWriter.hasIncomplete
+          ? `${executionResult.content}\n...[原文产物未完整保存]`
+          : executionResult.content,
+      truncated: executionResult.truncated || (retainArtifact && artifactWriter.hasIncomplete),
+      cleanupUncertain,
+    });
+  }
+  return Object.freeze({ ...executionResult, artifact: artifactReference, cleanupUncertain });
+}
+
+function toArtifactSourceStatus(
+  status: ToolExecutionResult["status"],
+  abortSignal: AbortSignal,
+): ArtifactSourceStatus {
+  return abortSignal.aborted ? "aborted" : status === "completed" ? "completed" : "failed";
 }

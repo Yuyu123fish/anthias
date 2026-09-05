@@ -1,9 +1,9 @@
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import type { ModelRequest, ModelStream } from "../src/model-stream.js";
-import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -117,9 +117,7 @@ describe("execute_command Agent Tool Loop", () => {
       reason: "not_pending",
     });
 
-    const sessionRecords = (
-      await readFile(join(sessionDirectory, `${session.sessionId}.jsonl`), "utf8")
-    )
+    const sessionRecords = (await readFile(join(session.storageDirectory, "session.jsonl"), "utf8"))
       .trimEnd()
       .split("\n")
       .map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -241,6 +239,8 @@ describe("execute_command Agent Tool Loop", () => {
     for (const toolResult of toolResults) {
       expect(toolResult).toMatchObject({ status: "completed", truncated: true });
       expect(toolResult.content).toContain("...[命令输出已截断，管道已继续排空]");
+      expect(toolResult.artifact).toMatchObject({ complete: true });
+      expect(toolResult.artifact?.byteLength).toBeGreaterThan(0);
       expect(Buffer.byteLength(toolResult.content, "utf8")).toBeLessThanOrEqual(64 * 1024);
       expect(toolResult.content.split("\n").length).toBeLessThanOrEqual(2_000);
     }
@@ -248,6 +248,56 @@ describe("execute_command Agent Tool Loop", () => {
     expect(await readFile(join(workspaceRoot, "lines-drained.txt"), "utf8")).toContain("yes");
     expect(modelRequestCount).toBe(3);
     expect(agent.state.running).toBe(false);
+  });
+
+  it("continues draining a command when artifact storage is unavailable", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-artifact-write-failure-"));
+    temporaryDirectories.add(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const shell = await resolveSessionShell(process.env);
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    await writeFile(join(session.storageDirectory, "artifacts"), "blocked");
+    const command =
+      shell.kind === "powershell"
+        ? "Write-Output 'drained'; Set-Content -LiteralPath 'drain-after-artifact-failure.txt' -Value 'yes'"
+        : "printf 'drained\\n'; printf 'yes\\n' > drain-after-artifact-failure.txt";
+    const modelStream: ModelStream = async function* () {
+      yield {
+        type: "tool_call",
+        toolCallId: "00000000-0000-4000-8000-000000000055",
+        toolName: "execute_command",
+        input: { command, timeoutMs: 10_000 },
+        invalid: false,
+      } as const;
+      yield finishEvent("tool_calls");
+      return;
+    };
+    let modelRequestCount = 0;
+    const continuingModelStream: ModelStream = async function* (modelRequest, abortSignal) {
+      modelRequestCount += 1;
+      if (modelRequestCount === 1) {
+        yield* modelStream(modelRequest, abortSignal);
+        return;
+      }
+      yield { type: "text_delta", delta: "写盘失败后仍完成。" } as const;
+      yield finishEvent("stop");
+    };
+    const agent = createAgentWithModelStream({ modelStream: continuingModelStream, session });
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+      }
+    });
+
+    await expect(agent.prompt("写盘失败排空")).resolves.toEqual({ status: "completed" });
+    expect(
+      await readFile(join(workspaceRoot, "drain-after-artifact-failure.txt"), "utf8"),
+    ).toContain("yes");
+    const toolResult = agent.state.messageHistory.find((message) => message.role === "tool");
+    expect(toolResult).toMatchObject({ status: "completed" });
+    expect(toolResult?.content).toContain("drained");
+    expect(toolResult?.artifact).toBeUndefined();
+    await agent.close();
   });
 
   it("aborts a running command once and returns to idle after process-tree cleanup", async () => {

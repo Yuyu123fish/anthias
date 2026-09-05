@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import type { AssistantToolCallPart } from "../../message.js";
+import type { ArtifactWriter } from "../../session/artifacts.js";
 import type { SessionShell } from "../../session/index.js";
 import {
   hasOnlyKeys,
@@ -131,6 +132,7 @@ export async function executePreparedCommand(
   preparedTool: PreparedCommandTool,
   abortSignal: AbortSignal,
   publishUpdate: (update: CommandExecutionUpdate) => void,
+  artifactWriter?: ArtifactWriter,
 ): Promise<CommandExecutionResult> {
   if (abortSignal.aborted) {
     return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
@@ -239,9 +241,15 @@ export async function executePreparedCommand(
     const handleAbort = () => requestTermination("aborted");
 
     childProcess.stdout?.on("data", (chunk: Buffer) => {
+      if (artifactWriter !== undefined) {
+        void artifactWriter.write(chunk);
+      }
       publishAcceptedOutput("stdout", stdoutDecoder.write(chunk));
     });
     childProcess.stderr?.on("data", (chunk: Buffer) => {
+      if (artifactWriter !== undefined) {
+        void artifactWriter.write(chunk);
+      }
       publishAcceptedOutput("stderr", stderrDecoder.write(chunk));
     });
     childProcess.once("error", () => settle(null, true));

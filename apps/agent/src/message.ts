@@ -31,6 +31,24 @@ export type AssistantToolCallPart = Readonly<{
 /** 枚举 AssistantMessage 可以持久化的有序内容 part。 */
 export type AssistantContentPart = AssistantTextPart | AssistantToolCallPart;
 
+/** 说明 Tool 原文未能完整保存的可枚举原因。 */
+export type ToolArtifactIncompleteReason =
+  | "artifact_limit"
+  | "session_limit"
+  | "write_failed"
+  | "source_failed"
+  | "aborted"
+  | "unknown";
+
+/** 保存当前 Session 内可再次读取的 Tool 原文引用。 */
+export type ToolArtifactReference = Readonly<{
+  artifactId: string;
+  toolCallId: string;
+  byteLength: number;
+  complete: boolean;
+  incompleteReason?: ToolArtifactIncompleteReason;
+}>;
+
 /** 表示活动中或已经终结的一条 Assistant 消息。 */
 export type AssistantMessage = Readonly<{
   role: "assistant";
@@ -46,6 +64,7 @@ export type ToolResultMessage = Readonly<{
   status: "completed" | "failed" | "denied" | "aborted" | "unknown";
   content: string;
   truncated: boolean;
+  artifact?: ToolArtifactReference;
 }>;
 
 /** 枚举 Agent 对外可见的线性消息。 */

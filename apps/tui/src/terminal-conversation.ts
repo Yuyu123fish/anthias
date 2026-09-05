@@ -305,6 +305,11 @@ export function runTui({
     try {
       await pendingPromptResultPromise;
     } finally {
+      try {
+        await agent.close();
+      } catch {
+        requestedExitCode = 1;
+      }
       await renderQueue;
       try {
         const remainingAssistantText = await flushActiveAssistant(presentationState);
@@ -517,6 +522,22 @@ async function renderEvent(
   eventTimestamp: number,
 ): Promise<void> {
   switch (event.type) {
+    case "session_cleanup": {
+      if (event.result.deleted > 0)
+        terminalDriver.writeStable(
+          `已清理 ${event.result.deleted} 个超过两周未使用的对话及产物。\n`,
+        );
+      if (event.result.status === "unavailable")
+        terminalDriver.writeStable("对话清理未完成，将在下次启动时重试。\n");
+      const uncertainReasons = event.result.skipReasons.filter(
+        (reason) => !["近期使用", "仍有使用者", "旧对话仍在使用或未过期"].includes(reason),
+      );
+      if (uncertainReasons.length > 0)
+        terminalDriver.writeStable(
+          `对话清理已跳过：${uncertainReasons.map(sanitizeTerminalText).join("；")}。\n`,
+        );
+      return;
+    }
     case "run_start":
       presentationState.runPhase = "requesting_model";
       presentationState.assistantHeadingCommitted = false;
@@ -693,6 +714,8 @@ async function renderEvent(
       tool.cleanupUncertain = event.cleanupUncertain;
       presentationState.tools.set(tool.toolCallId, tool);
       terminalDriver.writeStable(`${renderToolSummary(tool, terminalCapabilities)}\n`);
+      const artifactSummary = renderArtifactSummary(event.result, terminalCapabilities);
+      if (artifactSummary.length > 0) terminalDriver.writeStable(`${artifactSummary}\n`);
       if (event.cleanupUncertain) {
         terminalDriver.writeStable("! Tool 资源清理结果不确定，请在继续前检查相关进程。\n");
       }
@@ -1376,8 +1399,10 @@ function renderHistoricalToolResult(
   return `${renderToolSymbol(tool, terminalCapabilities)} [${shortToolCallId(
     message.toolCallId,
   )}] ${message.toolName}  ${renderToolStatus(message.status)}${
-    message.truncated ? ` ${semanticSeparator(terminalCapabilities)} 已截断` : ""
-  }`;
+    message.truncated
+      ? ` ${semanticSeparator(terminalCapabilities)} ${message.artifact === undefined ? "已截断" : "预览已压缩"}`
+      : ""
+  }${message.artifact === undefined ? "" : `\n${renderArtifactSummary(message, terminalCapabilities)}`}`;
 }
 
 function createUnknownTool(
@@ -1497,6 +1522,8 @@ function renderPromptRejection(
   reason: Extract<PromptResult, { status: "rejected" }>["reason"],
 ): string {
   switch (reason) {
+    case "closed":
+      return "Agent 已关闭。\n";
     case "empty":
       return "请输入非空提示词。\n";
     case "busy":
@@ -1510,4 +1537,14 @@ function renderPromptRejection(
 
 function isTty(stream: NodeJS.ReadableStream | NodeJS.WritableStream): boolean {
   return (stream as { isTTY?: boolean }).isTTY === true;
+}
+
+function renderArtifactSummary(
+  message: ToolResultMessage,
+  capabilities: TerminalCapabilities,
+): string {
+  const artifact = message.artifact;
+  if (artifact === undefined) return "";
+  const separator = semanticSeparator(capabilities);
+  return `原文产物 ${sanitizeTerminalText(artifact.artifactId)} ${separator} ${artifact.byteLength} bytes ${separator} ${artifact.complete ? "完整" : "部分保存"}`;
 }

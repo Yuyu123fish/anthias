@@ -26,7 +26,12 @@ const CURRENT_USER_COMMAND_BOUNDARY =
 
 /** 按权限模式、Tool 类型和准备结果形成唯一 Policy Decision。 */
 export function decideToolPolicy(input: ToolPolicyInput): ToolPolicyDecision {
-  if (input.toolName === "read_file" || input.toolName === "glob" || input.toolName === "grep") {
+  if (
+    input.toolName === "read_file" ||
+    input.toolName === "glob" ||
+    input.toolName === "grep" ||
+    input.toolName === "read_artifact"
+  ) {
     return freezeDecision(
       "allow",
       "read.workspace_only",

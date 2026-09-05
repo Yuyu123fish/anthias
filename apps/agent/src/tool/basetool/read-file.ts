@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
 import type { AssistantToolCallPart } from "../../message.js";
+import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
@@ -37,6 +38,7 @@ export async function executeReadFileTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
+  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
@@ -52,6 +54,12 @@ export async function executeReadFileTool(
       return failedToolResult(`read_file 目标不是文件：${target.relativePath}`);
     }
     const text = await readStrictUtf8File(target.absolutePath);
+    if (artifactWriter !== undefined) {
+      const bytes = Buffer.from(text, "utf8");
+      for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+        await artifactWriter.write(bytes.subarray(offset, offset + 64 * 1024));
+      }
+    }
     if (abortSignal.aborted) {
       return failedToolResult("Tool 执行已停止。");
     }

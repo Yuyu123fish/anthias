@@ -31,9 +31,33 @@ type FakeAgentBehavior = Readonly<{
     controls: FakeAgentControls,
   ): ToolApprovalResponse;
   abort?(controls: FakeAgentControls): void;
+  close?(): Promise<void>;
 }>;
 
 describe("runTui", () => {
+  it("waits for Agent close before resolving terminal exit", async () => {
+    const closeStarted = Promise.withResolvers<void>();
+    const closeGate = Promise.withResolvers<void>();
+    const close = vi.fn(async () => {
+      closeStarted.resolve();
+      await closeGate.promise;
+    });
+    const agent = createFakeAgent({ prompt: async () => ({ status: "completed" }), close });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const exit = runTui({ agent, input, output, signalSource: new EventEmitter() });
+    let exited = false;
+    void exit.then(() => {
+      exited = true;
+    });
+    input.write("/exit\n");
+    await closeStarted.promise;
+    expect(exited).toBe(false);
+    closeGate.resolve();
+    await expect(exit).resolves.toBe(0);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it("renders Session identity, workspace, and reopened message history", async () => {
     const promptHandler = vi.fn(async (): Promise<PromptResult> => ({ status: "completed" }));
     const agent = createFakeAgent({ prompt: promptHandler }, [
@@ -1278,7 +1302,7 @@ describe("runTui", () => {
 });
 
 function createFakeAgent(
-  { prompt, respondToToolApproval, abort }: FakeAgentBehavior,
+  { prompt, respondToToolApproval, abort, close }: FakeAgentBehavior,
   messageHistory: readonly Message[] = [],
   workspaceRoot = "C:\\workspace",
 ): Agent {
@@ -1337,6 +1361,7 @@ function createFakeAgent(
       respondToToolApproval?.(toolApprovalRequestId, decision, controls) ??
       Object.freeze({ status: "rejected", reason: "not_pending" }),
     abort: () => abort?.(controls),
+    close: () => close?.() ?? Promise.resolve(),
     subscribe(listener) {
       listeners.add(listener);
       return () => {

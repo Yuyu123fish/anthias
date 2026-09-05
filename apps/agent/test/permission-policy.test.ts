@@ -2,8 +2,8 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type AgentEvent, createAgentWithModelStream, type PermissionMode } from "../src/agent.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model-stream.js";
-import { type AgentEvent, createAgentWithModelStream, type PermissionMode } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -42,7 +42,12 @@ describe("Permission Mode", () => {
     await expect(agent.prompt("只做分析")).resolves.toEqual({ status: "completed" });
 
     expect(agent.state.permissionMode).toBe("plan");
-    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual(["read_file", "glob", "grep"]);
+    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "read_file",
+      "glob",
+      "grep",
+      "read_artifact",
+    ]);
     expect(modelRequests[0]?.systemPrompt).toContain("Plan 模式");
     expect(modelRequests[0]?.systemPrompt).toContain("不得请求或声称已经产生");
     expect(modelRequests[0]?.systemPrompt).not.toContain("修改后运行相关验证");
@@ -81,7 +86,12 @@ describe("Permission Mode", () => {
 
     expect(agent.setPermissionMode("agent")).toEqual({ status: "rejected", reason: "busy" });
     expect(agent.state.permissionMode).toBe("plan");
-    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual(["read_file", "glob", "grep"]);
+    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "read_file",
+      "glob",
+      "grep",
+      "read_artifact",
+    ]);
 
     releaseModel.resolve();
     await expect(promptResultPromise).resolves.toEqual({ status: "completed" });

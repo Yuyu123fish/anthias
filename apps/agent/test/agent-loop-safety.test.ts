@@ -2,8 +2,8 @@ import { glob, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createAgentWithModelStream } from "../src/agent.js";
 import type { ModelStream, ModelStreamEvent } from "../src/model-stream.js";
-import { createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -101,7 +101,7 @@ async function createTestSession() {
 /** 读取指定 Session 目录中唯一 JSONL 文件的最终记录。 */
 async function finalSessionRecord(sessionDirectory: string) {
   const sessionFiles: string[] = [];
-  for await (const sessionFileName of glob("*.jsonl", { cwd: sessionDirectory })) {
+  for await (const sessionFileName of glob("*/*/session.jsonl", { cwd: sessionDirectory })) {
     sessionFiles.push(sessionFileName);
   }
   const [sessionFileName] = sessionFiles;

@@ -1,77 +1,100 @@
+import { randomUUID } from "node:crypto";
 import {
-  type AssistantMessage,
-  type AssistantToolCallPart,
-  isToolCallPart,
-  type Message,
-  type ToolResultMessage,
-} from "./message.js";
-import {
-  type ModelFinishReason,
-  type ModelInputMessage,
-  type ModelRequest,
-  type ModelStream,
-  streamAssistantMessage,
-  toModelInputMessage,
-} from "./model-stream.js";
-import type { PermissionMode } from "./permission-mode.js";
-import type { ModelToolDefinition } from "./tool/definitions.js";
-import type {
-  PreparedToolExecution,
-  ToolApprovalPlan,
-  ToolCallPlan,
-  ToolRunner,
-} from "./tool/tool-runner.js";
+  type AgentLoopEvent,
+  type AgentLoopResult,
+  type AgentLoopToolApproval,
+  runAgentLoop,
+} from "./agent-loop.js";
+import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
+import type { ModelStream } from "./model-stream.js";
+import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission-mode.js";
+import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
+import { createSessionArtifactStore } from "./session/artifacts.js";
+import type { SessionCleanupResult } from "./session/cleanup.js";
+import type { Session, SessionRunLease } from "./session/index.js";
+import { getToolDefinitions } from "./tool/definitions.js";
+import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
 
-/** 枚举 Agent Loop 当前正在推进的活动阶段。 */
-export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
+export type { PermissionMode } from "./permission-mode.js";
 
-/** 枚举 Agent Loop 停止迭代时可以交给 Run 的结果。 */
-export type AgentLoopResult =
+/** 枚举 Run 对外交付的活动阶段。 */
+export type RunPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
+
+/** 描述公开状态中当前 Run 的身份与阶段。 */
+export type ActiveRun = Readonly<{
+  runId: string;
+  phase: RunPhase;
+}>;
+
+/** 描述一个已经通过校验和预检、即将真实执行的 Tool 动作。 */
+export type ToolActivity = Readonly<{
+  toolCallId: string;
+  toolName: string;
+  summary: string;
+}>;
+
+/** 描述交互 Adapter 需要呈现的一次副作用 Tool 确认请求。 */
+export type ToolApprovalRequest = Readonly<{
+  toolApprovalRequestId: string;
+  toolCallId: string;
+  toolName: "edit_file" | "write_file" | "execute_command";
+  target: string;
+  preview: string;
+  permissionMode: PermissionMode;
+  riskSummary: string;
+  executionBoundary: string;
+}>;
+
+/** 表示 TUI 对当前 Tool 确认响应的同步接纳结果。 */
+export type ToolApprovalResponse =
+  | Readonly<{ status: "accepted" }>
+  | Readonly<{ status: "rejected"; reason: "not_pending" | "request_mismatch" }>;
+
+/** 表示权限模式切换已经生效，或因活动 Run 被拒绝。 */
+export type PermissionModeChangeResult =
+  | Readonly<{ status: "accepted"; permissionMode: PermissionMode }>
+  | Readonly<{ status: "rejected"; reason: "busy" | "closed" }>;
+
+/** 提供交互 Adapter 可读取但不能修改的 Agent 状态快照。 */
+export type AgentState = Readonly<{
+  sessionId: string;
+  workspaceRoot: string;
+  permissionMode: PermissionMode;
+  messageHistory: readonly Message[];
+  activeAssistantMessage: AssistantMessage | null;
+  activeRun: ActiveRun | null;
+  pendingToolApproval: ToolApprovalRequest | null;
+  running: boolean;
+  lastError: string | null;
+}>;
+
+/** 枚举一个已接受 Run 的公开终态。 */
+export type FinishedPromptResult =
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "aborted" }>
   | Readonly<{ status: "failed"; error: string }>;
 
-/** 表示 Agent Loop 等到的一次确认标识及最终决定。 */
-export type AgentLoopToolApproval = Readonly<{
-  toolApprovalRequestId: string;
-  decision: "approve" | "deny" | "aborted";
-}>;
+/** 表示提示词被拒绝或完成一次 Run 后的结果。 */
+export type PromptResult =
+  | Readonly<{
+      status: "rejected";
+      reason: "empty" | "busy" | "session_busy" | "session_changed" | "closed";
+    }>
+  | FinishedPromptResult;
 
-/** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
-export type AgentLoopEvent =
-  | Readonly<{
-      type: "reasoning_start";
-    }>
-  | Readonly<{
-      type: "reasoning_update";
-      delta: string;
-    }>
-  | Readonly<{
-      type: "reasoning_end";
-    }>
-  | Readonly<{
-      type: "assistant_message_start";
-      message: AssistantMessage;
-    }>
-  | Readonly<{
-      type: "assistant_message_update";
-      message: AssistantMessage;
-      delta: string | null;
-    }>
-  | Readonly<{
-      type: "assistant_message_end";
-      message: AssistantMessage;
-    }>
-  | Readonly<{
-      type: "tool_result";
-      message: ToolResultMessage;
-    }>
-  | Readonly<{
-      type: "tool_execution_start";
-      toolCall: AssistantToolCallPart;
-      toolApprovalRequestId: string | null;
-      activitySummary: string;
-    }>
+/** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
+export type AgentEvent =
+  | Readonly<{ type: "session_cleanup"; result: SessionCleanupResult }>
+  | Readonly<{ type: "run_start"; runId: string }>
+  | Readonly<{ type: "run_phase_changed"; runId: string; phase: RunPhase }>
+  | Readonly<{ type: "reasoning_start"; runId: string }>
+  | Readonly<{ type: "reasoning_update"; runId: string; delta: string }>
+  | Readonly<{ type: "reasoning_end"; runId: string }>
+  | Readonly<{ type: "permission_mode_changed"; permissionMode: PermissionMode }>
+  | Readonly<{ type: "message_start"; message: Message }>
+  | Readonly<{ type: "message_update"; message: AssistantMessage; delta: string }>
+  | Readonly<{ type: "message_end"; message: Message }>
+  | Readonly<{ type: "tool_execution_start"; activity: ToolActivity }>
   | Readonly<{
       type: "tool_execution_update";
       toolCallId: string;
@@ -83,578 +106,666 @@ export type AgentLoopEvent =
       type: "tool_execution_end";
       toolCallId: string;
       toolName: string;
-      result: ToolResultMessage;
+      result: Extract<Message, { role: "tool" }>;
       cleanupUncertain: boolean;
+    }>
+  | Readonly<{ type: "tool_approval_requested"; request: ToolApprovalRequest }>
+  | Readonly<{
+      type: "tool_approval_resolved";
+      request: ToolApprovalRequest;
+      decision: "approve" | "deny" | "aborted";
+    }>
+  | Readonly<{
+      type: "run_end";
+      runId: string;
+      result: FinishedPromptResult;
     }>;
 
-/** 配置一次纯 Agent Loop 所需的上下文、能力与 Run 回调。 */
-export type RunAgentLoopOptions = Readonly<{
-  messages: readonly Message[];
+/** 定义同步观察 AgentEvent 的监听器。 */
+export type AgentListener = (event: AgentEvent) => void;
+
+/** 暴露交互 Adapter 操作 Agent 所需的最小公开 Interface。 */
+export type Agent = Readonly<{
+  readonly state: AgentState;
+  prompt(promptText: string): Promise<PromptResult>;
+  setPermissionMode(permissionMode: PermissionMode): PermissionModeChangeResult;
+  respondToToolApproval(
+    toolApprovalRequestId: string,
+    decision: "approve" | "deny",
+  ): ToolApprovalResponse;
+  abort(): void;
+  close(): Promise<void>;
+  subscribe(listener: AgentListener): () => void;
+}>;
+
+/** 配置内部 Model Stream 与已打开 Session 的 Agent 运行宿主。 */
+export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
-  systemPrompt: string;
-  toolDefinitions: readonly ModelToolDefinition[];
-  permissionMode: PermissionMode;
-  toolRunner: ToolRunner;
+  session: Session;
+  permissionMode?: PermissionMode | undefined;
+  toolRunner?: ToolRunner | undefined;
+  startCleanup?:
+    | ((report: (result: SessionCleanupResult) => void) => () => Promise<void>)
+    | undefined;
+}>;
+
+/** 集中持有一个活动 Run 的取消、Session lease、Loop 投影与唯一终态。 */
+type ActiveRunOwnership = {
+  runId: string;
+  phase: RunPhase;
+  sessionLease: SessionRunLease;
   abortController: AbortController;
-  emit(event: AgentLoopEvent): Promise<void>;
-  updatePhase(phase: AgentLoopPhase): void;
-  requestToolApproval(
-    toolCall: AssistantToolCallPart,
-    approvalPlan: ToolApprovalPlan,
-  ): Promise<AgentLoopToolApproval>;
-}>;
+  permissionMode: PermissionMode;
+  visibleReasoningActive: boolean;
+  sessionWriteFailed: boolean;
+  terminalResultPromise: Promise<FinishedPromptResult> | null;
+};
 
-/** 表示一次模型请求形成的 AssistantMessage 与完成原因。 */
-type AssistantRequestResult = Readonly<{
-  message: AssistantMessage;
-  modelInputMessage: Extract<ModelInputMessage, { role: "assistant" }>;
-  finishReason: ModelFinishReason | null;
-}>;
-
-/** 保存批次中一个 ToolCall 的源位置和一次性执行计划。 */
-type PlannedToolCall = Readonly<{
-  sourceIndex: number;
-  toolCall: AssistantToolCallPart;
-  plan: ToolCallPlan;
-}>;
-
-/** 表示 Tool 预检已返回、失败，或因 Run 停止而不再等待。 */
-type ToolPreparationWaitResult =
-  | Readonly<{ status: "prepared"; preparation: Awaited<ReturnType<ToolCallPlan["prepare"]>> }>
-  | Readonly<{ status: "failed" }>
-  | Readonly<{ status: "aborted" }>;
-
-/** 协调并发调用按源顺序发布 execution start。 */
-type SourceOrderStartGate = Readonly<{
-  waitForTurn(sourceIndex: number): Promise<void>;
-  completeTurn(sourceIndex: number): void;
+/** 持有当前确认 Promise 的唯一解决入口和对应请求。 */
+type PendingToolApproval = Readonly<{
+  runId: string;
+  request: ToolApprovalRequest;
+  resolve(decision: "approve" | "deny" | "aborted"): void;
 }>;
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
-const MODEL_REQUEST_LIMIT = 12;
-const TOOL_CALL_BATCH_LIMIT = 32;
-const READ_ONLY_TOOL_CONCURRENCY_LIMIT = 4;
-const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
-const ABORTED_LOOP_RESULT = Object.freeze({ status: "aborted" } as const);
-const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
-const MODEL_REQUEST_LIMIT_RESULT = Object.freeze({
+const SAFE_SESSION_ERROR = "Session 写入失败，请检查本地存储后重试。";
+const SAFE_SESSION_RELEASE_ERROR = "Session 资源释放失败，已停止继续写入；请重新打开 Session。";
+const SESSION_FAILED_RESULT = Object.freeze({
   status: "failed",
-  error: "模型连续请求次数超过安全上限，Run 已停止。",
+  error: SAFE_SESSION_ERROR,
 } as const);
-const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
+const SESSION_RELEASE_FAILED_RESULT = Object.freeze({
   status: "failed",
-  error: "单次模型响应包含过多 ToolCall，Run 已停止。",
+  error: SAFE_SESSION_RELEASE_ERROR,
 } as const);
+const MODEL_FAILED_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
+const EMPTY_PROMPT_RESULT = Object.freeze({ status: "rejected", reason: "empty" } as const);
+const BUSY_PROMPT_RESULT = Object.freeze({ status: "rejected", reason: "busy" } as const);
+const SESSION_BUSY_PROMPT_RESULT = Object.freeze({
+  status: "rejected",
+  reason: "session_busy",
+} as const);
+const SESSION_CHANGED_PROMPT_RESULT = Object.freeze({
+  status: "rejected",
+  reason: "session_changed",
+} as const);
+const CLOSED_PROMPT_RESULT = Object.freeze({ status: "rejected", reason: "closed" } as const);
+const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
 
-/** 推进 Model → Tool → Model，并用内部上限阻止异常循环和过大调用批次。 */
-export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
-  const messageHistory = [...options.messages];
-  const transientModelMessages = new Map<
-    AssistantMessage,
-    Extract<ModelInputMessage, { role: "assistant" }>
-  >();
-  let modelRequestCount = 0;
-
-  while (true) {
-    if (options.abortController.signal.aborted) {
-      return ABORTED_LOOP_RESULT;
-    }
-    if (modelRequestCount >= MODEL_REQUEST_LIMIT) {
-      return MODEL_REQUEST_LIMIT_RESULT;
-    }
-
-    options.updatePhase("requesting_model");
-    modelRequestCount += 1;
-    const assistantRequest = await streamAssistantResponse(
-      messageHistory,
-      transientModelMessages,
-      options,
-    );
-    if (assistantRequest.message.status === "aborted") {
-      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-      return ABORTED_LOOP_RESULT;
-    }
-    if (assistantRequest.message.status === "failed") {
-      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-      return FAILED_LOOP_RESULT;
-    }
-
-    // 获取 ToolCall 列表
-    const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
-    if (toolCalls.length === 0) {
-      return assistantRequest.finishReason === "stop" ? COMPLETED_LOOP_RESULT : FAILED_LOOP_RESULT;
-    }
-    if (assistantRequest.finishReason !== "tool_calls") {
-      await appendToolResults(
-        toolCalls,
-        "aborted",
-        "模型未正常结束 ToolCall。",
-        messageHistory,
-        options,
-      );
-      return FAILED_LOOP_RESULT;
-    }
-    if (toolCalls.length > TOOL_CALL_BATCH_LIMIT) {
-      await appendToolResults(
-        toolCalls,
-        "failed",
-        "单次模型响应包含过多 ToolCall，调用未执行。",
-        messageHistory,
-        options,
-      );
-      return TOOL_CALL_BATCH_LIMIT_RESULT;
-    }
-
-    const plannedToolCalls = toolCalls.map((toolCall, sourceIndex) =>
-      Object.freeze({
-        sourceIndex,
-        toolCall,
-        plan: options.toolRunner.createPlan(toolCall, options.permissionMode),
+/** 使用内部 Model Stream 与已打开 Session 创建 Agent 运行宿主。 */
+export function createAgentWithModelStream({
+  modelStream,
+  session,
+  permissionMode: initialPermissionMode = DEFAULT_PERMISSION_MODE,
+  toolRunner: providedToolRunner,
+  startCleanup,
+}: CreateAgentWithModelStreamOptions): Agent {
+  const messageHistory: Message[] = [...session.messageHistory];
+  const artifactStore = createSessionArtifactStore({
+    sessionId: session.sessionId,
+    storageDirectory: session.storageDirectory,
+  });
+  for (const message of messageHistory) {
+    if (message.role === "tool" && message.artifact !== undefined)
+      artifactStore.registerReference(message.artifact);
+  }
+  const toolRunner =
+    providedToolRunner ??
+    createToolRunner({
+      workspace: Object.freeze({
+        workspaceRoot: session.workspaceRoot,
+        sessionDirectory: session.sessionDirectory,
       }),
-    );
-    const parallelReadOnlyBatch = plannedToolCalls.every(
-      ({ plan }) => plan.scheduling === "parallel_read_only",
-    );
-    if (parallelReadOnlyBatch) {
-      const toolResultMessages = await executeParallelReadOnlyBatch(plannedToolCalls, options);
-      for (const toolResultMessage of toolResultMessages) {
-        await appendToolResultMessage(toolResultMessage, messageHistory, options);
-      }
-      if (options.abortController.signal.aborted) {
-        return ABORTED_LOOP_RESULT;
-      }
-      continue;
-    }
-
-    for (let toolIndex = 0; toolIndex < plannedToolCalls.length; toolIndex += 1) {
-      const plannedToolCall = plannedToolCalls[toolIndex];
-      if (plannedToolCall === undefined) {
-        throw new Error("ToolCall 顺序状态缺失。");
-      }
-      const toolResultMessage = await formToolResultMessage(plannedToolCall, options, null);
-      await appendToolResultMessage(toolResultMessage, messageHistory, options);
-      if (options.abortController.signal.aborted) {
-        await appendToolResults(
-          plannedToolCalls.slice(toolIndex + 1).map(({ toolCall }) => toolCall),
-          "aborted",
-          "Run 已停止，调用未执行。",
-          messageHistory,
-          options,
-        );
-        return ABORTED_LOOP_RESULT;
-      }
-    }
-  }
-}
-
-/** 流式形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
-async function streamAssistantResponse(
-  messageHistory: Message[],
-  transientModelMessages: Map<AssistantMessage, Extract<ModelInputMessage, { role: "assistant" }>>,
-  options: RunAgentLoopOptions,
-): Promise<AssistantRequestResult> {
-  let finalMessage: AssistantMessage | null = null;
-  let finalModelInputMessage: Extract<ModelInputMessage, { role: "assistant" }> | null = null;
-  let finishReason: ModelFinishReason | null = null;
-
-  const modelRequest: ModelRequest = Object.freeze({
-    systemPrompt: options.systemPrompt,
-    messages: Object.freeze(
-      messageHistory.map((message) =>
-        message.role === "assistant"
-          ? (transientModelMessages.get(message) ?? toModelInputMessage(message))
-          : toModelInputMessage(message),
-      ),
-    ),
-    tools: options.toolDefinitions,
-  });
-
-  // 异步遍历可迭代模型响应
-  for await (const messageEvent of streamAssistantMessage(
-    options.modelStream,
-    modelRequest,
-    options.abortController.signal,
-  )) {
-    if (messageEvent.type === "reasoning_start") {
-      await options.emit({ type: "reasoning_start" });
-      continue;
-    }
-    if (messageEvent.type === "reasoning_update") {
-      await options.emit({ type: "reasoning_update", delta: messageEvent.delta });
-      continue;
-    }
-    if (messageEvent.type === "reasoning_end") {
-      await options.emit({ type: "reasoning_end" });
-      continue;
-    }
-    if (messageEvent.type === "start") {
-      await options.emit({
-        type: "assistant_message_start",
-        message: messageEvent.partialAssistantMessage,
-      });
-      continue;
-    }
-    if (messageEvent.type === "update") {
-      await options.emit({
-        type: "assistant_message_update",
-        message: messageEvent.partialAssistantMessage,
-        delta: messageEvent.delta,
-      });
-      continue;
-    }
-
-    finalMessage = messageEvent.message;
-    finalModelInputMessage = messageEvent.modelInputMessage;
-    finishReason = messageEvent.finishReason;
-  }
-
-  if (finalMessage === null || finalModelInputMessage === null) {
-    throw new Error("Model Stream 未形成最终 AssistantMessage。");
-  }
-  await options.emit({ type: "assistant_message_end", message: finalMessage });
-  transientModelMessages.set(finalMessage, finalModelInputMessage);
-  messageHistory.push(finalMessage);
-  return Object.freeze({
-    message: finalMessage,
-    modelInputMessage: finalModelInputMessage,
-    finishReason,
-  });
-}
-
-/** 按源索引保存并发结果，并为未领取调用补齐 aborted 消息。 */
-async function executeParallelReadOnlyBatch(
-  plannedToolCalls: readonly PlannedToolCall[],
-  options: RunAgentLoopOptions,
-): Promise<readonly ToolResultMessage[]> {
-  const toolResultMessages: Array<ToolResultMessage | undefined> = Array.from({
-    length: plannedToolCalls.length,
-  });
-  const startGate = createSourceOrderStartGate(plannedToolCalls.length);
-  let nextSourceIndex = 0;
-
-  /** 单个 worker 每次只领取下一个递增索引，abort 后不再领取。 */
-  async function runWorker(): Promise<void> {
-    while (!options.abortController.signal.aborted) {
-      const sourceIndex = nextSourceIndex;
-      if (sourceIndex >= plannedToolCalls.length) {
-        return;
-      }
-      nextSourceIndex += 1;
-      const plannedToolCall = plannedToolCalls[sourceIndex];
-      if (plannedToolCall === undefined) {
-        throw new Error("ToolCall 并发队列状态缺失。");
-      }
-      toolResultMessages[sourceIndex] = await formToolResultMessage(
-        plannedToolCall,
-        options,
-        startGate,
-      );
-    }
-  }
-
-  const workerCount = Math.min(READ_ONLY_TOOL_CONCURRENCY_LIMIT, plannedToolCalls.length);
-  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
-  for (const plannedToolCall of plannedToolCalls) {
-    toolResultMessages[plannedToolCall.sourceIndex] ??= createAbortedToolResultMessage(
-      plannedToolCall.toolCall,
-      "Run 已停止，调用未执行。",
-    );
-  }
-  return Object.freeze(
-    toolResultMessages.map((toolResultMessage) => {
-      if (toolResultMessage === undefined) {
-        throw new Error("ToolCall 结果缺失。");
-      }
-      return toolResultMessage;
-    }),
-  );
-}
-
-/** 通过统一 Tool Module 预检、确认并形成一条尚未提交的结果消息。 */
-async function formToolResultMessage(
-  plannedToolCall: PlannedToolCall,
-  options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
-): Promise<ToolResultMessage> {
-  const { plan, toolCall } = plannedToolCall;
-  const preparationWaitResult = await waitForPreparationOrAbort(
-    plan,
-    options.abortController.signal,
-  );
-  if (preparationWaitResult.status === "aborted") {
-    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createAbortedToolResultMessage(toolCall, plan.abortedPreparationContent);
-  }
-  if (preparationWaitResult.status === "failed") {
-    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createToolResultMessage(toolCall, {
-      status: "failed",
-      content: "Tool 预检失败。",
-      truncated: false,
+      shell: session.shell,
+      artifactStore,
     });
-  }
-  const { preparation } = preparationWaitResult;
-  if (options.abortController.signal.aborted) {
-    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createAbortedToolResultMessage(toolCall, plan.abortedPreparationContent);
-  }
+  const eventListeners = new Set<AgentListener>();
+  let permissionMode = initialPermissionMode;
+  let activeAssistantMessage: AssistantMessage | null = null;
+  let lastError: string | null = null;
+  let activeRun: ActiveRunOwnership | null = null;
+  let sessionUnavailableResult: FinishedPromptResult | null = null;
+  let sessionLeaseAcquisitionPending = false;
+  let sessionChanged = false;
+  let pendingToolApproval: PendingToolApproval | null = null;
+  let ownedPromptResultPromise: Promise<PromptResult> | null = null;
+  let closeRequested = false;
+  let closeCompletionPromise: Promise<void> | null = null;
 
-  if (!preparation.ok) {
-    await skipExecutionStart(plannedToolCall.sourceIndex, startGate);
-    return createToolResultMessage(toolCall, preparation.result);
-  }
-  return executePreparedToolCall(
-    plannedToolCall,
-    preparation.preparedExecution,
-    options,
-    startGate,
-  );
-}
-
-/** 协调一个已预检 Tool 的确认、执行和事件，结果由调用方串行提交。 */
-async function executePreparedToolCall(
-  plannedToolCall: PlannedToolCall,
-  preparedExecution: PreparedToolExecution,
-  options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
-): Promise<ToolResultMessage> {
-  const { toolCall, sourceIndex } = plannedToolCall;
-  let toolApprovalRequestId: string | null = null;
-  const approvalPlan = preparedExecution.approval;
-  if (approvalPlan !== null) {
-    if (startGate !== null) {
-      await skipExecutionStart(sourceIndex, startGate);
-      return createToolResultMessage(toolCall, {
-        status: "failed",
-        content: "只读并发计划不能请求副作用确认。",
-        truncated: false,
-      });
-    }
-    // 需要人工确认的 ToolCall，切换到等待人工确认阶段
-    options.updatePhase("awaiting_tool_approval");
-    const approval = await options.requestToolApproval(toolCall, approvalPlan);
-    toolApprovalRequestId = approval.toolApprovalRequestId;
-    if (approval.decision !== "approve" || options.abortController.signal.aborted) {
-      return createToolResultMessage(toolCall, {
-        status: approval.decision === "deny" ? "denied" : "aborted",
-        content:
-          approval.decision === "deny"
-            ? approvalPlan.deniedContent
-            : preparedExecution.executionUnavailableContent,
-        truncated: false,
-      });
-    }
-  }
-
-  if (options.abortController.signal.aborted) {
-    await skipExecutionStart(sourceIndex, startGate);
-    return createAbortedToolResultMessage(toolCall, preparedExecution.executionUnavailableContent);
-  }
-
-  options.updatePhase("executing_tool");
-  const executionStarted = await publishExecutionStart(
-    plannedToolCall,
-    toolApprovalRequestId,
-    preparedExecution.activitySummary,
-    options,
-    startGate,
-  );
-  if (!executionStarted) {
-    return createAbortedToolResultMessage(toolCall, preparedExecution.executionUnavailableContent);
-  }
-
-  let executionResult: Awaited<ReturnType<PreparedToolExecution["execute"]>>;
-  try {
-    executionResult = await preparedExecution.execute(options.abortController.signal, (update) => {
-      if (!options.abortController.signal.aborted) {
-        void options.emit({
-          type: "tool_execution_update",
-          toolCallId: toolCall.toolCallId,
-          toolName: toolCall.toolName,
-          stream: update.stream,
-          delta: update.delta,
-        });
-      }
-    });
-  } catch {
-    executionResult = Object.freeze({
-      status: "failed",
-      content: "Tool 执行失败。",
-      truncated: false,
-      cleanupUncertain: true,
+  /** 生成只读状态投影；完成消息与活动 partial 的生命周期由各自形成边界持有。 */
+  function createStateSnapshot(): AgentState {
+    return Object.freeze({
+      sessionId: session.sessionId,
+      workspaceRoot: session.workspaceRoot,
+      permissionMode,
+      messageHistory: Object.freeze([...messageHistory]),
+      activeAssistantMessage,
+      activeRun: activeRun
+        ? Object.freeze({
+            runId: activeRun.runId,
+            phase: activeRun.phase,
+          })
+        : null,
+      pendingToolApproval: pendingToolApproval?.request ?? null,
+      running: activeRun !== null,
+      lastError,
     });
   }
 
-  const toolResultMessage = createToolResultMessage(toolCall, {
-    status:
-      executionResult.status === "completed"
-        ? "completed"
-        : options.abortController.signal.aborted
-          ? "aborted"
-          : "failed",
-    content: executionResult.content,
-    truncated: executionResult.truncated,
-  });
-  await options.emit({
-    type: "tool_execution_end",
-    toolCallId: toolCall.toolCallId,
-    toolName: toolCall.toolName,
-    result: toolResultMessage,
-    cleanupUncertain: executionResult.cleanupUncertain,
-  });
-  return toolResultMessage;
-}
-
-/** abort 后立即结束对无副作用预检的等待，迟到的预检结果不会进入执行。 */
-function waitForPreparationOrAbort(
-  plan: ToolCallPlan,
-  abortSignal: AbortSignal,
-): Promise<ToolPreparationWaitResult> {
-  if (abortSignal.aborted) {
-    return Promise.resolve(Object.freeze({ status: "aborted" }));
-  }
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result: ToolPreparationWaitResult) => {
-      if (settled) {
-        return;
+  /** 按注册顺序同步发布事件，并隔离订阅者异常。 */
+  function publishEvent(event: AgentEvent): void {
+    const eventSnapshot = Object.freeze(event);
+    for (const listener of [...eventListeners]) {
+      try {
+        void listener(eventSnapshot);
+      } catch {
+        // 订阅者没有第二条错误通道；呈现异常不能破坏 Run 的唯一终结路径。
       }
-      settled = true;
-      abortSignal.removeEventListener("abort", handleAbort);
-      resolve(result);
-    };
-    const handleAbort = () => finish(Object.freeze({ status: "aborted" }));
-    abortSignal.addEventListener("abort", handleAbort, { once: true });
-    if (abortSignal.aborted) {
-      handleAbort();
+    }
+  }
+
+  /** 同步更新唯一 Run phase，并只为真实变化发布一次事件。 */
+  function updateRunPhase(currentRun: ActiveRunOwnership, nextPhase: RunPhase): void {
+    if (currentRun.phase === nextPhase) {
       return;
     }
-    void Promise.resolve()
-      .then(() => plan.prepare())
-      .then(
-        (preparation) => finish(Object.freeze({ status: "prepared", preparation })),
-        () => finish(Object.freeze({ status: "failed" })),
-      );
-  });
-}
-
-function createAbortedToolResultMessage(
-  toolCall: AssistantToolCallPart,
-  content: string,
-): ToolResultMessage {
-  return createToolResultMessage(toolCall, { status: "aborted", content, truncated: false });
-}
-
-/** 串行提交已经形成的结果消息，再把它加入下一轮模型上下文。 */
-async function appendToolResultMessage(
-  toolResultMessage: ToolResultMessage,
-  messageHistory: Message[],
-  options: RunAgentLoopOptions,
-): Promise<void> {
-  await options.emit({ type: "tool_result", message: toolResultMessage });
-  messageHistory.push(toolResultMessage);
-}
-
-function createToolResultMessage(
-  toolCall: AssistantToolCallPart,
-  result: Readonly<{
-    status: ToolResultMessage["status"];
-    content: string;
-    truncated: boolean;
-  }>,
-): ToolResultMessage {
-  return Object.freeze({
-    role: "tool",
-    toolCallId: toolCall.toolCallId,
-    toolName: toolCall.toolName,
-    status: result.status,
-    content: result.content,
-    truncated: result.truncated,
-  });
-}
-
-/** 建立一组只在前一个索引完成 start 决策后开放的有界 gate。 */
-function createSourceOrderStartGate(toolCallCount: number): SourceOrderStartGate {
-  const turns = Array.from({ length: toolCallCount }, () => Promise.withResolvers<void>());
-  turns[0]?.resolve();
-  return Object.freeze({
-    async waitForTurn(sourceIndex) {
-      await turns[sourceIndex]?.promise;
-    },
-    completeTurn(sourceIndex) {
-      turns[sourceIndex + 1]?.resolve();
-    },
-  });
-}
-
-/** 对不执行的调用也按源顺序释放后续 start gate。 */
-async function skipExecutionStart(
-  sourceIndex: number,
-  startGate: SourceOrderStartGate | null,
-): Promise<void> {
-  if (startGate === null) {
-    return;
+    currentRun.phase = nextPhase;
+    publishEvent({
+      type: "run_phase_changed",
+      runId: currentRun.runId,
+      phase: nextPhase,
+    });
   }
-  await startGate.waitForTurn(sourceIndex);
-  startGate.completeTurn(sourceIndex);
-}
 
-/** 在 gate 内按源顺序发布 start，并在 abort 时只释放后续调用。 */
-async function publishExecutionStart(
-  plannedToolCall: PlannedToolCall,
-  toolApprovalRequestId: string | null,
-  activitySummary: string,
-  options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
-): Promise<boolean> {
-  if (startGate !== null) {
-    await startGate.waitForTurn(plannedToolCall.sourceIndex);
-  }
-  try {
-    if (options.abortController.signal.aborted) {
-      return false;
+  /** 防御性收口仍活动的瞬时 Reasoning，不保存它的正文。 */
+  function closeVisibleReasoning(currentRun: ActiveRunOwnership): void {
+    if (!currentRun.visibleReasoningActive) {
+      return;
     }
-    await options.emit({
-      type: "tool_execution_start",
-      toolCall: plannedToolCall.toolCall,
-      toolApprovalRequestId,
-      activitySummary,
-    });
-    return true;
-  } finally {
-    startGate?.completeTurn(plannedToolCall.sourceIndex);
+    currentRun.visibleReasoningActive = false;
+    publishEvent({ type: "reasoning_end", runId: currentRun.runId });
   }
+
+  /** 注册事件监听器，并返回可重复调用的取消订阅函数。 */
+  function subscribeToEvents(listener: AgentListener): () => void {
+    eventListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) {
+        return;
+      }
+      subscribed = false;
+      eventListeners.delete(listener);
+    };
+  }
+
+  /** 只在 Agent 空闲时改变后续 Run 的权限快照。 */
+  function setPermissionMode(nextPermissionMode: PermissionMode): PermissionModeChangeResult {
+    if (closeRequested) {
+      return Object.freeze({ status: "rejected", reason: "closed" });
+    }
+    if (activeRun !== null || sessionLeaseAcquisitionPending) {
+      return Object.freeze({ status: "rejected", reason: "busy" });
+    }
+    if (permissionMode !== nextPermissionMode) {
+      permissionMode = nextPermissionMode;
+      publishEvent({ type: "permission_mode_changed", permissionMode });
+    }
+    return Object.freeze({ status: "accepted", permissionMode });
+  }
+
+  /** 请求中止当前 Run，实际终结继续由 Agent Loop 和统一收口路径完成。 */
+  function abortActiveRun(): void {
+    const currentRun = activeRun;
+    if (currentRun === null || currentRun.abortController.signal.aborted) {
+      return;
+    }
+    currentRun.abortController.abort();
+    resolvePendingToolApproval(currentRun, "aborted");
+  }
+
+  /** 只解决当前标识完全匹配的确认，不直接执行任何 Tool。 */
+  function respondToToolApproval(
+    toolApprovalRequestId: string,
+    decision: "approve" | "deny",
+  ): ToolApprovalResponse {
+    const pendingApproval = pendingToolApproval;
+    if (pendingApproval === null) {
+      return Object.freeze({ status: "rejected", reason: "not_pending" });
+    }
+    if (pendingApproval.request.toolApprovalRequestId !== toolApprovalRequestId) {
+      return Object.freeze({ status: "rejected", reason: "request_mismatch" });
+    }
+    if (
+      activeRun?.runId !== pendingApproval.runId ||
+      activeRun.phase !== "awaiting_tool_approval"
+    ) {
+      return Object.freeze({ status: "rejected", reason: "request_mismatch" });
+    }
+
+    pendingToolApproval = null;
+    publishEvent({
+      type: "tool_approval_resolved",
+      request: pendingApproval.request,
+      decision,
+    });
+    pendingApproval.resolve(decision);
+    return Object.freeze({ status: "accepted" });
+  }
+
+  /** 解决当前 Run 唯一待决确认，晚到或其他 Run 的请求保持不变。 */
+  function resolvePendingToolApproval(currentRun: ActiveRunOwnership, decision: "aborted"): void {
+    const pendingApproval = pendingToolApproval;
+    if (pendingApproval === null || pendingApproval.runId !== currentRun.runId) {
+      return;
+    }
+    pendingToolApproval = null;
+    publishEvent({
+      type: "tool_approval_resolved",
+      request: pendingApproval.request,
+      decision,
+    });
+    pendingApproval.resolve(decision);
+  }
+
+  /** 发布完整预览并等待当前 ToolCall 的一次性确认决定。 */
+  function waitForToolApproval(
+    currentRun: ActiveRunOwnership,
+    toolCall: AssistantToolCallPart,
+    approvalPlan: ToolApprovalPlan,
+  ): Promise<AgentLoopToolApproval> {
+    const request: ToolApprovalRequest = Object.freeze({
+      toolApprovalRequestId: randomUUID(),
+      toolCallId: toolCall.toolCallId,
+      toolName: approvalPlan.toolName,
+      target: approvalPlan.target,
+      preview: approvalPlan.preview,
+      permissionMode: currentRun.permissionMode,
+      riskSummary: approvalPlan.riskSummary,
+      executionBoundary: approvalPlan.executionBoundary,
+    });
+    return new Promise((resolve) => {
+      pendingToolApproval = Object.freeze({
+        runId: currentRun.runId,
+        request,
+        resolve: (decision) =>
+          resolve(
+            Object.freeze({
+              toolApprovalRequestId: request.toolApprovalRequestId,
+              decision,
+            }),
+          ),
+      });
+      publishEvent({ type: "tool_approval_requested", request });
+      if (currentRun.abortController.signal.aborted) {
+        resolvePendingToolApproval(currentRun, "aborted");
+      }
+    });
+  }
+
+  /** 在异步获取 lease 之前登记整个 prompt，关闭流程也能等待尚未开始的 Run。 */
+  function prompt(promptText: string): Promise<PromptResult> {
+    if (closeRequested) {
+      return Promise.resolve(CLOSED_PROMPT_RESULT);
+    }
+    if (ownedPromptResultPromise !== null || activeRun !== null || sessionLeaseAcquisitionPending) {
+      return Promise.resolve(BUSY_PROMPT_RESULT);
+    }
+    const promptCompletion = Promise.withResolvers<PromptResult>();
+    ownedPromptResultPromise = promptCompletion.promise;
+    void submitPrompt(promptText).then(
+      (result) => {
+        ownedPromptResultPromise = null;
+        promptCompletion.resolve(result);
+      },
+      (error: unknown) => {
+        ownedPromptResultPromise = null;
+        promptCompletion.reject(error);
+      },
+    );
+    return promptCompletion.promise;
+  }
+
+  /** 终态事件交付后才释放 Session 使用标记，保证清理任务不会命中仍在退出的 Agent。 */
+  function close(): Promise<void> {
+    if (closeCompletionPromise !== null) {
+      return closeCompletionPromise;
+    }
+    closeRequested = true;
+    abortActiveRun();
+    closeCompletionPromise = (async () => {
+      try {
+        await ownedPromptResultPromise;
+      } finally {
+        try {
+          try {
+            await artifactStore.close();
+          } finally {
+            await session.close();
+          }
+        } finally {
+          try {
+            await stopCleanup?.();
+          } finally {
+            eventListeners.clear();
+          }
+        }
+      }
+    })();
+    return closeCompletionPromise;
+  }
+
+  /** 接纳提示词、建立一次 Run，并把实际迭代委托给 Agent Loop。 */
+  async function submitPrompt(promptText: string): Promise<PromptResult> {
+    if (promptText.trim().length === 0) {
+      return EMPTY_PROMPT_RESULT;
+    }
+    if (activeRun !== null || sessionLeaseAcquisitionPending) {
+      return BUSY_PROMPT_RESULT;
+    }
+    if (sessionChanged) {
+      return SESSION_CHANGED_PROMPT_RESULT;
+    }
+    if (sessionUnavailableResult !== null) {
+      return sessionUnavailableResult;
+    }
+
+    lastError = null;
+    const runId = randomUUID();
+    sessionLeaseAcquisitionPending = true;
+    let sessionRunAcquisition: Awaited<ReturnType<Session["acquireRun"]>>;
+    try {
+      sessionRunAcquisition = await session.acquireRun(runId);
+    } catch {
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      lastError = SAFE_SESSION_ERROR;
+      return SESSION_FAILED_RESULT;
+    } finally {
+      sessionLeaseAcquisitionPending = false;
+    }
+    if (sessionRunAcquisition.status === "rejected") {
+      if (sessionRunAcquisition.reason === "session_changed") {
+        sessionChanged = true;
+        return SESSION_CHANGED_PROMPT_RESULT;
+      }
+      return SESSION_BUSY_PROMPT_RESULT;
+    }
+
+    if (closeRequested) {
+      await sessionRunAcquisition.lease.release();
+      return ABORTED_PROMPT_RESULT;
+    }
+
+    const currentRun: ActiveRunOwnership = {
+      runId,
+      phase: "requesting_model",
+      sessionLease: sessionRunAcquisition.lease,
+      abortController: new AbortController(),
+      permissionMode,
+      visibleReasoningActive: false,
+      sessionWriteFailed: false,
+      terminalResultPromise: null,
+    };
+    activeRun = currentRun;
+
+    const userMessage: UserMessage = Object.freeze({ role: "user", content: promptText });
+    try {
+      // UserMessage 刷新成功后 Run 才算被接受，后续事件与 Tool 才能开始。
+      await currentRun.sessionLease.appendMessage(userMessage);
+    } catch {
+      return failBeforeRunStart(currentRun);
+    }
+
+    messageHistory.push(userMessage);
+    publishEvent({ type: "run_start", runId });
+    publishEvent({ type: "message_start", message: userMessage });
+    publishEvent({ type: "message_end", message: userMessage });
+
+    try {
+      if (closeRequested || currentRun.abortController.signal.aborted) {
+        return finishRun(currentRun, ABORTED_PROMPT_RESULT);
+      }
+      const loopResult = await runAgentLoop({
+        messages: messageHistory,
+        modelStream,
+        systemPrompt: createCodingSystemPrompt(
+          session.workspaceRoot,
+          session.shell,
+          currentRun.permissionMode,
+        ),
+        toolDefinitions: getToolDefinitions(currentRun.permissionMode),
+        permissionMode: currentRun.permissionMode,
+        toolRunner,
+        abortController: currentRun.abortController,
+        emit: (event) => processAgentLoopEvent(currentRun, event),
+        updatePhase: (phase) => updateRunPhase(currentRun, phase),
+        requestToolApproval: (toolCall, approvalPlan) =>
+          waitForToolApproval(currentRun, toolCall, approvalPlan),
+      });
+      return finishRun(currentRun, toFinishedPromptResult(loopResult));
+    } catch {
+      const requestedResult = currentRun.sessionWriteFailed
+        ? SESSION_FAILED_RESULT
+        : currentRun.abortController.signal.aborted
+          ? ABORTED_PROMPT_RESULT
+          : MODEL_FAILED_RESULT;
+      return finishRun(currentRun, requestedResult);
+    }
+  }
+
+  /** 在 run_start 之前安全处理首条 UserMessage 或 lease 释放失败。 */
+  async function failBeforeRunStart(currentRun: ActiveRunOwnership): Promise<FinishedPromptResult> {
+    let failedResult: FinishedPromptResult = SESSION_FAILED_RESULT;
+    try {
+      await currentRun.sessionLease.release();
+    } catch {
+      failedResult = SESSION_RELEASE_FAILED_RESULT;
+    }
+    lastError = failedResult.status === "failed" ? failedResult.error : SAFE_SESSION_ERROR;
+    sessionUnavailableResult = failedResult;
+    if (activeRun === currentRun) {
+      activeRun = null;
+    }
+    return failedResult;
+  }
+
+  /** 持久化 Agent Loop 事实，再投影为稳定的公开 AgentEvent。 */
+  async function processAgentLoopEvent(
+    currentRun: ActiveRunOwnership,
+    event: AgentLoopEvent,
+  ): Promise<void> {
+    switch (event.type) {
+      case "reasoning_start":
+        closeVisibleReasoning(currentRun);
+        currentRun.visibleReasoningActive = true;
+        publishEvent({ type: "reasoning_start", runId: currentRun.runId });
+        return;
+      case "reasoning_update":
+        if (!currentRun.visibleReasoningActive) {
+          currentRun.visibleReasoningActive = true;
+          publishEvent({ type: "reasoning_start", runId: currentRun.runId });
+        }
+        publishEvent({
+          type: "reasoning_update",
+          runId: currentRun.runId,
+          delta: event.delta,
+        });
+        return;
+      case "reasoning_end":
+        closeVisibleReasoning(currentRun);
+        return;
+      case "assistant_message_start":
+        activeAssistantMessage = event.message;
+        publishEvent({ type: "message_start", message: event.message });
+        return;
+      case "assistant_message_update":
+        activeAssistantMessage = event.message;
+        if (event.delta !== null) {
+          publishEvent({
+            type: "message_update",
+            message: event.message,
+            delta: event.delta,
+          });
+        }
+        return;
+      case "assistant_message_end":
+        await appendCompletedMessage(currentRun, event.message, true);
+        activeAssistantMessage = null;
+        return;
+      case "tool_result":
+        await appendCompletedMessage(currentRun, event.message, false);
+        return;
+      case "tool_execution_start":
+        if (event.toolApprovalRequestId !== null) {
+          await appendToolExecutionStarted(currentRun, event.toolCall, event.toolApprovalRequestId);
+        }
+        publishEvent({
+          type: "tool_execution_start",
+          activity: Object.freeze({
+            toolCallId: event.toolCall.toolCallId,
+            toolName: event.toolCall.toolName,
+            summary: event.activitySummary,
+          }),
+        });
+        return;
+      case "tool_execution_update":
+        publishEvent(event);
+        return;
+      case "tool_execution_end":
+        publishEvent(event);
+        return;
+    }
+  }
+
+  /** 刷新副作用开始事实，失败时封存 Session 且不执行副作用。 */
+  async function appendToolExecutionStarted(
+    currentRun: ActiveRunOwnership,
+    toolCall: AssistantToolCallPart,
+    toolApprovalRequestId: string,
+  ): Promise<void> {
+    if (
+      toolCall.toolName !== "edit_file" &&
+      toolCall.toolName !== "write_file" &&
+      toolCall.toolName !== "execute_command"
+    ) {
+      throw new Error("副作用 Tool 名称无效。");
+    }
+    try {
+      await currentRun.sessionLease.appendToolExecutionStarted({
+        toolCallId: toolCall.toolCallId,
+        toolName: toolCall.toolName,
+        toolApprovalRequestId,
+      });
+    } catch {
+      currentRun.sessionWriteFailed = true;
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      lastError = SAFE_SESSION_ERROR;
+      throw new Error(SAFE_SESSION_ERROR);
+    }
+  }
+
+  /** 先刷新完成消息，再更新内存投影并发布结束事件。 */
+  async function appendCompletedMessage(
+    currentRun: ActiveRunOwnership,
+    message: Message,
+    messageStartAlreadyPublished: boolean,
+  ): Promise<void> {
+    try {
+      await currentRun.sessionLease.appendMessage(message);
+    } catch {
+      currentRun.sessionWriteFailed = true;
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      lastError = SAFE_SESSION_ERROR;
+      throw new Error(SAFE_SESSION_ERROR);
+    }
+    if (message.role === "tool" && message.artifact !== undefined)
+      artifactStore.registerReference(message.artifact);
+    messageHistory.push(message);
+    if (!messageStartAlreadyPublished) {
+      publishEvent({ type: "message_start", message });
+    }
+    publishEvent({ type: "message_end", message });
+  }
+
+  /** 将当前 Run 收敛到唯一终态。 */
+  function finishRun(
+    currentRun: ActiveRunOwnership,
+    requestedResult: FinishedPromptResult,
+  ): Promise<FinishedPromptResult> {
+    if (currentRun.terminalResultPromise !== null) {
+      return currentRun.terminalResultPromise;
+    }
+    currentRun.terminalResultPromise = finalizeRun(currentRun, requestedResult);
+    return currentRun.terminalResultPromise;
+  }
+
+  /** 写入唯一 RunFinishedRecord，交付 run_end 后释放 Session 所有权。 */
+  async function finalizeRun(
+    currentRun: ActiveRunOwnership,
+    requestedResult: FinishedPromptResult,
+  ): Promise<FinishedPromptResult> {
+    let finalResult = requestedResult;
+    resolvePendingToolApproval(currentRun, "aborted");
+    closeVisibleReasoning(currentRun);
+    activeAssistantMessage = null;
+    if (finalResult.status === "failed") {
+      lastError = finalResult.error;
+    }
+
+    try {
+      if (currentRun.sessionWriteFailed) {
+        throw new Error(SAFE_SESSION_ERROR);
+      }
+      await currentRun.sessionLease.appendRunFinished({ status: finalResult.status });
+    } catch {
+      finalResult = SESSION_FAILED_RESULT;
+      lastError = finalResult.error;
+      sessionUnavailableResult = SESSION_FAILED_RESULT;
+    }
+
+    // activeRun 保留到 run_end 同步交付后，阻止终态订阅者重入 prompt。
+    publishEvent({
+      type: "run_end",
+      runId: currentRun.runId,
+      result: finalResult,
+    });
+    try {
+      await currentRun.sessionLease.release();
+    } catch {
+      sessionUnavailableResult = SESSION_RELEASE_FAILED_RESULT;
+      lastError = SAFE_SESSION_RELEASE_ERROR;
+    } finally {
+      if (activeRun === currentRun) {
+        activeRun = null;
+      }
+    }
+    return finalResult;
+  }
+
+  const stopCleanup = startCleanup?.((result) => publishEvent({ type: "session_cleanup", result }));
+
+  return Object.freeze({
+    get state() {
+      return createStateSnapshot();
+    },
+    prompt,
+    setPermissionMode,
+    respondToToolApproval,
+    abort: abortActiveRun,
+    close,
+    subscribe: subscribeToEvents,
+  });
 }
 
-/** 按模型给出的顺序为一组未执行 ToolCall 补齐结果。 */
-async function appendToolResults(
-  toolCalls: readonly AssistantToolCallPart[],
-  status: Extract<ToolResultMessage["status"], "failed" | "aborted">,
-  content: string,
-  messageHistory: Message[],
-  options: RunAgentLoopOptions,
-): Promise<void> {
-  for (const toolCall of toolCalls) {
-    const toolResultMessage = createToolResultMessage(toolCall, {
-      status,
-      content,
-      truncated: false,
-    });
-    await appendToolResultMessage(toolResultMessage, messageHistory, options);
+/** 把内部 Loop 终态复制为由 Agent 拥有的公开结果。 */
+function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResult {
+  switch (loopResult.status) {
+    case "completed":
+      return Object.freeze({ status: "completed" });
+    case "aborted":
+      return Object.freeze({ status: "aborted" });
+    case "failed":
+      return Object.freeze({ status: "failed", error: loopResult.error });
   }
-}
-
-/** 为异常终止的 AssistantMessage 补齐其中尚未执行的 ToolCall。 */
-async function appendUnresolvedToolResults(
-  assistantMessage: AssistantMessage,
-  messageHistory: Message[],
-  options: RunAgentLoopOptions,
-): Promise<void> {
-  await appendToolResults(
-    assistantMessage.content.filter(isToolCallPart),
-    "aborted",
-    "模型请求未正常完成，ToolCall 未执行。",
-    messageHistory,
-    options,
-  );
 }

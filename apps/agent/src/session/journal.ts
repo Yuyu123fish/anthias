@@ -3,12 +3,18 @@ import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   isNonNegativeInteger,
+  type LegacySessionHeader,
   type MessageRecord,
+  migrateLegacySessionRecords,
   parseJsonObject,
+  parseLegacySessionRecord,
+  parseSessionHeader,
+  parseSessionRecord,
   type RunFinishedRecord,
   type SessionHeader,
   type SessionRecord,
   type UnfinishedRun,
+  validateSessionRecords,
 } from "./schema.js";
 
 /** 保存内存投影对应的文件大小与最后一个线性 seq。 */
@@ -19,6 +25,80 @@ export type SessionFileCheckpoint = Readonly<{
 
 /** 表示读取期间 Session 文件已变化，调用方不能继续使用旧投影。 */
 export class SessionChangedError extends Error {}
+
+/** 只读校验后的 JSONL 投影，记录偏移始终以 UTF-8 磁盘字节为单位。 */
+export type VerifiedSessionJournal =
+  | Readonly<{
+      header: SessionHeader;
+      records: readonly SessionRecord[];
+      recordByteOffsets: readonly number[];
+      fileSize: number;
+    }>
+  | Readonly<{
+      header: LegacySessionHeader;
+      records: readonly SessionRecord[];
+      recordByteOffsets: readonly number[];
+      fileSize: number;
+    }>;
+
+/** 不修复、不迁移也不刷新 use 记录地读取完整日志，供清理与索引重建使用。 */
+export async function readSessionJournal(sessionFilePath: string): Promise<VerifiedSessionJournal> {
+  const sessionBytes = await readFile(sessionFilePath);
+  if (sessionBytes.at(-1) !== 0x0a) {
+    throw new Error("Session 文件尾部不完整。");
+  }
+  return parseVerifiedSessionJournal(sessionBytes);
+}
+
+/** 仅在已经持有写锁的打开路径中修复可证明未完成的尾段后读取日志。 */
+export async function readCompleteSessionJournal(
+  sessionFilePath: string,
+): Promise<VerifiedSessionJournal> {
+  const sessionText = await readCompleteSessionText(sessionFilePath);
+  return parseVerifiedSessionJournal(Buffer.from(sessionText, "utf8"));
+}
+
+function parseVerifiedSessionJournal(sessionBytes: Buffer): VerifiedSessionJournal {
+  let sessionText: string;
+  try {
+    sessionText = new TextDecoder("utf-8", { fatal: true }).decode(sessionBytes);
+  } catch {
+    throw new Error("Session 文件不是合法 UTF-8。");
+  }
+  if (!sessionText.endsWith("\n")) {
+    throw new Error("Session 文件尾部不完整。");
+  }
+  const lines = sessionText.slice(0, -1).split("\n");
+  const header = parseSessionHeader(lines[0]);
+  const recordByteOffsets: number[] = [];
+  let byteOffset = Buffer.byteLength(`${lines[0]}\n`, "utf8");
+  if (header.schemaVersion === 2) {
+    const records = lines.slice(1).map((line, index) => {
+      recordByteOffsets.push(byteOffset);
+      byteOffset += Buffer.byteLength(`${line}\n`, "utf8");
+      return parseSessionRecord(line, index + 1);
+    });
+    validateSessionRecords(records);
+    return Object.freeze({
+      header,
+      records: Object.freeze(records),
+      recordByteOffsets: Object.freeze(recordByteOffsets),
+      fileSize: sessionBytes.byteLength,
+    });
+  }
+  const records = lines.slice(1).map((line, index) => {
+    recordByteOffsets.push(byteOffset);
+    byteOffset += Buffer.byteLength(`${line}\n`, "utf8");
+    return parseLegacySessionRecord(line, index + 1);
+  });
+  const migratedRecords = migrateLegacySessionRecords(records);
+  return Object.freeze({
+    header,
+    records: migratedRecords,
+    recordByteOffsets: Object.freeze(recordByteOffsets),
+    fileSize: sessionBytes.byteLength,
+  });
+}
 
 /** 创建 Agent 自有目录的本地忽略规则，并拒绝覆盖不一致的已有文件。 */
 export async function ensureSessionGitignore(sessionDirectory: string): Promise<void> {
@@ -92,24 +172,26 @@ export function areSameCheckpoint(
 /** 严格解码 Session，并只精确截断无换行的未完成 JSON 尾段。 */
 export async function readCompleteSessionText(sessionFilePath: string): Promise<string> {
   const sessionBytes = await readFile(sessionFilePath);
-  let sessionText: string;
-  try {
-    sessionText = new TextDecoder("utf-8", { fatal: true }).decode(sessionBytes);
-  } catch {
-    throw new Error("Session 文件不是合法 UTF-8。");
-  }
   if (sessionBytes.at(-1) === 0x0a) {
-    return sessionText;
+    return decodeUtf8Strict(sessionBytes, "Session 文件不是合法 UTF-8。");
   }
 
   const finalNewlineByteIndex = sessionBytes.lastIndexOf(0x0a);
   if (finalNewlineByteIndex < 0) {
     throw new Error("Session Header 不完整。");
   }
-  const tailText = new TextDecoder("utf-8", { fatal: true }).decode(
-    sessionBytes.subarray(finalNewlineByteIndex + 1),
+  const completePrefix = sessionBytes.subarray(0, finalNewlineByteIndex + 1);
+  const completePrefixText = decodeUtf8Strict(completePrefix, "Session 文件不是合法 UTF-8。");
+  const incompleteTail = sessionBytes.subarray(finalNewlineByteIndex + 1);
+  const validTailByteLength = findValidUtf8PrefixBeforeIncompleteTail(incompleteTail);
+  if (validTailByteLength === null) {
+    throw new Error("Session 文件不是合法 UTF-8。");
+  }
+  const validTailText = decodeUtf8Strict(
+    incompleteTail.subarray(0, validTailByteLength),
+    "Session 文件不是合法 UTF-8。",
   );
-  if (tailText.trim().length === 0 || classifyJsonText(tailText) !== "incomplete") {
+  if (validTailText.trim().length === 0 || classifyJsonText(validTailText) !== "incomplete") {
     throw new Error("Session 文件包含完整或无效的未换行尾段。");
   }
 
@@ -120,18 +202,117 @@ export async function readCompleteSessionText(sessionFilePath: string): Promise<
   } finally {
     await sessionFileHandle.close();
   }
-  return new TextDecoder("utf-8", { fatal: true }).decode(
-    sessionBytes.subarray(0, finalNewlineByteIndex + 1),
-  );
+  return completePrefixText;
 }
 
+function decodeUtf8Strict(bytes: Buffer, errorMessage: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+/**
+ * 只容忍 EOF 截断了 UTF-8 多字节码点；任何中间非法字节都不能被恢复路径忽略。
+ */
+function findValidUtf8PrefixBeforeIncompleteTail(bytes: Buffer): number | null {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const leadingByte = bytes[offset];
+    if (leadingByte === undefined) {
+      return null;
+    }
+    if (leadingByte <= 0x7f) {
+      offset += 1;
+      continue;
+    }
+    const expectedByteLength = getUtf8SequenceLength(leadingByte);
+    if (expectedByteLength === null) {
+      return null;
+    }
+    if (offset + expectedByteLength > bytes.byteLength) {
+      for (let index = offset + 1; index < bytes.byteLength; index += 1) {
+        const continuationByte = bytes[index];
+        if (continuationByte === undefined || (continuationByte & 0xc0) !== 0x80) {
+          return null;
+        }
+      }
+      return offset;
+    }
+    const secondByte = bytes[offset + 1];
+    if (secondByte === undefined || (secondByte & 0xc0) !== 0x80) {
+      return null;
+    }
+    if (
+      (leadingByte === 0xe0 && secondByte < 0xa0) ||
+      (leadingByte === 0xed && secondByte > 0x9f) ||
+      (leadingByte === 0xf0 && secondByte < 0x90) ||
+      (leadingByte === 0xf4 && secondByte > 0x8f)
+    ) {
+      return null;
+    }
+    for (let index = offset + 2; index < offset + expectedByteLength; index += 1) {
+      const continuationByte = bytes[index];
+      if (continuationByte === undefined || (continuationByte & 0xc0) !== 0x80) {
+        return null;
+      }
+    }
+    offset += expectedByteLength;
+  }
+  return offset;
+}
+
+function getUtf8SequenceLength(leadingByte: number): 2 | 3 | 4 | null {
+  if (leadingByte >= 0xc2 && leadingByte <= 0xdf) {
+    return 2;
+  }
+  if (leadingByte >= 0xe0 && leadingByte <= 0xef) {
+    return 3;
+  }
+  if (leadingByte >= 0xf0 && leadingByte <= 0xf4) {
+    return 4;
+  }
+  return null;
+}
+/**
+ * 供迁移发布恢复确认：备份仅比当前旧来源多出可证明未提交的 EOF JSON 尾段时才可视为同一事实源。
+ */
+export function hasRecoverableIncompleteSessionTail(sessionBytes: Buffer): boolean {
+  if (sessionBytes.at(-1) === 0x0a) {
+    return false;
+  }
+  const finalNewlineByteIndex = sessionBytes.lastIndexOf(0x0a);
+  if (finalNewlineByteIndex < 0) {
+    return false;
+  }
+  try {
+    decodeUtf8Strict(
+      sessionBytes.subarray(0, finalNewlineByteIndex + 1),
+      "Session 文件不是合法 UTF-8。",
+    );
+    const incompleteTail = sessionBytes.subarray(finalNewlineByteIndex + 1);
+    const validTailByteLength = findValidUtf8PrefixBeforeIncompleteTail(incompleteTail);
+    if (validTailByteLength === null) {
+      return false;
+    }
+    const validTailText = decodeUtf8Strict(
+      incompleteTail.subarray(0, validTailByteLength),
+      "Session 文件不是合法 UTF-8。",
+    );
+    return validTailText.trim().length > 0 && classifyJsonText(validTailText) === "incomplete";
+  } catch {
+    return false;
+  }
+}
 /** 按调用顺序补齐未决 ToolResult，再写入唯一 interrupted 终态。 */
 export async function appendRecoveryRecords(
   sessionFilePath: string,
   records: SessionRecord[],
   unfinishedRun: UnfinishedRun,
 ): Promise<void> {
-  let nextSequence = records.length + 1;
+  let nextSequence = (records.at(-1)?.seq ?? 0) + 1;
+  let parentEntryId = records.at(-1)?.entryId ?? null;
   for (const toolCall of unfinishedRun.toolCalls) {
     if (toolCall.resolved) {
       continue;
@@ -142,6 +323,7 @@ export async function appendRecoveryRecords(
       entryId: randomUUID(),
       seq: nextSequence,
       timestamp: new Date().toISOString(),
+      parentEntryId,
       runId: unfinishedRun.runId,
       message: Object.freeze({
         type: "tool_result",
@@ -157,6 +339,7 @@ export async function appendRecoveryRecords(
     });
     await appendJsonLine(sessionFilePath, recoveryRecord);
     records.push(recoveryRecord);
+    parentEntryId = recoveryRecord.entryId;
     nextSequence += 1;
   }
 
@@ -165,13 +348,13 @@ export async function appendRecoveryRecords(
     entryId: randomUUID(),
     seq: nextSequence,
     timestamp: new Date().toISOString(),
+    parentEntryId,
     runId: unfinishedRun.runId,
     status: "interrupted",
   });
   await appendJsonLine(sessionFilePath, runFinishedRecord);
   records.push(runFinishedRecord);
 }
-
 /** 区分完整、语法未完成与已经无效的单个 JSON 值。 */
 function classifyJsonText(text: string): "complete" | "incomplete" | "invalid" {
   let cursor = 0;

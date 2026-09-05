@@ -26,8 +26,18 @@ export type ToolExecutionStartedDetails = Readonly<{
   toolApprovalRequestId: string;
 }>;
 
-/** 表示 Schema 1 JSONL 文件中唯一且无 seq 的首行。 */
+/** Schema 2 不可变首行。可变索引永远不回写到 Header。 */
 export type SessionHeader = Readonly<{
+  type: "session_header";
+  schemaVersion: 2;
+  sessionId: string;
+  createdAt: string;
+  workspaceRoot: string;
+  shell: SessionShell;
+}>;
+
+/** Schema 1 仅作为一次显式迁移的输入。 */
+export type LegacySessionHeader = Readonly<{
   type: "session_header";
   schemaVersion: 1;
   sessionId: string;
@@ -36,13 +46,73 @@ export type SessionHeader = Readonly<{
   shell: SessionShell;
 }>;
 
-/** 表示 AssistantMessage 中已经完成的文本 part。 */
+export type ParsedSessionHeader = SessionHeader | LegacySessionHeader;
+
+/** 工具原文落盘后的可验证引用；不完整状态必须说明原因。 */
+export type ToolArtifactReference = Readonly<{
+  artifactId: string;
+  toolCallId: string;
+  byteLength: number;
+  complete: boolean;
+  incompleteReason?: ArtifactIncompleteReason;
+}>;
+
+export type ArtifactIncompleteReason =
+  | "artifact_limit"
+  | "session_limit"
+  | "write_failed"
+  | "source_failed"
+  | "aborted"
+  | "unknown";
+
+/** 一次有效模型调用归一化后的用量；未知值保持 null，不伪装为零。 */
+export type PersistedUsage = Readonly<{
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+}>;
+
+/** 后续 Context 写入成功压缩所需的已确认事实。 */
+export type CompactionDetails = Readonly<{
+  summary: string;
+  coversThroughEntryId: string;
+  firstKeptEntryId: string | null;
+  retainedUserEntryIds: readonly string[];
+  usageBefore: PersistedUsage;
+  inputTokenEstimateAfter: number;
+  modelId: string;
+  contextVersion: string;
+}>;
+
+/** 后续 Model Context 可写入的校准用量事实。 */
+export type RequestUsageDetails = Readonly<{
+  purpose: "response" | "compaction" | "approval";
+  requestEntryId: string | null;
+  contextVersion: string;
+  usage: PersistedUsage;
+}>;
+
+/** 后续审批模块可写入的可追溯决定事实。 */
+export type ApprovalDecisionDetails = Readonly<{
+  toolCallId: string;
+  toolName: string;
+  permissionMode: "agent" | "plan";
+  decisionSource: "user" | "auto_review" | "policy";
+  decision: "allowed" | "denied" | "needs_user";
+  reason: string;
+  authorizationEntryIds: readonly string[];
+}>;
+
+/** 不能从消息、Run 或 Header 推导的真实使用活动。 */
+export type SessionUseDetails = Readonly<{
+  activity: "opened" | "browsed";
+}>;
+
 type DurableTextPart = Readonly<{
   type: "text";
   text: string;
 }>;
 
-/** 表示 AssistantMessage 中一个已经收敛的 ToolCall part。 */
 type DurableToolCallPart = Readonly<{
   type: "tool_call";
   toolCallId: string;
@@ -51,7 +121,6 @@ type DurableToolCallPart = Readonly<{
   invalid: boolean;
 }>;
 
-/** 表示 Schema 1 可持久化的完整消息。 */
 type DurableMessage =
   | Readonly<{
       type: "user";
@@ -69,42 +138,96 @@ type DurableMessage =
       status: "completed" | "failed" | "denied" | "aborted" | "unknown";
       content: string;
       truncated: boolean;
+      artifact?: ToolArtifactReference;
     }>;
 
-/** 将一条完整消息绑定到稳定的 Run 与线性 seq。 */
-export type MessageRecord = Readonly<{
-  type: "message";
+type SessionEntryBase = Readonly<{
   entryId: string;
   seq: number;
   timestamp: string;
-  runId: string;
-  message: DurableMessage;
+  parentEntryId: string | null;
 }>;
 
-/** 证明经批准的副作用 Tool 已在本地效果发生前刷新开始事实。 */
-type ToolExecutionStartedRecord = Readonly<{
-  type: "tool_execution_started";
-  entryId: string;
-  seq: number;
-  timestamp: string;
-  runId: string;
-  toolCallId: string;
-  toolName: string;
-  toolApprovalRequestId: string;
-}>;
+/** 将一条完整消息绑定到稳定 Run 与线性父引用。 */
+export type MessageRecord = SessionEntryBase &
+  Readonly<{
+    type: "message";
+    runId: string;
+    message: DurableMessage;
+  }>;
+
+type ToolExecutionStartedRecord = SessionEntryBase &
+  Readonly<{
+    type: "tool_execution_started";
+    runId: string;
+    toolCallId: string;
+    toolName: string;
+    toolApprovalRequestId: string;
+  }>;
 
 /** 记录 Run 的唯一终态。 */
-export type RunFinishedRecord = Readonly<{
-  type: "run_finished";
-  entryId: string;
-  seq: number;
-  timestamp: string;
-  runId: string;
-  status: "completed" | "aborted" | "failed" | "interrupted";
-}>;
+export type RunFinishedRecord = SessionEntryBase &
+  Readonly<{
+    type: "run_finished";
+    runId: string;
+    status: "completed" | "aborted" | "failed" | "interrupted";
+  }>;
 
-/** 枚举 Schema 1 允许出现在 Header 之后的持久记录。 */
-export type SessionRecord = MessageRecord | ToolExecutionStartedRecord | RunFinishedRecord;
+export type SessionUseRecord = SessionEntryBase &
+  Readonly<{
+    type: "session_use";
+    activity: SessionUseDetails["activity"];
+  }>;
+
+export type CompactionRecord = SessionEntryBase &
+  Readonly<{
+    type: "compaction";
+    summary: string;
+    coversThroughEntryId: string;
+    firstKeptEntryId: string | null;
+    retainedUserEntryIds: readonly string[];
+    usageBefore: PersistedUsage;
+    inputTokenEstimateAfter: number;
+    modelId: string;
+    contextVersion: string;
+  }>;
+
+export type RequestUsageRecord = SessionEntryBase &
+  Readonly<{
+    type: "request_usage";
+    purpose: RequestUsageDetails["purpose"];
+    requestEntryId: string | null;
+    contextVersion: string;
+    usage: PersistedUsage;
+  }>;
+
+export type ApprovalDecisionRecord = SessionEntryBase &
+  Readonly<{
+    type: "approval_decision";
+    toolCallId: string;
+    toolName: string;
+    permissionMode: ApprovalDecisionDetails["permissionMode"];
+    decisionSource: ApprovalDecisionDetails["decisionSource"];
+    decision: ApprovalDecisionDetails["decision"];
+    reason: string;
+    authorizationEntryIds: readonly string[];
+  }>;
+
+/** 枚举 Schema 2 允许出现在 Header 之后的持久记录。 */
+export type SessionRecord =
+  | MessageRecord
+  | ToolExecutionStartedRecord
+  | RunFinishedRecord
+  | SessionUseRecord
+  | CompactionRecord
+  | RequestUsageRecord
+  | ApprovalDecisionRecord;
+
+/** Schema 1 记录保留原字段，迁移时才补齐 parentEntryId。 */
+export type LegacySessionRecord =
+  | Omit<MessageRecord, "parentEntryId">
+  | Omit<ToolExecutionStartedRecord, "parentEntryId">
+  | Omit<RunFinishedRecord, "parentEntryId">;
 
 /** 汇总最后一个未终结 Run 中可由持久事实判定的 Tool 状态。 */
 export type UnfinishedRun = Readonly<{
@@ -119,8 +242,8 @@ export type UnfinishedRun = Readonly<{
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** 将首行解析为经过 Schema 1 基本校验的 SessionHeader。 */
-export function parseSessionHeader(line: string | undefined): SessionHeader {
+/** 解析 Header，同时将 Schema 1 明确保留在迁移输入分支。 */
+export function parseSessionHeader(line: string | undefined): ParsedSessionHeader {
   const value = parseJsonObject(line);
   if (
     !hasExactKeys(value, [
@@ -132,7 +255,7 @@ export function parseSessionHeader(line: string | undefined): SessionHeader {
       "shell",
     ]) ||
     value.type !== "session_header" ||
-    value.schemaVersion !== 1 ||
+    (value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
     !isUuid(value.sessionId) ||
     !isUtcTimestamp(value.createdAt) ||
     typeof value.workspaceRoot !== "string" ||
@@ -140,26 +263,181 @@ export function parseSessionHeader(line: string | undefined): SessionHeader {
   ) {
     throw new Error("Session Header 无效。");
   }
-  return value as SessionHeader;
+  return value as ParsedSessionHeader;
 }
-
-/** 解析一条记录，并拒绝断裂的 seq、身份或基本字段。 */
+/** 解析 Schema 2 记录，并拒绝断裂的 seq、身份、父引用或未知字段。 */
 export function parseSessionRecord(line: string, expectedSequence: number): SessionRecord {
   const value = parseJsonObject(line);
-  if (value.seq !== expectedSequence) {
-    throw new Error("Session record seq 不连续。");
-  }
-  if (!isUuid(value.entryId) || !isUuid(value.runId) || !isUtcTimestamp(value.timestamp)) {
+  if (!hasValidEntryIdentity(value, expectedSequence, true)) {
     throw new Error("Session record identity 无效。");
+  }
+  if (value.type === "message") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "runId",
+        "message",
+      ]) ||
+      !isUuid(value.runId) ||
+      !isDurableMessage(value.message)
+    ) {
+      throw new Error("Session MessageRecord 无效。");
+    }
+    return value as MessageRecord;
+  }
+  if (value.type === "tool_execution_started") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "runId",
+        "toolCallId",
+        "toolName",
+        "toolApprovalRequestId",
+      ]) ||
+      !isUuid(value.runId) ||
+      !isUuid(value.toolCallId) ||
+      !isNonEmptyString(value.toolName) ||
+      !isUuid(value.toolApprovalRequestId)
+    ) {
+      throw new Error("Session ToolExecutionStartedRecord 无效。");
+    }
+    return value as ToolExecutionStartedRecord;
+  }
+  if (value.type === "run_finished") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "runId",
+        "status",
+      ]) ||
+      !isUuid(value.runId) ||
+      !isRunFinishedStatus(value.status)
+    ) {
+      throw new Error("Session RunFinishedRecord 无效。");
+    }
+    return value as RunFinishedRecord;
+  }
+  if (value.type === "session_use") {
+    if (
+      !hasExactKeys(value, ["type", "entryId", "seq", "timestamp", "parentEntryId", "activity"]) ||
+      !isSessionUseActivity(value.activity)
+    ) {
+      throw new Error("SessionUseRecord 无效。");
+    }
+    return value as SessionUseRecord;
+  }
+  if (value.type === "compaction") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "summary",
+        "coversThroughEntryId",
+        "firstKeptEntryId",
+        "retainedUserEntryIds",
+        "usageBefore",
+        "inputTokenEstimateAfter",
+        "modelId",
+        "contextVersion",
+      ]) ||
+      typeof value.summary !== "string" ||
+      !isUuid(value.coversThroughEntryId) ||
+      !(value.firstKeptEntryId === null || isUuid(value.firstKeptEntryId)) ||
+      !isUuidArray(value.retainedUserEntryIds) ||
+      !isPersistedUsage(value.usageBefore) ||
+      !isNonNegativeSafeInteger(value.inputTokenEstimateAfter) ||
+      !isNonEmptyString(value.modelId) ||
+      !isNonEmptyString(value.contextVersion)
+    ) {
+      throw new Error("CompactionRecord 无效。");
+    }
+    return value as CompactionRecord;
+  }
+  if (value.type === "request_usage") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "purpose",
+        "requestEntryId",
+        "contextVersion",
+        "usage",
+      ]) ||
+      !isRequestUsagePurpose(value.purpose) ||
+      !(value.requestEntryId === null || isUuid(value.requestEntryId)) ||
+      !isNonEmptyString(value.contextVersion) ||
+      !isPersistedUsage(value.usage)
+    ) {
+      throw new Error("RequestUsageRecord 无效。");
+    }
+    return value as RequestUsageRecord;
+  }
+  if (value.type === "approval_decision") {
+    if (
+      !hasExactKeys(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "toolCallId",
+        "toolName",
+        "permissionMode",
+        "decisionSource",
+        "decision",
+        "reason",
+        "authorizationEntryIds",
+      ]) ||
+      !isUuid(value.toolCallId) ||
+      !isNonEmptyString(value.toolName) ||
+      !isPermissionMode(value.permissionMode) ||
+      !isDecisionSource(value.decisionSource) ||
+      !isApprovalDecision(value.decision) ||
+      typeof value.reason !== "string" ||
+      !isUuidArray(value.authorizationEntryIds)
+    ) {
+      throw new Error("ApprovalDecisionRecord 无效。");
+    }
+    return value as ApprovalDecisionRecord;
+  }
+  throw new Error("Session 包含未知记录类型。");
+}
+
+/** 解析 Schema 1 记录；此函数只能由迁移路径使用。 */
+export function parseLegacySessionRecord(
+  line: string,
+  expectedSequence: number,
+): LegacySessionRecord {
+  const value = parseJsonObject(line);
+  if (!hasValidEntryIdentity(value, expectedSequence, false) || !isUuid(value.runId)) {
+    throw new Error("Legacy Session record identity 无效。");
   }
   if (value.type === "message") {
     if (
       !hasExactKeys(value, ["type", "entryId", "seq", "timestamp", "runId", "message"]) ||
       !isDurableMessage(value.message)
     ) {
-      throw new Error("Session MessageRecord 无效。");
+      throw new Error("Legacy Session MessageRecord 无效。");
     }
-    return value as MessageRecord;
+    return value as LegacySessionRecord;
   }
   if (value.type === "tool_execution_started") {
     if (
@@ -177,42 +455,60 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
       !isNonEmptyString(value.toolName) ||
       !isUuid(value.toolApprovalRequestId)
     ) {
-      throw new Error("Session ToolExecutionStartedRecord 无效。");
+      throw new Error("Legacy Session ToolExecutionStartedRecord 无效。");
     }
-    return value as ToolExecutionStartedRecord;
+    return value as LegacySessionRecord;
   }
-  if (value.type === "run_finished") {
-    if (
-      !hasExactKeys(value, ["type", "entryId", "seq", "timestamp", "runId", "status"]) ||
-      !isRunFinishedStatus(value.status)
-    ) {
-      throw new Error("Session RunFinishedRecord 无效。");
-    }
-    return value as RunFinishedRecord;
+  if (
+    value.type === "run_finished" &&
+    hasExactKeys(value, ["type", "entryId", "seq", "timestamp", "runId", "status"]) &&
+    isRunFinishedStatus(value.status)
+  ) {
+    return value as LegacySessionRecord;
   }
-  throw new Error("Session 包含未知记录类型。");
+  throw new Error("Legacy Session 包含未知记录类型。");
 }
 
-/** 以线性 Run 状态机校验全局身份、Tool 引用和唯一终态。 */
+/** 将 Schema 1 的已验证事实无损升级为线性父引用记录。 */
+export function migrateLegacySessionRecords(
+  legacyRecords: readonly LegacySessionRecord[],
+): readonly SessionRecord[] {
+  let parentEntryId: string | null = null;
+  const migratedRecords = legacyRecords.map((legacyRecord) => {
+    const migratedRecord = Object.freeze({ ...legacyRecord, parentEntryId }) as SessionRecord;
+    parentEntryId = migratedRecord.entryId;
+    return migratedRecord;
+  });
+  validateSessionRecords(migratedRecords);
+  return Object.freeze(migratedRecords);
+}
+/** 以线性父引用和 Run 状态机校验全局身份、Tool 引用和唯一终态。 */
 export function validateSessionRecords(records: readonly SessionRecord[]): UnfinishedRun | null {
   const entryIds = new Set<string>();
+
   const runIds = new Set<string>();
   const toolApprovalRequestIds = new Set<string>();
   const toolCalls = new Map<
     string,
     { runId: string; toolName: string; started: boolean; resolved: boolean }
   >();
+  let expectedParentEntryId: string | null = null;
   let activeRunId: string | null = null;
   let activeRunToolCallIds: string[] = [];
   let lastAssistantStatus: "completed" | "aborted" | "failed" | null = null;
   let lastAssistantHasToolCall = false;
 
   for (const record of records) {
-    if (entryIds.has(record.entryId)) {
-      throw new Error("Session entryId 重复。");
+    if (entryIds.has(record.entryId) || record.parentEntryId !== expectedParentEntryId) {
+      throw new Error("Session entryId 或 parentEntryId 无效。");
     }
+    validateFactReferences(record, entryIds, toolCalls);
     entryIds.add(record.entryId);
+    expectedParentEntryId = record.entryId;
 
+    if (!isRunRecord(record)) {
+      continue;
+    }
     if (activeRunId === null) {
       if (record.type !== "message" || record.message.type !== "user") {
         throw new Error("Session Run 必须由 UserMessage 开始。");
@@ -230,7 +526,6 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
     if (record.runId !== activeRunId) {
       throw new Error("Session Run 不能交错。");
     }
-
     if (record.type === "message") {
       if (record.message.type === "user") {
         throw new Error("Session Run 只能包含一个起始 UserMessage。");
@@ -258,7 +553,6 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
         }
         continue;
       }
-
       const referencedToolCall = toolCalls.get(record.message.toolCallId);
       const firstUnresolvedToolCallId = activeRunToolCallIds.find(
         (toolCallId) => !toolCalls.get(toolCallId)?.resolved,
@@ -275,7 +569,6 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
       referencedToolCall.resolved = true;
       continue;
     }
-
     if (record.type === "tool_execution_started") {
       const referencedToolCall = toolCalls.get(record.toolCallId);
       const firstUnresolvedToolCallId = activeRunToolCallIds.find(
@@ -296,7 +589,6 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
       toolApprovalRequestIds.add(record.toolApprovalRequestId);
       continue;
     }
-
     if (activeRunToolCallIds.some((toolCallId) => !toolCalls.get(toolCallId)?.resolved)) {
       throw new Error("Session RunFinished 不能越过未决 ToolCall。");
     }
@@ -337,6 +629,43 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
   });
 }
 
+/** 判断结构有效的 CompactionEntry 是否能作为恢复 checkpoint。 */
+export function isValidCompactionRecord(
+  record: CompactionRecord,
+  previousRecordsByEntryId: ReadonlyMap<string, SessionRecord>,
+): boolean {
+  return (
+    previousRecordsByEntryId.has(record.coversThroughEntryId) &&
+    (record.firstKeptEntryId === null || previousRecordsByEntryId.has(record.firstKeptEntryId)) &&
+    new Set(record.retainedUserEntryIds).size === record.retainedUserEntryIds.length &&
+    record.retainedUserEntryIds.every((entryId) => {
+      const retainedRecord = previousRecordsByEntryId.get(entryId);
+      return retainedRecord?.type === "message" && retainedRecord.message.type === "user";
+    })
+  );
+}
+
+/** 从可验证使用事实推导清理使用的最后活动时间，不读取 mtime 或索引。 */
+export function deriveLastActivityAt(
+  header: ParsedSessionHeader,
+  records: readonly SessionRecord[],
+): string {
+  let lastActivityAt = header.createdAt;
+  for (const record of records) {
+    if (
+      record.type === "session_use" ||
+      record.type === "message" ||
+      record.type === "tool_execution_started" ||
+      record.type === "run_finished"
+    ) {
+      if (record.timestamp > lastActivityAt) {
+        lastActivityAt = record.timestamp;
+      }
+    }
+  }
+  return lastActivityAt;
+}
+
 /** 将一行 JSON 收窄为对象，拒绝空文件与非对象值。 */
 export function parseJsonObject(line: string | undefined): Record<string, unknown> {
   if (line === undefined) {
@@ -349,7 +678,46 @@ export function parseJsonObject(line: string | undefined): Record<string, unknow
   return value as Record<string, unknown>;
 }
 
-/** 将公开消息转换为不包含流式状态的 Schema 1 持久形状。 */
+function validateFactReferences(
+  record: SessionRecord,
+  previousEntryIds: ReadonlySet<string>,
+  previousToolCalls: ReadonlyMap<
+    string,
+    { runId: string; toolName: string; started: boolean; resolved: boolean }
+  >,
+): void {
+  if (record.type === "compaction") {
+    return;
+  }
+  if (
+    record.type === "request_usage" &&
+    record.requestEntryId !== null &&
+    !previousEntryIds.has(record.requestEntryId)
+  ) {
+    throw new Error("RequestUsageRecord 引用无效。");
+  }
+  if (record.type === "approval_decision") {
+    const toolCall = previousToolCalls.get(record.toolCallId);
+    if (
+      toolCall === undefined ||
+      toolCall.toolName !== record.toolName ||
+      new Set(record.authorizationEntryIds).size !== record.authorizationEntryIds.length ||
+      record.authorizationEntryIds.some((entryId) => !previousEntryIds.has(entryId))
+    ) {
+      throw new Error("ApprovalDecisionRecord 授权引用无效。");
+    }
+  }
+}
+function isRunRecord(
+  record: SessionRecord,
+): record is MessageRecord | ToolExecutionStartedRecord | RunFinishedRecord {
+  return (
+    record.type === "message" ||
+    record.type === "tool_execution_started" ||
+    record.type === "run_finished"
+  );
+}
+/** 将公开消息转换为不包含流式状态的 Schema 2 持久形状。 */
 export function toDurableMessage(message: Message): DurableMessage {
   if (message.role === "user") {
     return Object.freeze({
@@ -358,6 +726,7 @@ export function toDurableMessage(message: Message): DurableMessage {
     });
   }
   if (message.role === "tool") {
+    const artifact = getToolResultArtifact(message);
     return Object.freeze({
       type: "tool_result",
       toolCallId: message.toolCallId,
@@ -365,6 +734,7 @@ export function toDurableMessage(message: Message): DurableMessage {
       status: message.status,
       content: message.content,
       truncated: message.truncated,
+      ...(artifact === undefined ? {} : { artifact: snapshotArtifactReference(artifact) }),
     });
   }
   if (message.status === "streaming") {
@@ -387,11 +757,16 @@ export function fromDurableMessage(message: DurableMessage): Message {
       status: message.status,
       content: message.content,
       truncated: message.truncated,
-    } satisfies ToolResultMessage);
+      ...(message.artifact === undefined
+        ? {}
+        : { artifact: snapshotArtifactReference(message.artifact) }),
+    } as ToolResultMessage);
   }
   if (message.type === "user") {
-    const content = message.content.map((part) => part.text).join("");
-    return Object.freeze({ role: "user", content } satisfies UserMessage);
+    return Object.freeze({
+      role: "user",
+      content: message.content.map((part) => part.text).join(""),
+    } satisfies UserMessage);
   }
   return Object.freeze({
     role: "assistant",
@@ -400,7 +775,6 @@ export function fromDurableMessage(message: DurableMessage): Message {
   } satisfies AssistantMessage);
 }
 
-/** 将公开 Assistant part 转换为可持久化的 Schema 1 part。 */
 function toDurableAssistantPart(part: AssistantContentPart): DurableTextPart | DurableToolCallPart {
   if (part.type === "text") {
     return Object.freeze({ type: "text", text: part.text });
@@ -417,7 +791,6 @@ function toDurableAssistantPart(part: AssistantContentPart): DurableTextPart | D
   });
 }
 
-/** 将持久 Assistant part 恢复为 Agent 消息 part。 */
 function fromDurableAssistantPart(
   part: DurableTextPart | DurableToolCallPart,
 ): AssistantContentPart {
@@ -432,7 +805,210 @@ function fromDurableAssistantPart(
       });
 }
 
-/** 深复制并冻结一个已经验证的 JSON 值。 */
+function getToolResultArtifact(message: ToolResultMessage): ToolArtifactReference | undefined {
+  const artifact = (message as ToolResultMessage & { artifact?: unknown }).artifact;
+  if (artifact === undefined) {
+    return undefined;
+  }
+  if (!isToolArtifactReference(artifact) || artifact.toolCallId !== message.toolCallId) {
+    throw new Error("ToolResult artifact 引用无效。");
+  }
+  return artifact;
+}
+
+function snapshotArtifactReference(artifact: ToolArtifactReference): ToolArtifactReference {
+  if (artifact.complete) {
+    return Object.freeze({
+      artifactId: artifact.artifactId,
+      toolCallId: artifact.toolCallId,
+      byteLength: artifact.byteLength,
+      complete: true,
+    });
+  }
+  if (artifact.incompleteReason === undefined) {
+    throw new Error("ToolResult artifact 不完整时必须说明原因。");
+  }
+  return Object.freeze({
+    artifactId: artifact.artifactId,
+    toolCallId: artifact.toolCallId,
+    byteLength: artifact.byteLength,
+    complete: false,
+    incompleteReason: artifact.incompleteReason,
+  });
+}
+function hasValidEntryIdentity(
+  value: Record<string, unknown>,
+  expectedSequence: number,
+  requiresParentEntryId: boolean,
+): boolean {
+  return (
+    value.seq === expectedSequence &&
+    isUuid(value.entryId) &&
+    isUtcTimestamp(value.timestamp) &&
+    (!requiresParentEntryId || value.parentEntryId === null || isUuid(value.parentEntryId))
+  );
+}
+
+function isDurableMessage(value: unknown): value is DurableMessage {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const message = value as Record<string, unknown>;
+  if (message.type === "user") {
+    return (
+      hasExactKeys(message, ["type", "content"]) &&
+      Array.isArray(message.content) &&
+      message.content.every(isTextPart)
+    );
+  }
+  if (message.type === "assistant") {
+    return (
+      hasExactKeys(message, ["type", "content", "status"]) &&
+      Array.isArray(message.content) &&
+      message.content.every((part) => isTextPart(part) || isToolCallPart(part)) &&
+      isAssistantTerminalStatus(message.status)
+    );
+  }
+  const allowedKeys = Object.hasOwn(message, "artifact")
+    ? ["type", "toolCallId", "toolName", "status", "content", "truncated", "artifact"]
+    : ["type", "toolCallId", "toolName", "status", "content", "truncated"];
+  return (
+    message.type === "tool_result" &&
+    hasExactKeys(message, allowedKeys) &&
+    isUuid(message.toolCallId) &&
+    isNonEmptyString(message.toolName) &&
+    isToolResultStatus(message.status) &&
+    typeof message.content === "string" &&
+    typeof message.truncated === "boolean" &&
+    (message.artifact === undefined ||
+      (isToolArtifactReference(message.artifact) &&
+        message.artifact.toolCallId === message.toolCallId))
+  );
+}
+
+function isToolArtifactReference(value: unknown): value is ToolArtifactReference {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const artifact = value as Record<string, unknown>;
+  const expectedKeys =
+    artifact.complete === true
+      ? ["artifactId", "toolCallId", "byteLength", "complete"]
+      : ["artifactId", "toolCallId", "byteLength", "complete", "incompleteReason"];
+  return (
+    hasExactKeys(artifact, expectedKeys) &&
+    isUuid(artifact.artifactId) &&
+    isUuid(artifact.toolCallId) &&
+    isNonNegativeSafeInteger(artifact.byteLength) &&
+    typeof artifact.complete === "boolean" &&
+    (artifact.complete || isArtifactIncompleteReason(artifact.incompleteReason))
+  );
+}
+
+function isTextPart(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const part = value as Record<string, unknown>;
+  return (
+    hasExactKeys(part, ["type", "text"]) && part.type === "text" && typeof part.text === "string"
+  );
+}
+
+function isToolCallPart(value: unknown): value is DurableToolCallPart {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const part = value as Record<string, unknown>;
+  return (
+    hasExactKeys(part, ["type", "toolCallId", "toolName", "input", "invalid"]) &&
+    part.type === "tool_call" &&
+    isUuid(part.toolCallId) &&
+    isNonEmptyString(part.toolName) &&
+    isJsonValue(part.input) &&
+    typeof part.invalid === "boolean"
+  );
+}
+function isPersistedUsage(value: unknown): value is PersistedUsage {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const usage = value as Record<string, unknown>;
+  return (
+    hasExactKeys(usage, ["inputTokens", "outputTokens", "cachedInputTokens"]) &&
+    [usage.inputTokens, usage.outputTokens, usage.cachedInputTokens].every(
+      (tokenCount) => tokenCount === null || isNonNegativeSafeInteger(tokenCount),
+    )
+  );
+}
+
+function isUuidArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every(isUuid);
+}
+
+function isSessionUseActivity(value: unknown): value is SessionUseDetails["activity"] {
+  return value === "opened" || value === "browsed";
+}
+
+function isRequestUsagePurpose(value: unknown): value is RequestUsageDetails["purpose"] {
+  return value === "response" || value === "compaction" || value === "approval";
+}
+
+function isPermissionMode(value: unknown): value is ApprovalDecisionDetails["permissionMode"] {
+  return value === "agent" || value === "plan";
+}
+
+function isDecisionSource(value: unknown): value is ApprovalDecisionDetails["decisionSource"] {
+  return value === "user" || value === "auto_review" || value === "policy";
+}
+
+function isApprovalDecision(value: unknown): value is ApprovalDecisionDetails["decision"] {
+  return value === "allowed" || value === "denied" || value === "needs_user";
+}
+
+function isArtifactIncompleteReason(value: unknown): value is ArtifactIncompleteReason {
+  return (
+    value === "artifact_limit" ||
+    value === "session_limit" ||
+    value === "write_failed" ||
+    value === "source_failed" ||
+    value === "aborted" ||
+    value === "unknown"
+  );
+}
+
+function isToolResultStatus(value: unknown): boolean {
+  return (
+    value === "completed" ||
+    value === "failed" ||
+    value === "denied" ||
+    value === "aborted" ||
+    value === "unknown"
+  );
+}
+
+/** 判断名称是否属于必须记录开始事实的副作用 Tool。 */
+export function isSideEffectToolName(
+  value: unknown,
+): value is ToolExecutionStartedDetails["toolName"] {
+  return value === "edit_file" || value === "write_file" || value === "execute_command";
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (Array.isArray(value)) {
+    return value.every(isJsonValue);
+  }
+  return (
+    typeof value === "object" && Object.values(value as Record<string, unknown>).every(isJsonValue)
+  );
+}
+
 function snapshotJsonValue(value: JsonValue): JsonValue {
   if (Array.isArray(value)) {
     return Object.freeze(value.map(snapshotJsonValue));
@@ -456,7 +1032,6 @@ export function snapshotSessionShell(shell: SessionShell): SessionShell {
   });
 }
 
-/** 判断未知值是否满足 SessionHeader 的 Shell 基本形状。 */
 function isSessionShell(value: unknown): value is SessionShell {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -471,117 +1046,20 @@ function isSessionShell(value: unknown): value is SessionShell {
   );
 }
 
-/** 判断未知值是否为 Schema 1 支持的完整持久消息。 */
-function isDurableMessage(value: unknown): value is DurableMessage {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const message = value as Record<string, unknown>;
-  if (message.type === "user") {
-    return (
-      hasExactKeys(message, ["type", "content"]) &&
-      Array.isArray(message.content) &&
-      message.content.every(isTextPart)
-    );
-  }
-  if (message.type === "assistant") {
-    return (
-      hasExactKeys(message, ["type", "content", "status"]) &&
-      Array.isArray(message.content) &&
-      message.content.every((part) => isTextPart(part) || isToolCallPart(part)) &&
-      isAssistantTerminalStatus(message.status)
-    );
-  }
-  return (
-    message.type === "tool_result" &&
-    hasExactKeys(message, ["type", "toolCallId", "toolName", "status", "content", "truncated"]) &&
-    isUuid(message.toolCallId) &&
-    isNonEmptyString(message.toolName) &&
-    isToolResultStatus(message.status) &&
-    typeof message.content === "string" &&
-    typeof message.truncated === "boolean"
-  );
-}
-
-/** 判断未知值是否为完整文本 part。 */
-function isTextPart(value: unknown): boolean {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const part = value as Record<string, unknown>;
-  return (
-    hasExactKeys(part, ["type", "text"]) && part.type === "text" && typeof part.text === "string"
-  );
-}
-
-/** 判断未知值是否为带稳定身份的完整 ToolCall part。 */
-function isToolCallPart(value: unknown): value is DurableToolCallPart {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const part = value as Record<string, unknown>;
-  return (
-    hasExactKeys(part, ["type", "toolCallId", "toolName", "input", "invalid"]) &&
-    part.type === "tool_call" &&
-    isUuid(part.toolCallId) &&
-    isNonEmptyString(part.toolName) &&
-    isJsonValue(part.input) &&
-    typeof part.invalid === "boolean"
-  );
-}
-
-/** 判断 ToolResult 是否使用 Schema 1 已确认的五种结果状态。 */
-function isToolResultStatus(value: unknown): boolean {
-  return (
-    value === "completed" ||
-    value === "failed" ||
-    value === "denied" ||
-    value === "aborted" ||
-    value === "unknown"
-  );
-}
-
-/** 判断名称是否属于必须记录开始事实的副作用 Tool。 */
-export function isSideEffectToolName(
-  value: unknown,
-): value is ToolExecutionStartedDetails["toolName"] {
-  return value === "edit_file" || value === "write_file" || value === "execute_command";
-}
-
-/** 判断未知值能否由 JSON 无损表示。 */
-function isJsonValue(value: unknown): value is JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return true;
-  }
-  if (typeof value === "number") {
-    return Number.isFinite(value);
-  }
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue);
-  }
-  if (typeof value !== "object") {
-    return false;
-  }
-  return Object.values(value as Record<string, unknown>).every(isJsonValue);
-}
-
 /** 判断对象是否恰好包含声明字段，拒绝缺失和 Schema 外扩展。 */
 export function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actualKeys = Object.keys(value);
   return actualKeys.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
-/** 判断未知值是否为非空字符串。 */
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-/** 判断未知值是否为 AssistantMessage 的三个可持久终态。 */
 function isAssistantTerminalStatus(value: unknown): value is RunFinishedDetails["status"] {
   return value === "completed" || value === "aborted" || value === "failed";
 }
 
-/** 判断未知值是否为可持久化的 Run 终态。 */
 export function isRunFinishedStatus(value: unknown): value is RunFinishedRecord["status"] {
   return isAssistantTerminalStatus(value) || value === "interrupted";
 }
@@ -603,19 +1081,12 @@ export function isUtcTimestamp(value: unknown): value is string {
   }
 }
 
-/** 判断未知值是否为非负整数。 */
 export function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
-/** 比较当前 Shell 是否与 SessionHeader 中的固定描述完全一致。 */
-export function areSameShell(recordedShell: SessionShell, shell: SessionShell): boolean {
-  return (
-    recordedShell.kind === shell.kind &&
-    recordedShell.executable === shell.executable &&
-    recordedShell.arguments.length === shell.arguments.length &&
-    recordedShell.arguments.every((argument, index) => argument === shell.arguments[index])
-  );
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** 按当前平台规则比较两个已规范化工作区根目录。 */
@@ -626,4 +1097,14 @@ export function areSameWorkspace(recordedWorkspaceRoot: string, workspaceRoot: s
     );
   }
   return recordedWorkspaceRoot === workspaceRoot;
+}
+
+/** 比较当前 Shell 是否与 SessionHeader 中的固定描述完全一致。 */
+export function areSameShell(recordedShell: SessionShell, shell: SessionShell): boolean {
+  return (
+    recordedShell.kind === shell.kind &&
+    recordedShell.executable === shell.executable &&
+    recordedShell.arguments.length === shell.arguments.length &&
+    recordedShell.arguments.every((argument, index) => argument === shell.arguments[index])
+  );
 }

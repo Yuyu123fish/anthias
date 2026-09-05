@@ -1,7 +1,8 @@
 import { access, appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type Agent, createAgentWithModelStream } from "../src/agent.js";
 import type { AgentEvent, AssistantMessage, Message } from "../src/index.js";
 import {
   type ModelRequest,
@@ -9,13 +10,14 @@ import {
   type ModelStreamEvent,
   streamAssistantMessage,
 } from "../src/model-stream.js";
-import { type Agent, createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   openSession,
   type Session,
   type SessionShell,
 } from "../src/session/index.js";
+
+import { getSessionLockDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
 const sessionFilePaths = new WeakMap<Agent, string>();
@@ -35,6 +37,70 @@ afterEach(async () => {
 });
 
 describe("Agent", () => {
+  it("waits for a pending lease acquisition before closing and never starts model work", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-agent-close-"));
+    temporaryDirectories.add(workspaceRoot);
+    const session = await createSession({
+      workspaceRoot,
+      sessionDirectory: join(workspaceRoot, "sessions"),
+      shell: TEST_SHELL,
+    });
+    const acquired = Promise.withResolvers<void>();
+    const continueAcquisition = Promise.withResolvers<void>();
+    const closeSession = vi.fn(() => session.close());
+    let modelRequests = 0;
+    const delayedSession: Session = {
+      ...session,
+      async acquireRun(runId) {
+        const result = await session.acquireRun(runId);
+        acquired.resolve();
+        await continueAcquisition.promise;
+        return result;
+      },
+      close: closeSession,
+    };
+    const agent = createAgentWithModelStream({
+      session: delayedSession,
+      modelStream: async function* () {
+        modelRequests += 1;
+        yield stopFinish();
+      },
+    });
+    const promptResult = agent.prompt("pending");
+    await acquired.promise;
+    const closed = agent.close();
+    expect(agent.close()).toBe(closed);
+    expect(closeSession).not.toHaveBeenCalled();
+    await expect(agent.prompt("late")).resolves.toEqual({ status: "rejected", reason: "closed" });
+    continueAcquisition.resolve();
+    await expect(promptResult).resolves.toEqual({ status: "aborted" });
+    await closed;
+    expect(closeSession).toHaveBeenCalledTimes(1);
+    expect(modelRequests).toBe(0);
+    expect(agent.state.messageHistory).toEqual([]);
+  });
+
+  it("delivers the aborted Run before releasing Session resources on close", async () => {
+    const started = Promise.withResolvers<void>();
+    const agent = await createTestAgent(async function* (_request, signal) {
+      yield textDelta("partial");
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    });
+    const events: AgentEvent[] = [];
+    agent.subscribe((event) => events.push(event));
+    const promptResult = agent.prompt("start");
+    await started.promise;
+    await agent.close();
+    await expect(promptResult).resolves.toEqual({ status: "aborted" });
+    expect(events.at(-1)).toMatchObject({ type: "run_end", result: { status: "aborted" } });
+    expect(agent.state.running).toBe(false);
+    expect(agent.setPermissionMode("plan")).toEqual({ status: "rejected", reason: "closed" });
+  });
+
   it("normalizes visible reasoning spans without changing the durable AssistantMessage", async () => {
     const modelRequest: ModelRequest = Object.freeze({
       systemPrompt: "test",
@@ -473,6 +539,12 @@ describe("Agent", () => {
       sessionId: "00000000-0000-4000-8000-000000000001",
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
+      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
+      records: Object.freeze([]),
+      appendCompaction: async () => undefined,
+      appendRequestUsage: async () => undefined,
+      appendApprovalDecision: async () => undefined,
+      close: async () => undefined,
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -485,6 +557,9 @@ describe("Agent", () => {
               }
             },
             async appendToolExecutionStarted() {},
+            async appendCompaction() {},
+            async appendRequestUsage() {},
+            async appendApprovalDecision() {},
             async appendRunFinished() {
               appendedRunFinishedCount += 1;
             },
@@ -527,6 +602,12 @@ describe("Agent", () => {
       sessionId: "00000000-0000-4000-8000-000000000011",
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
+      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
+      records: Object.freeze([]),
+      appendCompaction: async () => undefined,
+      appendRequestUsage: async () => undefined,
+      appendApprovalDecision: async () => undefined,
+      close: async () => undefined,
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -540,6 +621,9 @@ describe("Agent", () => {
             async appendToolExecutionStarted() {
               throw new Error("must not append ToolExecutionStarted");
             },
+            async appendCompaction() {},
+            async appendRequestUsage() {},
+            async appendApprovalDecision() {},
             async appendRunFinished() {
               throw new Error("must not append RunFinished");
             },
@@ -587,6 +671,12 @@ describe("Agent", () => {
       sessionId: "00000000-0000-4000-8000-000000000002",
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
+      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
+      records: Object.freeze([]),
+      appendCompaction: async () => undefined,
+      appendRequestUsage: async () => undefined,
+      appendApprovalDecision: async () => undefined,
+      close: async () => undefined,
       shell: TEST_SHELL,
       messageHistory: Object.freeze([]),
       async acquireRun() {
@@ -597,6 +687,9 @@ describe("Agent", () => {
               appendedMessageCount += 1;
             },
             async appendToolExecutionStarted() {},
+            async appendCompaction() {},
+            async appendRequestUsage() {},
+            async appendApprovalDecision() {},
             async appendRunFinished() {
               appendedRunFinishedCount += 1;
               throw new Error("run completion persistence failed");
@@ -640,6 +733,12 @@ describe("Agent", () => {
         sessionId: randomSessionId(),
         workspaceRoot: "C:\\workspace",
         sessionDirectory: "C:\\workspace\\data\\conversation",
+        storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
+        records: Object.freeze([]),
+        appendCompaction: async () => undefined,
+        appendRequestUsage: async () => undefined,
+        appendApprovalDecision: async () => undefined,
+        close: async () => undefined,
         shell: TEST_SHELL,
         messageHistory: Object.freeze([]),
         async acquireRun() {
@@ -813,7 +912,7 @@ async function createTestAgent(modelStream: ModelStream): Promise<Agent> {
     shell: TEST_SHELL,
   });
   const agent = createAgentWithModelStream({ modelStream, session });
-  sessionFilePaths.set(agent, join(workspaceRoot, "sessions", `${session.sessionId}.jsonl`));
+  sessionFilePaths.set(agent, join(session.storageDirectory, "session.jsonl"));
   return agent;
 }
 
@@ -836,7 +935,10 @@ function getSessionFilePath(agent: Agent): string {
 }
 
 function getSessionLockPath(agent: Agent): string {
-  return getSessionFilePath(agent).replace(/\.jsonl$/u, ".lock");
+  return getSessionLockDirectory(
+    dirname(dirname(dirname(getSessionFilePath(agent)))),
+    agent.state.sessionId,
+  );
 }
 
 function randomSessionId(): string {

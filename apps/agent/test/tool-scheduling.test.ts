@@ -2,9 +2,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model-stream.js";
-import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -392,7 +392,7 @@ async function createTestAgent(modelStream: ModelStream, toolRunner: ToolRunner)
   const session = await createSession({ workspaceRoot, sessionDirectory, shell });
   return Object.freeze({
     agent: createAgentWithModelStream({ modelStream, session, toolRunner }),
-    sessionFilePath: join(sessionDirectory, `${session.sessionId}.jsonl`),
+    sessionFilePath: join(session.storageDirectory, "session.jsonl"),
   });
 }
 

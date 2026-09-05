@@ -2,9 +2,9 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAgentWithModelStream } from "../src/agent.js";
 import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelStream, ModelStreamEvent } from "../src/model-stream.js";
-import { createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,

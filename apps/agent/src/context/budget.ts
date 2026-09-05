@@ -1,0 +1,102 @@
+/** Tool 结果在模型上下文中的首期单项上限。 */
+export const TOOL_RESULT_TOKEN_LIMIT = 4_000;
+
+/** 同一条 Assistant 回复产生的 Tool 结果共享的首期上限。 */
+export const TOOL_RESULT_BATCH_TOKEN_LIMIT = 8_000;
+
+/** 估算一段文本占用的 token 数；这是保守启发式，不等同于 Provider tokenizer。 */
+export function estimateTextTokens(text: string): number {
+  let tokens = 0;
+  let asciiCharacterCount = 0;
+
+  const flushAsciiCharacters = () => {
+    tokens += Math.ceil(asciiCharacterCount / 3);
+    asciiCharacterCount = 0;
+  };
+
+  for (const character of text) {
+    if (isAsciiCharacter(character)) {
+      asciiCharacterCount += 1;
+      continue;
+    }
+    flushAsciiCharacters();
+    tokens += 1;
+  }
+  flushAsciiCharacters();
+  return tokens;
+}
+
+/** 将文本限制在 token 预算内，并保留明确的截断标记。 */
+export function boundTextToTokenBudget(
+  text: string,
+  tokenBudget: number,
+  truncationMarker = "...[结果已截断，原文可通过产物读取]",
+): Readonly<{ content: string; truncated: boolean; estimatedTokens: number }> {
+  if (tokenBudget <= 0) {
+    return Object.freeze({ content: "", truncated: text.length > 0, estimatedTokens: 0 });
+  }
+  const estimatedTokens = estimateTextTokens(text);
+  if (estimatedTokens <= tokenBudget) {
+    return Object.freeze({ content: text, truncated: false, estimatedTokens });
+  }
+
+  const markerTokens = estimateTextTokens(truncationMarker);
+  if (markerTokens >= tokenBudget) {
+    const markerCharacters = Array.from(truncationMarker);
+    const marker = takeTextPrefix(markerCharacters, tokenBudget);
+    return Object.freeze({
+      content: marker,
+      truncated: true,
+      estimatedTokens: estimateTextTokens(marker),
+    });
+  }
+
+  const characters = Array.from(text);
+  let lower = 0;
+  let upper = characters.length;
+  while (lower < upper) {
+    const middle = Math.ceil((lower + upper) / 2);
+    const prefix = characters.slice(0, middle).join("");
+    const candidate = prefix + "\n" + truncationMarker;
+    if (estimateTextTokens(candidate) <= tokenBudget) {
+      lower = middle;
+    } else {
+      upper = middle - 1;
+    }
+  }
+  const prefix = characters.slice(0, lower).join("");
+  const content = prefix + (prefix.length === 0 ? "" : "\n") + truncationMarker;
+  return Object.freeze({
+    content,
+    truncated: true,
+    estimatedTokens: estimateTextTokens(content),
+  });
+}
+
+/** 估算结构化输入的文本表示，并保留少量消息封装余量。 */
+export function estimateJsonTokens(value: unknown): number {
+  let serializedValue: string;
+  try {
+    serializedValue = JSON.stringify(value) ?? "";
+  } catch {
+    serializedValue = "";
+  }
+  return estimateTextTokens(serializedValue) + 4;
+}
+
+function takeTextPrefix(characters: readonly string[], tokenBudget: number): string {
+  let prefix = "";
+  for (const character of characters) {
+    const nextPrefix = prefix + character;
+    if (estimateTextTokens(nextPrefix) > tokenBudget) {
+      break;
+    }
+    prefix = nextPrefix;
+  }
+  return prefix;
+}
+
+function isAsciiCharacter(character: string): boolean {
+  const codePoint = character.codePointAt(0) ?? 0;
+  return codePoint <= 0x7f;
+}

@@ -2,13 +2,13 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ModelRequest, ModelStream } from "../src/model-stream.js";
 import {
   type Agent,
   type AgentEvent,
   createAgentWithModelStream,
   type ToolApprovalRequest,
-} from "../src/run.js";
+} from "../src/agent.js";
+import type { ModelRequest, ModelStream } from "../src/model-stream.js";
 import {
   createSession,
   openSession,
@@ -277,7 +277,7 @@ async function createFileToolFixture(existingContent: string) {
     session,
     sessionDirectory,
     shell,
-    sessionFilePath: join(sessionDirectory, `${session.sessionId}.jsonl`),
+    sessionFilePath: join(session.storageDirectory, "session.jsonl"),
   });
 }
 

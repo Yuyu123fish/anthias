@@ -1,6 +1,9 @@
+import type { ToolArtifactReference } from "../message.js";
+
 type ToolExecutionResultContent = Readonly<{
   content: string;
   truncated: boolean;
+  artifact?: ToolArtifactReference;
 }>;
 
 /** 表示预检与执行层可以安全返回的失败结果。 */

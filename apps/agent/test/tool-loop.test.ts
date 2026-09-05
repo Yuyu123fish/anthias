@@ -2,8 +2,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import type { ModelRequest, ModelStream } from "../src/model-stream.js";
-import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
 import { createSession, resolveSessionDirectory } from "../src/session/index.js";
 
 const temporaryDirectories = new Set<string>();
@@ -71,6 +71,7 @@ describe("read-only Agent Tool Loop", () => {
       "read_file",
       "glob",
       "grep",
+      "read_artifact",
       "edit_file",
       "write_file",
       "execute_command",
@@ -127,10 +128,7 @@ describe("read-only Agent Tool Loop", () => {
       result: { status: "completed" },
     });
 
-    const sessionText = await readFile(
-      join(sessionDirectory, `${agent.state.sessionId}.jsonl`),
-      "utf8",
-    );
+    const sessionText = await readFile(join(session.storageDirectory, "session.jsonl"), "utf8");
     const records = sessionText
       .trimEnd()
       .split("\n")

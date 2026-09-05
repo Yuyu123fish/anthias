@@ -4,8 +4,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import { createOpenAICompatibleModelStream } from "../src/openai-compatible-model.js";
-import { type AgentEvent, createAgentWithModelStream } from "../src/run.js";
 import {
   createSession,
   resolveSessionDirectory,
@@ -400,9 +400,7 @@ describe("createOpenAICompatibleModelStream", () => {
       type: "run_end",
       result: { status: "completed" },
     });
-    const sessionRecords = (
-      await readFile(join(sessionDirectory, `${session.sessionId}.jsonl`), "utf8")
-    )
+    const sessionRecords = (await readFile(join(session.storageDirectory, "session.jsonl"), "utf8"))
       .trimEnd()
       .split("\n")
       .map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -411,7 +409,9 @@ describe("createOpenAICompatibleModelStream", () => {
       status: "completed",
     });
     expect(JSON.stringify(sessionRecords)).not.toContain("stage3-fake-process-key");
-    await expect(access(join(sessionDirectory, `${session.sessionId}.lock`))).rejects.toThrow();
+    await expect(
+      access(join(sessionDirectory, ".maintenance", "sessions", session.sessionId, "write.lock")),
+    ).rejects.toThrow();
     expect((await readdir(workspaceRoot)).some((name) => name.startsWith(".anthias-"))).toBe(false);
   });
 });

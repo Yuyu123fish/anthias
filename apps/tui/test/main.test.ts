@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import {
   cp,
+  glob,
   mkdir,
   mkdtemp,
-  readdir,
   readFile,
   realpath,
   rm,
@@ -92,9 +92,7 @@ describe("Anthias CLI", () => {
     expect(secondProcessResult.status).toBe(0);
     expect(firstProcessResult.stderr).toBe("");
     expect(secondProcessResult.stderr).toBe("");
-    const sessionFiles = (await readdir(sessionDirectory)).filter((name) =>
-      name.endsWith(".jsonl"),
-    );
+    const sessionFiles = await findSessionFiles(sessionDirectory);
     expect(sessionFiles).toHaveLength(2);
     const recordedWorkspaces = await Promise.all(
       sessionFiles.map(async (sessionFile) => {
@@ -140,13 +138,16 @@ describe("Anthias CLI", () => {
     }
     expect(firstProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
     expect(firstProcessResult.stdout).toContain("Mode: Agent\n");
-    expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
+    const sessionFiles = await findSessionFiles(sessionDirectory);
+    expect(sessionFiles).toHaveLength(1);
+    const sessionFile = sessionFiles[0];
+    if (sessionFile === undefined) throw new Error("expected a time-partitioned Session");
     const sessionHeader = JSON.parse(
-      (await readFile(join(sessionDirectory, `${sessionId}.jsonl`), "utf8")).trimEnd(),
+      (await readFile(join(sessionDirectory, sessionFile), "utf8")).split("\n")[0] ?? "",
     ) as Record<string, unknown>;
     expect(sessionHeader).toMatchObject({
       type: "session_header",
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId,
       workspaceRoot: normalizedWorkspaceRoot,
     });
@@ -163,7 +164,7 @@ describe("Anthias CLI", () => {
     expect(reopenedProcessResult.stdout).toContain(`Session: ${sessionId}\n`);
     expect(reopenedProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
     expect(reopenedProcessResult.stdout).toContain("Mode: Agent\n");
-    expect((await readdir(sessionDirectory)).sort()).toEqual([".gitignore", `${sessionId}.jsonl`]);
+    expect(await findSessionFiles(sessionDirectory)).toEqual(sessionFiles);
   });
 
   it("exits before Session creation when model configuration is missing", async () => {
@@ -315,4 +316,12 @@ function createModelEnvironment(sessionDirectory?: string): NodeJS.ProcessEnv {
     ANTHIAS_MODEL_API_KEY: "local-key",
     ...(sessionDirectory === undefined ? {} : { ANTHIAS_SESSION_DIR: sessionDirectory }),
   };
+}
+
+async function findSessionFiles(sessionDirectory: string): Promise<string[]> {
+  const sessionFiles: string[] = [];
+  for await (const sessionFile of glob("*/*/session.jsonl", { cwd: sessionDirectory })) {
+    sessionFiles.push(sessionFile);
+  }
+  return sessionFiles;
 }

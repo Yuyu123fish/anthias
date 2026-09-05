@@ -15,15 +15,18 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Message } from "../src/message.js";
 import {
-  createSession,
-  openSession,
+  createSession as createSessionRuntime,
+  openSession as openSessionRuntime,
   resolveSessionShell,
   type Session,
   type SessionRunLease,
   type SessionShell,
 } from "../src/session/index.js";
+import { getSessionLockDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
+const activeSessions = new Set<Session>();
+const activeRunLeases = new Set<SessionRunLease>();
 const TEST_SHELL: SessionShell = Object.freeze({
   kind: "powershell",
   executable: "pwsh",
@@ -31,6 +34,10 @@ const TEST_SHELL: SessionShell = Object.freeze({
 });
 
 afterEach(async () => {
+  await Promise.all([...activeRunLeases].map((runLease) => runLease.release()));
+  activeRunLeases.clear();
+  await Promise.all([...activeSessions].map((session) => session.close()));
+  activeSessions.clear();
   await Promise.all(
     [...temporaryDirectories].map((temporaryDirectory) =>
       rm(temporaryDirectory, { recursive: true, force: true }),
@@ -56,7 +63,7 @@ describe("Session", () => {
     ).rejects.toThrow("没有可用的 pwsh");
   });
 
-  it("creates one newline-terminated Schema 1 header", async () => {
+  it("creates one newline-terminated Schema 2 header in its UTC storage directory", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-create-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     await mkdtemp(join(fixtureRoot, "workspace-seed-"));
@@ -74,23 +81,32 @@ describe("Session", () => {
     expect(session.workspaceRoot).toBe(existingWorkspaceRoot);
     expect(session.messageHistory).toEqual([]);
 
-    const sessionText = await readFile(
-      join(sessionDirectory, `${session.sessionId}.jsonl`),
-      "utf8",
-    );
+    const sessionText = await readFile(join(session.storageDirectory, "session.jsonl"), "utf8");
     expect(sessionText.endsWith("\n")).toBe(true);
     expect(sessionText.split("\n")).toHaveLength(2);
 
     const sessionHeader = JSON.parse(sessionText.trimEnd()) as Record<string, unknown>;
     expect(sessionHeader).toEqual({
       type: "session_header",
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId: session.sessionId,
       createdAt: expect.any(String),
       workspaceRoot: existingWorkspaceRoot,
       shell: TEST_SHELL,
     });
     expect(new Date(String(sessionHeader.createdAt)).toISOString()).toBe(sessionHeader.createdAt);
+    const createdAt = String(sessionHeader.createdAt);
+    expect(session.sessionDirectory).toBe(await realpath(sessionDirectory));
+    expect(session.storageDirectory).toBe(
+      join(
+        session.sessionDirectory,
+        createdAt.slice(0, 10),
+        `${createdAt.replace(/[-:.]/g, "")}-${session.sessionId}`,
+      ),
+    );
+    await expect(
+      access(join(session.storageDirectory, "session.index.json")),
+    ).resolves.toBeUndefined();
   });
 
   it("appends one completed text run and reopens its message projection", async () => {
@@ -116,12 +132,12 @@ describe("Session", () => {
     await runLease.appendRunFinished({ status: "completed" });
     await runLease.release();
 
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const completedSessionText = await readFile(sessionFilePath, "utf8");
     expect(completedSessionText.endsWith("\n")).toBe(true);
     const completedRecords = completedSessionText.trimEnd().split("\n").slice(1).map(parseRecord);
     expect(completedRecords.map((record) => record.seq)).toEqual([1, 2, 3]);
-    expect(completedRecords.every(hasValidEntryIdentity)).toBe(true);
+    expectValidRecordChain(completedRecords);
     expect(completedRecords[0]).toMatchObject({
       type: "message",
       runId,
@@ -149,6 +165,11 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
     expect(reopenedSession.messageHistory).toEqual([userMessage, assistantMessage]);
+    expect(reopenedSession.storageDirectory).toBe(session.storageDirectory);
+    expectOnlySessionUseAppended(
+      Buffer.from(completedSessionText, "utf8"),
+      await readFile(sessionFilePath),
+    );
 
     const continuedRunLease = await acquireSessionRun(reopenedSession, randomUUID());
     await continuedRunLease.appendMessage({
@@ -158,7 +179,8 @@ describe("Session", () => {
     await continuedRunLease.release();
     const continuedSessionText = await readFile(sessionFilePath, "utf8");
     const continuedRecords = continuedSessionText.trimEnd().split("\n").slice(1).map(parseRecord);
-    expect(continuedRecords.at(-1)?.seq).toBe(4);
+    expect(continuedRecords.at(-1)?.seq).toBe(5);
+    expectValidRecordChain(continuedRecords);
   });
 
   it("rejects reopening when a later Run reuses a historical runId", async () => {
@@ -170,20 +192,40 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
     const reusedRunId = randomUUID();
-    for (const [question, answer] of [
-      ["first", "first answer"],
-      ["second", "second answer"],
-    ] as const) {
-      const runLease = await acquireSessionRun(session, reusedRunId);
-      await runLease.appendMessage({ role: "user", content: question });
-      await runLease.appendMessage({
-        role: "assistant",
-        content: [{ type: "text", text: answer }],
-        status: "completed",
-      });
-      await runLease.appendRunFinished({ status: "completed" });
-      await runLease.release();
-    }
+    const runLease = await acquireSessionRun(session, reusedRunId);
+    await runLease.appendMessage({ role: "user", content: "first" });
+    await runLease.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "first answer" }],
+      status: "completed",
+    });
+    await runLease.appendRunFinished({ status: "completed" });
+    await runLease.release();
+    const reusedRunRecords = withParentEntryIds(
+      [
+        {
+          ...createRecordIdentity(4, reusedRunId),
+          type: "message",
+          message: { type: "user", content: [{ type: "text", text: "second" }] },
+        },
+        {
+          ...createRecordIdentity(5, reusedRunId),
+          type: "message",
+          message: {
+            type: "assistant",
+            content: [{ type: "text", text: "second answer" }],
+            status: "completed",
+          },
+        },
+        { ...createRecordIdentity(6, reusedRunId), type: "run_finished", status: "completed" },
+      ],
+      session.records.at(-1)?.entryId ?? null,
+    );
+    await appendFile(
+      join(session.storageDirectory, "session.jsonl"),
+      `${reusedRunRecords.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      "utf8",
+    );
 
     await expect(
       openSession({
@@ -208,7 +250,7 @@ describe("Session", () => {
     const runLease = await acquireSessionRun(session, runId);
     await runLease.appendMessage({ role: "user", content: "read then answer" });
     await runLease.release();
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const records = [
       {
         ...createRecordIdentity(2, runId),
@@ -247,7 +289,9 @@ describe("Session", () => {
     ];
     await appendFile(
       sessionFilePath,
-      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      `${withParentEntryIds(records, session.records.at(-1)?.entryId ?? null)
+        .map((record) => JSON.stringify(record))
+        .join("\n")}\n`,
       "utf8",
     );
 
@@ -305,7 +349,7 @@ describe("Session", () => {
     const runLease = await acquireSessionRun(session, randomUUID());
     await runLease.appendMessage({ role: "user", content: "hello" });
     await runLease.release();
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const validSessionText = await readFile(sessionFilePath, "utf8");
     await writeFile(sessionFilePath, validSessionText.replace('"seq":1', '"seq":2'), "utf8");
 
@@ -316,7 +360,7 @@ describe("Session", () => {
         sessionDirectory,
         shell: TEST_SHELL,
       }),
-    ).rejects.toThrow("seq 不连续");
+    ).rejects.toThrow("Session record identity 无效");
   });
 
   it("rejects a complete whitespace-only tail record", async () => {
@@ -327,7 +371,7 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const validSessionText = await readFile(sessionFilePath, "utf8");
     await writeFile(sessionFilePath, `${validSessionText} \n`, "utf8");
 
@@ -388,6 +432,7 @@ describe("Session", () => {
         };
         lines.splice(3, 0, {
           ...createRecordIdentity(3, runId),
+          parentEntryId: lines[2]?.entryId,
           type: "message",
           message: {
             type: "tool_result",
@@ -398,7 +443,7 @@ describe("Session", () => {
             truncated: false,
           },
         });
-        lines[4] = { ...lines[4], seq: 4 };
+        lines[4] = { ...lines[4], seq: 4, parentEntryId: lines[3]?.entryId };
       },
     },
   ])("rejects a complete Session containing $name", async ({ mutate }) => {
@@ -419,7 +464,7 @@ describe("Session", () => {
     });
     await runLease.appendRunFinished({ status: "completed" });
     await runLease.release();
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const sessionLines = (await readFile(sessionFilePath, "utf8"))
       .slice(0, -1)
       .split("\n")
@@ -439,7 +484,9 @@ describe("Session", () => {
         shell: TEST_SHELL,
       }),
     ).rejects.toThrow();
-    await expect(access(join(sessionDirectory, `${session.sessionId}.lock`))).rejects.toThrow();
+    await expect(
+      access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
+    ).rejects.toThrow();
   });
 
   it("truncates only an incomplete final JSON fragment and preserves every prior byte", async () => {
@@ -450,7 +497,7 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const completePrefix = await readFile(sessionFilePath);
     await appendFile(sessionFilePath, Buffer.from('{"type":"message","entryId":"'));
 
@@ -461,7 +508,7 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
 
-    expect(await readFile(sessionFilePath)).toEqual(completePrefix);
+    expectOnlySessionUseAppended(completePrefix, await readFile(sessionFilePath));
   });
 
   it.each([
@@ -478,7 +525,7 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     await appendFile(sessionFilePath, tail);
 
     await expect(
@@ -515,7 +562,7 @@ describe("Session", () => {
       const runLease = await acquireSessionRun(session, runId);
       await runLease.appendMessage({ role: "user", content: "recover me" });
       await runLease.release();
-      const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+      const sessionFilePath = join(session.storageDirectory, "session.jsonl");
       const existingRecords = (await readFile(sessionFilePath, "utf8")).slice(0, -1).split("\n");
       let nextSequence = 2;
       if (withToolCall) {
@@ -551,7 +598,14 @@ describe("Session", () => {
           }),
         );
       }
-      await writeFile(sessionFilePath, `${existingRecords.join("\n")}\n`, "utf8");
+      const [sessionHeader, ...interruptedRecords] = existingRecords.map(parseRecord);
+      await writeFile(
+        sessionFilePath,
+        `${[sessionHeader, ...withParentEntryIds(interruptedRecords)]
+          .map((record) => JSON.stringify(record))
+          .join("\n")}\n`,
+        "utf8",
+      );
 
       await openSession({
         sessionId: session.sessionId,
@@ -577,11 +631,11 @@ describe("Session", () => {
           message: { toolCallId, toolName: "write_file", status: resultStatus },
         });
       }
-      expect(recoveredRecords.at(-1)).toMatchObject({
-        type: "run_finished",
-        runId,
-        status: "interrupted",
-      });
+      expect(recoveredRecords.filter((record) => record.type === "run_finished")).toEqual([
+        expect.objectContaining({ runId, status: "interrupted" }),
+      ]);
+      expect(recoveredRecords.at(-1)).toMatchObject({ type: "session_use", activity: "opened" });
+      expectValidRecordChain(recoveredRecords);
 
       const bytesAfterFirstRecovery = await readFile(sessionFilePath);
       await openSession({
@@ -590,7 +644,7 @@ describe("Session", () => {
         sessionDirectory,
         shell: TEST_SHELL,
       });
-      expect(await readFile(sessionFilePath)).toEqual(bytesAfterFirstRecovery);
+      expectOnlySessionUseAppended(bytesAfterFirstRecovery, await readFile(sessionFilePath));
     },
   );
 
@@ -602,7 +656,7 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const lockDirectory = join(sessionDirectory, `${session.sessionId}.lock`);
+    const lockDirectory = getSessionLockDirectory(sessionDirectory, session.sessionId);
     await writeLockOwner(lockDirectory, process.pid, randomUUID());
 
     await expect(
@@ -640,7 +694,7 @@ describe("Session", () => {
     if (acquisition.status !== "acquired") {
       throw new Error("expected Session Run lease");
     }
-    const lockDirectory = join(sessionDirectory, `${session.sessionId}.lock`);
+    const lockDirectory = getSessionLockDirectory(sessionDirectory, session.sessionId);
     await writeFile(
       join(lockDirectory, "owner.json"),
       `${JSON.stringify({
@@ -663,14 +717,16 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const sessionFilePath = join(sessionDirectory, `${session.sessionId}.jsonl`);
+    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     await appendFile(sessionFilePath, " ");
 
     await expect(session.acquireRun(randomUUID())).resolves.toEqual({
       status: "rejected",
       reason: "session_changed",
     });
-    await expect(access(join(sessionDirectory, `${session.sessionId}.lock`))).rejects.toThrow();
+    await expect(
+      access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
+    ).rejects.toThrow();
   });
 });
 
@@ -685,7 +741,58 @@ async function acquireSessionRun(session: Session, runId: string): Promise<Sessi
   if (acquisition.status !== "acquired") {
     throw new Error(`expected acquired Session Run, received ${acquisition.reason}`);
   }
+  activeRunLeases.add(acquisition.lease);
   return acquisition.lease;
+}
+
+async function createSession(
+  options: Parameters<typeof createSessionRuntime>[0],
+): Promise<Session> {
+  const session = await createSessionRuntime(options);
+  activeSessions.add(session);
+  return session;
+}
+
+async function openSession(options: Parameters<typeof openSessionRuntime>[0]): Promise<Session> {
+  const session = await openSessionRuntime(options);
+  activeSessions.add(session);
+  return session;
+}
+
+function expectOnlySessionUseAppended(previousBytes: Buffer, currentBytes: Buffer): void {
+  expect(currentBytes.subarray(0, previousBytes.byteLength)).toEqual(previousBytes);
+  const appendedText = currentBytes.subarray(previousBytes.byteLength).toString("utf8");
+  expect(appendedText.endsWith("\n")).toBe(true);
+  expect(appendedText.trimEnd().split("\n").map(parseRecord)).toEqual([
+    expect.objectContaining({ type: "session_use", activity: "opened" }),
+  ]);
+  const currentRecords = currentBytes
+    .toString("utf8")
+    .trimEnd()
+    .split("\n")
+    .slice(1)
+    .map(parseRecord);
+  expectValidRecordChain(currentRecords);
+}
+
+function expectValidRecordChain(records: readonly Record<string, unknown>[]): void {
+  expect(records.every(hasValidEntryIdentity)).toBe(true);
+  expect(records.map((record) => record.seq)).toEqual(
+    records.map((_record, recordIndex) => recordIndex + 1),
+  );
+  for (const [recordIndex, record] of records.entries()) {
+    expect(record.parentEntryId).toBe(records[recordIndex - 1]?.entryId ?? null);
+  }
+}
+
+function withParentEntryIds(
+  records: readonly Record<string, unknown>[],
+  firstParentEntryId: string | null = null,
+): Record<string, unknown>[] {
+  return records.map((record, recordIndex) => ({
+    ...record,
+    parentEntryId: recordIndex === 0 ? firstParentEntryId : records[recordIndex - 1]?.entryId,
+  }));
 }
 
 function parseRecord(line: string): Record<string, unknown> {

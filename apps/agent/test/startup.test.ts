@@ -2,11 +2,19 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createAgentFromEnvironment } from "../src/index.js";
+import {
+  type Agent,
+  createAgentFromEnvironment as createProductionAgentFromEnvironment,
+} from "../src/index.js";
+import { locateSessionStorage } from "../src/session/locations.js";
+import { getSessionLockDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
+const activeAgents = new Set<Agent>();
 
 afterEach(async () => {
+  await Promise.all([...activeAgents].map((agent) => agent.close()));
+  activeAgents.clear();
   await Promise.all(
     [...temporaryDirectories].map((temporaryDirectory) =>
       rm(temporaryDirectory, { recursive: true, force: true }),
@@ -92,10 +100,7 @@ describe("createAgentFromEnvironment", () => {
         running: false,
         lastError: null,
       });
-      expect(await readdir(sessionDirectory)).toEqual([
-        ".gitignore",
-        `${creationResult.agent.state.sessionId}.jsonl`,
-      ]);
+      await expectSessionStorage(sessionDirectory, creationResult.agent.state.sessionId);
       await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
     }
   });
@@ -116,10 +121,7 @@ describe("createAgentFromEnvironment", () => {
     if (!creationResult.ok) {
       return;
     }
-    expect(await readdir(sessionDirectory)).toEqual([
-      ".gitignore",
-      `${creationResult.agent.state.sessionId}.jsonl`,
-    ]);
+    await expectSessionStorage(sessionDirectory, creationResult.agent.state.sessionId);
     await expect(readFile(join(sessionDirectory, ".gitignore"), "utf8")).resolves.toBe("*\n");
   });
 
@@ -161,10 +163,11 @@ describe("createAgentFromEnvironment", () => {
       return;
     }
     expect(creationResult.agent.state.permissionMode).toBe("plan");
-    const sessionText = await readFile(
-      join(sessionDirectory, `${creationResult.agent.state.sessionId}.jsonl`),
-      "utf8",
+    const location = await locateSessionStorage(
+      sessionDirectory,
+      creationResult.agent.state.sessionId,
     );
+    const sessionText = await readFile(location.sessionFilePath, "utf8");
     expect(sessionText).not.toContain("permissionMode");
   });
 
@@ -208,9 +211,9 @@ describe("createAgentFromEnvironment", () => {
     if (!firstCreationResult.ok) {
       throw new Error("expected initial Agent creation to succeed");
     }
-    const lockDirectory = join(
+    const lockDirectory = getSessionLockDirectory(
       sessionDirectory,
-      `${firstCreationResult.agent.state.sessionId}.lock`,
+      firstCreationResult.agent.state.sessionId,
     );
     await mkdir(lockDirectory);
     await writeFile(
@@ -305,6 +308,13 @@ describe("createAgentFromEnvironment", () => {
       throw new Error("expected initial Agent creation to succeed");
     }
 
+    const originalDirectoryEntries = await readdir(sessionDirectory);
+    const originalLocation = await locateSessionStorage(
+      sessionDirectory,
+      firstCreationResult.agent.state.sessionId,
+    );
+    const originalSessionBytes = await readFile(originalLocation.sessionFilePath);
+
     const mismatchResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot: requestedWorkspaceRoot,
@@ -317,12 +327,45 @@ describe("createAgentFromEnvironment", () => {
       reason: "workspace_mismatch",
       error: `Session 属于工作区 ${recordedWorkspaceRoot}，当前工作区是 ${requestedWorkspaceRoot}。请回到原工作区或创建新 Session。`,
     });
-    expect(await readdir(sessionDirectory)).toEqual([
-      ".gitignore",
-      `${firstCreationResult.agent.state.sessionId}.jsonl`,
-    ]);
+    expect(await readdir(sessionDirectory)).toEqual(originalDirectoryEntries);
+    expect(await readFile(originalLocation.sessionFilePath)).toEqual(originalSessionBytes);
   });
 });
+
+async function createAgentFromEnvironment(
+  options: Parameters<typeof createProductionAgentFromEnvironment>[0],
+) {
+  const result = await createProductionAgentFromEnvironment(options);
+  if (result.ok) {
+    activeAgents.add(result.agent);
+  }
+  return result;
+}
+
+async function expectSessionStorage(sessionDirectory: string, sessionId: string): Promise<void> {
+  const location = await locateSessionStorage(sessionDirectory, sessionId);
+  expect(location.source).toBe("schema2");
+  const sessionText = await readFile(location.sessionFilePath, "utf8");
+  const header = JSON.parse(sessionText.trimEnd().split("\n")[0] ?? "") as Record<string, unknown>;
+  expect(header).toMatchObject({ schemaVersion: 2, sessionId });
+  const createdAt = String(header.createdAt);
+  expect(location.storageDirectory).toBe(
+    join(
+      sessionDirectory,
+      createdAt.slice(0, 10),
+      `${createdAt.replace(/[-:.]/g, "")}-${sessionId}`,
+    ),
+  );
+  await expect(
+    readFile(join(location.storageDirectory, "session.index.json"), "utf8"),
+  ).resolves.toContain(sessionId);
+  expect(await readdir(sessionDirectory)).toEqual([
+    ".gitignore",
+    ".maintenance",
+    createdAt.slice(0, 10),
+    "session-locations.json",
+  ]);
+}
 
 async function createValidEnvironment(sessionDirectory: string): Promise<NodeJS.ProcessEnv> {
   const shellDirectory = join(sessionDirectory, "..", "test-bin");

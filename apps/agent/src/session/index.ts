@@ -6,35 +6,55 @@ import type { Message } from "../message.js";
 import {
   appendJsonLine,
   appendRecoveryRecords,
-  areSameCheckpoint,
   ensureSessionGitignore,
-  readCompleteSessionText,
+  readCompleteSessionJournal,
   readSessionCheckpoint,
+  readSessionJournal,
   SessionChangedError,
   type SessionFileCheckpoint,
   writeNewSessionHeader,
 } from "./journal.js";
 import {
+  createSessionStorageDirectory,
+  locateSessionStorage,
+  type SessionStorageLocation,
+  writeSessionLocation,
+} from "./locations.js";
+import {
   acquireSessionLock,
+  acquireSessionUsageMarker,
   DEFAULT_SESSION_LOCK_SYSTEM,
+  getSessionLockDirectory,
   releaseSessionLock,
+  releaseSessionUsageMarker,
   SessionBusyError,
   type SessionLockOwnership,
   type SessionLockSystem,
+  type SessionUsageMarkerOwnership,
 } from "./lock.js";
+import { completePublishedMigration, migrateLegacySession } from "./migration.js";
+import { readOrRebuildResumeIndex } from "./resume-index.js";
 import {
+  type ApprovalDecisionDetails,
+  type ApprovalDecisionRecord,
   areSameShell,
   areSameWorkspace,
+  type CompactionDetails,
+  type CompactionRecord,
   fromDurableMessage,
   isSideEffectToolName,
   isUuid,
+  isValidCompactionRecord,
   type MessageRecord,
-  parseSessionHeader,
   parseSessionRecord,
+  type RequestUsageDetails,
+  type RequestUsageRecord,
   type RunFinishedDetails,
   type SessionHeader,
   type SessionRecord,
   type SessionShell,
+  type SessionUseDetails,
+  type SessionUseRecord,
   snapshotSessionShell,
   type ToolExecutionStartedDetails,
   toDurableMessage,
@@ -43,11 +63,14 @@ import {
 
 export type { SessionLockSystem } from "./lock.js";
 export type {
+  ApprovalDecisionDetails,
+  CompactionDetails,
+  RequestUsageDetails,
   RunFinishedDetails,
   SessionShell,
+  SessionUseDetails,
   ToolExecutionStartedDetails,
 } from "./schema.js";
-
 export { SessionBusyError, SessionChangedError };
 
 /** 表示请求的 Session 身份或持久文件不能安全打开。 */
@@ -69,11 +92,14 @@ export class SessionWorkspaceMismatchError extends Error {
 /** 表示当前固定 Shell 不可用或与 Session Header 不一致。 */
 export class SessionShellUnavailableError extends Error {}
 
-/** 持有单个已接受 Run 的 Session 锁与串行追加能力。 */
+/** 持有单个已接受 Run 的 Session 写锁与串行追加能力。 */
 export type SessionRunLease = Readonly<{
   appendMessage(message: Message): Promise<void>;
   appendToolExecutionStarted(details: ToolExecutionStartedDetails): Promise<void>;
   appendRunFinished(details: RunFinishedDetails): Promise<void>;
+  appendCompaction(details: CompactionDetails): Promise<void>;
+  appendRequestUsage(details: RequestUsageDetails): Promise<void>;
+  appendApprovalDecision(details: ApprovalDecisionDetails): Promise<void>;
   release(): Promise<void>;
 }>;
 
@@ -82,17 +108,23 @@ export type SessionRunAcquisition =
   | Readonly<{ status: "acquired"; lease: SessionRunLease }>
   | Readonly<{ status: "rejected"; reason: "session_busy" | "session_changed" }>;
 
-/** 提供线性 Session 的持久消息投影与串行追加行为。 */
+/** 提供线性 Session 的持久事实、只读消息投影与关闭生命周期。 */
 export type Session = Readonly<{
   sessionId: string;
   workspaceRoot: string;
   sessionDirectory: string;
+  storageDirectory: string;
   shell: SessionShell;
   readonly messageHistory: readonly Message[];
+  readonly records: readonly SessionRecord[];
   acquireRun(runId: string): Promise<SessionRunAcquisition>;
+  appendCompaction(details: CompactionDetails): Promise<void>;
+  appendRequestUsage(details: RequestUsageDetails): Promise<void>;
+  appendApprovalDecision(details: ApprovalDecisionDetails): Promise<void>;
+  close(): Promise<void>;
 }>;
 
-/** 配置一个新 Session 绑定的工作区、目录与固定 Shell。 */
+/** 配置一个新 Session 绑定的工作区、数据根与固定 Shell。 */
 export type CreateSessionOptions = Readonly<{
   workspaceRoot: string;
   sessionDirectory: string;
@@ -148,7 +180,7 @@ export async function resolveSessionShell(
         arguments: ["-lc"],
       });
     } catch {
-      // 不可执行的 SHELL 不是稳定运行时，统一回退到 Schema 1 的 POSIX 默认值。
+      // 不可执行的 SHELL 不是稳定运行时，统一回退到 POSIX 默认值。
     }
   }
   try {
@@ -163,7 +195,6 @@ export async function resolveSessionShell(
   }
 }
 
-/** 在显式环境 PATH 中解析一个真实存在的可执行文件。 */
 async function resolveExecutableFromPath(
   executableName: string,
   environment: NodeJS.ProcessEnv,
@@ -180,8 +211,8 @@ async function resolveExecutableFromPath(
     if (directory.length === 0) {
       continue;
     }
-    const candidatePath = join(directory, executableName);
     try {
+      const candidatePath = join(directory, executableName);
       await access(candidatePath, constants.X_OK);
       return await realpath(candidatePath);
     } catch {
@@ -190,8 +221,7 @@ async function resolveExecutableFromPath(
   }
   return null;
 }
-
-/** 创建一个绑定规范化工作区的线性 JSONL Session。 */
+/** 创建一个绑定规范化工作区、UTC 存储目录和独立使用标记的 Session。 */
 export async function createSession({
   workspaceRoot,
   sessionDirectory,
@@ -199,37 +229,61 @@ export async function createSession({
   lockSystem = DEFAULT_SESSION_LOCK_SYSTEM,
 }: CreateSessionOptions): Promise<Session> {
   const normalizedWorkspaceRoot = await realpath(workspaceRoot);
-  const sessionId = randomUUID();
-  const sessionShell = snapshotSessionShell(shell);
+  const normalizedSessionDirectory = await prepareSessionDirectory(sessionDirectory);
   const sessionHeader: SessionHeader = Object.freeze({
     type: "session_header",
-    schemaVersion: 1,
-    sessionId,
+    schemaVersion: 2,
+    sessionId: randomUUID(),
     createdAt: new Date().toISOString(),
     workspaceRoot: normalizedWorkspaceRoot,
-    shell: sessionShell,
+    shell: snapshotSessionShell(shell),
   });
+  const location = await createSessionStorageDirectory(normalizedSessionDirectory, sessionHeader);
+  await writeNewSessionHeader(location.sessionFilePath, sessionHeader);
+  await writeSessionLocation(normalizedSessionDirectory, location).catch(() => undefined);
 
-  await mkdir(sessionDirectory, { recursive: true });
-  await ensureSessionGitignore(sessionDirectory);
-  const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const sessionFilePath = join(normalizedSessionDirectory, `${sessionId}.jsonl`);
-  await writeNewSessionHeader(sessionFilePath, sessionHeader);
-  const checkpoint = await readSessionCheckpoint(sessionFilePath);
-  return createSessionRuntime(
-    sessionFilePath,
-    sessionId,
-    normalizedWorkspaceRoot,
+  const lockDirectory = getSessionLockDirectory(
     normalizedSessionDirectory,
-    sessionShell,
-    [],
-    checkpoint,
-    join(normalizedSessionDirectory, `${sessionId}.lock`),
-    lockSystem,
+    sessionHeader.sessionId,
   );
+  const ownership = await acquireSessionLock(lockDirectory, lockSystem);
+  let usageMarker: SessionUsageMarkerOwnership | null = null;
+  try {
+    usageMarker = await acquireSessionUsageMarker(
+      normalizedSessionDirectory,
+      sessionHeader.sessionId,
+      lockSystem,
+    );
+    const journal = await readCompleteSessionJournal(location.sessionFilePath);
+    if (journal.header.schemaVersion !== 2) {
+      throw new InvalidSessionError("新建 Session Header 不是 Schema 2。");
+    }
+    const checkpoint = await readSessionCheckpoint(location.sessionFilePath);
+    await readOrRebuildResumeIndex(location.storageDirectory, journal).catch(() => undefined);
+    return createSessionRuntime({
+      sessionFilePath: location.sessionFilePath,
+      sessionId: sessionHeader.sessionId,
+      workspaceRoot: normalizedWorkspaceRoot,
+      sessionDirectory: normalizedSessionDirectory,
+      storageDirectory: location.storageDirectory,
+      shell: sessionHeader.shell,
+      initialRecords: journal.records,
+      initialCheckpoint: checkpoint,
+      lockDirectory,
+      lockSystem,
+      usageMarker,
+    });
+  } catch (error) {
+    if (usageMarker !== null) {
+      await releaseSessionUsageMarker(usageMarker).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    await releaseSessionLock(ownership);
+  }
 }
 
-/** 打开一个完整的 Schema 1 文件，并从持久消息重建只读投影。 */
+/** 按稳定 ID 打开、必要时显式迁移旧格式，并在返回前写入本次打开的使用事实。 */
 export async function openSession({
   sessionId,
   workspaceRoot,
@@ -242,195 +296,532 @@ export async function openSession({
   }
   const normalizedWorkspaceRoot = await realpath(workspaceRoot);
   const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const sessionFilePath = join(normalizedSessionDirectory, `${sessionId}.jsonl`);
-  const lockDirectory = join(normalizedSessionDirectory, `${sessionId}.lock`);
-  const startupLock = await acquireSessionLock(lockDirectory, lockSystem);
-  let sessionText: string;
-  let sessionHeader: SessionHeader;
-  let records: SessionRecord[];
-  let checkpoint: SessionFileCheckpoint;
+  let location = await locateSessionStorage(normalizedSessionDirectory, sessionId);
+  const lockDirectory = getSessionLockDirectory(normalizedSessionDirectory, sessionId);
+  const ownership = await acquireSessionLock(lockDirectory, lockSystem);
+  let usageMarker: SessionUsageMarkerOwnership | null = null;
   try {
-    sessionText = await readCompleteSessionText(sessionFilePath);
-
-    const lines = sessionText.slice(0, -1).split("\n");
-    sessionHeader = parseSessionHeader(lines[0]);
-    if (sessionHeader.sessionId !== sessionId) {
-      throw new Error("Session Header 与请求的 Session ID 不匹配。");
+    location = await locateSessionStorage(normalizedSessionDirectory, sessionId);
+    if (location.source === "schema1") {
+      const migratedSession = await migrateLegacySession(normalizedSessionDirectory, location);
+      location = migratedSession.location;
+    } else {
+      await completePublishedMigration(normalizedSessionDirectory, location);
+      location = withoutLegacyFilePath(location);
     }
-    if (!areSameWorkspace(sessionHeader.workspaceRoot, normalizedWorkspaceRoot)) {
-      throw new SessionWorkspaceMismatchError(sessionHeader.workspaceRoot, normalizedWorkspaceRoot);
+
+    let journal = await readCompleteSessionJournal(location.sessionFilePath);
+    if (journal.header.schemaVersion !== 2 || journal.header.sessionId !== sessionId) {
+      throw new InvalidSessionError("Session Header 与请求的 Session ID 不匹配。");
+    }
+    if (!areSameWorkspace(journal.header.workspaceRoot, normalizedWorkspaceRoot)) {
+      throw new SessionWorkspaceMismatchError(
+        journal.header.workspaceRoot,
+        normalizedWorkspaceRoot,
+      );
     }
     const requestedShell = snapshotSessionShell(shell);
-    if (!areSameShell(sessionHeader.shell, requestedShell)) {
+    if (!areSameShell(journal.header.shell, requestedShell)) {
       throw new SessionShellUnavailableError("Session Shell 与当前固定 Shell 不匹配。");
     }
-    records = lines.slice(1).map((line, recordIndex) => parseSessionRecord(line, recordIndex + 1));
-    const unfinishedRun = validateSessionRecords(records);
+
+    const recoveredRecords = [...journal.records];
+    const unfinishedRun = validateSessionRecords(recoveredRecords);
     if (unfinishedRun !== null) {
-      await appendRecoveryRecords(sessionFilePath, records, unfinishedRun);
+      await appendRecoveryRecords(location.sessionFilePath, recoveredRecords, unfinishedRun);
+      journal = await readCompleteSessionJournal(location.sessionFilePath);
     }
-    checkpoint = await readSessionCheckpoint(sessionFilePath);
+    if (journal.header.schemaVersion !== 2) {
+      throw new InvalidSessionError("Session Schema 迁移未完成。");
+    }
+    usageMarker = await acquireSessionUsageMarker(
+      normalizedSessionDirectory,
+      sessionId,
+      lockSystem,
+    );
+    const sessionRecords = [...journal.records];
+    await appendSessionUseRecord(location.sessionFilePath, sessionRecords, { activity: "opened" });
+    const checkpoint = await readSessionCheckpoint(location.sessionFilePath);
+    journal = await readCompleteSessionJournal(location.sessionFilePath);
+    await readOrRebuildResumeIndex(location.storageDirectory, journal).catch(() => undefined);
+    return createSessionRuntime({
+      sessionFilePath: location.sessionFilePath,
+      sessionId,
+      workspaceRoot: normalizedWorkspaceRoot,
+      sessionDirectory: normalizedSessionDirectory,
+      storageDirectory: location.storageDirectory,
+      shell: journal.header.shell,
+      initialRecords: journal.records,
+      initialCheckpoint: checkpoint,
+      lockDirectory,
+      lockSystem,
+      usageMarker,
+    });
+  } catch (error) {
+    if (usageMarker !== null) {
+      await releaseSessionUsageMarker(usageMarker).catch(() => undefined);
+    }
+    throw error;
   } finally {
-    await releaseSessionLock(startupLock);
+    await releaseSessionLock(ownership);
   }
-
-  const messageHistory = records
-    .filter((record): record is MessageRecord => record.type === "message")
-    .map((record) => fromDurableMessage(record.message));
-
-  return createSessionRuntime(
-    sessionFilePath,
-    sessionHeader.sessionId,
-    normalizedWorkspaceRoot,
-    normalizedSessionDirectory,
-    sessionHeader.shell,
-    messageHistory,
-    checkpoint,
-    lockDirectory,
-    lockSystem,
-  );
 }
 
+async function prepareSessionDirectory(sessionDirectory: string): Promise<string> {
+  await mkdir(sessionDirectory, { recursive: true });
+  await ensureSessionGitignore(sessionDirectory);
+  return realpath(sessionDirectory);
+}
+type SessionRuntimeOptions = Readonly<{
+  sessionFilePath: string;
+  sessionId: string;
+  workspaceRoot: string;
+  sessionDirectory: string;
+  storageDirectory: string;
+  shell: SessionShell;
+  initialRecords: readonly SessionRecord[];
+  initialCheckpoint: SessionFileCheckpoint;
+  lockDirectory: string;
+  lockSystem: SessionLockSystem;
+  usageMarker: SessionUsageMarkerOwnership;
+}>;
+
 /** 从已验证的 Header 与记录投影组装 Session 运行时。 */
-function createSessionRuntime(
-  sessionFilePath: string,
-  sessionId: string,
-  workspaceRoot: string,
-  sessionDirectory: string,
-  shell: SessionShell,
-  initialMessageHistory: readonly Message[],
-  initialCheckpoint: SessionFileCheckpoint,
-  lockDirectory: string,
-  lockSystem: SessionLockSystem,
-): Session {
-  const messageHistory = [...initialMessageHistory];
-  let checkpoint = initialCheckpoint;
+function createSessionRuntime(options: SessionRuntimeOptions): Session {
+  const messageHistory = options.initialRecords
+    .filter((record): record is MessageRecord => record.type === "message")
+    .map((record) => fromDurableMessage(record.message));
+  let records = [...options.initialRecords];
+  let checkpoint = options.initialCheckpoint;
   let sessionChanged = false;
+  let closed = false;
+  let closePromise: Promise<void> | null = null;
+  let activeLeaseCompletion: Promise<void> | null = null;
+  const pendingRunAcquisitionCompletions = new Set<Promise<void>>();
+
+  async function refreshAfterUsageOnlyAppend(): Promise<boolean> {
+    const journal = await readSessionJournal(options.sessionFilePath).catch(() => null);
+    if (
+      journal === null ||
+      journal.header.schemaVersion !== 2 ||
+      journal.header.sessionId !== options.sessionId
+    ) {
+      sessionChanged = true;
+      return false;
+    }
+    const diskRecords = journal.records;
+    if (records.length === diskRecords.length) {
+      if (
+        records.every(
+          (record, index) => JSON.stringify(record) === JSON.stringify(diskRecords[index]),
+        )
+      ) {
+        const refreshedCheckpoint = await readSessionCheckpoint(options.sessionFilePath).catch(
+          () => null,
+        );
+        if (refreshedCheckpoint === null) {
+          sessionChanged = true;
+          return false;
+        }
+        checkpoint = refreshedCheckpoint;
+        return true;
+      }
+      sessionChanged = true;
+      return false;
+    }
+    const knownPrefixIsUnchanged =
+      records.length < diskRecords.length &&
+      records.every(
+        (record, index) => JSON.stringify(record) === JSON.stringify(diskRecords[index]),
+      );
+    const appendedRecords = diskRecords.slice(records.length);
+    if (
+      !knownPrefixIsUnchanged ||
+      appendedRecords.some((record) => record.type !== "session_use")
+    ) {
+      sessionChanged = true;
+      return false;
+    }
+    const refreshedCheckpoint = await readSessionCheckpoint(options.sessionFilePath).catch(
+      () => null,
+    );
+    if (refreshedCheckpoint === null) {
+      sessionChanged = true;
+      return false;
+    }
+    records = [...diskRecords];
+    checkpoint = refreshedCheckpoint;
+    await refreshResumeIndex().catch(() => undefined);
+    return true;
+  }
+  async function refreshResumeIndex(): Promise<void> {
+    const journal = await readCompleteSessionJournal(options.sessionFilePath);
+    if (journal.header.schemaVersion !== 2) {
+      throw new Error("Session 恢复索引只能写入 Schema 2 日志。");
+    }
+    await readOrRebuildResumeIndex(options.storageDirectory, journal);
+  }
+
+  async function appendRecord(
+    createRecord: (sequence: number, parentEntryId: string | null) => SessionRecord,
+    afterAppend?: (record: SessionRecord) => void,
+  ): Promise<void> {
+    const rawRecord = createRecord(checkpoint.lastSequence + 1, records.at(-1)?.entryId ?? null);
+    const record = parseSessionRecord(JSON.stringify(rawRecord), checkpoint.lastSequence + 1);
+    if (record.type === "compaction") {
+      const previousRecordsByEntryId = new Map<string, SessionRecord>();
+      for (const previousRecord of records) {
+        previousRecordsByEntryId.set(previousRecord.entryId, previousRecord);
+      }
+      if (!isValidCompactionRecord(record, previousRecordsByEntryId)) {
+        throw new Error("CompactionEntry 引用无效。");
+      }
+    }
+    validateSessionRecords([...records, record]);
+    await appendJsonLine(options.sessionFilePath, record);
+    records.push(record);
+    checkpoint = await readSessionCheckpoint(options.sessionFilePath);
+    afterAppend?.(record);
+    await refreshResumeIndex().catch(() => undefined);
+  }
+
+  async function appendStandaloneRecord(
+    createRecord: (sequence: number, parentEntryId: string | null) => SessionRecord,
+  ): Promise<void> {
+    if (closed) {
+      throw new Error("Session 已关闭，不能追加持久事实。");
+    }
+    let ownership: SessionLockOwnership;
+    try {
+      ownership = await acquireSessionLock(options.lockDirectory, options.lockSystem);
+    } catch (error) {
+      if (error instanceof SessionBusyError) {
+        throw new SessionBusyError("Session 正在被 Run 使用。");
+      }
+      throw error;
+    }
+    try {
+      if (!(await refreshAfterUsageOnlyAppend())) {
+        throw new SessionChangedError("Session 业务历史已变化，不能用旧上下文追加事实。");
+      }
+      await appendRecord(createRecord);
+    } finally {
+      await releaseSessionLock(ownership);
+    }
+  }
 
   return Object.freeze({
-    sessionId,
-    workspaceRoot,
-    sessionDirectory,
-    shell,
+    sessionId: options.sessionId,
+    workspaceRoot: options.workspaceRoot,
+    sessionDirectory: options.sessionDirectory,
+    storageDirectory: options.storageDirectory,
+    shell: options.shell,
     get messageHistory() {
       return Object.freeze([...messageHistory]);
+    },
+    get records() {
+      return Object.freeze([...records]);
     },
     async acquireRun(runId) {
       if (!isUuid(runId)) {
         throw new Error("Run ID 无效。");
       }
+      if (closed) {
+        throw new Error("Session 已关闭，不能开始新的 Run。");
+      }
       if (sessionChanged) {
         return Object.freeze({ status: "rejected", reason: "session_changed" });
       }
 
-      let ownership: SessionLockOwnership;
-      try {
-        ownership = await acquireSessionLock(lockDirectory, lockSystem);
-      } catch (error) {
-        if (error instanceof SessionBusyError) {
-          return Object.freeze({ status: "rejected", reason: "session_busy" });
-        }
-        throw error;
-      }
-
-      const actualCheckpoint = await readSessionCheckpoint(sessionFilePath).catch(() => null);
-      if (actualCheckpoint === null || !areSameCheckpoint(checkpoint, actualCheckpoint)) {
-        sessionChanged = true;
-        await releaseSessionLock(ownership);
-        return Object.freeze({ status: "rejected", reason: "session_changed" });
-      }
-
-      let nextSequence = checkpoint.lastSequence + 1;
-      let appendQueue: Promise<void> = Promise.resolve();
-      let released = false;
-      let runFinished = false;
-
-      /** 串行刷新一条记录，并在成功后推进内存检查点。 */
-      function enqueueRecord(
-        createRecord: (sequence: number) => SessionRecord,
-        afterAppend?: () => void,
-      ): Promise<void> {
-        if (released) {
-          return Promise.reject(new Error("Session Run lease 已释放。"));
-        }
-        const appendPromise = appendQueue.then(async () => {
-          const record = createRecord(nextSequence);
-          await appendJsonLine(sessionFilePath, record);
-          nextSequence += 1;
-          checkpoint = await readSessionCheckpoint(sessionFilePath);
-          afterAppend?.();
-        });
-        appendQueue = appendPromise.catch(() => undefined);
-        return appendPromise;
-      }
-
-      const lease: SessionRunLease = Object.freeze({
-        appendMessage(message) {
-          const durableMessage = toDurableMessage(message);
-          const historyMessage = fromDurableMessage(durableMessage);
-          return enqueueRecord(
-            (sequence) =>
-              Object.freeze({
-                type: "message",
-                entryId: randomUUID(),
-                seq: sequence,
-                timestamp: new Date().toISOString(),
-                runId,
-                message: durableMessage,
-              }),
-            () => messageHistory.push(historyMessage),
-          );
-        },
-        appendToolExecutionStarted(details) {
-          if (
-            !isUuid(details.toolCallId) ||
-            !isSideEffectToolName(details.toolName) ||
-            !isUuid(details.toolApprovalRequestId)
-          ) {
-            return Promise.reject(new Error("ToolExecutionStarted 身份无效。"));
-          }
-          return enqueueRecord((sequence) =>
-            Object.freeze({
-              type: "tool_execution_started",
-              entryId: randomUUID(),
-              seq: sequence,
-              timestamp: new Date().toISOString(),
-              runId,
-              toolCallId: details.toolCallId,
-              toolName: details.toolName,
-              toolApprovalRequestId: details.toolApprovalRequestId,
-            }),
-          );
-        },
-        appendRunFinished(details) {
-          return enqueueRecord(
-            (sequence) =>
-              Object.freeze({
-                type: "run_finished",
-                entryId: randomUUID(),
-                seq: sequence,
-                timestamp: new Date().toISOString(),
-                runId,
-                status: details.status,
-              }),
-            () => {
-              runFinished = true;
-            },
-          );
-        },
-        async release() {
-          if (released) {
-            return;
-          }
-          released = true;
-          await appendQueue;
-          if (!runFinished && checkpoint.lastSequence >= nextSequence - 1) {
-            sessionChanged = true;
-          }
-          await releaseSessionLock(ownership);
-        },
+      let resolveAcquisitionCompletion!: () => void;
+      const acquisitionCompletion = new Promise<void>((resolve) => {
+        resolveAcquisitionCompletion = resolve;
       });
-      return Object.freeze({ status: "acquired", lease });
+      pendingRunAcquisitionCompletions.add(acquisitionCompletion);
+      let ownership: SessionLockOwnership | null = null;
+      try {
+        try {
+          ownership = await acquireSessionLock(options.lockDirectory, options.lockSystem);
+        } catch (error) {
+          if (error instanceof SessionBusyError) {
+            return Object.freeze({ status: "rejected", reason: "session_busy" });
+          }
+          throw error;
+        }
+        if (closed || !(await refreshAfterUsageOnlyAppend())) {
+          const rejectedOwnership = ownership;
+          ownership = null;
+          await releaseSessionLock(rejectedOwnership);
+          return Object.freeze({
+            status: "rejected",
+            reason: closed ? "session_busy" : "session_changed",
+          });
+        }
+
+        const leaseOwnership = ownership;
+        if (leaseOwnership === null) {
+          throw new Error("Session Run 锁所有权丢失。");
+        }
+        let released = false;
+        let runFinished = false;
+        let resolveLeaseCompletion!: () => void;
+        activeLeaseCompletion = new Promise<void>((resolve) => {
+          resolveLeaseCompletion = resolve;
+        });
+        let appendQueue: Promise<void> = Promise.resolve();
+
+        function enqueueRecord(
+          createRecord: (sequence: number, parentEntryId: string | null) => SessionRecord,
+          afterAppend?: (record: SessionRecord) => void,
+        ): Promise<void> {
+          if (released) {
+            return Promise.reject(new Error("Session Run lease 已释放。"));
+          }
+          const appendPromise = appendQueue.then(() => appendRecord(createRecord, afterAppend));
+          appendQueue = appendPromise.catch(() => undefined);
+          return appendPromise;
+        }
+
+        const lease: SessionRunLease = Object.freeze({
+          appendMessage(message) {
+            const durableMessage = toDurableMessage(message);
+            const historyMessage = fromDurableMessage(durableMessage);
+            return enqueueRecord(
+              (sequence, parentEntryId) =>
+                Object.freeze({
+                  type: "message",
+                  entryId: randomUUID(),
+                  seq: sequence,
+                  timestamp: new Date().toISOString(),
+                  parentEntryId,
+                  runId,
+                  message: durableMessage,
+                }),
+              () => messageHistory.push(historyMessage),
+            );
+          },
+          appendToolExecutionStarted(details) {
+            if (
+              !isUuid(details.toolCallId) ||
+              !isSideEffectToolName(details.toolName) ||
+              !isUuid(details.toolApprovalRequestId)
+            ) {
+              return Promise.reject(new Error("ToolExecutionStarted 身份无效。"));
+            }
+            return enqueueRecord((sequence, parentEntryId) =>
+              Object.freeze({
+                type: "tool_execution_started",
+                entryId: randomUUID(),
+                seq: sequence,
+                timestamp: new Date().toISOString(),
+                parentEntryId,
+                runId,
+                toolCallId: details.toolCallId,
+                toolName: details.toolName,
+                toolApprovalRequestId: details.toolApprovalRequestId,
+              }),
+            );
+          },
+          appendRunFinished(details) {
+            return enqueueRecord(
+              (sequence, parentEntryId) =>
+                Object.freeze({
+                  type: "run_finished",
+                  entryId: randomUUID(),
+                  seq: sequence,
+                  timestamp: new Date().toISOString(),
+                  parentEntryId,
+                  runId,
+                  status: details.status,
+                }),
+              () => {
+                runFinished = true;
+              },
+            );
+          },
+          appendCompaction(details) {
+            return enqueueRecord((sequence, parentEntryId) =>
+              createCompactionRecord(sequence, parentEntryId, details),
+            );
+          },
+          appendRequestUsage(details) {
+            return enqueueRecord((sequence, parentEntryId) =>
+              createRequestUsageRecord(sequence, parentEntryId, details),
+            );
+          },
+          appendApprovalDecision(details) {
+            return enqueueRecord((sequence, parentEntryId) =>
+              createApprovalDecisionRecord(sequence, parentEntryId, details),
+            );
+          },
+          async release() {
+            if (released) {
+              return;
+            }
+            released = true;
+            try {
+              await appendQueue;
+              if (!runFinished) {
+                sessionChanged = true;
+              }
+            } finally {
+              try {
+                await releaseSessionLock(leaseOwnership);
+              } finally {
+                resolveLeaseCompletion();
+                activeLeaseCompletion = null;
+              }
+            }
+          },
+        });
+        ownership = null;
+        return Object.freeze({ status: "acquired", lease });
+      } finally {
+        try {
+          if (ownership !== null) {
+            await releaseSessionLock(ownership);
+          }
+        } finally {
+          resolveAcquisitionCompletion();
+          pendingRunAcquisitionCompletions.delete(acquisitionCompletion);
+        }
+      }
     },
+    appendCompaction(details) {
+      return appendStandaloneRecord((sequence, parentEntryId) =>
+        createCompactionRecord(sequence, parentEntryId, details),
+      );
+    },
+    appendRequestUsage(details) {
+      return appendStandaloneRecord((sequence, parentEntryId) =>
+        createRequestUsageRecord(sequence, parentEntryId, details),
+      );
+    },
+    appendApprovalDecision(details) {
+      return appendStandaloneRecord((sequence, parentEntryId) =>
+        createApprovalDecisionRecord(sequence, parentEntryId, details),
+      );
+    },
+    close() {
+      if (closePromise !== null) {
+        return closePromise;
+      }
+      closed = true;
+      const acquisitionsAtClose = [...pendingRunAcquisitionCompletions];
+      closePromise = (async () => {
+        try {
+          await Promise.all(acquisitionsAtClose);
+          await activeLeaseCompletion;
+        } finally {
+          await releaseSessionUsageMarker(options.usageMarker);
+        }
+      })();
+      return closePromise;
+    },
+  });
+}
+async function appendSessionUseRecord(
+  sessionFilePath: string,
+  records: SessionRecord[],
+  details: SessionUseDetails,
+): Promise<void> {
+  const record: SessionUseRecord = Object.freeze({
+    type: "session_use",
+    entryId: randomUUID(),
+    seq: (records.at(-1)?.seq ?? 0) + 1,
+    timestamp: new Date().toISOString(),
+    parentEntryId: records.at(-1)?.entryId ?? null,
+    activity: details.activity,
+  });
+  validateSessionRecords([...records, record]);
+  await appendJsonLine(sessionFilePath, record);
+  records.push(record);
+}
+
+function withoutLegacyFilePath(location: SessionStorageLocation): SessionStorageLocation {
+  return Object.freeze({
+    sessionId: location.sessionId,
+    storageDirectory: location.storageDirectory,
+    sessionFilePath: location.sessionFilePath,
+    relativeStorageDirectory: location.relativeStorageDirectory,
+    source: location.source,
+  });
+}
+function createCompactionRecord(
+  sequence: number,
+  parentEntryId: string | null,
+  details: CompactionDetails,
+): CompactionRecord {
+  return Object.freeze({
+    type: "compaction",
+    entryId: randomUUID(),
+    seq: sequence,
+    timestamp: new Date().toISOString(),
+    parentEntryId,
+    summary: details.summary,
+    coversThroughEntryId: details.coversThroughEntryId,
+    firstKeptEntryId: details.firstKeptEntryId,
+    retainedUserEntryIds: Object.freeze([...details.retainedUserEntryIds]),
+    usageBefore: snapshotUsage(details.usageBefore),
+    inputTokenEstimateAfter: details.inputTokenEstimateAfter,
+    modelId: details.modelId,
+    contextVersion: details.contextVersion,
+  });
+}
+
+function createRequestUsageRecord(
+  sequence: number,
+  parentEntryId: string | null,
+  details: RequestUsageDetails,
+): RequestUsageRecord {
+  return Object.freeze({
+    type: "request_usage",
+    entryId: randomUUID(),
+    seq: sequence,
+    timestamp: new Date().toISOString(),
+    parentEntryId,
+    purpose: details.purpose,
+    requestEntryId: details.requestEntryId,
+    contextVersion: details.contextVersion,
+    usage: snapshotUsage(details.usage),
+  });
+}
+
+function createApprovalDecisionRecord(
+  sequence: number,
+  parentEntryId: string | null,
+  details: ApprovalDecisionDetails,
+): ApprovalDecisionRecord {
+  return Object.freeze({
+    type: "approval_decision",
+    entryId: randomUUID(),
+    seq: sequence,
+    timestamp: new Date().toISOString(),
+    parentEntryId,
+    toolCallId: details.toolCallId,
+    toolName: details.toolName,
+    permissionMode: details.permissionMode,
+    decisionSource: details.decisionSource,
+    decision: details.decision,
+    reason: details.reason,
+    authorizationEntryIds: Object.freeze([...details.authorizationEntryIds]),
+  });
+}
+
+function snapshotUsage(
+  usage: Readonly<{
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cachedInputTokens: number | null;
+  }>,
+): Readonly<{
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+}> {
+  return Object.freeze({
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cachedInputTokens: usage.cachedInputTokens,
   });
 }

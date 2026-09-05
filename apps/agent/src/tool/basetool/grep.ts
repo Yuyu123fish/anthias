@@ -1,4 +1,5 @@
 import type { AssistantToolCallPart } from "../../message.js";
+import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isOptionalIntegerInRange,
@@ -36,6 +37,7 @@ export async function executeGrepTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
+  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
@@ -98,6 +100,14 @@ export async function executeGrepTool(
       }
     }
     resultLines.splice(2, 0, `skippedNonUtf8OrBinaryFiles: ${skippedFileCount}`);
+    if (artifactWriter !== undefined) {
+      for (const line of resultLines) {
+        await artifactWriter.write(line + "\n");
+      }
+      if (discoveredFiles.truncated) {
+        artifactWriter.markIncomplete("source_failed");
+      }
+    }
     const rendered = boundToolOutput(resultLines);
     return Object.freeze({
       status: "completed",

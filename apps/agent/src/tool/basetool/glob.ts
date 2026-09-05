@@ -1,4 +1,5 @@
 import type { AssistantToolCallPart } from "../../message.js";
+import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
@@ -31,6 +32,7 @@ export async function executeGlobTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
+  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
@@ -51,6 +53,14 @@ export async function executeGlobTool(
       `base: ${inputResult.input.path}`,
       ...discoveredFiles.paths.map((file) => file.relativePath),
     ]);
+    if (artifactWriter !== undefined) {
+      for (const file of discoveredFiles.paths) {
+        await artifactWriter.write(file.relativePath + "\n");
+      }
+      if (discoveredFiles.truncated) {
+        artifactWriter.markIncomplete("source_failed");
+      }
+    }
     return Object.freeze({
       status: "completed",
       content: rendered.content,
