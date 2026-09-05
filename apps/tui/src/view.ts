@@ -18,6 +18,7 @@ import {
   TuiAltScreen,
   truncateToWidth,
   VStack,
+  visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { createCommandAutocomplete } from "./command.js";
@@ -27,6 +28,12 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
+import {
+  createExecutionTurn,
+  type ExecutionControl,
+  type ExecutionStep,
+  type ExecutionTurn,
+} from "./execution-view.js";
 import { createTheme } from "./theme.js";
 
 export type ConversationView = Readonly<{
@@ -45,6 +52,8 @@ type Detail = {
   truncated: boolean;
   startedAt: number;
   endedAt?: number;
+  step: ExecutionStep;
+  body: Text;
 };
 
 /** 长期保留布局、消息组件和滚动容器；AgentEvent 只更新发生变化的内容。 */
@@ -69,21 +78,58 @@ export function createConversationView(options: {
   let submittedEditorText: string | undefined;
   let approval: ToolApprovalRequest | null = agent.state.pendingToolApproval;
   let approvalUnrenderable = false;
-  let activeAssistant: MarkdownContent | undefined;
+  let activeAssistant: { content: MarkdownContent; step: ExecutionStep } | undefined;
   let activeReasoning: Detail | undefined;
-  let activeReasoningLabel: Text | undefined;
+  let activeTurn: ExecutionTurn | undefined;
+  const executionTurns = new Map<Component, ExecutionTurn>();
+  let conversationRevision = 0;
+  let conversationCache:
+    | { width: number; revision: number; lines: string[]; controls: ExecutionControl[] }
+    | undefined;
+  let pendingScrollTop: number | undefined;
+  let headerHeight = 2;
+  let renderedColumns = 0;
+  let renderedRows = 0;
+  let renderedDetailsVisible = false;
+  let renderedConversationRevision = -1;
+  let pressedControl: { activate: () => void; dragged: boolean; x: number; y: number } | undefined;
   const details: Detail[] = [];
   const toolDetails = new Map<string, Detail>();
-  const toolLabels = new Map<string, Text>();
   const markdownContents = new Set<MarkdownContent>();
   const conversation = new Container();
   const detailText = new Text("当前没有详情。", 1, 0);
-  const detailHeading = new Text("", 1, 0);
+  const detailButtons = [
+    { label: "[<]", activate: () => toggleDetails("prev") },
+    { label: "[>]", activate: () => toggleDetails("next") },
+    { label: "[x]", activate: () => toggleDetails() },
+  ];
+  let detailControls: ExecutionControl[] = [];
+  const detailHeading: Component = {
+    invalidate() {},
+    render(width) {
+      detailControls = [];
+      if (approval !== null)
+        return [truncateToWidth(theme.coral(" 执行确认 · PageDown 浏览"), width, "")];
+      let line = ` 详情 ${details.length ? selectedDetail + 1 : 0}/${details.length} `;
+      for (const button of detailButtons) {
+        const column = visibleWidth(line);
+        if (column + button.label.length > width) break;
+        detailControls.push({
+          row: 0,
+          column,
+          width: button.label.length,
+          activate: button.activate,
+        });
+        line += `${button.label} `;
+      }
+      return [truncateToWidth(theme.lagoon(line), width, "")];
+    },
+  };
   const conversationScroll = new ScrollView(conversation, {
     follow: "end",
     primary: true,
-    scrollbar: "auto",
-    scrollbarStyle: theme.muted,
+    scrollbar: "always",
+    scrollbarStyle: theme.scrollbar,
   });
   let detailContentHeight = 0;
   let renderedApprovalId: string | undefined;
@@ -105,7 +151,7 @@ export function createConversationView(options: {
   const detailScroll = new ScrollView(detailDocument, {
     follow: "none",
     scrollbar: "always",
-    scrollbarStyle: theme.muted,
+    scrollbarStyle: theme.scrollbar,
   });
   const terminal: Terminal = {
     get columns() {
@@ -123,6 +169,7 @@ export function createConversationView(options: {
           if (!handleInput(data)) onInput(data);
         },
         () => {
+          pressedControl = undefined;
           if (approval !== null) updateDetails();
           onResize();
         },
@@ -135,6 +182,12 @@ export function createConversationView(options: {
     write(data) {
       try {
         options.terminal.write(data);
+        if (data.includes("\u001b[?2026h")) {
+          renderedColumns = options.terminal.columns;
+          renderedRows = options.terminal.rows;
+          renderedDetailsVisible = detailsVisible;
+          renderedConversationRevision = conversationCache?.revision ?? -1;
+        }
       } catch {
         options.failure();
       }
@@ -162,7 +215,7 @@ export function createConversationView(options: {
   const header: Component = {
     invalidate() {},
     render(width) {
-      return [
+      const lines = [
         truncateToWidth(
           theme.coral("><> Anthias") +
             theme.muted(`  Session ${sanitizeTerminalText(agent.state.sessionId.slice(0, 8))}`),
@@ -173,6 +226,8 @@ export function createConversationView(options: {
           width,
         ),
       ];
+      headerHeight = lines.length;
+      return lines;
     },
   };
   const status: Component = {
@@ -217,23 +272,37 @@ export function createConversationView(options: {
   };
   const detailPanel = new VStack([
     { component: detailHeading, shrink: 0 },
-    { component: detailScroll, grow: 1, minSize: 0 },
+    { component: detailScroll, basis: 0, grow: 1, minSize: 0 },
   ]);
   const body = new HStack(
     [
       {
         component: conversationScroll,
+        basis: 0,
         grow: 1,
         minSize: 0,
         visible: (viewport) => !detailsVisible || viewport.width >= 100,
       },
-      { component: detailPanel, basis: 42, grow: 1, minSize: 0, visible: () => detailsVisible },
+      {
+        component: detailPanel,
+        basis: 42,
+        grow: 0,
+        shrink: 0,
+        visible: (viewport) => detailsVisible && viewport.width >= 100,
+      },
+      {
+        component: detailPanel,
+        basis: 0,
+        grow: 1,
+        minSize: 0,
+        visible: (viewport) => detailsVisible && viewport.width < 100,
+      },
     ],
     { gap: 1 },
   );
   const layout = new VStack([
     { component: header, shrink: 0 },
-    { component: body, grow: 1, minSize: 1 },
+    { component: body, basis: 0, grow: 1, minSize: 1 },
     { component: editor, shrink: 1, minSize: 3, maxSize: 12 },
     { component: status, shrink: 0 },
   ]);
@@ -241,6 +310,7 @@ export function createConversationView(options: {
   const root = new VStack([
     {
       component: layout,
+      basis: 0,
       grow: 1,
       minSize: 0,
       visible: (viewport) => hasLayoutSpace(viewport.width, viewport.height),
@@ -251,7 +321,14 @@ export function createConversationView(options: {
     },
   ]);
   // pi 的定时绘制在回调中运行；叶组件失败也必须回到 TUI 的统一资源收口。
-  for (const component of [header, status, editor, detailDocument, conversation, compactTerminal]) {
+  for (const component of [
+    header,
+    status,
+    editor,
+    detailHeading,
+    detailDocument,
+    compactTerminal,
+  ]) {
     const render = component.render.bind(component);
     component.render = (width) => {
       try {
@@ -262,6 +339,41 @@ export function createConversationView(options: {
       }
     };
   }
+  const invalidate = conversation.invalidate.bind(conversation);
+  conversation.invalidate = () => {
+    conversationRevision += 1;
+    invalidate();
+  };
+  conversation.render = (width) => {
+    if (conversationCache?.width === width && conversationCache.revision === conversationRevision)
+      return conversationCache.lines;
+    try {
+      const lines: string[] = [];
+      const controls: ExecutionControl[] = [];
+      for (const child of conversation.children) {
+        const offset = lines.length;
+        for (const line of child.render(width)) lines.push(line);
+        for (const control of executionTurns.get(child)?.controls ?? [])
+          controls.push({ ...control, row: offset + control.row });
+      }
+      const safeLines = lines.map((line) => truncateToWidth(line, Math.max(1, width), ""));
+      conversationCache = { width, revision: conversationRevision, lines: safeLines, controls };
+      if (pendingScrollTop !== undefined) {
+        // 手动展开沿用被点击标题的位置；先让 ScrollView 知道新高度，避免末尾跟随把标题推走。
+        conversationScroll.updateLayout(
+          safeLines.length,
+          conversationScroll.viewportHeight,
+          requestRender,
+        );
+        conversationScroll.scrollTo(pendingScrollTop);
+        pendingScrollTop = undefined;
+      }
+      return safeLines;
+    } catch {
+      options.failure();
+      return [];
+    }
+  };
   tui.setLayoutRoot(root);
   tui.setFocus(editor);
 
@@ -278,11 +390,26 @@ export function createConversationView(options: {
   function requestRender(): void {
     if (!closed) tui.requestRender();
   }
+  function invalidateConversation(): void {
+    conversationRevision += 1;
+    requestRender();
+  }
+  function ensureTurn(): ExecutionTurn {
+    if (activeTurn === undefined) {
+      activeTurn = createExecutionTurn(theme, capabilities.unicode, () => {
+        pendingScrollTop = conversationScroll.scrollTop;
+        invalidateConversation();
+      });
+      executionTurns.set(activeTurn, activeTurn);
+      conversation.addChild(activeTurn);
+    }
+    return activeTurn;
+  }
   function newMarkdown(text: string): MarkdownContent {
     const content = createMarkdownContent({
       workspaceRoot: agent.state.workspaceRoot,
       capabilities,
-      requestRender,
+      requestRender: invalidateConversation,
       ...(options.codeHighlighter === undefined
         ? {}
         : { codeHighlighter: options.codeHighlighter }),
@@ -298,14 +425,46 @@ export function createConversationView(options: {
   ): void {
     conversation.addChild(new Text(theme[color](sanitizeTerminalText(title)), 1, 1));
     conversation.addChild(new Text(sanitizeTerminalText(text), 1, 0));
+    invalidateConversation();
+  }
+  function appendExecutionText(title: string, text: string): void {
+    if (activeTurn === undefined || activeTurn.status !== "running") {
+      appendText(title, text);
+      return;
+    }
+    const content = sanitizeTerminalText(text);
+    activeTurn.steps.push({
+      kind: "detail",
+      title: sanitizeTerminalText(title),
+      text: content,
+      content: new Text(content, 0, 0),
+      expanded: true,
+    });
+    invalidateConversation();
   }
   function appendMessage(message: Message): void {
-    if (message.role === "user") appendText("You", message.content, "coral");
-    else if (message.role === "assistant") {
-      conversation.addChild(new Text(theme.coral("><> Anthias"), 1, 1));
-      const content = newMarkdown(assistantText(message));
-      conversation.addChild(content);
-      if (message.status === "streaming") activeAssistant = content;
+    if (message.role === "user") {
+      activeTurn?.finish();
+      activeTurn = undefined;
+      appendText("You", message.content, "coral");
+      ensureTurn();
+    } else if (message.role === "assistant") {
+      const turn = ensureTurn();
+      const text = assistantText(message);
+      const content = newMarkdown(text);
+      const step: ExecutionStep = {
+        kind: "message",
+        title: "中间回复",
+        text,
+        content,
+        expanded: true,
+        hasToolCalls: message.content.some((part) => part.type === "tool_call"),
+        messageStatus: message.status,
+      };
+      turn.steps.push(step);
+      turn.answer = step.hasToolCalls ? undefined : step;
+      if (message.status === "streaming") activeAssistant = { content, step };
+      invalidateConversation();
     } else
       completeTool(
         message.toolCallId,
@@ -315,33 +474,58 @@ export function createConversationView(options: {
         message.truncated,
       );
   }
+  function updateAssistant(message: AssistantMessage): void {
+    if (activeAssistant === undefined) {
+      appendMessage(message);
+      return;
+    }
+    const { content, step } = activeAssistant;
+    step.text = assistantText(message);
+    step.hasToolCalls = message.content.some((part) => part.type === "tool_call");
+    step.messageStatus = message.status;
+    content.setText(step.text);
+    ensureTurn().answer = step.hasToolCalls ? undefined : step;
+    invalidateConversation();
+  }
+  function finishActiveTurn(): void {
+    activeTurn?.finish();
+  }
   function resetConversation(): void {
     for (const content of markdownContents) content.close();
     markdownContents.clear();
     conversation.clear();
     details.length = 0;
     toolDetails.clear();
-    toolLabels.clear();
+    executionTurns.clear();
+    activeTurn = undefined;
+    conversationCache = undefined;
+    pressedControl = undefined;
     activeAssistant = undefined;
     activeReasoning = undefined;
-    activeReasoningLabel = undefined;
     approval = agent.state.pendingToolApproval;
     detailsVisible = approval !== null;
     for (const message of agent.state.messageHistory) appendMessage(message);
+    if (!agent.state.running) finishActiveTurn();
     if (agent.state.activeAssistantMessage !== null)
       appendMessage(agent.state.activeAssistantMessage);
     if (agent.state.messageHistory.length === 0)
       appendText("开始工作", "描述你的任务，或输入 / 查看命令。", "muted");
     conversationScroll.scrollToEnd();
+    invalidateConversation();
     updateDetails();
+  }
+  let displayedDetailText = "";
+  function setDetailText(text: string): void {
+    if (text === displayedDetailText) return;
+    displayedDetailText = text;
+    detailText.setText(text);
   }
   function updateDetails(resetScroll = false): void {
     if (approval !== null) {
       const text = formatApproval(approval);
       approvalUnrenderable =
         !isApprovalDisplayable(approval) || terminal.columns < 20 || terminal.rows < 8;
-      detailHeading.setText(theme.coral("执行确认 · PageDown 浏览"));
-      detailText.setText(
+      setDetailText(
         approvalUnrenderable
           ? "终端空间不足或审批内容无法完整呈现，无法安全确认。请放大窗口或输入 deny。"
           : text,
@@ -349,12 +533,7 @@ export function createConversationView(options: {
     } else {
       selectedDetail = Math.max(0, Math.min(selectedDetail, details.length - 1));
       const selected = details[selectedDetail];
-      detailHeading.setText(
-        theme.lagoon(
-          `详情 ${details.length ? selectedDetail + 1 : 0}/${details.length} · /details prev|next`,
-        ),
-      );
-      detailText.setText(
+      setDetailText(
         selected === undefined
           ? "当前没有可显示的详情。"
           : `${selected.title}${selected.endedAt === undefined ? "" : ` · ${((selected.endedAt - selected.startedAt) / 1000).toFixed(1)}s`}\n${selected.truncated ? "[较早详情已省略]\n" : ""}${selected.content || "（等待内容）"}`,
@@ -367,6 +546,32 @@ export function createConversationView(options: {
     const next = detail.content + sanitizeTerminalText(delta);
     detail.truncated ||= next.length > 128 * 1024;
     detail.content = next.slice(-128 * 1024);
+    detail.body.setText(`${detail.truncated ? "[较早详情已省略]\n" : ""}${detail.content}`);
+    invalidateConversation();
+  }
+  function createDetail(id: string, title: string, content: string): Detail {
+    const body = new Text(sanitizeTerminalText(content), 0, 0);
+    const step: ExecutionStep = {
+      kind: "detail",
+      title: sanitizeTerminalText(title),
+      text: "",
+      content: body,
+      expanded: true,
+    };
+    ensureTurn().steps.push(step);
+    const detail: Detail = {
+      id,
+      title: sanitizeTerminalText(title),
+      content: sanitizeTerminalText(content),
+      truncated: false,
+      startedAt: now(),
+      step,
+      body,
+    };
+    details.push(detail);
+    if (!detailsVisible) selectedDetail = details.length - 1;
+    invalidateConversation();
+    return detail;
   }
   function completeTool(
     id: string,
@@ -377,31 +582,79 @@ export function createConversationView(options: {
   ): void {
     let detail = toolDetails.get(id);
     if (detail === undefined) {
-      detail = {
-        id,
-        title: sanitizeTerminalText(`${name} [${id.slice(-8)}]`),
-        content: "",
-        truncated: false,
-        startedAt: now(),
-      };
-      details.push(detail);
+      detail = createDetail(id, `${name} [${id.slice(-8)}]`, "");
       toolDetails.set(id, detail);
     }
     if (detail.endedAt === undefined) {
-      appendDetail(detail, `\n[result] ${content}`);
       detail.truncated ||= truncated;
+      appendDetail(detail, `\n[result] ${content}`);
       detail.endedAt = now();
+      detail.step.expanded = false;
     }
-    let label = toolLabels.get(id);
-    if (label === undefined) {
-      label = new Text("", 1, 1);
-      conversation.addChild(label);
-      toolLabels.set(id, label);
+    detail.step.title = `${detail.title} · ${sanitizeTerminalText(status)}`;
+    invalidateConversation();
+  }
+  function controlAt(x: number, y: number): ExecutionControl | undefined {
+    if (
+      approval !== null ||
+      !hasLayoutSpace(terminal.columns, terminal.rows) ||
+      renderedColumns !== terminal.columns ||
+      renderedRows !== terminal.rows ||
+      renderedDetailsVisible !== detailsVisible
+    )
+      return undefined;
+    if (detailsVisible && y === headerHeight) {
+      const left = terminal.columns >= 100 ? terminal.columns - 42 : 0;
+      if (x >= left)
+        return detailControls.find(
+          (control) => x - left >= control.column && x - left < control.column + control.width,
+        );
     }
-    label.setText(theme.lagoon(sanitizeTerminalText(`${name} [${id.slice(-8)}] · ${status}`)));
+    if (detailsVisible && terminal.columns < 100) return undefined;
+    const width = terminal.columns - (detailsVisible ? 43 : 0);
+    if (
+      x < 0 ||
+      x >= width - 1 ||
+      y < headerHeight ||
+      y >= headerHeight + conversationScroll.viewportHeight ||
+      renderedConversationRevision !== conversationRevision
+    )
+      return undefined;
+    const row = y - headerHeight + conversationScroll.scrollTop;
+    return conversationCache?.controls.find(
+      (control) => control.row === row && x >= control.column && x < control.column + control.width,
+    );
+  }
+  function handleMouse(data: string): boolean {
+    if (!data.startsWith("\u001b")) return false;
+    const match = /^\[<(\d+);(\d+);(\d+)([Mm])$/u.exec(data.slice(1));
+    if (match === null) return false;
+    const button = Number(match[1]);
+    const x = Number(match[2]) - 1;
+    const y = Number(match[3]) - 1;
+    const release = match[4] === "m";
+    if (
+      pressedControl !== undefined &&
+      (button & 32) !== 0 &&
+      (x !== pressedControl.x || y !== pressedControl.y)
+    )
+      pressedControl.dragged = true;
+    if (button !== 0) return false;
+    if (release) {
+      const pressed = pressedControl;
+      pressedControl = undefined;
+      if (pressed === undefined) return false;
+      if (!pressed.dragged && controlAt(x, y)?.activate === pressed.activate) pressed.activate();
+      return true;
+    }
+    const control = controlAt(x, y);
+    if (control === undefined) return false;
+    pressedControl = { activate: control.activate, dragged: false, x, y };
+    return true;
   }
   function handleInput(data: string): boolean {
     if (closed) return true;
+    if (handleMouse(data)) return true;
     if (matchesKey(data, Key.ctrl("c"))) {
       options.interrupt();
       return true;
@@ -490,12 +743,11 @@ export function createConversationView(options: {
           appendMessage(event.message);
           break;
         case "message_update":
-          if (activeAssistant === undefined) appendMessage(event.message);
-          else activeAssistant.setText(assistantText(event.message));
+          updateAssistant(event.message);
           break;
         case "message_end":
           if (event.message.role === "assistant") {
-            activeAssistant?.setText(assistantText(event.message));
+            updateAssistant(event.message);
             activeAssistant = undefined;
           } else if (event.message.role === "tool")
             completeTool(
@@ -507,57 +759,38 @@ export function createConversationView(options: {
             );
           break;
         case "reasoning_start": {
-          activeReasoning = {
-            id: `reasoning:${event.runId}:${details.length}`,
-            title: "Reasoning",
-            content: "",
-            truncated: false,
-            startedAt: now(),
-          };
-          details.push(activeReasoning);
-          activeReasoningLabel = new Text(theme.muted("Reasoning · 思考中"), 1, 1);
-          conversation.addChild(activeReasoningLabel);
-          if (!detailsVisible) selectedDetail = details.length - 1;
+          activeReasoning = createDetail(
+            `reasoning:${event.runId}:${details.length}`,
+            "Reasoning",
+            "",
+          );
+          activeReasoning.step.title = "Reasoning · 思考中";
           break;
         }
         case "reasoning_update":
           if (activeReasoning !== undefined) {
             appendDetail(activeReasoning, event.delta);
-            const preview = activeReasoning.content.slice(-320).split("\n").slice(-3).join("\n");
-            activeReasoningLabel?.setText(
-              theme.muted(
-                `Reasoning · ${((now() - activeReasoning.startedAt) / 1000).toFixed(1)}s\n${preview}`,
-              ),
-            );
+            activeReasoning.step.title = `Reasoning · ${((now() - activeReasoning.startedAt) / 1000).toFixed(1)}s`;
           }
           break;
         case "reasoning_end":
           if (activeReasoning !== undefined) {
             activeReasoning.endedAt = now();
-            activeReasoningLabel?.setText(
-              theme.muted(
-                `Reasoning · 已思考 ${((activeReasoning.endedAt - activeReasoning.startedAt) / 1000).toFixed(1)}s · Ctrl+T 查看详情`,
-              ),
-            );
+            activeReasoning.step.title = `Reasoning · 已思考 ${((activeReasoning.endedAt - activeReasoning.startedAt) / 1000).toFixed(1)}s`;
+            activeReasoning.step.expanded = false;
             activeReasoning = undefined;
-            activeReasoningLabel = undefined;
+            invalidateConversation();
           }
           break;
         case "tool_execution_start": {
           const { activity } = event;
-          const detail: Detail = {
-            id: activity.toolCallId,
-            title: sanitizeTerminalText(`${activity.toolName} [${activity.toolCallId.slice(-8)}]`),
-            content: sanitizeTerminalText(activity.summary),
-            truncated: false,
-            startedAt: now(),
-          };
-          details.push(detail);
+          const detail = createDetail(
+            activity.toolCallId,
+            `${activity.toolName} [${activity.toolCallId.slice(-8)}]`,
+            activity.summary,
+          );
+          detail.step.title = `${detail.title} · 运行中`;
           toolDetails.set(activity.toolCallId, detail);
-          const label = new Text(theme.lagoon(`${detail.title} · 运行中\n${detail.content}`), 1, 1);
-          toolLabels.set(activity.toolCallId, label);
-          conversation.addChild(label);
-          if (!detailsVisible) selectedDetail = details.length - 1;
           break;
         }
         case "tool_execution_update": {
@@ -574,7 +807,7 @@ export function createConversationView(options: {
             event.result.truncated,
           );
           if (event.cleanupUncertain)
-            appendText("资源状态", "Tool 资源清理结果不确定，请查看详情。");
+            appendExecutionText("资源状态", "Tool 资源清理结果不确定，请查看详情。");
           break;
         case "tool_approval_requested":
           approval = event.request;
@@ -583,24 +816,29 @@ export function createConversationView(options: {
           break;
         case "tool_approval_resolved":
           approval = null;
-          appendText("执行确认", event.decision);
+          appendExecutionText("执行确认", event.decision);
           break;
         case "tool_authorization":
-          appendText(`授权 · ${event.source} · ${event.decision}`, event.reason);
+          appendExecutionText(`授权 · ${event.source} · ${event.decision}`, event.reason);
           break;
         case "compaction_start":
-          appendText("Context", "正在压缩上下文，完整历史会保留。");
+          appendExecutionText("Context", "正在压缩上下文，完整历史会保留。");
           break;
         case "compaction_end":
-          appendText(
+          appendExecutionText(
             "Context",
             `压缩完成 ${event.inputTokensBefore} → ${event.inputTokensAfter} tokens`,
           );
           break;
         case "compaction_failed":
-          appendText("Context", event.error);
+          appendExecutionText("Context", event.error);
           break;
         case "run_end":
+          activeTurn?.finish(event.result.status);
+          if (approval === null) detailsVisible = false;
+          activeAssistant = undefined;
+          activeReasoning = undefined;
+          invalidateConversation();
           if (event.result.status === "failed") appendText("运行失败", event.result.error);
           else if (event.result.status === "aborted")
             appendText("已停止", "可以继续输入新的任务。");

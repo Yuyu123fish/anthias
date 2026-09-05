@@ -94,7 +94,9 @@ notepad $PROFILE
 | 主动压缩 | `/compact`，只压缩历史投影，不产生额外普通回复 |
 | 查询或切换模式 | `/mode`、`/mode plan`、`/mode agent`、`/mode auto_allow`；只能在空闲时切换 |
 | 查看上下文用量 | `/context`，当前窗口与各用途累计用量分别显示 |
-| 阅读与详情 | `PageUp/PageDown` 滚动，`Ctrl+Home/End` 到顶部/末尾；`/details` 或 `Ctrl+T` 查看详情 |
+| 阅读与滚动 | 鼠标滚轮、点击轨道或拖动右侧滑块；`PageUp/PageDown`、`Ctrl+Home/End` 继续可用 |
+| 执行过程 | 任务结束后自动折叠；点击执行过程或步骤标题展开、收起，最终回答保持可见 |
+| 详情面板 | `/details` 或 `Ctrl+T` 打开；点击 `[<]`、`[>]` 切换详情，`[x]` 关闭；窄屏占满正文区 |
 | 批准当前副作用 | 完整阅读审批详情后输入 `approve`；详情未读完时阻止确认 |
 | 拒绝当前副作用 | 输入 `deny` |
 | 停止当前 Run | 运行中按 `Ctrl+C`，停止后可以继续输入 |

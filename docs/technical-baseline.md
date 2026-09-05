@@ -56,7 +56,7 @@ Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 Ab
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
-当前 TUI 复用 `@earendil-works/pi-tui` 的 `TuiAltScreen`、Editor、ScrollView 与 Markdown。全屏固定 Workspace、输入和状态，正文由应用内滚动；模型事件按顺序更新呈现状态，合并到差量同步帧，未闭合代码块立即显示。用户向上阅读时保留位置，回到末尾才恢复跟随；宽屏详情与正文并列，窄屏覆盖。退出恢复终端模式、光标与监听器。
+当前 TUI 复用 `@earendil-works/pi-tui` 的 `TuiAltScreen`、Editor、ScrollView 与 Markdown。全屏固定 Workspace、输入和状态，正文由应用内滚动；模型事件按顺序更新呈现状态，合并到差量同步帧，未闭合代码块立即显示。用户向上阅读时保留位置，回到末尾才恢复跟随；宽屏详情与正文并列，窄屏覆盖。正文与详情的可见滑块支持点击和拖动。任务结束后，思考、Tool 与中间消息折叠到执行过程，最终回答保持可见；执行过程与单个步骤可鼠标展开/收起，审批仍独立呈现。伸展区域显式声明布局尺寸，正文按宽度和内容版本缓存最终安全行，普通滚动复用已完成的渲染。退出恢复终端模式、光标与监听器。
 
 文件引用继续经过 Workspace 校验；外部文本先安全化，lazy Shiki 失败或延迟不阻塞输入。Unicode 宽度使用 pi TUI 的实现，非 TTY 仍为无控制序列的纯文本路径。CLI 从任意 cwd 或 --workspace 启动，Agent 的 Workspace 与 Anthias data/conversation 分别装配。
 

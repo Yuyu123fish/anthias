@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { AssistantMessage } from "@anthias/agent";
+import type { AssistantMessage, Message } from "@anthias/agent";
+import { Markdown } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { TerminalCapabilities } from "../src/content-renderer.js";
 import { runTui } from "../src/index.js";
 import { approvalRequest, createFakeAgent } from "./fixtures.js";
 import { createTestTerminal } from "./terminal-fixture.js";
@@ -12,7 +14,16 @@ afterEach(async () => {
   cleanups.clear();
 });
 
-function createHarness(interactive = true, columns = 100, rows = 28) {
+function createHarness(
+  interactive = true,
+  columns = 100,
+  rows = 28,
+  capabilities: TerminalCapabilities = {
+    colorDepth: "truecolor",
+    hyperlinks: false,
+    unicode: true,
+  },
+) {
   const fake = createFakeAgent();
   const input = new PassThrough();
   input.resume();
@@ -29,7 +40,7 @@ function createHarness(interactive = true, columns = 100, rows = 28) {
     output,
     signalSource: signals,
     ...(interactive ? { terminal: terminal.terminal } : {}),
-    terminalCapabilities: { colorDepth: "truecolor", hyperlinks: false, unicode: true },
+    terminalCapabilities: capabilities,
   });
   cleanups.add(async () => {
     input.end();
@@ -45,6 +56,12 @@ async function screenContains(terminal: ReturnType<typeof createTestTerminal>, t
     expect(terminal.text()).toContain(text);
   });
 }
+function clickText(terminal: ReturnType<typeof createTestTerminal>, text: string): void {
+  const { x, y } = terminal.locate(text);
+  terminal.mouse(0, x, y);
+  terminal.mouse(0, x, y, true);
+}
+
 function assistant(
   content: string,
   status: AssistantMessage["status"] = "streaming",
@@ -104,16 +121,296 @@ describe("Anthias TUI", () => {
       await harness.terminal.flush();
       expect(harness.terminal.text()).not.toContain("Line 69");
     });
-    const readingScreen = harness.terminal.text().split("\n").slice(2, -4).join("\n");
+    const contentRows = () =>
+      Array.from(
+        { length: 19 },
+        (_, index) =>
+          harness.terminal.screen.buffer.active
+            .getLine(index + 2)
+            ?.translateToString(true, 0, 99) ?? "",
+      ).join("\n");
+    const readingScreen = contentRows();
     text += "\n\nNew last line";
     harness.emit({ type: "message_update", message: assistant(text), delta: "\n\nNew last line" });
     await new Promise((resolve) => setTimeout(resolve, 40));
     await harness.terminal.flush();
-    expect(harness.terminal.text().split("\n").slice(2, -4).join("\n")).toBe(readingScreen);
+    expect(contentRows()).toBe(readingScreen);
     expect(harness.terminal.text()).toContain("Workspace:");
     expect(harness.terminal.text()).not.toContain("New last line");
     harness.terminal.send("\u001b[1;5F");
     await screenContains(harness.terminal, "New last line");
+  });
+
+  it("collapses a finished process and expands its individual steps with mouse clicks", async () => {
+    const harness = createHarness();
+    await screenContains(harness.terminal, "Workspace:");
+    harness.emit({
+      type: "message_start",
+      message: { role: "user", content: "Inspect the project" },
+    });
+    harness.emit({ type: "reasoning_start", runId: "fold-run" });
+    harness.emit({
+      type: "reasoning_update",
+      runId: "fold-run",
+      delta: "Inspecting the folder tree",
+    });
+    harness.emit({ type: "reasoning_end", runId: "fold-run" });
+    harness.emit({
+      type: "tool_execution_start",
+      activity: { toolCallId: "inspect-1", toolName: "read_file", summary: "README.md" },
+    });
+    harness.emit({
+      type: "tool_execution_end",
+      toolCallId: "inspect-1",
+      toolName: "read_file",
+      cleanupUncertain: false,
+      result: {
+        role: "tool",
+        toolCallId: "inspect-1",
+        toolName: "read_file",
+        status: "completed",
+        content: "Specific file contents",
+        truncated: false,
+      },
+    });
+    harness.emit({ type: "message_start", message: assistant("The final answer is ready.") });
+    harness.emit({
+      type: "message_end",
+      message: assistant("The final answer is ready.", "completed"),
+    });
+    harness.emit({ type: "run_end", runId: "fold-run", result: { status: "completed" } });
+    await screenContains(harness.terminal, "执行过程");
+    expect(harness.terminal.text()).toContain("The final answer is ready.");
+    expect(harness.terminal.text()).not.toContain("read_file");
+    clickText(harness.terminal, "执行过程");
+    await screenContains(harness.terminal, "read_file");
+    expect(harness.terminal.text()).not.toContain("Specific file contents");
+    clickText(harness.terminal, "read_file");
+    await screenContains(harness.terminal, "Specific file contents");
+    clickText(harness.terminal, "read_file");
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text()).not.toContain("Specific file contents");
+    });
+    clickText(harness.terminal, "执行过程");
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text()).not.toContain("read_file");
+    });
+    expect(harness.terminal.text()).toContain("The final answer is ready.");
+  });
+
+  it.each([true, false])(
+    "shows a scrollbar thumb and preserves native mouse dragging (unicode: %s)",
+    async (unicode) => {
+      const harness = createHarness(true, 80, 24, {
+        colorDepth: unicode ? "truecolor" : "none",
+        hyperlinks: false,
+        unicode,
+      });
+      await screenContains(harness.terminal, "Workspace:");
+      harness.emit({
+        type: "message_start",
+        message: assistant(
+          Array.from({ length: 100 }, (_, index) => `Scrollable line ${index}`).join("\n\n"),
+        ),
+      });
+      await screenContains(harness.terminal, "Scrollable line 99");
+      const thumbRows = Array.from({ length: 24 }, (_, row) => row).filter(
+        (row) =>
+          harness.terminal.screen.buffer.active.getLine(row)?.getCell(79)?.getChars() ===
+          (unicode ? "┃" : "#"),
+      );
+      expect(thumbRows.length).toBeGreaterThan(0);
+      harness.terminal.mouse(0, 79, thumbRows[0] ?? 0);
+      harness.terminal.mouse(32, 79, 2);
+      harness.terminal.mouse(0, 79, 2, true);
+      await screenContains(harness.terminal, "Scrollable line 0");
+      expect(harness.terminal.text()).not.toContain("Scrollable line 99");
+    },
+  );
+
+  it("reuses rendered Markdown during wheel scrolling and input changes", async () => {
+    const harness = createHarness();
+    await screenContains(harness.terminal, "Workspace:");
+    harness.emit({
+      type: "message_start",
+      message: assistant(
+        Array.from({ length: 80 }, (_, index) => `Cached paragraph ${index}`).join("\n\n"),
+      ),
+    });
+    await screenContains(harness.terminal, "Cached paragraph 79");
+    // 等待正文已有的异步文件装饰完成，再测量纯滚轮路径。
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await harness.terminal.flush();
+    const markdownRender = vi.spyOn(Markdown.prototype, "render");
+    try {
+      for (let index = 0; index < 8; index += 1) {
+        harness.terminal.mouse(64, 20, 10);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        await harness.terminal.flush();
+      }
+      harness.terminal.send("a draft");
+      await screenContains(harness.terminal, "a draft");
+      expect(harness.terminal.text()).not.toContain("Cached paragraph 79");
+      expect(markdownRender).not.toHaveBeenCalled();
+    } finally {
+      markdownRender.mockRestore();
+    }
+  });
+
+  it("restores grouped history and keeps mouse controls accurate after scrolling and resize", async () => {
+    const harness = createHarness(true, 120, 28);
+    await screenContains(harness.terminal, "Workspace:");
+    const history: Message[] = [];
+    for (let index = 0; index < 8; index += 1) {
+      history.push(
+        { role: "user", content: `Historical task ${index}` },
+        {
+          role: "assistant",
+          status: "completed",
+          content: [
+            { type: "text", text: `Intermediate plan ${index}` },
+            {
+              type: "tool_call",
+              toolCallId: `call-${index}`,
+              toolName: "read_file",
+              input: {},
+              invalid: false,
+            },
+          ],
+        },
+        {
+          role: "tool",
+          toolCallId: `call-${index}`,
+          toolName: "read_file",
+          status: "completed",
+          content: Array.from({ length: 60 }, (_, line) => `Result ${index} line ${line}`).join(
+            "\n",
+          ),
+          truncated: false,
+        },
+        {
+          role: "assistant",
+          status: "completed",
+          content: [
+            {
+              type: "tool_call",
+              toolCallId: `next-${index}`,
+              toolName: "read_file",
+              input: {},
+              invalid: false,
+            },
+          ],
+        },
+        {
+          role: "tool",
+          toolCallId: `next-${index}`,
+          toolName: "read_file",
+          status: "completed",
+          content: `Separate result ${index}`,
+          truncated: false,
+        },
+        assistant(`Historical answer ${index}`, "completed"),
+      );
+    }
+    harness.setState({ messageHistory: history });
+    harness.emit({ type: "session_changed", sessionId: harness.agent.state.sessionId });
+    await screenContains(harness.terminal, "Historical answer 7");
+    expect(harness.terminal.text()).not.toContain("Reasoning");
+    harness.terminal.send("\u001b[1;5H");
+    await screenContains(harness.terminal, "Historical task 0");
+    harness.terminal.mouse(65, 20, 8);
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.locate("Historical task 0").y).toBe(2);
+    });
+    expect(harness.terminal.text()).toContain("执行过程 · 3 步");
+    const processTitle = harness.terminal.locate("执行过程");
+    harness.terminal.mouse(0, processTitle.x, processTitle.y);
+    harness.terminal.mouse(32, processTitle.x + 1, processTitle.y);
+    harness.terminal.mouse(0, processTitle.x + 1, processTitle.y, true);
+    await harness.terminal.flush();
+    expect(harness.terminal.text()).not.toContain("read_file");
+    clickText(harness.terminal, "执行过程");
+    await screenContains(harness.terminal, "[call-0]");
+    expect(harness.terminal.locate("执行过程").y).toBe(processTitle.y);
+    clickText(harness.terminal, "中间回复");
+    await screenContains(harness.terminal, "Intermediate plan 0");
+    clickText(harness.terminal, "中间回复");
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text()).not.toContain("Intermediate plan 0");
+    });
+    const stepTitle = harness.terminal.locate("[call-0]");
+    clickText(harness.terminal, "[call-0]");
+    await screenContains(harness.terminal, "Result 0 line 0");
+    expect(harness.terminal.locate("[call-0]").y).toBe(stepTitle.y);
+    expect(harness.terminal.text()).not.toContain("Separate result 0");
+    const content = harness.terminal.locate("Result 0 line 0");
+    harness.terminal.mouse(0, content.x, content.y);
+    harness.terminal.mouse(32, content.x + 5, content.y);
+    harness.terminal.mouse(0, content.x + 5, content.y, true);
+    await vi.waitFor(() =>
+      expect(harness.terminal.writes.some((write) => write.startsWith("\u001b]52;"))).toBe(true),
+    );
+    expect(harness.terminal.text()).toContain("Result 0 line 0");
+    harness.terminal.send("\u0014");
+    await screenContains(harness.terminal, "详情 16/16");
+    clickText(harness.terminal, "[<]");
+    await screenContains(harness.terminal, "详情 15/16");
+    harness.terminal.resize(80, 28);
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text()).not.toContain("Historical task 0");
+    });
+    expect(harness.terminal.text()).toContain("详情 15/16");
+    clickText(harness.terminal, "[>]");
+    await screenContains(harness.terminal, "Separate result 7");
+    expect(harness.terminal.screen.buffer.active.getLine(4)?.getCell(79)?.getChars()).toBe("┃");
+    clickText(harness.terminal, "[x]");
+    await screenContains(harness.terminal, "[call-0]");
+    harness.terminal.mouse(0, 5, 25);
+    harness.terminal.mouse(0, 5, 25, true);
+    expect(harness.terminal.text()).toContain("Result 0 line 0");
+    clickText(harness.terminal, "[call-0]");
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text()).not.toContain("Result 0 line 0");
+    });
+    clickText(harness.terminal, "[next-0]");
+    await screenContains(harness.terminal, "Separate result 0");
+  });
+
+  it("retains failed and stopped process status and closes intermediate details at run end", async () => {
+    const harness = createHarness(true, 80, 26);
+    await screenContains(harness.terminal, "Workspace:");
+    for (const status of ["failed", "aborted"] as const) {
+      harness.emit({ type: "message_start", message: { role: "user", content: `Task ${status}` } });
+      harness.emit({ type: "reasoning_start", runId: status });
+      harness.emit({
+        type: "reasoning_update",
+        runId: status,
+        delta: `Retained ${status} reasoning`,
+      });
+      harness.emit({ type: "reasoning_end", runId: status });
+      harness.terminal.send("\u0014");
+      await screenContains(harness.terminal, `Retained ${status} reasoning`);
+      harness.emit({ type: "message_start", message: assistant(`Partial answer ${status}`) });
+      harness.emit({ type: "message_end", message: assistant(`Partial answer ${status}`, status) });
+      harness.emit({
+        type: "run_end",
+        runId: status,
+        result: status === "failed" ? { status, error: "Local failure" } : { status },
+      });
+      await screenContains(harness.terminal, `Partial answer ${status}`);
+      expect(harness.terminal.text()).not.toContain(`Retained ${status} reasoning`);
+      expect(harness.terminal.text()).toContain(
+        status === "failed" ? "执行过程 · 1 步 · 失败" : "执行过程 · 1 步 · 已停止",
+      );
+    }
+    harness.terminal.send("\u001b[1;5H");
+    await screenContains(harness.terminal, "执行过程 · 1 步 · 失败");
   });
 
   it("keeps multiline paste and Chinese input through resize as one submission", async () => {
@@ -164,9 +461,18 @@ describe("Anthias TUI", () => {
     harness.setState({ pendingToolApproval: request, running: true });
     harness.emit({ type: "tool_approval_requested", request });
     await screenContains(harness.terminal, "Risk:");
+    harness.terminal.send("\u0014");
+    harness.terminal.send("\u001b");
+    harness.terminal.mouse(0, 20, 2);
+    harness.terminal.mouse(0, 20, 2, true);
+    await screenContains(harness.terminal, "执行确认");
+    expect(harness.terminal.text()).not.toContain("[x]");
     harness.terminal.send("approve");
     harness.terminal.send("\r");
     expect(harness.agent.respondToToolApproval).not.toHaveBeenCalled();
+    harness.terminal.mouse(0, 79, 3);
+    harness.terminal.mouse(32, 79, 19);
+    harness.terminal.mouse(0, 79, 19, true);
     harness.terminal.send("\u001b[1;5F");
     await screenContains(harness.terminal, "command line 49");
     harness.terminal.send("approve");

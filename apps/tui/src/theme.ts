@@ -40,5 +40,6 @@ export function createTheme(capabilities: TerminalCapabilities) {
     strikethrough: emphasis(9),
     underline: emphasis(4),
   };
-  return { coral, muted, lagoon, editor, markdown };
+  const scrollbar = (_text: string) => coral(capabilities.unicode ? "┃" : "#");
+  return { coral, muted, lagoon, scrollbar, editor, markdown };
 }

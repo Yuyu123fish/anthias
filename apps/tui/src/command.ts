@@ -43,6 +43,7 @@ export function commandHelp(): string {
     '/mcp prompt <id> <name> [{"参数名":"值"}]',
     "",
     "Enter 提交 · Alt+Enter / Shift+Enter 换行 · Tab 补全",
+    "鼠标滚轮 / 拖动右侧滑块滚动 · 点击执行过程或步骤标题展开、收起",
     "PageUp / PageDown 滚动 · Ctrl+Home / Ctrl+End 顶部/末尾",
     "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
     "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。",

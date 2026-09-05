@@ -1,4 +1,4 @@
-import type { Terminal } from "@earendil-works/pi-tui";
+import { type Terminal, visibleWidth } from "@earendil-works/pi-tui";
 import { Terminal as HeadlessTerminal } from "@xterm/headless";
 import { vi } from "vitest";
 
@@ -53,6 +53,17 @@ export function createTestTerminal(columns = 100, rows = 28) {
     screen,
     send(data: string) {
       inputListener(data);
+    },
+    mouse(button: number, x: number, y: number, release = false) {
+      inputListener(`\u001b[<${button};${x + 1};${y + 1}${release ? "m" : "M"}`);
+    },
+    locate(text: string) {
+      for (let row = 0; row < rows; row += 1) {
+        const line = screen.buffer.active.getLine(row)?.translateToString(true) ?? "";
+        const index = line.indexOf(text);
+        if (index >= 0) return { x: visibleWidth(line.slice(0, index)), y: row };
+      }
+      throw new Error(`Text is not visible: ${text}`);
     },
     resize(width: number, height: number) {
       columns = width;
