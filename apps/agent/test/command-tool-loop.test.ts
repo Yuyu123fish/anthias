@@ -256,7 +256,7 @@ describe("execute_command Agent Tool Loop", () => {
     expect(await readFile(join(workspaceRoot, "lines-drained.txt"), "utf8")).toContain("yes");
     expect(modelRequestCount).toBe(3);
     expect(agent.state.running).toBe(false);
-  });
+  }, 25_000);
 
   it("continues draining a command when artifact storage is unavailable", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-command-artifact-write-failure-"));

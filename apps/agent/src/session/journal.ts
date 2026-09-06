@@ -11,6 +11,7 @@ import {
   parseSessionHeader,
   parseSessionRecord,
   type RunFinishedRecord,
+  type Schema2SessionHeader,
   type SessionHeader,
   type SessionRecord,
   type UnfinishedRun,
@@ -27,19 +28,12 @@ export type SessionFileCheckpoint = Readonly<{
 export class SessionChangedError extends Error {}
 
 /** 只读校验后的 JSONL 投影，记录偏移始终以 UTF-8 磁盘字节为单位。 */
-export type VerifiedSessionJournal =
-  | Readonly<{
-      header: SessionHeader;
-      records: readonly SessionRecord[];
-      recordByteOffsets: readonly number[];
-      fileSize: number;
-    }>
-  | Readonly<{
-      header: LegacySessionHeader;
-      records: readonly SessionRecord[];
-      recordByteOffsets: readonly number[];
-      fileSize: number;
-    }>;
+export type VerifiedSessionJournal = Readonly<{
+  header: SessionHeader | Schema2SessionHeader | LegacySessionHeader;
+  records: readonly SessionRecord[];
+  recordByteOffsets: readonly number[];
+  fileSize: number;
+}>;
 
 /** 不修复、不迁移也不刷新 use 记录地读取完整日志，供清理与索引重建使用。 */
 export async function readSessionJournal(sessionFilePath: string): Promise<VerifiedSessionJournal> {
@@ -72,13 +66,13 @@ function parseVerifiedSessionJournal(sessionBytes: Buffer): VerifiedSessionJourn
   const header = parseSessionHeader(lines[0]);
   const recordByteOffsets: number[] = [];
   let byteOffset = Buffer.byteLength(`${lines[0]}\n`, "utf8");
-  if (header.schemaVersion === 2) {
+  if (header.schemaVersion === 2 || header.schemaVersion === 3) {
     const records = lines.slice(1).map((line, index) => {
       recordByteOffsets.push(byteOffset);
       byteOffset += Buffer.byteLength(`${line}\n`, "utf8");
-      return parseSessionRecord(line, index + 1);
+      return parseSessionRecord(line, index + 1, header.schemaVersion);
     });
-    validateSessionRecords(records);
+    validateSessionRecords(records, header);
     return Object.freeze({
       header,
       records: Object.freeze(records),

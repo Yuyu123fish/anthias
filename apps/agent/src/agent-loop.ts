@@ -556,7 +556,7 @@ async function executePreparedToolCall(
   return toolResultMessage;
 }
 
-/** abort 后立即结束对无副作用预检的等待，迟到的预检结果不会进入执行。 */
+/** 取消阻止迟到预检进入执行；持有进程的预检先完成取消收口。 */
 function waitForPreparationOrAbort(
   plan: ToolCallPlan,
   abortSignal: AbortSignal,
@@ -574,17 +574,24 @@ function waitForPreparationOrAbort(
       abortSignal.removeEventListener("abort", handleAbort);
       resolve(result);
     };
-    const handleAbort = () => finish(Object.freeze({ status: "aborted" }));
+    const handleAbort = () => {
+      if (!plan.waitForPreparationOnAbort) finish(Object.freeze({ status: "aborted" }));
+    };
     abortSignal.addEventListener("abort", handleAbort, { once: true });
     if (abortSignal.aborted) {
-      handleAbort();
+      finish(Object.freeze({ status: "aborted" }));
       return;
     }
     void Promise.resolve()
-      .then(() => plan.prepare())
+      .then(() => plan.prepare(abortSignal))
       .then(
-        (preparation) => finish(Object.freeze({ status: "prepared", preparation })),
-        () => finish(Object.freeze({ status: "failed" })),
+        (preparation) =>
+          finish(
+            abortSignal.aborted
+              ? Object.freeze({ status: "aborted" })
+              : Object.freeze({ status: "prepared", preparation }),
+          ),
+        () => finish(Object.freeze({ status: abortSignal.aborted ? "aborted" : "failed" })),
       );
   });
 }

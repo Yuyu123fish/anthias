@@ -4,7 +4,7 @@
 
 ## 1. 安装依赖并构建
 
-需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）。先在 Anthias 仓库执行：
+需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）；Git/worktree 功能还需要 Git。先在 Anthias 仓库执行：
 
 ```powershell
 Set-Location 'C:\projects\anthias'
@@ -116,9 +116,9 @@ anthias --workspace 'D:\你的项目' --session '<完整的 Session UUID>'
 $env:ANTHIAS_SESSION_DIR = 'D:\AnthiasData\conversation'
 ```
 
-恢复旧 Session 时也需要使用原来的数据目录。显式打开该目录内的旧 Schema 1 Session 时会保存原始备份并迁移；程序不自动扫描其他工作区。
+恢复旧 Session 时也需要使用原来的数据目录。显式打开该目录内的旧 Schema 1/2 Session 时会保存原始备份并升级到 Schema 3；程序不自动扫描其他工作区。
 
-会话以 UTC 日期和创建时间戳分目录保存；日志、索引与工具产物归属于同一个 Session。每次启动会在后台检查最近使用时间，两周未使用且没有活动使用者的会话及其产物会被清理。压缩保留完整历史，只缩减模型输入；TUI 显示过程和结果，成功后自动继续。
+会话以 UTC 日期和创建时间戳分目录保存；日志、索引与工具产物归属于同一个 Session。每次启动会在后台检查最近使用时间，两周未使用且没有活动使用者的会话及其产物会被清理；协作会话按根和成员成组检查，未交付资源会阻止清理。压缩保留完整历史，只缩减模型输入；TUI 显示过程和结果，成功后自动继续。
 
 Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬拒绝规则的命令无法通过确认放行。命令以当前用户权限运行，没有 OS 沙箱，Workspace 和命令 `cwd` 不代表文件或网络隔离。
 
@@ -180,3 +180,41 @@ description: 检查项目的接口兼容性与错误处理
 - **Session Workspace 不匹配或正在使用**：使用原 Workspace 恢复，并先退出占用该 Session 的另一个 Anthias 进程。
 
 日常开发验证在仓库根目录运行 `pnpm verify`。它使用确定性本地测试；真实模型可用性需要在正确配置后另外确认。
+
+## MultiAgent 与本地 Git
+
+[Feature 007](specs/feature007-multi-agent/spec.md) 增加了 SubAgent、AgentTeam 和受管 Git worktree，当前等待开发者验收。使用可写成员前，需要 PATH 中存在 Git，目标是已有提交的普通 Git 仓库；无仓库时仍可进行只读委派。
+
+| 操作 | 用法 |
+| --- | --- |
+| 查看成员、任务和状态 | `/agents` |
+| 只读 / 可写委派 | `/agent spawn 检查会话恢复` / `/agent spawn --write 修复指定问题并报告验证` |
+| 等待、查看结果 | `/agent wait <成员ID>`、`/agent result <成员ID>` |
+| 查看完整工具产物 | `/agent artifact <成员ID> <产物ID> [cursor]` |
+| 停止 / 释放执行者 | `/agent stop <成员ID>` / `/agent release <成员ID>` |
+| 显式继续已有成员 | `/agent resume <成员ID> [新任务]` |
+| 建立团队、添加成员 | `/team create 修复小组`、`/team add --write 实施限定修改` |
+| 分派下一任务、发送消息 | `/team assign <成员ID> 下一任务`、`/team message <成员ID> 补充信息` |
+| 团队任务与结束 | `/team tasks`、`/team close` |
+| 查看仓库和工作区 | `/git status [worktreeID]`、`/git diff [worktreeID]`、`/git worktrees` |
+| 独立创建、核对工作区 | `/git create [已提交ref]`、`/git inspect <worktreeID>` |
+
+SubAgent 完成后释放执行者；Team 成员保留上下文等待下一次明确分派，两者共用三个名额。成员不能继续创建 Agent 或 Team。普通消息只入队，不会唤醒空闲成员；正在执行时会在下次模型请求前接收。主 Agent 和成员的待确认操作统一在 TUI 中呈现，并标出成员来源。
+
+可写成员从固定提交创建自己的目录，默认使用创建时的 HEAD；主目录的未提交修改不会带入。目录默认位于 Anthias 的 `data/worktrees/<根SessionID>/`，可用绝对路径环境变量 `ANTHIAS_WORKTREE_DIR` 覆盖。它独立于 `ANTHIAS_SESSION_DIR`，历史不会随 worktree 回收而消失。worktree 只隔离代码目录，外部服务、端口和数据库仍需任务自行安排。
+
+成员停止后，先查看差异，再通过明确文件列表提交：
+
+```text
+/git commit {"worktreeId":"<worktreeID>","paths":["src/example.ts"],"message":"修复明确问题"}
+/git integrate <worktreeID> <返回的commit>
+/git diff
+/git continue
+/git remove <worktreeID>
+```
+
+`integrate` 将指定成果放入主目录的暂存区，`continue` 检查后形成一个本地集成提交；一次处理一个集成。冲突时保留现场，可修复冲突后 `continue`，或 `/git abort` 中止本次集成。提交、集成和回收均经过权限检查，不自动推送。主目录已有暂存或未完成 Git 操作时会拒绝集成。
+
+移除只针对本根 Session 创建、已经停止且干净的受管 worktree；未集成的已提交成果需要显式 `/git remove <worktreeID> discard`。它不使用强制删除，也不删除分支。结束团队或释放成员只结束执行者，保留代码与历史。
+
+重开根 Session 时成员显示为中断，不自动发起模型请求或重放副作用。`/agent result` 不要求原工作目录存在；显式继续时会核对原目录及 Git 身份，资源缺失时保留诊断，不偷偷重建。已结束 Team 的旧成员仍可查看历史，继续工作需在新 Team 中分派。会话清理按根和成员成组检查，活动成员、待处理任务、待收消息、未移除 worktree 或不确定 Git 操作会阻止清理。

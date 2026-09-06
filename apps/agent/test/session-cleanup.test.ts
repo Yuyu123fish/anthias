@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanupExpiredSessions } from "../src/session/cleanup.js";
+import { openSession } from "../src/session/index.js";
+import { readSessionJournal } from "../src/session/journal.js";
 import {
   acquireSessionLock,
   acquireSessionUsageMarker,
@@ -174,6 +176,193 @@ describe("Session cleanup", () => {
     expect((await stat(first.directory)).isDirectory()).toBe(true);
     expect((await stat(second.directory)).isDirectory()).toBe(true);
   });
+  it("deletes an expired root and member as one group after every resource is terminal", async () => {
+    const root = await fixtureRoot();
+    const rootSessionId = randomUUID();
+    const memberSessionId = randomUUID();
+    const worktreeId = randomUUID();
+    const rootSession = await fixtureSchema3Session(root, {
+      id: rootSessionId,
+      rootSessionId,
+      sessionKind: "primary",
+      coordination: [
+        {
+          kind: "member",
+          key: memberSessionId,
+          payload: {
+            sessionId: memberSessionId,
+            kind: "subagent",
+            status: "closed",
+            workspaceRoot: root,
+            writable: true,
+            worktreeId,
+          },
+        },
+        { kind: "team", key: randomUUID(), payload: { status: "closed" } },
+        { kind: "task", key: randomUUID(), payload: { status: "completed", result: "" } },
+        { kind: "delivery", key: randomUUID(), payload: { status: "delivered" } },
+        {
+          kind: "worktree",
+          key: worktreeId,
+          payload: { id: worktreeId, rootSessionId, status: "removed" },
+        },
+        {
+          kind: "git_operation",
+          key: randomUUID(),
+          payload: { operationType: "integration", phase: "committed" },
+        },
+      ],
+    });
+    const memberSession = await fixtureSchema3Session(root, {
+      id: memberSessionId,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+
+    expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+      deleted: 2,
+      status: "completed",
+    });
+    await expect(stat(rootSession.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(memberSession.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["member", "task", "worktree", "git_operation"] as const)(
+    "protects the entire group when latest %s state is unfinished or uncertain",
+    async (unsafeKind) => {
+      const root = await fixtureRoot();
+      const rootSessionId = randomUUID();
+      const memberSessionId = randomUUID();
+      const worktreeId = randomUUID();
+      const coordination: Array<{
+        kind: "member" | "task" | "worktree" | "git_operation";
+        key: string;
+        payload: Record<string, unknown>;
+      }> = [
+        {
+          kind: "member",
+          key: memberSessionId,
+          payload: {
+            sessionId: memberSessionId,
+            kind: "subagent",
+            status: unsafeKind === "member" ? "running" : "closed",
+            workspaceRoot: root,
+            writable: false,
+          },
+        },
+      ];
+      if (unsafeKind === "task") {
+        coordination.push({ kind: "task", key: randomUUID(), payload: { status: "pending" } });
+      }
+      if (unsafeKind === "worktree") {
+        coordination.push({
+          kind: "worktree",
+          key: worktreeId,
+          payload: { id: worktreeId, rootSessionId, status: "ready" },
+        });
+      }
+      if (unsafeKind === "git_operation") {
+        coordination.push({
+          kind: "git_operation",
+          key: randomUUID(),
+          payload: { operationType: "commit", phase: "intent" },
+        });
+      }
+      const rootSession = await fixtureSchema3Session(root, {
+        id: rootSessionId,
+        rootSessionId,
+        sessionKind: "primary",
+        coordination,
+      });
+      const memberSession = await fixtureSchema3Session(root, {
+        id: memberSessionId,
+        rootSessionId,
+        sessionKind: "subagent",
+      });
+
+      expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+        deleted: 0,
+      });
+      expect((await stat(rootSession.directory)).isDirectory()).toBe(true);
+      expect((await stat(memberSession.directory)).isDirectory()).toBe(true);
+    },
+  );
+  it("restores a half-moved five-Session group before preserving a reopened source", async () => {
+    const root = await fixtureRoot();
+    const rootSessionId = randomUUID();
+    const memberSessionIds = Array.from({ length: 4 }, () => randomUUID());
+    const rootSession = await fixtureSchema3Session(root, {
+      id: rootSessionId,
+      rootSessionId,
+      sessionKind: "primary",
+      coordination: memberSessionIds.map((memberSessionId) => ({
+        kind: "member",
+        key: memberSessionId,
+        payload: {
+          sessionId: memberSessionId,
+          kind: "subagent",
+          status: "closed",
+          workspaceRoot: root,
+          writable: false,
+        },
+      })),
+    });
+    const memberSessions = await Promise.all(
+      memberSessionIds.map((memberSessionId) =>
+        fixtureSchema3Session(root, {
+          id: memberSessionId,
+          rootSessionId,
+          sessionKind: "subagent",
+        }),
+      ),
+    );
+    const trash = `.maintenance/trash/${rootSessionId}-${randomUUID()}`;
+    await mkdir(join(root, trash), { recursive: true });
+    await writeFile(
+      join(root, ".maintenance", "cleanup-state.json"),
+      JSON.stringify({
+        cursor: null,
+        pending: {
+          kind: "group",
+          rootSessionId,
+          cursorAfter: rootSession.relativeDirectory,
+          trash,
+          sessions: [
+            { source: rootSession.relativeDirectory, sessionId: rootSessionId },
+            ...memberSessions.map((memberSession) => ({
+              source: memberSession.relativeDirectory,
+              sessionId: memberSession.id,
+            })),
+          ],
+        },
+      }),
+    );
+    const movedMember = memberSessions[0];
+    if (movedMember === undefined) throw new Error("missing member fixture");
+    await rename(movedMember.directory, join(root, trash, movedMember.id));
+
+    const reopenedRoot = await openSession({
+      sessionId: rootSessionId,
+      workspaceRoot: root,
+      sessionDirectory: root,
+      shell: { kind: "posix", executable: "/bin/sh", arguments: ["-lc"] },
+    });
+    try {
+      expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+        deleted: 0,
+        status: "completed",
+      });
+      expect((await stat(rootSession.directory)).isDirectory()).toBe(true);
+      for (const memberSession of memberSessions) {
+        expect((await stat(memberSession.directory)).isDirectory()).toBe(true);
+      }
+      expect(
+        (await readSessionJournal(join(rootSession.directory, "session.jsonl"))).records.at(-1),
+      ).toMatchObject({ type: "session_use", activity: "opened" });
+    } finally {
+      await reopenedRoot.close();
+    }
+  });
   it("does not scan when another cleanup owns the global lock or cancellation has arrived", async () => {
     const root = await fixtureRoot();
     const session = await fixtureSession(root);
@@ -206,6 +395,56 @@ async function fixtureRoot(): Promise<string> {
   return root;
 }
 
+async function fixtureSchema3Session(
+  root: string,
+  options: Readonly<{
+    id: string;
+    rootSessionId: string;
+    sessionKind: "primary" | "subagent" | "teammate";
+    coordination?: readonly Readonly<{
+      kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation";
+      key: string;
+      payload: Record<string, unknown>;
+    }>[];
+  }>,
+) {
+  const createdAt = "2026-07-01T00:00:00.000Z";
+  const relativeDirectory = `${createdAt.slice(0, 10)}/${createdAt.replace(/[-:.]/gu, "")}-${options.id}`;
+  const directory = join(root, relativeDirectory);
+  await mkdir(directory, { recursive: true });
+  let parentEntryId: string | null = null;
+  const records = (options.coordination ?? []).map((coordination, index) => {
+    const record = {
+      type: "coordination",
+      entryId: randomUUID(),
+      seq: index + 1,
+      timestamp: createdAt,
+      parentEntryId,
+      ...coordination,
+    };
+    parentEntryId = record.entryId;
+    return record;
+  });
+  await writeFile(
+    join(directory, "session.jsonl"),
+    `${[
+      {
+        type: "session_header",
+        schemaVersion: 3,
+        sessionId: options.id,
+        rootSessionId: options.rootSessionId,
+        sessionKind: options.sessionKind,
+        createdAt,
+        workspaceRoot: root,
+        shell: { kind: "posix", executable: "/bin/sh", arguments: ["-lc"] },
+      },
+      ...records,
+    ]
+      .map((record) => JSON.stringify(record))
+      .join("\n")}\n`,
+  );
+  return { id: options.id, directory, relativeDirectory };
+}
 async function fixtureSession(
   root: string,
   createdAt = "2026-07-01T00:00:00.000Z",

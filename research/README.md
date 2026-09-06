@@ -2,7 +2,9 @@
 
 `research/` 只保存为项目级或跨 Feature 决定提供证据的限时调查。属于某个编号 Feature 的 Research 必须放在对应的 `specs/featurexxx-xxxxx/` 目录；具体命名见 [Feature 文档约定](../specs/README.md)。Research 用来回答明确问题，不是产品定义、Feature、Plan 或实施授权。
 
-当前没有进行中的项目级或跨 Feature Research。
+已转入 Feature 的研究：
+
+- [Feature 007 MultiAgent 实现比较](../specs/feature007-multi-agent/research.md)：pi、Codex 和 Claude Code 的资料及项目取舍随 Feature 保存。
 
 ## 目录约定
 

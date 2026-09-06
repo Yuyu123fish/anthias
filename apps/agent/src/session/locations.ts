@@ -6,12 +6,14 @@ import { hasRecoverableIncompleteSessionTail } from "./journal.js";
 import {
   hasExactKeys,
   isUuid,
+  type ParsedSessionHeader,
   parseJsonObject,
   parseSessionHeader,
   type SessionHeader,
 } from "./schema.js";
 
 const LOCATION_INDEX_FILE_NAME = "session-locations.json";
+const locationIndexUpdateQueues = new Map<string, Promise<void>>();
 const DATE_DIRECTORY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const SESSION_DIRECTORY_PATTERN = /^(\d{8}T\d{9}Z)-([0-9a-f-]{36})$/iu;
 
@@ -31,7 +33,7 @@ type SessionLocationIndex = Readonly<{
 }>;
 
 /** 由不可变 Header 生成 UTC 日期与时间戳目录，绝不依据重新打开时间移动 Session。 */
-export function getSessionStorageRelativeDirectory(header: SessionHeader): string {
+export function getSessionStorageRelativeDirectory(header: ParsedSessionHeader): string {
   const dateDirectory = header.createdAt.slice(0, 10);
   const timestampDirectory = `${header.createdAt.replace(/[-:.]/gu, "")}-${header.sessionId}`;
   if (
@@ -72,6 +74,7 @@ export async function createSessionStorageDirectory(
 export async function locateSessionStorage(
   sessionDirectory: string,
   sessionId: string,
+  options: Readonly<{ updateCache?: boolean }> = {},
 ): Promise<SessionStorageLocation> {
   if (!isUuid(sessionId)) {
     throw new Error("Session ID 无效。");
@@ -98,7 +101,7 @@ export async function locateSessionStorage(
     }
   }
   const resolvedLocation = await resolveLocationCandidates(candidates);
-  if (resolvedLocation.source === "schema2") {
+  if (resolvedLocation.source === "schema2" && options.updateCache !== false) {
     await writeSessionLocation(normalizedSessionDirectory, resolvedLocation).catch(() => undefined);
   }
   return resolvedLocation;
@@ -113,19 +116,21 @@ export async function writeSessionLocation(
     return;
   }
   const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const existingIndex = await readSessionLocationIndex(normalizedSessionDirectory).catch(() =>
-    emptyIndex(),
-  );
-  const locations = {
-    ...existingIndex.locations,
-    [location.sessionId]: Object.freeze({
-      relativeStorageDirectory: location.relativeStorageDirectory,
-    }),
-  };
-  await writeSessionLocationIndex(
-    normalizedSessionDirectory,
-    Object.freeze({ schemaVersion: 1, locations }),
-  );
+  await serializeLocationIndexUpdate(normalizedSessionDirectory, async () => {
+    const existingIndex = await readSessionLocationIndex(normalizedSessionDirectory).catch(() =>
+      emptyIndex(),
+    );
+    const locations = {
+      ...existingIndex.locations,
+      [location.sessionId]: Object.freeze({
+        relativeStorageDirectory: location.relativeStorageDirectory as string,
+      }),
+    };
+    await writeSessionLocationIndex(
+      normalizedSessionDirectory,
+      Object.freeze({ schemaVersion: 1, locations }),
+    );
+  });
 }
 
 /** 清理发布后移除缓存条目；缓存损坏由后续扫描重建，不阻止文件清理。 */
@@ -137,18 +142,20 @@ export async function removeSessionLocation(
     throw new Error("Session ID 无效。");
   }
   const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const existingIndex = await readSessionLocationIndex(normalizedSessionDirectory).catch(
-    () => null,
-  );
-  if (existingIndex === null || !Object.hasOwn(existingIndex.locations, sessionId)) {
-    return;
-  }
-  const locations = { ...existingIndex.locations };
-  delete locations[sessionId];
-  await writeSessionLocationIndex(
-    normalizedSessionDirectory,
-    Object.freeze({ schemaVersion: 1, locations }),
-  );
+  await serializeLocationIndexUpdate(normalizedSessionDirectory, async () => {
+    const existingIndex = await readSessionLocationIndex(normalizedSessionDirectory).catch(
+      () => null,
+    );
+    if (existingIndex === null || !Object.hasOwn(existingIndex.locations, sessionId)) {
+      return;
+    }
+    const locations = { ...existingIndex.locations };
+    delete locations[sessionId];
+    await writeSessionLocationIndex(
+      normalizedSessionDirectory,
+      Object.freeze({ schemaVersion: 1, locations }),
+    );
+  });
 }
 
 /** 检查目录是否恰好属于 Schema 2 的受管布局，供清理在删除前做最后确认。 */
@@ -172,7 +179,7 @@ export function isSessionStorageDirectory(
 /** 创建迁移暂存目录，名称不能被扫描器当作一个正常 Session。 */
 export async function createMigrationStagingDirectory(
   sessionDirectory: string,
-  header: SessionHeader,
+  header: ParsedSessionHeader,
 ): Promise<string> {
   const normalizedSessionDirectory = await realpath(sessionDirectory);
   const relativeStorageDirectory = getSessionStorageRelativeDirectory(header);
@@ -249,6 +256,23 @@ async function writeSessionLocationIndex(
   await rename(temporaryIndexPath, indexPath);
 }
 
+async function serializeLocationIndexUpdate(
+  sessionDirectory: string,
+  update: () => Promise<void>,
+): Promise<void> {
+  const previousUpdate = locationIndexUpdateQueues.get(sessionDirectory) ?? Promise.resolve();
+  const currentUpdate = previousUpdate.catch(() => undefined).then(update);
+  const queueTail = currentUpdate.catch(() => undefined);
+  locationIndexUpdateQueues.set(sessionDirectory, queueTail);
+  try {
+    await currentUpdate;
+  } finally {
+    if (locationIndexUpdateQueues.get(sessionDirectory) === queueTail) {
+      locationIndexUpdateQueues.delete(sessionDirectory);
+    }
+  }
+}
+
 async function inspectSchema2Location(
   sessionDirectory: string,
   sessionId: string,
@@ -272,8 +296,11 @@ async function inspectSchema2Location(
     throw new Error("Session 存储目录不存在。");
   }
   const sessionFilePath = join(storageDirectory, "session.jsonl");
-  const header = parseSessionHeader((await readFile(sessionFilePath, "utf8")).split("\n", 1)[0]);
-  if (header.schemaVersion !== 2 || header.sessionId !== sessionId) {
+  const header = await readManagedDirectoryHeader(storageDirectory, sessionFilePath);
+  if (
+    (header.schemaVersion !== 2 && header.schemaVersion !== 3) ||
+    header.sessionId !== sessionId
+  ) {
     throw new Error("Session location 与 Header 不匹配。");
   }
   return Object.freeze({
@@ -284,6 +311,23 @@ async function inspectSchema2Location(
     source: "schema2",
   });
 }
+async function readManagedDirectoryHeader(
+  storageDirectory: string,
+  sessionFilePath: string,
+): Promise<ParsedSessionHeader> {
+  try {
+    return parseSessionHeader((await readFile(sessionFilePath, "utf8")).split("\n", 1)[0]);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    await readFile(join(storageDirectory, "schema-upgrade-state.json"));
+    return parseSessionHeader(
+      (await readFile(join(storageDirectory, "schema2-session.jsonl"), "utf8")).split("\n", 1)[0],
+    );
+  }
+}
+
 async function scanSessionLocations(
   sessionDirectory: string,
   sessionId: string,

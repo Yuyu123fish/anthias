@@ -264,6 +264,7 @@ describe("Agent", () => {
     expect(promptResult).toEqual({ status: "completed" });
     expect(agent.state).toEqual({
       operation: null,
+      collaboration: { rootSessionId: agent.state.sessionId, members: [], team: null, tasks: [] },
       messageHistory: [
         { role: "user", content: "你好" },
         {
@@ -539,11 +540,15 @@ describe("Agent", () => {
     let releasedLeaseCount = 0;
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000001",
+      rootSessionId: "00000000-0000-4000-8000-000000000001",
+      sessionKind: "primary" as const,
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
       appendContextSource: async () => undefined,
+      appendCoordination: async () => undefined,
+      appendAgentInput: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -561,6 +566,8 @@ describe("Agent", () => {
             },
             async appendToolExecutionStarted() {},
             async appendContextSource() {},
+            async appendCoordination() {},
+            async appendAgentInput() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -604,11 +611,15 @@ describe("Agent", () => {
     let modelCallCount = 0;
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000011",
+      rootSessionId: "00000000-0000-4000-8000-000000000011",
+      sessionKind: "primary" as const,
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
       appendContextSource: async () => undefined,
+      appendCoordination: async () => undefined,
+      appendAgentInput: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -627,6 +638,8 @@ describe("Agent", () => {
               throw new Error("must not append ToolExecutionStarted");
             },
             async appendContextSource() {},
+            async appendCoordination() {},
+            async appendAgentInput() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -675,11 +688,15 @@ describe("Agent", () => {
     let releasedLeaseCount = 0;
     const session: Session = Object.freeze({
       sessionId: "00000000-0000-4000-8000-000000000002",
+      rootSessionId: "00000000-0000-4000-8000-000000000002",
+      sessionKind: "primary" as const,
       workspaceRoot: "C:\\workspace",
       sessionDirectory: "C:\\workspace\\data\\conversation",
       storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
       records: Object.freeze([]),
       appendContextSource: async () => undefined,
+      appendCoordination: async () => undefined,
+      appendAgentInput: async () => undefined,
       appendCompaction: async () => undefined,
       appendRequestUsage: async () => undefined,
       appendApprovalDecision: async () => undefined,
@@ -695,6 +712,8 @@ describe("Agent", () => {
             },
             async appendToolExecutionStarted() {},
             async appendContextSource() {},
+            async appendCoordination() {},
+            async appendAgentInput() {},
             async appendCompaction() {},
             async appendRequestUsage() {},
             async appendApprovalDecision() {},
@@ -739,11 +758,17 @@ describe("Agent", () => {
       let modelCallCount = 0;
       const session: Session = Object.freeze({
         sessionId: randomSessionId(),
+        get rootSessionId() {
+          return this.sessionId;
+        },
+        sessionKind: "primary" as const,
         workspaceRoot: "C:\\workspace",
         sessionDirectory: "C:\\workspace\\data\\conversation",
         storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
         records: Object.freeze([]),
         appendContextSource: async () => undefined,
+        appendCoordination: async () => undefined,
+        appendAgentInput: async () => undefined,
         appendCompaction: async () => undefined,
         appendRequestUsage: async () => undefined,
         appendApprovalDecision: async () => undefined,

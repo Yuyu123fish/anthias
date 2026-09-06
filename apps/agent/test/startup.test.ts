@@ -91,6 +91,12 @@ describe("createAgentFromEnvironment", () => {
     if (creationResult.ok) {
       expect(creationResult.agent.state).toEqual({
         operation: null,
+        collaboration: {
+          rootSessionId: creationResult.agent.state.sessionId,
+          members: [],
+          team: null,
+          tasks: [],
+        },
         sessionId: expect.any(String),
         workspaceRoot,
         permissionMode: "agent",
@@ -353,7 +359,12 @@ async function expectSessionStorage(sessionDirectory: string, sessionId: string)
   expect(location.source).toBe("schema2");
   const sessionText = await readFile(location.sessionFilePath, "utf8");
   const header = JSON.parse(sessionText.trimEnd().split("\n")[0] ?? "") as Record<string, unknown>;
-  expect(header).toMatchObject({ schemaVersion: 2, sessionId });
+  expect(header).toMatchObject({
+    schemaVersion: 3,
+    sessionId,
+    rootSessionId: sessionId,
+    sessionKind: "primary",
+  });
   const createdAt = String(header.createdAt);
   expect(location.storageDirectory).toBe(
     join(

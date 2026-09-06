@@ -34,6 +34,7 @@ import {
   type ExecutionStep,
   type ExecutionTurn,
 } from "./execution-view.js";
+import { collaborationStatus } from "./multi-agent-view.js";
 import { createTheme } from "./theme.js";
 
 export type ConversationView = Readonly<{
@@ -263,7 +264,7 @@ export function createConversationView(options: {
       return [
         truncateToWidth(
           theme.muted(
-            `${state.permissionMode} · ${phase} · ${contextText}${scrollText}${detailHint}`,
+            `${state.permissionMode} · ${phase} · ${contextText}${collaborationStatus(state.collaboration)}${scrollText}${detailHint}`,
           ),
           width,
         ),
@@ -893,6 +894,14 @@ export function createConversationView(options: {
 export function formatApproval(request: ToolApprovalRequest): string {
   return sanitizeTerminalText(
     [
+      ...(request.memberSessionId
+        ? [
+            "成员: " +
+              (request.memberName ?? request.memberSessionId) +
+              " · " +
+              request.memberSessionId,
+          ]
+        : []),
       `Tool: ${request.toolName}`,
       `Target: ${request.target}`,
       `Mode: ${request.permissionMode}`,

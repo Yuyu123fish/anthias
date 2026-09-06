@@ -1,7 +1,7 @@
 import { open, readdir, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { SessionSummary } from "../agent-controls.js";
-import { areSameWorkspace, isUuid, parseSessionHeader } from "./schema.js";
+import { areSameWorkspace, getSessionOwnership, isUuid, parseSessionHeader } from "./schema.js";
 
 /** 只读取受管布局的有界 Header，不打开 Session 或取得其使用权。 */
 export async function listSessions(
@@ -43,7 +43,10 @@ export async function listSessions(
         await file.close();
       }
       const header = parseSessionHeader(headerText);
-      if (areSameWorkspace(header.workspaceRoot, workspaceRoot))
+      if (
+        getSessionOwnership(header).sessionKind === "primary" &&
+        areSameWorkspace(header.workspaceRoot, workspaceRoot)
+      )
         summaries.set(header.sessionId, { id: header.sessionId, createdAt: header.createdAt });
     } catch {
       /* 列表允许跳过损坏文件；真正打开时仍由 Session 严格验证。 */

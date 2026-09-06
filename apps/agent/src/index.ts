@@ -31,7 +31,13 @@ export type {
   ToolResultMessage,
   UserMessage,
 } from "./message.js";
-
+export type {
+  CollaborationAction,
+  CollaborationSnapshot,
+  MemberSummary,
+  TeamSummary,
+  TeamTask,
+} from "./multi-agent/index.js";
 export {
   type AgentCreationFailure,
   type AgentCreationFailureReason,
@@ -39,3 +45,4 @@ export {
   type CreateAgentFromEnvironmentOptions,
   createAgentFromEnvironment,
 } from "./startup.js";
+export type { GitAction } from "./tool/git-tools.js";

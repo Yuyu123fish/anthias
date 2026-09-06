@@ -59,6 +59,11 @@ export function createFakeAgent() {
       return { status: "accepted", permissionMode };
     }),
     respondToToolApproval: vi.fn<Agent["respondToToolApproval"]>(() => ({ status: "accepted" })),
+    collaboration: {
+      snapshot: vi.fn(() => ({ members: [], team: null, tasks: [] })),
+      execute: vi.fn(async () => ({ ok: true as const, value: "done" })),
+    },
+    git: { execute: vi.fn(async () => ({ ok: true as const, value: "clean" })) },
     sessions: {
       list: vi.fn<Agent["sessions"]["list"]>(async () => ({
         ok: true,

@@ -104,7 +104,9 @@ export type ToolCallScheduling = "parallel_read_only" | "source_order_serial";
 export type ToolCallPlan = Readonly<{
   scheduling: ToolCallScheduling;
   abortedPreparationContent: string;
-  prepare(): Promise<ToolCallPreparation>;
+  prepare(signal?: AbortSignal): Promise<ToolCallPreparation>;
+  /** 持有子进程的预检必须等取消完成，避免关闭后遗留进程。 */
+  waitForPreparationOnAbort?: boolean;
 }>;
 
 /** 创建已经绑定运行环境、可以被 Agent Loop 直接调用的 ToolRunner。 */

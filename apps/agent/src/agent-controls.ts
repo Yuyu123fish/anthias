@@ -1,3 +1,5 @@
+import type { CollaborationControls } from "./multi-agent/index.js";
+import type { GitControls } from "./tool/git-tools.js";
 export type ActionResult<T> =
   | Readonly<{ ok: true; value: T }>
   | Readonly<{ ok: false; error: string }>;
@@ -31,6 +33,8 @@ export type McpCapabilities = Readonly<{
 }>;
 /** 这些行为由 Agent 持有；交互层只映射命令和展示安全摘要。 */
 export type AgentControls = Readonly<{
+  collaboration: CollaborationControls;
+  git: GitControls;
   sessions: Readonly<{
     list(): Promise<ActionResult<readonly SessionSummary[]>>;
     create(): Promise<ActionResult<void>>;

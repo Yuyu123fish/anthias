@@ -114,4 +114,37 @@ describe("slash commands", () => {
     expect(commandHelp()).toContain("/compact");
     expect(commandHelp()).toContain("Alt+Enter");
   });
+  it("routes collaboration and Git commands through Agent controls", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    for (const line of [
+      "/agents",
+      "/agent spawn --write implement a bounded change",
+      "/team create Review team",
+      "/team message member-id queued message",
+      "/git status",
+      '/git commit {"paths":["a file.ts"],"message":"change"}',
+    ]) {
+      const command = parseInput(line);
+      if (command.type === "command")
+        await executeCommand(command, { agent, notice, details() {}, exit() {} });
+    }
+    expect(agent.collaboration.execute).toHaveBeenCalledWith({
+      action: "spawn",
+      task: "implement a bounded change",
+      writable: true,
+      name: "implement a bounded change",
+    });
+    expect(agent.collaboration.execute).toHaveBeenCalledWith({
+      action: "message",
+      memberId: "member-id",
+      content: "queued message",
+    });
+    expect(agent.git.execute).toHaveBeenCalledWith({
+      action: "commit",
+      paths: ["a file.ts"],
+      message: "change",
+    });
+    expect(agent.prompt).not.toHaveBeenCalled();
+  });
 });

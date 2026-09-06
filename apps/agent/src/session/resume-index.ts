@@ -41,7 +41,7 @@ export async function readOrRebuildResumeIndex(
   storageDirectory: string,
   journal: VerifiedSessionJournal,
 ): Promise<SessionResumeIndex> {
-  if (journal.header.schemaVersion !== 2) {
+  if (journal.header.schemaVersion === 1) {
     throw new Error("Schema 1 Session 必须先迁移后才能建立恢复索引。");
   }
   const indexPath = join(storageDirectory, RESUME_INDEX_FILE_NAME);
@@ -76,7 +76,7 @@ export async function writeResumeIndex(
 
 /** 基于 UTF-8 字节偏移构建索引，不使用 JavaScript 字符位置或行号。 */
 export function buildResumeIndex(journal: VerifiedSessionJournal): SessionResumeIndex {
-  if (journal.header.schemaVersion !== 2) {
+  if (journal.header.schemaVersion === 1) {
     throw new Error("Schema 1 Session 没有 Schema 2 恢复索引。");
   }
   const entryLocations = new Map<string, IndexedEntryLocation>();
@@ -104,8 +104,11 @@ export function buildResumeIndex(journal: VerifiedSessionJournal): SessionResume
             throw new Error("CompactionEntry 引用了没有字节偏移的用户记录。");
           }
           const record = journal.records.find((candidate) => candidate.entryId === entryId);
-          if (record?.type !== "message" || record.message.type !== "user") {
-            throw new Error("CompactionEntry 保留引用不是 UserMessage。");
+          if (
+            record?.type !== "agent_input" &&
+            (record?.type !== "message" || record.message.type !== "user")
+          ) {
+            throw new Error("CompactionEntry 保留引用不是上下文输入。");
           }
           return location;
         });
@@ -195,7 +198,7 @@ function parseResumeIndex(value: unknown): SessionResumeIndex {
 }
 
 function isResumeIndexCurrent(index: SessionResumeIndex, journal: VerifiedSessionJournal): boolean {
-  if (journal.header.schemaVersion !== 2 || index.sessionId !== journal.header.sessionId) {
+  if (journal.header.schemaVersion === 1 || index.sessionId !== journal.header.sessionId) {
     return false;
   }
   try {

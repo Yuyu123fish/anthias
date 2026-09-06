@@ -26,11 +26,15 @@ export type ToolExecutionStartedDetails = Readonly<{
   toolApprovalRequestId: string;
 }>;
 
-/** Schema 2 不可变首行。可变索引永远不回写到 Header。 */
+export type SessionKind = "primary" | "subagent" | "teammate";
+
+/** Schema 3 不可变首行。可变索引永远不回写到 Header。 */
 export type SessionHeader = Readonly<{
   type: "session_header";
-  schemaVersion: 2;
+  schemaVersion: 3;
   sessionId: string;
+  rootSessionId: string;
+  sessionKind: SessionKind;
   createdAt: string;
   workspaceRoot: string;
   shell: SessionShell;
@@ -46,7 +50,17 @@ export type LegacySessionHeader = Readonly<{
   shell: SessionShell;
 }>;
 
-export type ParsedSessionHeader = SessionHeader | LegacySessionHeader;
+/** Schema 2 目录日志保持原格式可读，只有首次使用协作行为时才升级。 */
+export type Schema2SessionHeader = Readonly<{
+  type: "session_header";
+  schemaVersion: 2;
+  sessionId: string;
+  createdAt: string;
+  workspaceRoot: string;
+  shell: SessionShell;
+}>;
+
+export type ParsedSessionHeader = SessionHeader | Schema2SessionHeader | LegacySessionHeader;
 
 /** 工具原文落盘后的可验证引用；不完整状态必须说明原因。 */
 export type ToolArtifactReference = Readonly<{
@@ -102,6 +116,7 @@ export type ApprovalDecisionDetails = Readonly<{
   decision: "allowed" | "denied" | "needs_user";
   reason: string;
   authorizationEntryIds: readonly string[];
+  authorizationSessionId?: string;
   actionFingerprint?: string;
   toolApprovalRequestId?: string;
 }>;
@@ -109,6 +124,22 @@ export type ApprovalDecisionDetails = Readonly<{
 /** 不能从消息、Run 或 Header 推导的真实使用活动。 */
 export type SessionUseDetails = Readonly<{
   activity: "opened" | "browsed";
+}>;
+
+/** 根 Session 保存的成员、任务、交付与 Git 协调事实。 */
+export type CoordinationDetails = Readonly<{
+  kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation";
+  key: string;
+  payload: JsonValue;
+}>;
+
+/** Agent 间输入保留来源身份，不能提升为真实用户授权。 */
+export type AgentInputDetails = Readonly<{
+  messageId: string;
+  rootSessionId: string;
+  fromSessionId: string;
+  kind: "task" | "message" | "result";
+  content: string;
 }>;
 
 type DurableTextPart = Readonly<{
@@ -217,6 +248,7 @@ export type ApprovalDecisionRecord = SessionEntryBase &
     decision: ApprovalDecisionDetails["decision"];
     reason: string;
     authorizationEntryIds: readonly string[];
+    authorizationSessionId?: string;
     actionFingerprint?: string;
     toolApprovalRequestId?: string;
   }>;
@@ -233,8 +265,16 @@ export type ContextSourceDetails = Readonly<{
 export type ContextSourceRecord = SessionEntryBase &
   ContextSourceDetails &
   Readonly<{ type: "context_source"; runId?: string }>;
+export type CoordinationRecord = SessionEntryBase &
+  CoordinationDetails &
+  Readonly<{ type: "coordination"; runId?: string }>;
+export type AgentInputRecord = SessionEntryBase &
+  AgentInputDetails &
+  Readonly<{ type: "agent_input"; runId?: string }>;
 export type SessionRecord =
   | ContextSourceRecord
+  | CoordinationRecord
+  | AgentInputRecord
   | MessageRecord
   | ToolExecutionStartedRecord
   | RunFinishedRecord
@@ -262,34 +302,112 @@ export type UnfinishedRun = Readonly<{
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** 解析 Header，同时将 Schema 1 明确保留在迁移输入分支。 */
+/** 解析 Header，同时将 Schema 1/2 明确保留在兼容分支。 */
 export function parseSessionHeader(line: string | undefined): ParsedSessionHeader {
   const value = parseJsonObject(line);
+  const hasCommonFields =
+    value.type === "session_header" &&
+    isUuid(value.sessionId) &&
+    isUtcTimestamp(value.createdAt) &&
+    typeof value.workspaceRoot === "string" &&
+    isSessionShell(value.shell);
   if (
-    !hasExactKeys(value, [
+    value.schemaVersion === 3 &&
+    hasExactKeys(value, [
+      "type",
+      "schemaVersion",
+      "sessionId",
+      "rootSessionId",
+      "sessionKind",
+      "createdAt",
+      "workspaceRoot",
+      "shell",
+    ]) &&
+    hasCommonFields &&
+    isUuid(value.rootSessionId) &&
+    isSessionKind(value.sessionKind) &&
+    ((value.sessionKind === "primary" && value.rootSessionId === value.sessionId) ||
+      (value.sessionKind !== "primary" && value.rootSessionId !== value.sessionId))
+  ) {
+    return value as SessionHeader;
+  }
+  if (
+    (value.schemaVersion === 1 || value.schemaVersion === 2) &&
+    hasExactKeys(value, [
       "type",
       "schemaVersion",
       "sessionId",
       "createdAt",
       "workspaceRoot",
       "shell",
-    ]) ||
-    value.type !== "session_header" ||
-    (value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
-    !isUuid(value.sessionId) ||
-    !isUtcTimestamp(value.createdAt) ||
-    typeof value.workspaceRoot !== "string" ||
-    !isSessionShell(value.shell)
+    ]) &&
+    hasCommonFields
   ) {
-    throw new Error("Session Header 无效。");
+    return value as LegacySessionHeader | Schema2SessionHeader;
   }
-  return value as ParsedSessionHeader;
+  throw new Error("Session Header 无效。");
 }
-/** 解析 Schema 2 记录，并拒绝断裂的 seq、身份、父引用或未知字段。 */
-export function parseSessionRecord(line: string, expectedSequence: number): SessionRecord {
+
+/** 解析当前目录日志记录，并按 Header 版本拒绝尚未定义的记录。 */
+export function parseSessionRecord(
+  line: string,
+  expectedSequence: number,
+  schemaVersion: 2 | 3 = 3,
+): SessionRecord {
   const value = parseJsonObject(line);
   if (!hasValidEntryIdentity(value, expectedSequence, true)) {
     throw new Error("Session record identity 无效。");
+  }
+  if (value.type === "coordination") {
+    if (
+      schemaVersion !== 3 ||
+      !hasExactKeysWithOptionalRunId(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "kind",
+        "key",
+        "payload",
+      ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
+      !isCoordinationKind(value.kind) ||
+      !isNonEmptyString(value.key) ||
+      value.key.length > 2048 ||
+      !isJsonValue(value.payload) ||
+      jsonByteLength(value.payload) > 256 * 1024
+    ) {
+      throw new Error("CoordinationRecord 无效。");
+    }
+    return value as CoordinationRecord;
+  }
+  if (value.type === "agent_input") {
+    if (
+      schemaVersion !== 3 ||
+      !hasExactKeysWithOptionalRunId(value, [
+        "type",
+        "entryId",
+        "seq",
+        "timestamp",
+        "parentEntryId",
+        "messageId",
+        "rootSessionId",
+        "fromSessionId",
+        "kind",
+        "content",
+      ]) ||
+      !(value.runId === undefined || isUuid(value.runId)) ||
+      !isUuid(value.messageId) ||
+      !isUuid(value.rootSessionId) ||
+      !isUuid(value.fromSessionId) ||
+      !isAgentInputKind(value.kind) ||
+      typeof value.content !== "string" ||
+      Buffer.byteLength(value.content) > 16 * 1024
+    ) {
+      throw new Error("AgentInputRecord 无效。");
+    }
+    return value as AgentInputRecord;
   }
   if (value.type === "context_source") {
     if (
@@ -459,6 +577,7 @@ export function parseSessionRecord(line: string, expectedSequence: number): Sess
         "authorizationEntryIds",
       ]) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
+      !(value.authorizationSessionId === undefined || isUuid(value.authorizationSessionId)) ||
       !(value.actionFingerprint === undefined || isActionFingerprint(value.actionFingerprint)) ||
       !(value.toolApprovalRequestId === undefined || isUuid(value.toolApprovalRequestId)) ||
       !isUuid(value.toolCallId) ||
@@ -537,9 +656,26 @@ export function migrateLegacySessionRecords(
   validateSessionRecords(migratedRecords);
   return Object.freeze(migratedRecords);
 }
+/** 返回旧格式兼容投影或 Schema 3 明确声明的成员归属。 */
+export function getSessionOwnership(
+  header: ParsedSessionHeader,
+): Readonly<{ rootSessionId: string; sessionKind: SessionKind }> {
+  return header.schemaVersion === 3
+    ? Object.freeze({
+        rootSessionId: header.rootSessionId,
+        sessionKind: header.sessionKind,
+      })
+    : Object.freeze({ rootSessionId: header.sessionId, sessionKind: "primary" });
+}
+
 /** 以线性父引用和 Run 状态机校验全局身份、Tool 引用和唯一终态。 */
-export function validateSessionRecords(records: readonly SessionRecord[]): UnfinishedRun | null {
+export function validateSessionRecords(
+  records: readonly SessionRecord[],
+  header?: ParsedSessionHeader,
+): UnfinishedRun | null {
   const entryIds = new Set<string>();
+  const agentInputMessageIds = new Set<string>();
+  const ownership = header === undefined ? null : getSessionOwnership(header);
 
   const runIds = new Set<string>();
   const toolApprovalRequestIds = new Set<string>();
@@ -559,7 +695,26 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
     if (entryIds.has(record.entryId) || record.parentEntryId !== expectedParentEntryId) {
       throw new Error("Session entryId 或 parentEntryId 无效。");
     }
-    validateFactReferences(record, previousRecordsByEntryId, toolCalls);
+    validateFactReferences(record, previousRecordsByEntryId, toolCalls, ownership);
+    if (record.type === "agent_input") {
+      if (
+        agentInputMessageIds.has(record.messageId) ||
+        (ownership !== null && record.rootSessionId !== ownership.rootSessionId)
+      ) {
+        throw new Error("AgentInputRecord 归属或 messageId 无效。");
+      }
+      if (record.runId === undefined && activeRunId !== null) {
+        throw new Error("Run 中的 AgentInputRecord 必须绑定 runId。");
+      }
+      agentInputMessageIds.add(record.messageId);
+    }
+    if (
+      record.type === "coordination" &&
+      ownership !== null &&
+      ownership.sessionKind !== "primary"
+    ) {
+      throw new Error("只有根 Session 可以保存 CoordinationRecord。");
+    }
     if (isRunAssociatedFact(record) && record.runId !== undefined && record.runId !== activeRunId) {
       throw new Error("Session 事实的 runId 不属于当前打开的 Run。");
     }
@@ -576,8 +731,9 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
       continue;
     }
     if (activeRunId === null) {
-      if (record.type !== "message" || record.message.type !== "user") {
-        throw new Error("Session Run 必须由 UserMessage 开始。");
+      const startsWithUserMessage = record.type === "message" && record.message.type === "user";
+      if (!startsWithUserMessage && record.type !== "agent_input") {
+        throw new Error("Session Run 必须由 UserMessage 或 AgentInputRecord 开始。");
       }
       if (runIds.has(record.runId)) {
         throw new Error("Session runId 重复。");
@@ -591,6 +747,11 @@ export function validateSessionRecords(records: readonly SessionRecord[]): Unfin
     }
     if (record.runId !== activeRunId) {
       throw new Error("Session Run 不能交错。");
+    }
+    if (record.type === "agent_input") {
+      lastAssistantStatus = null;
+      lastAssistantHasToolCall = false;
+      continue;
     }
     if (record.type === "message") {
       if (record.message.type === "user") {
@@ -710,7 +871,10 @@ export function isValidCompactionRecord(
     new Set(record.retainedUserEntryIds).size === record.retainedUserEntryIds.length &&
     record.retainedUserEntryIds.every((entryId) => {
       const retainedRecord = previousRecordsByEntryId.get(entryId);
-      return retainedRecord?.type === "message" && retainedRecord.message.type === "user";
+      return (
+        retainedRecord?.type === "agent_input" ||
+        (retainedRecord?.type === "message" && retainedRecord.message.type === "user")
+      );
     })
   );
 }
@@ -725,6 +889,8 @@ export function deriveLastActivityAt(
     if (
       record.type === "session_use" ||
       record.type === "message" ||
+      record.type === "agent_input" ||
+      record.type === "coordination" ||
       record.type === "tool_execution_started" ||
       record.type === "run_finished"
     ) {
@@ -755,6 +921,7 @@ function validateFactReferences(
     string,
     { runId: string; toolName: string; started: boolean; resolved: boolean }
   >,
+  ownership: Readonly<{ rootSessionId: string; sessionKind: SessionKind }> | null,
 ): void {
   if (record.type === "compaction") {
     return;
@@ -768,16 +935,26 @@ function validateFactReferences(
   }
   if (record.type === "approval_decision") {
     const toolCall = previousToolCalls.get(record.toolCallId);
+    const hasUniqueAuthorizationEntries =
+      new Set(record.authorizationEntryIds).size === record.authorizationEntryIds.length;
+    const externalAuthorizationIsValid =
+      record.authorizationSessionId !== undefined &&
+      ownership !== null &&
+      ownership.sessionKind !== "primary" &&
+      record.authorizationSessionId === ownership.rootSessionId;
+    const localAuthorizationIsValid =
+      record.authorizationSessionId === undefined &&
+      record.authorizationEntryIds.every((entryId) => {
+        const authorizationRecord = previousRecordsByEntryId.get(entryId);
+        return (
+          authorizationRecord !== undefined && isTrustedAuthorizationSource(authorizationRecord)
+        );
+      });
     if (
       toolCall === undefined ||
       toolCall.toolName !== record.toolName ||
-      new Set(record.authorizationEntryIds).size !== record.authorizationEntryIds.length ||
-      record.authorizationEntryIds.some((entryId) => {
-        const authorizationRecord = previousRecordsByEntryId.get(entryId);
-        return (
-          authorizationRecord === undefined || !isTrustedAuthorizationSource(authorizationRecord)
-        );
-      })
+      !hasUniqueAuthorizationEntries ||
+      (!externalAuthorizationIsValid && !localAuthorizationIsValid)
     ) {
       throw new Error("ApprovalDecisionRecord 授权引用无效。");
     }
@@ -818,9 +995,15 @@ function validateToolExecutionApproval(
 
 function isRunAssociatedFact(
   record: SessionRecord,
-): record is CompactionRecord | RequestUsageRecord | ApprovalDecisionRecord | ContextSourceRecord {
+): record is
+  | CompactionRecord
+  | RequestUsageRecord
+  | ApprovalDecisionRecord
+  | ContextSourceRecord
+  | CoordinationRecord {
   return (
     record.type === "context_source" ||
+    record.type === "coordination" ||
     record.type === "compaction" ||
     record.type === "request_usage" ||
     record.type === "approval_decision"
@@ -829,11 +1012,16 @@ function isRunAssociatedFact(
 
 function isRunRecord(
   record: SessionRecord,
-): record is MessageRecord | ToolExecutionStartedRecord | RunFinishedRecord {
+): record is
+  | MessageRecord
+  | ToolExecutionStartedRecord
+  | RunFinishedRecord
+  | (AgentInputRecord & Readonly<{ runId: string }>) {
   return (
     record.type === "message" ||
     record.type === "tool_execution_started" ||
-    record.type === "run_finished"
+    record.type === "run_finished" ||
+    (record.type === "agent_input" && record.runId !== undefined)
   );
 }
 /** 将公开消息转换为不包含流式状态的 Schema 2 持久形状。 */
@@ -959,7 +1147,12 @@ function hasExactKeysWithOptionalApprovalFields(
   value: Record<string, unknown>,
   requiredKeys: readonly string[],
 ): boolean {
-  const optionalKeys = new Set(["runId", "actionFingerprint", "toolApprovalRequestId"]);
+  const optionalKeys = new Set([
+    "runId",
+    "authorizationSessionId",
+    "actionFingerprint",
+    "toolApprovalRequestId",
+  ]);
   return (
     requiredKeys.every((key) => Object.hasOwn(value, key)) &&
     Object.keys(value).every((key) => requiredKeys.includes(key) || optionalKeys.has(key))
@@ -1093,6 +1286,25 @@ function isSessionUseActivity(value: unknown): value is SessionUseDetails["activ
   return value === "opened" || value === "browsed";
 }
 
+function isSessionKind(value: unknown): value is SessionKind {
+  return value === "primary" || value === "subagent" || value === "teammate";
+}
+
+function isCoordinationKind(value: unknown): value is CoordinationDetails["kind"] {
+  return (
+    value === "member" ||
+    value === "team" ||
+    value === "task" ||
+    value === "delivery" ||
+    value === "worktree" ||
+    value === "git_operation"
+  );
+}
+
+function isAgentInputKind(value: unknown): value is AgentInputDetails["kind"] {
+  return value === "task" || value === "message" || value === "result";
+}
+
 function isRequestUsagePurpose(value: unknown): value is RequestUsageDetails["purpose"] {
   return value === "response" || value === "compaction" || value === "approval";
 }
@@ -1138,26 +1350,55 @@ export function isSideEffectToolName(
     value === "edit_file" ||
     value === "write_file" ||
     value === "execute_command" ||
+    value === "git" ||
+    value === "agent_spawn" ||
+    value === "agent_resume" ||
+    value === "team" ||
     (typeof value === "string" && /^mcp_[a-zA-Z0-9_-]+$/.test(value))
   );
 }
 
-function isJsonValue(value: unknown): value is JsonValue {
+export function isJsonValue(value: unknown): value is JsonValue {
+  try {
+    return isJsonValueAtDepth(value, new Set<object>(), 0);
+  } catch {
+    return false;
+  }
+}
+
+function isJsonValueAtDepth(
+  value: unknown,
+  ancestors: Set<object>,
+  depth: number,
+): value is JsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") {
     return true;
   }
   if (typeof value === "number") {
     return Number.isFinite(value);
   }
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue);
+  if (depth > 128 || typeof value !== "object") {
+    return false;
   }
-  return (
-    typeof value === "object" && Object.values(value as Record<string, unknown>).every(isJsonValue)
-  );
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  if (ancestors.has(value)) {
+    return false;
+  }
+  ancestors.add(value);
+  const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+  const valid = children.every((child) => isJsonValueAtDepth(child, ancestors, depth + 1));
+  ancestors.delete(value);
+  return valid;
 }
 
-function snapshotJsonValue(value: JsonValue): JsonValue {
+function jsonByteLength(value: JsonValue): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+export function snapshotJsonValue(value: JsonValue): JsonValue {
   if (Array.isArray(value)) {
     return Object.freeze(value.map(snapshotJsonValue));
   }

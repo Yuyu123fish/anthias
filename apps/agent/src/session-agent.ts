@@ -8,19 +8,28 @@ import {
 } from "./agent-loop.js";
 import { type ContextBudget, createContextBudget } from "./context/budget.js";
 import { type ContextUsage, createContextController } from "./context/index.js";
+import { agentInputMessage } from "./context/selection.js";
 import { createExternalCapabilities } from "./external-capabilities.js";
 import type { McpConnections } from "./mcp/index.js";
-import type { AssistantMessage, AssistantToolCallPart, Message, UserMessage } from "./message.js";
+import type {
+  AssistantMessage,
+  AssistantToolCallPart,
+  JsonValue,
+  Message,
+  UserMessage,
+} from "./message.js";
 import type { ModelStream, ModelUsage } from "./model/model-stream.js";
+import type { CollaborationSnapshot } from "./multi-agent/index.js";
 import { reviewToolApproval } from "./permission/auto-review.js";
 import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission/permission-mode.js";
 import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
 import { createSessionArtifactStore } from "./session/artifacts.js";
 import type { SessionCleanupResult } from "./session/cleanup.js";
-import type { Session, SessionRunLease } from "./session/index.js";
-import { isSideEffectToolName } from "./session/schema.js";
+import type { AgentInputDetails, Session, SessionRunLease } from "./session/index.js";
+import { isSideEffectToolName, type SessionRecord } from "./session/schema.js";
 import type { SkillLibrary } from "./skill/index.js";
 import { getToolDefinitions } from "./tool/definitions.js";
+import type { AgentToolExtension } from "./tool/managed-tool.js";
 import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
@@ -51,6 +60,8 @@ export type ToolApprovalRequest = Readonly<{
   toolApprovalRequestId: string;
   toolCallId: string;
   toolName: string;
+  memberSessionId?: string;
+  memberName?: string;
   target: string;
   preview: string;
   permissionMode: PermissionMode;
@@ -81,6 +92,7 @@ export type AgentState = Readonly<{
   pendingToolApproval: ToolApprovalRequest | null;
   running: boolean;
   lastError: string | null;
+  collaboration?: CollaborationSnapshot;
 }>;
 
 /** 枚举一个已接受 Run 的公开终态。 */
@@ -99,6 +111,7 @@ export type PromptResult =
 
 /** 枚举 Agent 按实际发生顺序同步发布的瞬时事件。 */
 export type AgentEvent =
+  | Readonly<{ type: "collaboration_changed"; snapshot: CollaborationSnapshot }>
   | Readonly<{ type: "operation_changed"; operation: AgentOperation }>
   | Readonly<{ type: "session_changed"; sessionId: string }>
   | Readonly<{ type: "skills_changed" }>
@@ -165,6 +178,8 @@ export type AgentListener = (event: AgentEvent) => void;
 export type SessionAgent = Readonly<{
   readonly state: AgentState;
   prompt(promptText: string): Promise<PromptResult>;
+  promptInternal(input: AgentInputDetails): Promise<PromptResult>;
+  runTool(toolName: string, input: JsonValue): Promise<PromptResult>;
   setPermissionMode(permissionMode: PermissionMode): PermissionModeChangeResult;
   respondToToolApproval(
     toolApprovalRequestId: string,
@@ -180,6 +195,10 @@ export type SessionAgent = Readonly<{
 /** 配置内部 Model Stream 与已打开 Session 的 Agent 运行宿主。 */
 export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
+  worktreeDirectory?: string;
+  managedTools?: AgentToolExtension;
+  beforeRequest?: (lease: SessionRunLease, signal: AbortSignal) => Promise<void>;
+  authorizationRecords?: () => readonly SessionRecord[];
   modelContext?: Readonly<{ modelId: string; budget: ContextBudget }>;
   session: Session;
   skills?: SkillLibrary;
@@ -248,6 +267,9 @@ export function createSessionAgent({
   startCleanup,
   skills,
   mcp,
+  managedTools,
+  beforeRequest,
+  authorizationRecords,
 }: CreateAgentWithModelStreamOptions): SessionAgent {
   const messageHistory: Message[] = [...session.messageHistory];
   const contextBudget = modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 });
@@ -297,7 +319,9 @@ export function createSessionAgent({
     });
   const toolRunner: ToolRunner = {
     createPlan: (call, mode) =>
-      external.createPlan(call, mode) ?? localToolRunner.createPlan(call, mode),
+      managedTools?.createPlan(call, mode) ??
+      external.createPlan(call, mode) ??
+      localToolRunner.createPlan(call, mode),
   };
   const eventListeners = new Set<AgentListener>();
   let permissionMode = initialPermissionMode;
@@ -513,6 +537,9 @@ export function createSessionAgent({
         decision: details.decision,
         reason,
         authorizationEntryIds: details.authorizationEntryIds,
+        ...(authorizationRecords && details.authorizationEntryIds.length
+          ? { authorizationSessionId: session.rootSessionId }
+          : {}),
         actionFingerprint: details.actionFingerprint,
         toolApprovalRequestId: details.toolApprovalRequestId,
       });
@@ -574,7 +601,7 @@ export function createSessionAgent({
       const reviewResult = await reviewToolApproval({
         modelStream,
         budget: contextBudget,
-        records: session.records,
+        records: authorizationRecords?.() ?? session.records,
         workspaceRoot: session.workspaceRoot,
         toolCall,
         approvalPlan,
@@ -612,7 +639,11 @@ export function createSessionAgent({
   }
 
   /** 在异步获取 lease 之前登记整个 prompt，关闭流程也能等待尚未开始的 Run。 */
-  function prompt(promptText: string): Promise<PromptResult> {
+  function prompt(
+    promptText: string,
+    internalInput?: AgentInputDetails,
+    controlCall?: AssistantToolCallPart,
+  ): Promise<PromptResult> {
     if (closeRequested) {
       return Promise.resolve(CLOSED_PROMPT_RESULT);
     }
@@ -621,7 +652,7 @@ export function createSessionAgent({
     }
     const promptCompletion = Promise.withResolvers<PromptResult>();
     ownedPromptResultPromise = promptCompletion.promise;
-    void submitPrompt(promptText).then(
+    void submitPrompt(promptText, internalInput, controlCall).then(
       (result) => {
         ownedPromptResultPromise = null;
         promptCompletion.resolve(result);
@@ -664,7 +695,11 @@ export function createSessionAgent({
   }
 
   /** 接纳提示词、建立一次 Run，并把实际迭代委托给 Agent Loop。 */
-  async function submitPrompt(promptText: string): Promise<PromptResult> {
+  async function submitPrompt(
+    promptText: string,
+    internalInput?: AgentInputDetails,
+    controlCall?: AssistantToolCallPart,
+  ): Promise<PromptResult> {
     if (promptText.trim().length === 0) {
       return EMPTY_PROMPT_RESULT;
     }
@@ -719,10 +754,13 @@ export function createSessionAgent({
     };
     activeRun = currentRun;
 
-    const userMessage: UserMessage = Object.freeze({ role: "user", content: promptText });
+    const userMessage: UserMessage = internalInput
+      ? agentInputMessage(internalInput)
+      : Object.freeze({ role: "user", content: promptText });
     try {
       // UserMessage 刷新成功后 Run 才算被接受，后续事件与 Tool 才能开始。
-      await currentRun.sessionLease.appendMessage(userMessage);
+      if (internalInput) await currentRun.sessionLease.appendAgentInput(internalInput);
+      else await currentRun.sessionLease.appendMessage(userMessage);
     } catch {
       return failBeforeRunStart(currentRun);
     }
@@ -739,6 +777,8 @@ export function createSessionAgent({
       let contextFailure: string | null = null;
       const contextModelStream = contextController.wrapRun({
         lease: currentRun.sessionLease,
+        beforeRequest: (signal) =>
+          beforeRequest?.(currentRun.sessionLease, signal) ?? Promise.resolve(),
         extendRequest: (request) => external.project(request, currentRun.permissionMode),
         emit: (event) => {
           if (event.type === "context_usage") publishEvent(event);
@@ -760,13 +800,16 @@ export function createSessionAgent({
       });
       const loopResult = await runAgentLoop({
         messages: messageHistory,
-        modelStream: contextModelStream.modelStream,
+        modelStream: controlCall ? controlToolStream(controlCall) : contextModelStream.modelStream,
         systemPrompt: createCodingSystemPrompt(
           session.workspaceRoot,
           session.shell,
           currentRun.permissionMode,
         ),
-        toolDefinitions: getToolDefinitions(currentRun.permissionMode),
+        toolDefinitions: [
+          ...getToolDefinitions(currentRun.permissionMode),
+          ...(managedTools?.definitions(currentRun.permissionMode) ?? []),
+        ],
         permissionMode: currentRun.permissionMode,
         toolRunner,
         abortController: currentRun.abortController,
@@ -1014,6 +1057,21 @@ export function createSessionAgent({
       return createStateSnapshot();
     },
     prompt,
+    promptInternal(input) {
+      if (input.rootSessionId !== session.rootSessionId)
+        return Promise.resolve({ status: "failed", error: "内部输入的根 Session 不匹配。" });
+      return prompt(input.content, input);
+    },
+    runTool(toolName, input) {
+      const call: AssistantToolCallPart = {
+        type: "tool_call",
+        toolCallId: randomUUID(),
+        toolName,
+        input,
+        invalid: false,
+      };
+      return prompt("用户直接执行 " + toolName + "：\n" + JSON.stringify(input), undefined, call);
+    },
     external,
     async compact(signal: AbortSignal) {
       await contextController.compact(
@@ -1057,4 +1115,22 @@ function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResu
     case "failed":
       return Object.freeze({ status: "failed", error: loopResult.error });
   }
+}
+
+/** 用户命令沿现有 Run、审批与 Tool Loop 执行，不为确定动作额外请求 Provider。 */
+function controlToolStream(call: AssistantToolCallPart): ModelStream {
+  let issued = false;
+  return async function* () {
+    if (!issued) {
+      issued = true;
+      yield {
+        type: "tool_call",
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        input: call.input,
+        invalid: false,
+      };
+      yield { type: "finish", finishReason: "tool_calls" };
+    } else yield { type: "finish", finishReason: "stop" };
+  };
 }

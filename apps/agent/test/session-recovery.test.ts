@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "../src/message.js";
+import { readSessionHistory } from "../src/session/history.js";
 import { createSession, openSession, type SessionShell } from "../src/session/index.js";
 import { readSessionJournal } from "../src/session/journal.js";
 import { getSessionStorageRelativeDirectory } from "../src/session/locations.js";
@@ -700,6 +701,106 @@ describe("Session recovery storage", () => {
     });
   });
 
+  it("reads member history after its workspace is missing without projecting AgentInput", async () => {
+    const storageRoot = await createTemporaryDirectory("anthias-session-history-store-");
+    const workspaceRoot = await createTemporaryDirectory("anthias-session-history-worktree-");
+    const sessionDirectory = join(storageRoot, "sessions");
+    const rootSessionId = randomUUID();
+    const member = await createSession({
+      workspaceRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+    const acquisition = await member.acquireRun(randomUUID());
+    expect(acquisition.status).toBe("acquired");
+    if (acquisition.status !== "acquired") throw new Error("expected member Run lease");
+    await acquisition.lease.appendAgentInput({
+      messageId: randomUUID(),
+      rootSessionId,
+      fromSessionId: rootSessionId,
+      kind: "task",
+      content: "source task",
+    });
+    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
+    await acquisition.lease.appendRunFinished({ status: "completed" });
+    await acquisition.lease.release();
+    await member.close();
+    await rm(workspaceRoot, { recursive: true });
+
+    const history = await readSessionHistory({
+      sessionDirectory,
+      sessionId: member.sessionId,
+      rootSessionId,
+    });
+    expect(history.header).toMatchObject({
+      schemaVersion: 3,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+    expect(history.records.some((record) => record.type === "agent_input")).toBe(true);
+    expect(history.messages).toEqual([ASSISTANT_MESSAGE]);
+    await expect(
+      readSessionHistory({
+        sessionDirectory,
+        sessionId: member.sessionId,
+        rootSessionId: randomUUID(),
+      }),
+    ).rejects.toThrow("不属于请求的根 Session");
+  });
+
+  it("reads Schema 2 without migration and upgrades it only for coordination", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-schema2-upgrade-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    await mkdir(sessionDirectory);
+    const sessionId = randomUUID();
+    const createdAt = "2026-04-05T06:07:08.901Z";
+    const header = {
+      type: "session_header" as const,
+      schemaVersion: 2 as const,
+      sessionId,
+      createdAt,
+      workspaceRoot: fixtureRoot,
+      shell: TEST_SHELL,
+    };
+    const relativeDirectory = getSessionStorageRelativeDirectory(header);
+    const storageDirectory = join(sessionDirectory, relativeDirectory);
+    await mkdir(storageDirectory, { recursive: true });
+    await writeFile(join(storageDirectory, "session.jsonl"), `${JSON.stringify(header)}\n`);
+
+    expect((await readSessionHistory({ sessionDirectory, sessionId })).header.schemaVersion).toBe(
+      2,
+    );
+    expect(
+      (await readSessionJournal(join(storageDirectory, "session.jsonl"))).header.schemaVersion,
+    ).toBe(2);
+
+    const session = await openSession({
+      sessionId,
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    expect(
+      (await readSessionJournal(join(storageDirectory, "session.jsonl"))).header.schemaVersion,
+    ).toBe(2);
+    await session.appendCoordination({
+      kind: "team",
+      key: randomUUID(),
+      payload: { status: "closed" },
+    });
+    const upgraded = await readSessionJournal(join(storageDirectory, "session.jsonl"));
+    expect(upgraded.header).toEqual({
+      ...header,
+      schemaVersion: 3,
+      rootSessionId: sessionId,
+      sessionKind: "primary",
+    });
+    expect(session.storageDirectory).toBe(storageDirectory);
+    expect(upgraded.records.at(-1)).toMatchObject({ type: "coordination", kind: "team" });
+    await session.close();
+  });
   it("accepts another opener's use record, retains independent markers, and closes idempotently", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-use-marker-");
     const sessionDirectory = join(fixtureRoot, "sessions");

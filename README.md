@@ -1,21 +1,14 @@
 # Anthias
 
-Anthias 是一个本地优先、交互形态无关的可分叉 Coding Agent。
+Anthias 是一个本地优先、交互形态无关的 Coding Agent。
 
-它把一次编码任务表示为一棵可以产生不同候选方向的执行树：用户可以从共同检查点创建互不覆盖的执行分支，让不同方案分别继续，再比较并选择后续采用的方向。
-
-    编码任务
-      └─ 共同检查点
-           ├─ 执行分支 A → 候选结果 A
-           └─ 执行分支 B → 候选结果 B
-                             ↓
-                        用户比较和选择
-
-执行分支是产品概念，不等同于 Git 分支、对话分支或多 Agent。当前路线也不包含 Agent 自我进化。
+已确认的后续方向是工程验证：把开发者对系统的疑问转化为可执行、可复现的验证，并根据实际证据解释结果。验证对象可以是页面、接口、命令行程序、并发逻辑、性能或数据一致性；缺少数据和验证手段时，Agent 可以利用工具与 Coding 能力准备数据、编写脚本和检查程序。这一方向待后续 Feature 实现。
 
 ## 当前重点
 
-Anthias 先建立一个可复用的 Coding Harness，再逐步完善交互体验、上下文管理和执行分叉。当前 Coding Harness 已形成模型对话、线性 Session、基础 Tool、工作区操作、权限与安全策略的本地闭环，并继续与具体界面分离：
+当前优先补齐 Coding Agent 剩余的基本功能，完善实际编码、上下文、运行控制和交互体验，再推进工程验证能力。下一项基础功能根据当前代码与实际使用缺口单独确定。
+
+当前 Coding Harness 已形成模型对话、线性 Session、基础 Tool、工作区操作、权限与安全策略的本地闭环，并继续与具体界面分离：
 
     Anthias Agent（运行核心）
       ├─ TUI 适配器（首个交互入口）
@@ -47,7 +40,8 @@ Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复�
 - [Feature 004](specs/feature004-tui-workspace-experience/spec.md) 的四个 Plan 已完成本地实现：可从任意目录或 `--workspace` 启动，Session 集中保存到 Anthias `data/conversation`；TUI 使用 `><°>` 分叉尾鱼标识、稳定 scrollback、动态运行区和常驻完整工作路径，并呈现 Visible Reasoning、可分页详情、Tool 活动、安全文件引用及 Shiki 代码高亮。自动门禁与 Windows ConPTY loopback 已通过；真实 DeepSeek 冒烟和 Windows Terminal 主观视觉检查仍是验收边界，因此 Feature 暂保持“实施中”。
 - [Feature 005](specs/feature005-context-engineering/spec.md) 已于 2026-09-05 由开发者验收，包含请求前预算、自动 Compaction、历史与模型上下文分离、Schema 2 恢复索引、按 UTC 时间归档、工具原文及 `read_artifact`、启动时清理两周未使用的会话，以及 AutoAllow 独立审核。`/context` 查看窗口与累计用量；[实施报告](specs/feature005-context-engineering/report.md) 记录实际验证边界。
 - [Feature 006](specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏固定面板与应用内滚动、流式 Markdown、统一 `/` 命令、会话切换与手动压缩、按需加载外部 Skill、显式连接 MCP。当前全屏交互替代 Feature 004 的 scrollback 方案；[实施报告](specs/feature006-command-skill-mcp-tui/report.md) 记录本地验证，等待开发者终端体验验收。
-- 可用的对话 fork、执行分叉、候选比较和 Desktop 尚未实现。
+- [Feature 007](specs/feature007-multi-agent/spec.md) 已实现 SubAgent、AgentTeam 与本地 Git/worktree；复用现有 Agent，最多三个成员，可写成员从固定提交隔离执行。来源授权、Schema 3 历史、显式继续和组清理已完成本地验证，等待开发者验收；使用方式见 [Quick Start](quick-start.md#multiagent-与本地-git)，证据见 [实施报告](specs/feature007-multi-agent/report.md)。
+- 工程验证方向尚未进入对应 Feature；Desktop 尚未实现。执行分叉已退出产品核心路线，不再作为必须实现的后续目标。
 
 ## 文档入口
 

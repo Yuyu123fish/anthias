@@ -8,6 +8,7 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
+import { collaborationStatus } from "./multi-agent-view.js";
 import { createTerminal } from "./terminal.js";
 import {
   type ConversationView,
@@ -170,6 +171,9 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   }
   function plainEvent(event: AgentEvent): void {
     switch (event.type) {
+      case "collaboration_changed":
+        write("\n" + collaborationStatus(event.snapshot).replace(/^ · /u, "") + "\n");
+        break;
       case "session_changed":
         write(
           `\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${{ agent: "Agent", plan: "Plan", auto_allow: "AutoAllow" }[agent.state.permissionMode]}\n`,

@@ -78,6 +78,12 @@ export async function createAgentFromEnvironment({
     return createAgentCreationFailure("storage_unavailable", "Session Directory 必须是绝对路径。");
   }
   const normalizedSessionDirectory = resolve(sessionDirectory);
+  const worktreeDirectory = environment.ANTHIAS_WORKTREE_DIR?.trim();
+  if (worktreeDirectory && !isAbsolute(worktreeDirectory))
+    return createAgentCreationFailure(
+      "storage_unavailable",
+      "ANTHIAS_WORKTREE_DIR 必须是绝对路径。",
+    );
 
   try {
     const shell = await resolveSessionShell(environment);
@@ -101,8 +107,18 @@ export async function createAgentFromEnvironment({
         createSkillLibrary({ workspaceRoot: normalizedWorkspaceRoot, environment }),
         createMcpConnections({ workspaceRoot: normalizedWorkspaceRoot, environment }),
       ]);
+      if (session.sessionKind !== "primary") {
+        await session.close();
+        return createAgentCreationFailure(
+          "invalid_session",
+          "这是成员 Session，请打开根 Session " +
+            session.rootSessionId +
+            "，再使用 /agent resume 继续。",
+        );
+      }
       const agent = createAgentWithModelStream({
         modelStream,
+        ...(worktreeDirectory ? { worktreeDirectory: resolve(worktreeDirectory) } : {}),
         skills,
         mcp,
         modelContext: {

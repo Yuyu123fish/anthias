@@ -11,13 +11,15 @@
 
 ## 产品边界
 
-- Anthias 是本地优先、交互形态无关的可分叉 Coding Agent；当前先建立可信、可复用的 Coding Harness，复杂分叉由后续 Feature 实现。
+- Anthias 是本地优先、交互形态无关的 Coding Agent；后续产品方向是围绕工程问题构造可执行、可复现的验证，并根据实际证据解释结果。
 - TUI 是首个交互入口，Desktop 是未来可选的 Adapter。两者应使用同一个 Agent Interface，不各自持有业务生命周期。
 - Agent 持有消息、模型运行以及后续 Tool 和工作区副作用；交互 Adapter 只负责输入与呈现。
-- 执行分支是产品概念，不等同于 Git 分支、只复制消息的对话分支、多 Agent 或 Agent 自我进化；具体实现机制尚未确认。
+- 工程验证不限于页面或全栈项目，也涵盖接口、命令行、并发、性能、数据一致性和故障恢复；可利用工具或 Coding 能力补齐数据与验证手段，仍受现有权限与资源边界约束。
+- 执行分叉已退出核心产品路线；Git worktree 等隔离机制按具体任务需要选择。为验证任务编写脚本不构成 Agent 自我进化的产品授权。
 - Java/JVM/Maven/JLine 路线，以及旧的 Electron Desktop、独立 Host、JSON-RPC 和 Feature 001 实现均已撤销。
 - Feature 001–003 已累计形成 Agent Loop、线性 Session、六个固定 Tool、权限与安全策略和只读有界并发；Feature 003 已由开发者验收。Feature 005 已于 2026-09-05 验收，补齐上下文压缩、产物与会话清理、AutoAllow，并完成其 Report 所列的限量 DeepSeek V4 Flash 冒烟；后续真实 Provider 验证继续单独授权，当前没有 OS 沙箱。
-- 后续设计先完成模型对话、Tool、本地能力和上下文等 Coding Harness 闭环，再证明从共同检查点分叉、独立推进、比较并选择的核心价值。
+- Feature 007 已实现，待开发者验收；涉及成员权限、Git 成果交付或协作历史恢复时读取 [Spec](specs/feature007-multi-agent/spec.md) 与 [Report](specs/feature007-multi-agent/report.md)。
+- 当前优先补齐 Coding Agent 剩余基本功能；工程验证方向已确认，留待后续 Feature，不提前建设专用验证框架、数据平台或证据存储接口。下一项基础功能按当前代码与实际使用缺口单独确认。
 
 ## 代码与运行时
 
@@ -26,7 +28,7 @@
 - TUI 与 Agent 首期在同一进程直接协作。Agent 以有序 AgentEvent 发布变化；未来 Desktop Adapter 可以转发同一事件，不要求现在创建 Electron、Host 或协议层。
 - Model Stream 是 Agent Module 的内部 seam：生产 Adapter 使用通用 OpenAI-compatible 接口，Agent 内部测试 Adapter 使用确定性本地流；Model Stream、模型消息、AI SDK 和 Provider 类型不得从 Agent package 入口导出。
 - TUI 不读取模型配置，不构造 Provider 或 Model Stream，也不依赖 AI SDK；它只接收已创建的 Agent，负责输入、呈现、停止和退出。
-- 当前 TUI 使用独立 pi TUI 的全屏终端、固定面板与应用内滚动；命令只调用 Agent 的会话、压缩、Skill、MCP 语义行为。Skill 正文按需加载，MCP 由用户显式连接；外部内容保存为有来源的上下文事实，权限与资源仍由 Agent 持有。Feature 006 的本地验证见对应 Report，主观终端体验仍待开发者验收。
+- 当前 TUI 使用独立 pi TUI 的全屏终端、固定面板与应用内滚动；命令只调用 Agent 的会话、压缩、Skill、MCP、协作与 Git 语义行为。Skill 正文按需加载，MCP 由用户显式连接；外部内容保存为有来源的上下文事实，权限与资源仍由 Agent 持有。Feature 006 的本地验证见对应 Report，主观终端体验仍待开发者验收。
 - DeepSeek V4 Flash 只是 OpenAI-compatible 日常参考配置，不得产生模型专用 Provider、枚举或条件分支。
 - 普通函数和判别联合足以表达的行为不增加类层级、Registry、Manager 或为未来变化预建的 Interface。
 - 终端状态、AbortController、模型流以及后续线程、进程、文件句柄和网络请求必须有明确持有者、取消方式和关闭时机。

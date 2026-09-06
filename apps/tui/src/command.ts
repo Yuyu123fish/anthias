@@ -1,8 +1,25 @@
 import type { Agent, ContextUsage, PermissionMode } from "@anthias/agent";
 import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./content-renderer.js";
+import { runCollaborationCommand } from "./multi-agent-view.js";
 
 const COMMANDS = [
+  { name: "agents", argumentHint: "", description: "成员、Team 与任务状态" },
+  {
+    name: "agent",
+    argumentHint: "[spawn|result|wait|stop|release|resume ...]",
+    description: "委派与成员历史",
+  },
+  {
+    name: "team",
+    argumentHint: "[create|add|assign|message|tasks|close ...]",
+    description: "持续团队协作",
+  },
+  {
+    name: "git",
+    argumentHint: "[status|create|commit|integrate ...]",
+    description: "本地 Git 与 worktree",
+  },
   { name: "help", argumentHint: "", description: "命令与快捷键" },
   { name: "new", argumentHint: "", description: "新建当前工作区的会话" },
   { name: "resume", argumentHint: "[id]", description: "列出或恢复会话" },
@@ -38,6 +55,15 @@ export function commandHelp(): string {
         `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ""}  ${command.description}`,
     ),
     "",
+    "/agent spawn [--write] <任务> | result <id> [offset] | wait <id> | stop <id> | release <id> | resume <id> [任务]",
+    "/agent artifact <id> <artifactId> [cursor]",
+    "/team create <名称> | add [--write] <任务> | assign <id> <任务> | message <id> <消息> | tasks | close",
+    "/git status|diff|log [worktreeId] | show [ref] | branches | worktrees",
+    "/git create [ref] | inspect <id> | remove <id> [discard]",
+    '/git commit {"paths":["文件路径"],"message":"提交说明","worktreeId":"可选"}',
+    "/git integrate <worktreeId> <commit> | continue | abort",
+    "可写成员从已提交版本创建；主目录未提交修改不会带入。",
+    "",
     "/mcp connect <id> | disconnect <id> | inspect <id>",
     "/mcp read <id> <uri>",
     '/mcp prompt <id> <name> [{"参数名":"值"}]',
@@ -66,7 +92,52 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
                 ? ["prev", "next"]
                 : command.name === "mcp"
                   ? ["connect", "disconnect", "inspect", "read", "prompt"]
-                  : [];
+                  : command.name === "agent"
+                    ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
+                    : command.name === "team"
+                      ? ["create", "add", "assign", "message", "tasks", "close"]
+                      : command.name === "git"
+                        ? [
+                            "status",
+                            "diff",
+                            "log",
+                            "show",
+                            "branches",
+                            "worktrees",
+                            "create",
+                            "inspect",
+                            "remove",
+                            "commit",
+                            "integrate",
+                            "continue",
+                            "abort",
+                          ]
+                        : [];
+        if ((command.name === "agent" || command.name === "team") && prefix.includes(" ")) {
+          const operation = prefix.split(/\s+/u)[0] ?? "";
+          if (
+            [
+              "result",
+              "artifact",
+              "wait",
+              "stop",
+              "release",
+              "resume",
+              "assign",
+              "message",
+            ].includes(operation)
+          ) {
+            const memberPrefix = prefix.slice(operation.length).trimStart();
+            return agent.collaboration
+              .snapshot()
+              .members.filter((member) => member.sessionId.startsWith(memberPrefix))
+              .map((member) => ({
+                value: operation + " " + member.sessionId,
+                label: member.sessionId,
+                description: sanitizeTerminalText(member.name + " · " + member.status),
+              }));
+          }
+        }
         if (command.name === "resume") {
           const result = await agent.sessions.list();
           return result.ok
@@ -125,6 +196,7 @@ export async function executeCommand(
   const { agent, notice } = options;
   const argumentsText = command.argumentsText.trim();
   const args = argumentsText ? argumentsText.split(/\s+/u) : [];
+  if (await runCollaborationCommand(command.name, argumentsText, agent, notice)) return;
   const report = (result: { ok: boolean; error?: string }, success: string) =>
     notice(result.ok ? success : (result.error ?? "操作失败。"));
   const invalid = () => notice(`参数无效。使用 /help 查看 /${command.name} 的用法。`);

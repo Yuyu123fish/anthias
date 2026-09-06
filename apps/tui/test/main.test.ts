@@ -148,7 +148,9 @@ describe("Anthias CLI", () => {
     ) as Record<string, unknown>;
     expect(sessionHeader).toMatchObject({
       type: "session_header",
-      schemaVersion: 2,
+      schemaVersion: 3,
+      sessionKind: "primary",
+      rootSessionId: sessionId,
       sessionId,
       workspaceRoot: normalizedWorkspaceRoot,
     });

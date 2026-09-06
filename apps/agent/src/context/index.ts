@@ -14,7 +14,12 @@ import {
   measureRequest,
   type UsageAnchor,
 } from "./request.js";
-import { createCompactionMessage, projectContextHistory, selectCompaction } from "./selection.js";
+import {
+  createCompactionMessage,
+  includeAgentInputs,
+  projectContextHistory,
+  selectCompaction,
+} from "./selection.js";
 
 type RequestPurpose = RequestUsageDetails["purpose"];
 export type RequestUsageTotals = Readonly<{
@@ -115,6 +120,7 @@ export function createContextController(options: {
     lease: Pick<SessionRunLease, "appendCompaction" | "appendRequestUsage">;
     manual?: boolean;
     extendRequest?: (request: ModelRequest) => ModelRequest;
+    beforeRequest?: (signal: AbortSignal) => Promise<void>;
     emit: (event: ContextEvent) => void;
     onFailure: (error: string) => void;
     onStorageFailure: () => void;
@@ -142,6 +148,11 @@ export function createContextController(options: {
     }
 
     const requestWithContext: ModelStream = async function* (rawRequest, abortSignal) {
+      await run.beforeRequest?.(abortSignal);
+      rawRequest = {
+        ...rawRequest,
+        messages: includeAgentInputs(session.records ?? [], rawRequest.messages),
+      };
       const originalRequest = rawRequest;
       rawRequest = run.extendRequest?.(rawRequest) ?? rawRequest;
       externalTokens =
@@ -168,7 +179,9 @@ export function createContextController(options: {
         budget.safetyTokens -
         Math.max(budget.responseOutputTokens, budget.summaryOutputTokens);
       const latestMessage = () =>
-        (session.records ?? []).findLast((record) => record.type === "message");
+        (session.records ?? []).findLast(
+          (record) => record.type === "message" || record.type === "agent_input",
+        );
       const requestEntryId = latestMessage()?.entryId ?? null;
       let compactionAttempted = false;
 

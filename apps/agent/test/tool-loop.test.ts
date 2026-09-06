@@ -75,6 +75,14 @@ describe("read-only Agent Tool Loop", () => {
       "edit_file",
       "write_file",
       "execute_command",
+      "agent_spawn",
+      "agent_list",
+      "agent_wait",
+      "agent_stop",
+      "agent_result",
+      "agent_resume",
+      "team",
+      "git",
     ]);
     expect(modelRequests[0]?.systemPrompt).toContain(workspaceRoot);
     expect(modelRequests[3]?.messages.map((message) => message.role)).toEqual([

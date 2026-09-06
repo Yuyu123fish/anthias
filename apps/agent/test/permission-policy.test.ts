@@ -47,7 +47,21 @@ describe("Permission Mode", () => {
       "glob",
       "grep",
       "read_artifact",
+      "agent_spawn",
+      "agent_list",
+      "agent_wait",
+      "agent_stop",
+      "agent_result",
+      "agent_resume",
+      "team",
+      "git",
     ]);
+    const gitDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "git");
+    expect(gitDefinition?.inputSchema.properties?.action).toMatchObject({
+      enum: expect.not.arrayContaining(["commit", "create", "integrate"]),
+    });
+    const spawnDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "agent_spawn");
+    expect(spawnDefinition?.inputSchema.properties?.writable).toMatchObject({ const: false });
     expect(modelRequests[0]?.systemPrompt).toContain("Plan 模式");
     expect(modelRequests[0]?.systemPrompt).toContain("不得请求或声称已经产生");
     expect(modelRequests[0]?.systemPrompt).not.toContain("修改后运行相关验证");
@@ -91,6 +105,14 @@ describe("Permission Mode", () => {
       "glob",
       "grep",
       "read_artifact",
+      "agent_spawn",
+      "agent_list",
+      "agent_wait",
+      "agent_stop",
+      "agent_result",
+      "agent_resume",
+      "team",
+      "git",
     ]);
 
     releaseModel.resolve();

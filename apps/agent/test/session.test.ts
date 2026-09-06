@@ -63,7 +63,7 @@ describe("Session", () => {
     ).rejects.toThrow("没有可用的 pwsh");
   });
 
-  it("creates one newline-terminated Schema 2 header in its UTC storage directory", async () => {
+  it("creates one newline-terminated Schema 3 primary header in its UTC storage directory", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-create-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     await mkdtemp(join(fixtureRoot, "workspace-seed-"));
@@ -88,8 +88,10 @@ describe("Session", () => {
     const sessionHeader = JSON.parse(sessionText.trimEnd()) as Record<string, unknown>;
     expect(sessionHeader).toEqual({
       type: "session_header",
-      schemaVersion: 2,
+      schemaVersion: 3,
       sessionId: session.sessionId,
+      rootSessionId: session.sessionId,
+      sessionKind: "primary",
       createdAt: expect.any(String),
       workspaceRoot: existingWorkspaceRoot,
       shell: TEST_SHELL,
@@ -109,6 +111,248 @@ describe("Session", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("validates preallocated member ownership", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-member-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    const rootSessionId = randomUUID();
+    const memberSessionId = randomUUID();
+    const member = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+      sessionId: memberSessionId,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+
+    expect(member).toMatchObject({
+      sessionId: memberSessionId,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+    const header = parseRecord(
+      (await readFile(join(member.storageDirectory, "session.jsonl"), "utf8")).trimEnd(),
+    );
+    expect(header).toMatchObject({
+      schemaVersion: 3,
+      sessionId: memberSessionId,
+      rootSessionId,
+      sessionKind: "subagent",
+    });
+    await expect(
+      createSessionRuntime({
+        workspaceRoot: fixtureRoot,
+        sessionDirectory,
+        shell: TEST_SHELL,
+        sessionId: randomUUID(),
+        rootSessionId,
+        sessionKind: "primary",
+      }),
+    ).rejects.toThrow("成员身份无效");
+  });
+
+  it("serializes standalone, Run acquisition, and held-Run coordination while sourced input stays out of messages", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-coordination-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    const rootRunId = randomUUID();
+    let rootForConcurrentAcquisition: Session | null = null;
+    let startConcurrentRun = false;
+    const concurrentRunAcquisition: { promise?: ReturnType<Session["acquireRun"]> } = {};
+    const coordinationLockSystem = Object.freeze({
+      processId: process.pid,
+      createOwnerToken() {
+        if (startConcurrentRun) {
+          startConcurrentRun = false;
+          if (rootForConcurrentAcquisition === null) {
+            throw new Error("expected root Session before concurrent acquisition");
+          }
+          // 在独立追加已创建锁目录时发起同实例 Run，固定复现两条获取路径争锁的窗口。
+          concurrentRunAcquisition.promise = rootForConcurrentAcquisition.acquireRun(rootRunId);
+        }
+        return randomUUID();
+      },
+      createTimestamp: () => new Date().toISOString(),
+      inspectProcess: () => "alive" as const,
+    });
+    const root = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+      lockSystem: coordinationLockSystem,
+    });
+    rootForConcurrentAcquisition = root;
+    const member = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+      rootSessionId: root.sessionId,
+      sessionKind: "teammate",
+    });
+
+    const standaloneCoordinationWrites = [
+      root.appendCoordination({
+        kind: "team",
+        key: randomUUID(),
+        payload: { status: "active" },
+      }),
+      root.appendCoordination({
+        kind: "delivery",
+        key: randomUUID(),
+        payload: { status: "queued" },
+      }),
+    ];
+    await Promise.all(standaloneCoordinationWrites);
+    expect(
+      root.records
+        .filter((record) => record.type === "coordination")
+        .every((record) => record.runId === undefined),
+    ).toBe(true);
+    startConcurrentRun = true;
+    await root.appendCoordination({
+      kind: "team",
+      key: randomUUID(),
+      payload: { status: "active" },
+    });
+    const pendingRootRunAcquisition = concurrentRunAcquisition.promise;
+    if (pendingRootRunAcquisition === undefined) {
+      throw new Error("expected concurrent Session Run acquisition");
+    }
+    const rootRunAcquisition = await pendingRootRunAcquisition;
+    expect(rootRunAcquisition.status).toBe("acquired");
+    if (rootRunAcquisition.status !== "acquired") {
+      throw new Error(`expected acquired Session Run, received ${rootRunAcquisition.reason}`);
+    }
+    const rootLease = rootRunAcquisition.lease;
+    activeRunLeases.add(rootLease);
+    await rootLease.appendMessage({ role: "user", content: "coordinate" });
+    const firstCoordination = root.appendCoordination({
+      kind: "member",
+      key: member.sessionId,
+      payload: { sessionId: member.sessionId, status: "running" },
+    });
+    const secondCoordination = root.appendCoordination({
+      kind: "task",
+      key: randomUUID(),
+      payload: { status: "pending" },
+    });
+    await Promise.all([firstCoordination, secondCoordination]);
+    await rootLease.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "coordinated" }],
+      status: "completed",
+    });
+    const finishWrite = rootLease.appendRunFinished({ status: "completed" });
+    const releaseWriteLock = rootLease.release();
+    const coordinationDuringRelease = root.appendCoordination({
+      kind: "team",
+      key: randomUUID(),
+      payload: { status: "closed" },
+    });
+    await Promise.all([finishWrite, releaseWriteLock, coordinationDuringRelease]);
+    const coordinationRecords = root.records.filter((record) => record.type === "coordination");
+    expect(coordinationRecords).toHaveLength(6);
+    expect(coordinationRecords.slice(3, 5).every((record) => record.runId === rootRunId)).toBe(
+      true,
+    );
+    expect(coordinationRecords.at(-1)?.runId).toBeUndefined();
+    expectValidRecordChain(root.records as readonly Record<string, unknown>[]);
+
+    const nextRootRunId = randomUUID();
+    const coordinationBeforeInputKey = randomUUID();
+    const nextRunAcquisitionPromise = root.acquireRun(nextRootRunId);
+    // acquisition 尚未向调用方交付 lease 时，后续协调事实不能抢先成为 Run 首记录。
+    const coordinationBeforeInputPromise = root.appendCoordination({
+      kind: "team",
+      key: coordinationBeforeInputKey,
+      payload: { status: "active" },
+    });
+    const nextRunAcquisition = await nextRunAcquisitionPromise;
+    expect(nextRunAcquisition.status).toBe("acquired");
+    if (nextRunAcquisition.status !== "acquired") {
+      throw new Error(`expected acquired Session Run, received ${nextRunAcquisition.reason}`);
+    }
+    const nextRootLease = nextRunAcquisition.lease;
+    activeRunLeases.add(nextRootLease);
+    await coordinationBeforeInputPromise;
+    const coordinationBeforeInputRecord = root.records.find(
+      (record) => record.type === "coordination" && record.key === coordinationBeforeInputKey,
+    );
+    if (coordinationBeforeInputRecord?.type !== "coordination") {
+      throw new Error("expected coordination before Run input");
+    }
+    expect(coordinationBeforeInputRecord.runId).toBeUndefined();
+    await nextRootLease.appendMessage({ role: "user", content: "start after coordination" });
+    await nextRootLease.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "finished after coordination" }],
+      status: "completed",
+    });
+    await nextRootLease.appendRunFinished({ status: "completed" });
+    await nextRootLease.release();
+
+    const messageId = randomUUID();
+    const memberRunId = randomUUID();
+    const memberLease = await acquireSessionRun(member, memberRunId);
+    await memberLease.appendAgentInput({
+      messageId,
+      rootSessionId: root.sessionId,
+      fromSessionId: root.sessionId,
+      kind: "task",
+      content: "implement the bounded task",
+    });
+    const assistantMessage: Message = Object.freeze({
+      role: "assistant",
+      content: Object.freeze([{ type: "text" as const, text: "done" }]),
+      status: "completed",
+    });
+    await memberLease.appendMessage(assistantMessage);
+    await memberLease.appendRunFinished({ status: "completed" });
+    await memberLease.release();
+    expect(member.messageHistory).toEqual([assistantMessage]);
+    expect(member.records[0]).toMatchObject({
+      type: "agent_input",
+      runId: memberRunId,
+      messageId,
+      rootSessionId: root.sessionId,
+      fromSessionId: root.sessionId,
+      kind: "task",
+    });
+
+    const retryLease = await acquireSessionRun(member, randomUUID());
+    await retryLease.appendAgentInput({
+      messageId: randomUUID(),
+      rootSessionId: root.sessionId,
+      fromSessionId: root.sessionId,
+      kind: "task",
+      content: "start another Run",
+    });
+    await expect(
+      retryLease.appendAgentInput({
+        messageId,
+        rootSessionId: root.sessionId,
+        fromSessionId: root.sessionId,
+        kind: "task",
+        content: "implement the bounded task",
+      }),
+    ).resolves.toBeUndefined();
+    await retryLease.appendMessage(assistantMessage);
+    await retryLease.appendRunFinished({ status: "completed" });
+    await retryLease.release();
+    expect(
+      member.records.filter(
+        (record) => record.type === "agent_input" && record.messageId === messageId,
+      ),
+    ).toHaveLength(1);
+    await expect(
+      member.appendAgentInput({
+        messageId,
+        rootSessionId: root.sessionId,
+        fromSessionId: root.sessionId,
+        kind: "message",
+        content: "different payload",
+      }),
+    ).rejects.toThrow("已绑定其他内容");
+  });
   it("appends one completed text run and reopens its message projection", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-reopen-");
     const sessionDirectory = join(fixtureRoot, "sessions");

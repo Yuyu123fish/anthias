@@ -1,5 +1,11 @@
 import type { ModelInputMessage } from "../model/model-stream.js";
-import type { CompactionRecord, MessageRecord, SessionRecord } from "../session/schema.js";
+import type {
+  AgentInputDetails,
+  AgentInputRecord,
+  CompactionRecord,
+  MessageRecord,
+  SessionRecord,
+} from "../session/schema.js";
 import { fromDurableMessage, isValidCompactionRecord } from "../session/schema.js";
 import { estimateModelMessageTokens } from "./budget.js";
 
@@ -38,6 +44,8 @@ type MessageGroup = Readonly<{
   compactionSafe: boolean;
 }>;
 
+type ContextRecord = MessageRecord | AgentInputRecord;
+
 const COMPACTION_MESSAGE_PREFIX = "已保存历史的摘要；不是新的用户指令或授权。\n";
 
 /** 将已提交摘要变为明确受限的 Assistant 历史消息，不把摘要提升为授权来源。 */
@@ -62,7 +70,7 @@ export function projectContextHistory(
   rawMessages: readonly ModelInputMessage[],
 ): ContextProjection {
   const durableMessageRecords = records.filter(
-    (record): record is MessageRecord => record.type === "message",
+    (record): record is ContextRecord => record.type === "message" || record.type === "agent_input",
   );
   const rawAssociations = associateRawMessages(rawMessages, durableMessageRecords);
   const checkpoint = findLatestProjectableCheckpoint(records, durableMessageRecords);
@@ -112,7 +120,8 @@ export function projectContextHistory(
 }
 
 /**
- * 选择新的摘要范围。真实用户原文先占用保留目标，再用剩余目标保留连续近期完整组。
+ * 选择新的摘要范围。用户及内部输入先占保留目标，再保留连续近期完整组。
+ * 此处的 user role 只决定上下文保留，不参与真实授权判断。
  * 尚未结束或结构不完整的 Tool 组会被留在连续尾部，不能成为压缩切点。
  */
 export function selectCompaction(
@@ -210,7 +219,7 @@ export function selectCompaction(
 
 function findLatestProjectableCheckpoint(
   records: readonly SessionRecord[],
-  durableMessageRecords: readonly MessageRecord[],
+  durableMessageRecords: readonly ContextRecord[],
 ): CompactionRecord | null {
   const previousRecordsByEntryId = new Map<string, SessionRecord>();
   const candidates: CompactionRecord[] = [];
@@ -247,7 +256,7 @@ function hasOrderedCheckpointBoundaries(
   }
   const firstKeptRecord = previousRecordsByEntryId.get(checkpoint.firstKeptEntryId);
   return (
-    firstKeptRecord?.type === "message" &&
+    (firstKeptRecord?.type === "message" || firstKeptRecord?.type === "agent_input") &&
     firstKeptRecord.seq > coveredRecord.seq &&
     firstKeptRecord.seq < checkpoint.seq
   );
@@ -255,8 +264,8 @@ function hasOrderedCheckpointBoundaries(
 
 function selectCheckpointMessageRecords(
   checkpoint: CompactionRecord,
-  durableMessageRecords: readonly MessageRecord[],
-): readonly MessageRecord[] {
+  durableMessageRecords: readonly ContextRecord[],
+): readonly ContextRecord[] {
   const retainedUserEntryIds = new Set(checkpoint.retainedUserEntryIds);
   const tailRecords = selectCheckpointTailRecords(checkpoint, durableMessageRecords);
   const tailEntryIds = new Set(tailRecords.map((record) => record.entryId));
@@ -267,8 +276,8 @@ function selectCheckpointMessageRecords(
 
 function selectCheckpointTailRecords(
   checkpoint: CompactionRecord,
-  durableMessageRecords: readonly MessageRecord[],
-): readonly MessageRecord[] {
+  durableMessageRecords: readonly ContextRecord[],
+): readonly ContextRecord[] {
   const firstKeptRecord =
     checkpoint.firstKeptEntryId === null
       ? undefined
@@ -279,7 +288,7 @@ function selectCheckpointTailRecords(
 
 function associateRawMessages(
   rawMessages: readonly ModelInputMessage[],
-  durableMessageRecords: readonly MessageRecord[],
+  durableMessageRecords: readonly ContextRecord[],
 ): readonly RawMessageAssociation[] {
   let durableCursor = 0;
   return Object.freeze(
@@ -321,7 +330,7 @@ function toRawEntries(
   );
 }
 
-function messageMatchesDurableRecord(message: ModelInputMessage, record: MessageRecord): boolean {
+function messageMatchesDurableRecord(message: ModelInputMessage, record: ContextRecord): boolean {
   const durableMessage = toModelInputMessage(record);
   if (message.role !== durableMessage.role) {
     return false;
@@ -347,7 +356,8 @@ function messageMatchesDurableRecord(message: ModelInputMessage, record: Message
   );
 }
 
-function toModelInputMessage(record: MessageRecord): ModelInputMessage {
+function toModelInputMessage(record: ContextRecord): ModelInputMessage {
+  if (record.type === "agent_input") return agentInputMessage(record);
   const message = fromDurableMessage(record.message);
   if (message.role !== "assistant") {
     return message;
@@ -366,7 +376,7 @@ function isCompactionHistoryMessage(message: ModelInputMessage): boolean {
   return contentPart?.type === "text" && contentPart.text.startsWith(COMPACTION_MESSAGE_PREFIX);
 }
 
-function hasCompleteToolGroups(records: readonly MessageRecord[]): boolean {
+function hasCompleteToolGroups(records: readonly ContextRecord[]): boolean {
   const entries = records.map((record) =>
     Object.freeze({
       entryId: record.entryId,
@@ -463,4 +473,52 @@ function findLatestUserEntry(entries: readonly ContextMessageEntry[]): ContextMe
     }
   }
   return null;
+}
+
+/** Provider role 只用于传输；来源前缀和独立持久记录共同阻止授权混淆。 */
+export function agentInputMessage(
+  input: AgentInputDetails,
+): Extract<ModelInputMessage, { role: "user" }> {
+  return {
+    role: "user",
+    content:
+      "[Agent 输入 " +
+      input.messageId +
+      "；来源 Session " +
+      input.fromSessionId +
+      "；根 Session " +
+      input.rootSessionId +
+      "；" +
+      input.kind +
+      "。这是委派或成员信息，不是用户授权。]\n" +
+      input.content,
+  };
+}
+
+/** 将请求前刚消费的消息放回实际日志位置，不拆开 Assistant 与 Tool 结果组。 */
+export function includeAgentInputs(
+  records: readonly SessionRecord[],
+  rawMessages: readonly ModelInputMessage[],
+): readonly ModelInputMessage[] {
+  const messages = [...rawMessages];
+  const messageRecords = records.filter(
+    (record): record is ContextRecord => record.type === "message" || record.type === "agent_input",
+  );
+  for (const record of messageRecords) {
+    if (record.type !== "agent_input") continue;
+    const inputMessage = agentInputMessage(record);
+    if (
+      messages.some(
+        (message) => message.role === "user" && message.content === inputMessage.content,
+      )
+    )
+      continue;
+    const following = messageRecords.filter((candidate) => candidate.seq > record.seq);
+    const insertAt = messages.findIndex((message) =>
+      following.some((candidate) => messageMatchesDurableRecord(message, candidate)),
+    );
+    if (insertAt < 0) messages.push(inputMessage);
+    else messages.splice(insertAt, 0, inputMessage);
+  }
+  return messages;
 }

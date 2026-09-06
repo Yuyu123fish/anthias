@@ -1,6 +1,8 @@
 # Anthias 技术基线
 
-状态：Feature 003、005 已验收；Feature 006 已实现并完成本地验证，主观终端体验待验收；真实外部调用证据按各 Feature Report 区分。
+状态：Feature 003、005 已验收；Feature 006、007 已实现并完成本地验证，开发者体验验收仍待完成；真实外部调用证据按各 Feature Report 区分。
+
+2026-09-06，产品方向调整为在 Coding Agent 基础上，围绕工程问题构造验证并交付证据。当前仍优先补齐 Coding Agent 基本功能；工程验证工具、数据准备与证据交付的具体机制留待后续 Feature。现有两个 package、Agent Interface、模型与 Tool 权限边界继续作为技术基线。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
 
@@ -11,7 +13,8 @@
 - Electron、React 和独立 Host 是首个 Feature 的强制基线；
 - JSON-RPC 2.0、MessagePort、Protocol DTO 和双向运行时校验是 Agent 的公共 Interface；
 - 为单一内存对话提前建立 ConversationId、TurnId、RunId、快照和五类 Run 通知；
-- 旧 Feature 001 的全部代码、Plan、Tasks、Report 和“已实现”状态。
+- 旧 Feature 001 的全部代码、Plan、Tasks、Report 和“已实现”状态；
+- 以执行分叉作为必须实现的后续目标，并据此安排 Coding Harness 的演进。
 
 这些内容不再构成当前实现起点。未来 Desktop Feature 可以重新评估 Electron、进程隔离和传输协议，但必须由当时的真实需求证明其复杂度。
 
@@ -68,7 +71,7 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed。
 
-Session 使用 Schema 2 JSONL，持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
+Session 使用 Schema 3 JSONL（兼容 Schema 1/2），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
 ## 模型配置方向
 
@@ -103,11 +106,21 @@ MCP 使用官方 TypeScript 客户端。配置发现与连接分开，`/mcp conn
 ## 仍待后续 Feature 决定
 
 - 旧 Workspace 内 Session 的可选迁移能力；当前实现明确不自动扫描或迁移；
-- 长历史检索和后续执行分叉所需的持久化扩展；
+- 长历史检索与 Session 持久化扩展；
 - 可复用授权、OS 沙箱、低权限执行和网络隔离；
 - 多 Provider、模型切换、重试和 Provider 专属能力；
 - Desktop 框架、进程模型和传输协议；
-- 检查点、执行分支和候选结果的存储与隔离机制；
-- Coding Agent 的具体用户场景与系统提示词。
+- Coding Agent 基础功能的具体使用场景与系统提示词；
+- 工程验证所需的工具接入、场景数据准备、验证程序与证据关联机制；具体接口、存储格式和工具选型尚未确认。
 
 这些未决项必须由对应 Feature 的真实用户结果证明，不以空接口、预留层或通用基础设施提前实现。
+
+## 多 Agent 协作
+
+Feature 007 已完成实现与本地验证，待开发者验收。在现有 Agent Module 内复用 SessionAgent，每个成员持有独立线性 Session 和取消资源；根持有三个成员名额、一个活动 Team、任务和消息队列。公开入口增加 `collaboration.snapshot/execute` 与 `git.execute`，TUI 只构造语义操作；没有新增 package、Host 或数据库。
+
+`multi-agent/` 负责成员运行、Team 与投递；`git/` 负责固定 argv 的本地仓库操作、受管 worktree、成果提交及集成。Tool 层承接参数、权限和审批，Session 层继续负责记录、兼容、只读历史和组清理。成员不能继续创建 Agent，内部委派和消息不成为用户授权，AutoAllow 核对真实根 Session 记录。
+
+Schema 3 Header 明确 `sessionKind`、`rootSessionId`；根和成员分别在原日期平铺目录保存 JSONL。根的 `coordination` 记录保存成员、任务、消息和 Git 事实，成员的 `agent_input` 保存带发送方与稳定消息 ID 的内部输入。旧 Schema 1/2 可读，显式执行采用兼容升级；只读历史不会触发迁移或要求 Workspace 存在。索引是可重建缓存，不承担跨 Session 事务。
+
+创建和 Git 写入先记录意图，再保存结果；跨日志投递先持久化收件输入，再确认送达，依靠稳定 ID 去重。重开只恢复历史状态，显式继续才创建新 Run。清理按根关系成组保护未交付资源，永远不删除 Git 目录或分支。`ANTHIAS_WORKTREE_DIR` 与 `ANTHIAS_SESSION_DIR` 分别配置代码和历史路径。具体限制与验证见 [Feature 007 Report](../specs/feature007-multi-agent/report.md)。
