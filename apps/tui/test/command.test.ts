@@ -8,6 +8,51 @@ import {
 import { createFakeAgent } from "./fixtures.js";
 
 describe("slash commands", () => {
+  it("routes memory management without creating a user prompt", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    for (const line of [
+      "/memory",
+      "/memory all",
+      "/memory list user candidate",
+      "/memory all experience review",
+      "/memory show record",
+      "/memory off",
+      "/memory save user global 以后先给结论",
+      "/memory forget record 2 no-send",
+    ]) {
+      const command = parseInput(line);
+      if (command.type === "command")
+        await executeCommand(command, { agent, notice, details() {}, exit() {} });
+    }
+    expect(agent.memory.query).toHaveBeenCalledWith({ status: "all", scope: "current" });
+    expect(agent.memory.query).toHaveBeenCalledWith({
+      kind: "user",
+      status: "candidate",
+      scope: "current",
+    });
+    expect(agent.memory.query).toHaveBeenCalledWith({
+      kind: "experience",
+      status: "review",
+      scope: "all",
+    });
+    expect(agent.memory.execute).toHaveBeenCalledWith({ action: "settings", automatic: false });
+    expect(agent.memory.execute).toHaveBeenCalledWith({
+      action: "save",
+      kind: "user",
+      scope: "global",
+      content: "以后先给结论",
+    });
+    expect(agent.memory.execute).toHaveBeenCalledWith({
+      action: "forget",
+      id: "record",
+      revision: 2,
+      stopSending: true,
+    });
+    expect(agent.prompt).not.toHaveBeenCalled();
+    expect(commandHelp()).toContain("/memory");
+  });
+
   it("preserves ordinary prompts and supports a literal leading slash", () => {
     expect(parseInput("read a/b and /help")).toEqual({
       type: "prompt",
@@ -76,12 +121,14 @@ describe("slash commands", () => {
       '/mcp prompt local review {"path":42}',
       "/details prev extra",
       "/skill:",
+      "/memory list invalid",
+      "/memory list user invalid",
     ]) {
       const command = parseInput(line);
       if (command.type === "command")
         await executeCommand(command, { agent, notice, details() {}, exit() {} });
     }
-    expect(notice).toHaveBeenCalledTimes(10);
+    expect(notice).toHaveBeenCalledTimes(12);
     expect(agent.sessions.create).not.toHaveBeenCalled();
     expect(agent.mcp.getPrompt).not.toHaveBeenCalled();
     expect(agent.skills.activate).not.toHaveBeenCalled();

@@ -1,7 +1,7 @@
 import { glob, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentWithModelStream } from "../src/agent.js";
 import type { ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import {
@@ -13,6 +13,7 @@ import {
 const temporaryDirectories = new Set<string>();
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     [...temporaryDirectories].map((directory) => rm(directory, { recursive: true, force: true })),
   );
@@ -20,27 +21,47 @@ afterEach(async () => {
 });
 
 describe("Agent Loop safety limits", () => {
-  it("never sends a thirteenth model request", async () => {
+  it("continues beyond the former run and shared request limits until normal completion", async () => {
     let modelRequestCount = 0;
     const { agent, sessionDirectory } = await createSafetyTestAgent(async function* () {
       modelRequestCount += 1;
-      yield toolCallEvent(modelRequestCount, "unknown_tool", {});
-      yield finishEvent("tool_calls");
+      if (modelRequestCount <= 64) {
+        yield toolCallEvent(modelRequestCount, "unknown_tool", {});
+        yield finishEvent("tool_calls");
+      } else {
+        yield { type: "text_delta", delta: "完成" };
+        yield finishEvent("stop");
+      }
     });
 
     await expect(agent.prompt("loop")).resolves.toEqual({
-      status: "failed",
-      error: "模型连续请求次数超过安全上限，Run 已停止。",
+      status: "completed",
     });
 
-    expect(modelRequestCount).toBe(12);
+    expect(modelRequestCount).toBe(65);
     expect(agent.state.messageHistory.filter((message) => message.role === "tool")).toHaveLength(
-      12,
+      64,
     );
     expect(await finalSessionRecord(sessionDirectory)).toMatchObject({
       type: "run_finished",
-      status: "failed",
+      status: "completed",
     });
+    await agent.close();
+  }, 60_000);
+
+  it("retains the task deadline after request counts are removed", async () => {
+    let requests = 0;
+    const startedAt = Date.now();
+    const { agent } = await createSafetyTestAgent(async function* () {
+      requests++;
+      vi.spyOn(Date, "now").mockReturnValue(startedAt + 31 * 60_000);
+      yield toolCallEvent(requests, "unknown_tool", {});
+      yield finishEvent("tool_calls");
+    });
+    expect((await agent.prompt("deadline")).status).toBe("aborted");
+    expect(requests).toBe(1);
+    expect(JSON.stringify(agent.collaboration.snapshot())).toContain("运行时限");
+    await agent.close();
   });
 
   it("rejects an oversized ToolCall batch before executing any call", async () => {

@@ -736,6 +736,7 @@ export function createConversationView(options: {
           resetConversation();
           editor.setAutocompleteProvider(createCommandAutocomplete(agent));
           break;
+        case "memory_changed":
         case "skills_changed":
         case "mcp_changed":
           editor.setAutocompleteProvider(createCommandAutocomplete(agent));

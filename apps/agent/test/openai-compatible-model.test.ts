@@ -374,6 +374,9 @@ describe("createOpenAICompatibleModelStream", () => {
     expect(requestBodies[1]).toMatchObject({
       messages: [
         { role: "system" },
+        { role: "user", content: expect.stringContaining("类别：environment") },
+        { role: "user", content: expect.stringContaining("类别：skill_directory") },
+        { role: "user", content: expect.stringContaining("类别：memory_index") },
         { role: "user", content: "把 target.txt 更新为 new 并验证" },
         {
           role: "assistant",

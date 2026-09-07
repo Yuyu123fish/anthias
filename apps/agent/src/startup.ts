@@ -45,6 +45,7 @@ export type CreateAgentFromEnvironmentOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   workspaceRoot: string;
   sessionDirectory: string;
+  memoryDirectory?: string;
   sessionId?: string;
   permissionMode?: PermissionMode | undefined;
 }>;
@@ -54,6 +55,7 @@ export async function createAgentFromEnvironment({
   environment = process.env,
   workspaceRoot,
   sessionDirectory,
+  memoryDirectory = fileURLToPath(new URL("../../../memory", import.meta.url)),
   sessionId,
   permissionMode,
 }: CreateAgentFromEnvironmentOptions): Promise<AgentCreationResult> {
@@ -73,6 +75,9 @@ export async function createAgentFromEnvironment({
       "workspace_unavailable",
       "Workspace 必须是存在且可访问的目录。",
     );
+  }
+  if (!isAbsolute(memoryDirectory)) {
+    return createAgentCreationFailure("storage_unavailable", "Memory Directory 必须是绝对路径。");
   }
   if (!isAbsolute(sessionDirectory)) {
     return createAgentCreationFailure("storage_unavailable", "Session Directory 必须是绝对路径。");
@@ -118,6 +123,7 @@ export async function createAgentFromEnvironment({
       }
       const agent = createAgentWithModelStream({
         modelStream,
+        memoryDirectory,
         ...(worktreeDirectory ? { worktreeDirectory: resolve(worktreeDirectory) } : {}),
         skills,
         mcp,

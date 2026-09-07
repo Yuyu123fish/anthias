@@ -243,7 +243,11 @@ describe("Agent", () => {
 
   it("streams one assistant message through the public interface", async () => {
     const modelStream: ModelStream = async function* (modelRequest, abortSignal) {
-      expect(modelRequest.messages).toEqual([{ role: "user", content: "你好" }]);
+      expect(modelRequest.messages.at(-1)).toMatchObject({
+        role: "user",
+        content: "你好",
+        entryId: expect.any(String),
+      });
       expect(abortSignal.aborted).toBe(false);
       yield textDelta("你");
       yield textDelta("好");
@@ -346,7 +350,13 @@ describe("Agent", () => {
   it("keeps ordered context and rejects empty prompts without events", async () => {
     const modelMessageBatches: unknown[] = [];
     const modelStream: ModelStream = async function* (modelRequest) {
-      modelMessageBatches.push(modelRequest.messages);
+      modelMessageBatches.push(
+        modelRequest.messages
+          .filter(
+            (message) => !(message.role === "user" && message.content.startsWith("[上下文来源：")),
+          )
+          .map(({ entryId: _entryId, ...message }) => message),
+      );
       yield textDelta(modelMessageBatches.length === 1 ? "first" : "second");
       yield stopFinish();
     };
@@ -682,6 +692,8 @@ describe("Agent", () => {
   });
 
   it("seals the Agent after run completion persistence fails", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-completion-failure-"));
+    temporaryDirectories.add(workspaceRoot);
     let appendedMessageCount = 0;
     let appendedRunFinishedCount = 0;
     let modelCallCount = 0;
@@ -690,9 +702,9 @@ describe("Agent", () => {
       sessionId: "00000000-0000-4000-8000-000000000002",
       rootSessionId: "00000000-0000-4000-8000-000000000002",
       sessionKind: "primary" as const,
-      workspaceRoot: "C:\\workspace",
-      sessionDirectory: "C:\\workspace\\data\\conversation",
-      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
+      workspaceRoot,
+      sessionDirectory: join(workspaceRoot, "conversation"),
+      storageDirectory: join(workspaceRoot, "conversation", "test-session"),
       records: Object.freeze([]),
       appendContextSource: async () => undefined,
       appendCoordination: async () => undefined,
@@ -912,7 +924,14 @@ describe("Agent", () => {
     const reopenedAgent = createAgentWithModelStream({
       session: reopenedSession,
       modelStream: async function* (modelRequest) {
-        modelMessageBatches.push(modelRequest.messages);
+        modelMessageBatches.push(
+          modelRequest.messages
+            .filter(
+              (message) =>
+                !(message.role === "user" && message.content.startsWith("[上下文来源：")),
+            )
+            .map(({ entryId: _entryId, ...message }) => message),
+        );
         yield textDelta("second answer");
         yield stopFinish();
       },

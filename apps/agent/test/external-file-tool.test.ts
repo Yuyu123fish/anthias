@@ -73,8 +73,12 @@ describe("external single-file approval", () => {
       yield finishEvent("stop");
     };
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
+    const approvalReady = Promise.withResolvers<void>();
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") approvalReady.resolve();
+    });
     const promptResultPromise = agent.prompt("修改外部文件");
-    await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
+    await approvalReady.promise;
     const approval = agent.state.pendingToolApproval;
     if (approval === null) {
       throw new Error("expected external edit approval");

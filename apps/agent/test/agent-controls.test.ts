@@ -127,24 +127,37 @@ describe("Agent capability controls", () => {
     );
     expect((await agent.prompt("读这份说明")).status).toBe("completed");
     expect(requests[0]?.systemPrompt).not.toContain("SAVED_SKILL_BODY");
-    expect(requests[1]?.systemPrompt).toContain("SAVED_SKILL_BODY");
-    expect(requests[2]?.systemPrompt).toContain("SAVED_REFERENCE_BODY");
-    expect(session.records.filter((record) => record.type === "context_source")).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.messages)).toContain("SAVED_SKILL_BODY");
+    expect(JSON.stringify(requests[2]?.messages)).toContain("SAVED_REFERENCE_BODY");
+    expect(
+      session.records.filter(
+        (record) =>
+          record.type === "context_source" &&
+          (record.kind === "skill" || record.kind === "skill_reference"),
+      ),
+    ).toHaveLength(2);
     expect(session.messageHistory.filter((message) => message.role === "user")).toHaveLength(1);
     expect((await agent.skills.activate("sample")).ok).toBe(true);
-    expect(session.records.filter((record) => record.type === "context_source")).toHaveLength(2);
+    expect(
+      session.records.filter(
+        (record) =>
+          record.type === "context_source" &&
+          (record.kind === "skill" || record.kind === "skill_reference"),
+      ),
+    ).toHaveLength(2);
     await agent.sessions.create();
     expect(agent.skills.list()[0]?.active).toBe(false);
     await writeFile(file, "---\nname: sample\ndescription: 测试指令\n---\nCHANGED_BODY");
     await agent.sessions.open(session.sessionId);
     expect(agent.skills.list()[0]?.error).toContain("变化");
     await agent.prompt("继续");
-    expect(requests.at(-1)?.systemPrompt).toContain("SAVED_SKILL_BODY");
-    expect(requests.at(-1)?.systemPrompt).not.toContain("CHANGED_BODY");
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("SAVED_SKILL_BODY");
+    expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("CHANGED_BODY");
     expect(agent.skills.list()[0]?.error).toContain("变化");
     expect((await agent.skills.activate(null)).ok).toBe(true);
     await agent.prompt("清除后");
-    expect(requests.at(-1)?.systemPrompt).not.toContain("SAVED_SKILL_BODY");
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("该来源已撤销");
+    expect(agent.skills.list()[0]?.active).toBe(false);
   });
 
   it("compacts without a fabricated user message or an extra normal response", async () => {

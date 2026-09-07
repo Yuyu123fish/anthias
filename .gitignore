@@ -20,5 +20,6 @@ out/
 # 本地运行日志
 *.log
 
-# Anthias 本地 Session 数据
+# Anthias 本地 Session 与记忆数据
 /data/
+/memory/

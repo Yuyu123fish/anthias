@@ -1,6 +1,8 @@
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ActionResult, AgentControls, AgentOperation } from "./agent-controls.js";
 import { createGitWorkspace } from "./git/index.js";
+import { createMemory } from "./memory/index.js";
 import {
   type CollaborationAction,
   createMultiAgent,
@@ -43,6 +45,8 @@ export type Agent = Omit<SessionAgent, "external" | "compact" | "promptInternal"
 export function createAgentWithModelStream(options: CreateAgentWithModelStreamOptions): Agent {
   const { startCleanup, worktreeDirectory, ...sessionOptions } = options;
   let currentSession = options.session;
+  const memoryDirectory =
+    options.memoryDirectory ?? resolve(options.session.sessionDirectory, "memory");
   const pendingApprovals = new Map<string, ToolApprovalRequest>();
   let currentRuntime = createRuntime(currentSession, options.permissionMode);
   let currentAgent = currentRuntime.agent;
@@ -116,6 +120,10 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     ) {
       fail("成员 Session 必须从其根 Session 查看或继续，不能作为主 Agent 打开。");
     }
+    const memory = createMemory({
+      directory: memoryDirectory,
+      workspaceRoot: rootSession.workspaceRoot,
+    });
     const git = createGitWorkspace({
       workspaceRoot: rootSession.workspaceRoot,
       worktreeDirectory:
@@ -165,6 +173,10 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       changed: (snapshot) => emit({ type: "collaboration_changed", snapshot }),
       memberEvent: (member, event) => routeEvent(event, member),
       createMember(session, permissionMode) {
+        const memberMemory = createMemory({
+          directory: memoryDirectory,
+          workspaceRoot: session.workspaceRoot,
+        });
         return createSessionAgent({
           session,
           permissionMode,
@@ -172,6 +184,18 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
           ...(sessionOptions.modelContext ? { modelContext: sessionOptions.modelContext } : {}),
           ...(sessionOptions.skills ? { skills: sessionOptions.skills } : {}),
           ...(sessionOptions.mcp ? { mcp: sessionOptions.mcp } : {}),
+          memory: memberMemory,
+          maintainMemory: async (action, writer, signal) => {
+            if (action.action !== "save" || action.id)
+              throw new Error("成员只能提交新候选，不能覆盖共享记忆。");
+            const snapshot = await memberMemory.execute(
+              action,
+              { ...writer, explicit: false, candidate: true },
+              signal,
+            );
+            emit({ type: "memory_changed" });
+            return snapshot;
+          },
           managedTools: toolsFor(session),
           beforeRequest: (lease, signal) => coordinator.drain(session.sessionId, lease, signal),
           authorizationRecords: () => rootSession.records,
@@ -183,10 +207,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       session: rootSession,
       permissionMode: mode,
       modelStream: coordinator.modelStream,
+      memory,
       managedTools: toolsFor(rootSession),
       beforeRequest: (lease, signal) => coordinator.drain(rootSession.sessionId, lease, signal),
     });
-    return { agent: primary, coordinator, git };
+    return { agent: primary, coordinator, git, memory };
   }
 
   async function invokeTool(
@@ -219,6 +244,7 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
   function perform<T>(
     name: Exclude<AgentOperation, null>,
     work: (signal: AbortSignal) => Promise<T>,
+    preservesCommittedResult = false,
   ): Promise<ActionResult<T>> {
     if (closed) return Promise.resolve({ ok: false, error: "Agent 已关闭。" });
     if (
@@ -239,7 +265,7 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       try {
         if (closed || controller.signal.aborted) return { ok: false, error: "操作已取消。" };
         const value = await work(controller.signal);
-        return controller.signal.aborted
+        return controller.signal.aborted && !preservesCommittedResult
           ? { ok: false, error: "操作已取消。" }
           : { ok: true, value };
       } catch (error) {
@@ -370,6 +396,44 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       return () => {
         listeners.delete(listener);
       };
+    },
+    memory: {
+      async query(query) {
+        try {
+          return {
+            ok: true,
+            value: await runDirectControl((signal) => currentRuntime.memory.query(query, signal)),
+          };
+        } catch (error) {
+          return { ok: false, error: error instanceof Error ? error.message : "记忆不可读取。" };
+        }
+      },
+      execute: (action) =>
+        perform(
+          "updating_memory",
+          async (signal) => {
+            try {
+              const snapshot = await currentRuntime.memory.execute(
+                action,
+                {
+                  explicit: true,
+                  source: {
+                    kind: "user",
+                    sessionId: currentSession.sessionId,
+                    entryIds: [],
+                    note: "用户通过 /memory 管理。",
+                  },
+                },
+                signal,
+              );
+              emit({ type: "memory_changed" });
+              return snapshot;
+            } catch (error) {
+              return fail(error instanceof Error ? error.message : "记忆维护失败。");
+            }
+          },
+          true,
+        ),
     },
     collaboration: {
       snapshot: () => currentRuntime.coordinator.snapshot(),

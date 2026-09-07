@@ -98,6 +98,7 @@ export type AgentLoopEvent =
 /** 配置一次纯 Agent Loop 所需的上下文、能力与 Run 回调。 */
 export type RunAgentLoopOptions = Readonly<{
   messages: readonly Message[];
+  messageEntryId?: (message: Message) => string | undefined;
   modelStream: ModelStream;
   systemPrompt: string;
   toolDefinitions: readonly ModelToolDefinition[];
@@ -146,40 +147,29 @@ type ToolResultBudget = {
 };
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
-const MODEL_REQUEST_LIMIT = 12;
 const TOOL_CALL_BATCH_LIMIT = 32;
 const READ_ONLY_TOOL_CONCURRENCY_LIMIT = 4;
 const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
 const ABORTED_LOOP_RESULT = Object.freeze({ status: "aborted" } as const);
 const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
-const MODEL_REQUEST_LIMIT_RESULT = Object.freeze({
-  status: "failed",
-  error: "模型连续请求次数超过安全上限，Run 已停止。",
-} as const);
 const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
   status: "failed",
   error: "单次模型响应包含过多 ToolCall，Run 已停止。",
 } as const);
 
-/** 推进 Model → Tool → Model，并用内部上限阻止异常循环和过大调用批次。 */
+/** 推进 Model → Tool → Model；取消、任务时限和批次资源限制分别由所属层持有。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = [...options.messages];
   const transientModelMessages = new Map<
     AssistantMessage,
     Extract<ModelInputMessage, { role: "assistant" }>
   >();
-  let modelRequestCount = 0;
 
   while (true) {
     if (options.abortController.signal.aborted) {
       return ABORTED_LOOP_RESULT;
     }
-    if (modelRequestCount >= MODEL_REQUEST_LIMIT) {
-      return MODEL_REQUEST_LIMIT_RESULT;
-    }
-
     options.updatePhase("requesting_model");
-    modelRequestCount += 1;
     const assistantRequest = await streamAssistantResponse(
       messageHistory,
       transientModelMessages,
@@ -295,11 +285,14 @@ async function streamAssistantResponse(
   const modelRequest: ModelRequest = Object.freeze({
     systemPrompt: options.systemPrompt,
     messages: Object.freeze(
-      messageHistory.map((message) =>
-        message.role === "assistant"
-          ? (transientModelMessages.get(message) ?? toModelInputMessage(message))
-          : toModelInputMessage(message),
-      ),
+      messageHistory.map((message) => {
+        const modelMessage =
+          message.role === "assistant"
+            ? (transientModelMessages.get(message) ?? toModelInputMessage(message))
+            : toModelInputMessage(message);
+        const entryId = options.messageEntryId?.(message);
+        return entryId ? { ...modelMessage, entryId } : modelMessage;
+      }),
     ),
     tools: options.toolDefinitions,
   });

@@ -73,7 +73,6 @@ export function createMultiAgent(options: {
   const team = createAgentTeam(options.root);
   const deliveries = new Map<string, Delivery>();
   let closed = false;
-  let requestCount = 0;
   let deadline = 0;
   let limitNotice: string | undefined;
   let budgetTimer: ReturnType<typeof setTimeout> | undefined;
@@ -160,7 +159,6 @@ export function createMultiAgent(options: {
   }
   function beginTask() {
     if (members.busy()) return;
-    requestCount = 0;
     limitNotice = undefined;
     deadline = Date.now() + 30 * 60_000;
     clearTimeout(budgetTimer);
@@ -173,13 +171,12 @@ export function createMultiAgent(options: {
   }
   const modelStream: ModelStream = async function* (request, signal) {
     if (deadline === 0) beginTask();
-    if (closed || signal.aborted || Date.now() >= deadline || requestCount >= 60) {
-      limitNotice = "整组模型调用次数或运行时限已达到上限，请明确新的任务后继续。";
+    if (closed || signal.aborted || Date.now() >= deadline) {
+      limitNotice = "整组运行时限已达到上限，请明确新的任务后继续。";
       changed();
       abort();
       throw new Error(limitNotice);
     }
-    requestCount++;
     yield* options.modelStream(request, signal);
   };
   async function send(caller: string, action: Extract<CollaborationAction, { action: "message" }>) {

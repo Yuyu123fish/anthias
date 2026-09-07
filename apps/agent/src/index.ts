@@ -22,6 +22,7 @@ export type {
   SkillSummary,
 } from "./agent-controls.js";
 export type { ContextUsage, RequestUsageTotals } from "./context/index.js";
+export type { MemoryAction, MemoryEntry, MemoryQuery, MemorySnapshot } from "./memory/index.js";
 export type {
   AssistantContentPart,
   AssistantMessage,

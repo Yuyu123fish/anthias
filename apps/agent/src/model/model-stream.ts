@@ -23,10 +23,12 @@ type ModelAssistantInputMessage = Readonly<{
 }>;
 
 /** 表示送入 Model Adapter 的一条 Agent 自有消息。 */
-export type ModelInputMessage =
+export type ModelInputMessage = (
   | Readonly<{ role: "user"; content: string }>
   | ModelAssistantInputMessage
-  | ToolResultMessage;
+  | ToolResultMessage
+) &
+  Readonly<{ entryId?: string }>;
 
 /** 保存 Provider 明确提供的调用用量；缺失字段保持未知，缓存是输入子集。 */
 export type ModelUsage = Readonly<{

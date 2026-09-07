@@ -64,9 +64,9 @@ async function seed(): Promise<Session> {
   await acquired.lease.release();
   return session;
 }
-function initialRequest(session: Session): ModelRequest {
+function initialRequest(): ModelRequest {
   return {
-    systemPrompt: createCodingSystemPrompt(session.workspaceRoot, shell, "agent"),
+    systemPrompt: createCodingSystemPrompt(),
     messages: [
       { role: "user", content: "Historical source " + "x".repeat(24_000) },
       { role: "assistant", content: [{ type: "text", text: "旧内容已读。" }] },
@@ -75,10 +75,10 @@ function initialRequest(session: Session): ModelRequest {
     tools: getToolDefinitions("agent"),
   };
 }
-function budgetFor(session: Session, extra = 0) {
+function budgetFor(extra = 0) {
   return createContextBudget(
     {
-      contextWindow: 20_000 + 512 + estimateModelRequestTokens(initialRequest(session)) + extra,
+      contextWindow: 20_000 + 512 + estimateModelRequestTokens(initialRequest()) + extra,
     },
     { responseOutputTokens: 512, summaryOutputTokens: 512, retainedTokens: 128 },
   );
@@ -87,7 +87,7 @@ function create(session: Session, modelStream: ModelStream, extra = 0): Agent {
   const agent = createAgentWithModelStream({
     session,
     modelStream,
-    modelContext: { modelId: "test", budget: budgetFor(session, extra) },
+    modelContext: { modelId: "test", budget: budgetFor(extra) },
   });
   cleanup.push(() => agent.close());
   return agent;
@@ -98,7 +98,7 @@ describe("Context integration", () => {
     const session = await seed();
     await writeFile(join(session.workspaceRoot, "note.txt"), "工具内容".repeat(200), "utf8");
     const purposes: string[] = [];
-    const requestBudget = budgetFor(session, 3000);
+    const requestBudget = budgetFor(3000);
     let responseCount = 0;
     const agent = create(
       session,
@@ -139,7 +139,7 @@ describe("Context integration", () => {
     expect(agent.state.messageHistory.filter((message) => message.role === "tool")).toHaveLength(1);
   });
 
-  it("compacts at threshold equality, commits before continuing and restores a separate projection", async () => {
+  it("compacts when the initial context exceeds its budget, commits before continuing and restores a separate projection", async () => {
     const session = await seed();
     const requests: ModelRequest[] = [];
     const agent = create(session, async function* (request) {
@@ -161,6 +161,9 @@ describe("Context integration", () => {
     expect(await agent.prompt("请继续，保留我的表达。")).toEqual({ status: "completed" });
     expect(requests.map((request) => request.purpose)).toEqual(["compaction", "response"]);
     expect(requests[1]?.messages.at(-1)).toEqual({
+      entryId: session.records.findLast(
+        (record) => record.type === "message" && record.message.type === "user",
+      )?.entryId,
       role: "user",
       content: "请继续，保留我的表达。",
     });

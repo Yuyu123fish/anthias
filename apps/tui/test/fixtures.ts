@@ -63,6 +63,16 @@ export function createFakeAgent() {
       snapshot: vi.fn(() => ({ members: [], team: null, tasks: [] })),
       execute: vi.fn(async () => ({ ok: true as const, value: "done" })),
     },
+    memory: {
+      query: vi.fn(async () => ({
+        ok: true as const,
+        value: { automatic: true, projectId: "test-project", entries: [], diagnostics: [] },
+      })),
+      execute: vi.fn(async () => ({
+        ok: true as const,
+        value: { automatic: true, projectId: "test-project", entries: [], diagnostics: [] },
+      })),
+    },
     git: { execute: vi.fn(async () => ({ ok: true as const, value: "clean" })) },
     sessions: {
       list: vi.fn<Agent["sessions"]["list"]>(async () => ({

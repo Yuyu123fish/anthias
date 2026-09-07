@@ -1110,6 +1110,7 @@ function createCompactionRecord(
     parentEntryId,
     ...(runId === undefined ? {} : { runId }),
     summary: details.summary,
+    ...(details.projection ? { projection: structuredClone(details.projection) } : {}),
     coversThroughEntryId: details.coversThroughEntryId,
     firstKeptEntryId: details.firstKeptEntryId,
     retainedUserEntryIds: Object.freeze([...details.retainedUserEntryIds]),
@@ -1207,7 +1208,12 @@ function createContextSourceRecord(
     seq,
     timestamp: new Date().toISOString(),
     parentEntryId,
-    ...details,
+    sourceId: details.sourceId,
+    kind: details.kind,
+    label: details.label,
+    fingerprint: details.fingerprint,
+    content: details.content,
+    ...(details.projection ? { projection: structuredClone(details.projection) } : {}),
     ...(runId === undefined ? {} : { runId }),
   });
 }

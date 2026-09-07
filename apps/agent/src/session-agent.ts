@@ -9,8 +9,10 @@ import {
 import { type ContextBudget, createContextBudget } from "./context/budget.js";
 import { type ContextUsage, createContextController } from "./context/index.js";
 import { agentInputMessage } from "./context/selection.js";
+import { createContextSources } from "./context/sources.js";
 import { createExternalCapabilities } from "./external-capabilities.js";
 import type { McpConnections } from "./mcp/index.js";
+import type { Memory } from "./memory/index.js";
 import type {
   AssistantMessage,
   AssistantToolCallPart,
@@ -22,7 +24,10 @@ import type { ModelStream, ModelUsage } from "./model/model-stream.js";
 import type { CollaborationSnapshot } from "./multi-agent/index.js";
 import { reviewToolApproval } from "./permission/auto-review.js";
 import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission/permission-mode.js";
-import { createCodingSystemPrompt } from "./prompts/coding-system-prompt.js";
+import {
+  createCodingEnvironmentPrompt,
+  createCodingSystemPrompt,
+} from "./prompts/coding-system-prompt.js";
 import { createSessionArtifactStore } from "./session/artifacts.js";
 import type { SessionCleanupResult } from "./session/cleanup.js";
 import type { AgentInputDetails, Session, SessionRunLease } from "./session/index.js";
@@ -30,6 +35,7 @@ import { isSideEffectToolName, type SessionRecord } from "./session/schema.js";
 import type { SkillLibrary } from "./skill/index.js";
 import { getToolDefinitions } from "./tool/definitions.js";
 import type { AgentToolExtension } from "./tool/managed-tool.js";
+import { createMemoryTools, type MaintainMemory } from "./tool/memory-tools.js";
 import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
@@ -114,6 +120,7 @@ export type AgentEvent =
   | Readonly<{ type: "collaboration_changed"; snapshot: CollaborationSnapshot }>
   | Readonly<{ type: "operation_changed"; operation: AgentOperation }>
   | Readonly<{ type: "session_changed"; sessionId: string }>
+  | Readonly<{ type: "memory_changed" }>
   | Readonly<{ type: "skills_changed" }>
   | Readonly<{ type: "mcp_changed" }>
   | Readonly<{ type: "tool_auto_review_start"; toolCallId: string; toolName: string }>
@@ -195,6 +202,9 @@ export type SessionAgent = Readonly<{
 /** 配置内部 Model Stream 与已打开 Session 的 Agent 运行宿主。 */
 export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
+  memoryDirectory?: string;
+  memory?: Memory;
+  maintainMemory?: MaintainMemory;
   worktreeDirectory?: string;
   managedTools?: AgentToolExtension;
   beforeRequest?: (lease: SessionRunLease, signal: AbortSignal) => Promise<void>;
@@ -219,6 +229,7 @@ type ActiveRunOwnership = {
   permissionMode: PermissionMode;
   visibleReasoningActive: boolean;
   sessionWriteFailed: boolean;
+  memoryCommittedBeforeFailure?: boolean;
   toolAuthorizations: Map<string, string>;
   reviewedToolActionFingerprints: Set<string>;
   deniedToolActionFingerprints: Set<string>;
@@ -270,15 +281,17 @@ export function createSessionAgent({
   managedTools,
   beforeRequest,
   authorizationRecords,
+  memory,
+  maintainMemory,
 }: CreateAgentWithModelStreamOptions): SessionAgent {
   const messageHistory: Message[] = [...session.messageHistory];
-  const contextBudget = modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 });
-  const contextController = createContextController({
-    session,
-    modelStream,
-    modelId: modelContext?.modelId ?? "deterministic-local",
-    budget: contextBudget,
+  const messageEntryIds = new WeakMap<Message, string>();
+  const initialMessageRecords = session.records.filter((record) => record.type === "message");
+  messageHistory.forEach((message, index) => {
+    const record = initialMessageRecords[index];
+    if (record) messageEntryIds.set(message, record.entryId);
   });
+  const contextBudget = modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 });
   const artifactStore = createSessionArtifactStore({
     sessionId: session.sessionId,
     storageDirectory: session.storageDirectory,
@@ -287,11 +300,12 @@ export function createSessionAgent({
     if (message.role === "tool" && message.artifact !== undefined)
       artifactStore.registerReference(message.artifact);
   }
-  const external = createExternalCapabilities({
+  const sources = createContextSources({
     session,
-    skills,
-    mcp,
-    artifactStore,
+    ...(memory ? { memory } : {}),
+    environment: () =>
+      createCodingEnvironmentPrompt(session.workspaceRoot, session.shell, permissionMode),
+    skillDirectory: () => external.directory(),
     appendSource: async (details) => {
       try {
         await (activeRun
@@ -307,6 +321,14 @@ export function createSessionAgent({
       }
     },
   });
+  const external = createExternalCapabilities({ sources, skills, mcp, artifactStore });
+  const contextController = createContextController({
+    session,
+    modelStream,
+    sources,
+    modelId: modelContext?.modelId ?? "deterministic-local",
+    budget: contextBudget,
+  });
   const localToolRunner =
     providedToolRunner ??
     createToolRunner({
@@ -317,8 +339,21 @@ export function createSessionAgent({
       shell: session.shell,
       artifactStore,
     });
+  const memoryTools = memory
+    ? createMemoryTools({
+        memory,
+        session,
+        sources,
+        ...(maintainMemory ? { maintain: maintainMemory } : {}),
+        changed: () => publishEvent({ type: "memory_changed" }),
+        onAdoptionFailure: () => {
+          if (activeRun) activeRun.memoryCommittedBeforeFailure = true;
+        },
+      })
+    : undefined;
   const toolRunner: ToolRunner = {
     createPlan: (call, mode) =>
+      memoryTools?.createPlan(call, mode) ??
       managedTools?.createPlan(call, mode) ??
       external.createPlan(call, mode) ??
       localToolRunner.createPlan(call, mode),
@@ -761,6 +796,10 @@ export function createSessionAgent({
       // UserMessage 刷新成功后 Run 才算被接受，后续事件与 Tool 才能开始。
       if (internalInput) await currentRun.sessionLease.appendAgentInput(internalInput);
       else await currentRun.sessionLease.appendMessage(userMessage);
+      const userRecord = session.records.findLast(
+        (record) => record.type === (internalInput ? "agent_input" : "message"),
+      );
+      if (userRecord) messageEntryIds.set(userMessage, userRecord.entryId);
     } catch {
       return failBeforeRunStart(currentRun);
     }
@@ -777,8 +816,15 @@ export function createSessionAgent({
       let contextFailure: string | null = null;
       const contextModelStream = contextController.wrapRun({
         lease: currentRun.sessionLease,
-        beforeRequest: (signal) =>
-          beforeRequest?.(currentRun.sessionLease, signal) ?? Promise.resolve(),
+        beforeRequest: async (signal) => {
+          try {
+            await beforeRequest?.(currentRun.sessionLease, signal);
+            await sources.prepare(signal);
+          } catch (error) {
+            contextFailure = error instanceof Error ? error.message : "上下文来源准备失败。";
+            throw error;
+          }
+        },
         extendRequest: (request) => external.project(request, currentRun.permissionMode),
         emit: (event) => {
           if (event.type === "context_usage") publishEvent(event);
@@ -800,15 +846,13 @@ export function createSessionAgent({
       });
       const loopResult = await runAgentLoop({
         messages: messageHistory,
+        messageEntryId: (message) => messageEntryIds.get(message),
         modelStream: controlCall ? controlToolStream(controlCall) : contextModelStream.modelStream,
-        systemPrompt: createCodingSystemPrompt(
-          session.workspaceRoot,
-          session.shell,
-          currentRun.permissionMode,
-        ),
+        systemPrompt: createCodingSystemPrompt(),
         toolDefinitions: [
           ...getToolDefinitions(currentRun.permissionMode),
           ...(managedTools?.definitions(currentRun.permissionMode) ?? []),
+          ...(memoryTools?.definitions(currentRun.permissionMode) ?? []),
         ],
         permissionMode: currentRun.permissionMode,
         toolRunner,
@@ -911,6 +955,12 @@ export function createSessionAgent({
         });
         return;
       case "tool_execution_start":
+        try {
+          await sources.checkExecution(currentRun.abortController.signal);
+        } catch {
+          currentRun.abortController.abort();
+          throw new Error("当前记忆已撤销，工具执行已停止。");
+        }
         if (isSideEffectToolName(event.toolCall.toolName)) {
           let approvalId = currentRun.toolAuthorizations.get(event.toolCall.toolCallId);
           if (approvalId === undefined) {
@@ -980,6 +1030,8 @@ export function createSessionAgent({
   ): Promise<void> {
     try {
       await currentRun.sessionLease.appendMessage(message);
+      const messageRecord = session.records.findLast((record) => record.type === "message");
+      if (messageRecord) messageEntryIds.set(message, messageRecord.entryId);
     } catch {
       currentRun.sessionWriteFailed = true;
       sessionUnavailableResult = SESSION_FAILED_RESULT;
@@ -1031,6 +1083,15 @@ export function createSessionAgent({
       sessionUnavailableResult = SESSION_FAILED_RESULT;
     }
 
+    if (currentRun.memoryCommittedBeforeFailure && finalResult.status === "failed") {
+      finalResult = {
+        status: "failed",
+        error: "记忆已保存，但本会话未能采用该版本；恢复会话后继续。 " + finalResult.error,
+      };
+      lastError = finalResult.error;
+      if (currentRun.sessionWriteFailed) sessionUnavailableResult = finalResult;
+    }
+
     // activeRun 保留到 run_end 同步交付后，阻止终态订阅者重入 prompt。
     publishEvent({
       type: "run_end",
@@ -1074,15 +1135,15 @@ export function createSessionAgent({
     },
     external,
     async compact(signal: AbortSignal) {
+      await sources.prepare(signal);
       await contextController.compact(
         external.project(
           {
-            systemPrompt: createCodingSystemPrompt(
-              session.workspaceRoot,
-              session.shell,
-              permissionMode,
-            ),
-            messages: messageHistory,
+            systemPrompt: createCodingSystemPrompt(),
+            messages: messageHistory.map((message) => {
+              const entryId = messageEntryIds.get(message);
+              return entryId ? { ...message, entryId } : message;
+            }),
             tools: getToolDefinitions(permissionMode),
           },
           permissionMode,

@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003、005 已验收；Feature 006、007 已实现并完成本地验证，开发者体验验收仍待完成；真实外部调用证据按各 Feature Report 区分。
+状态：Feature 003、005 已验收；Feature 006–008 已实现并完成本地验证，开发者体验验收仍待完成；真实外部调用证据按各 Feature Report 区分。
 
 2026-09-06，产品方向调整为在 Coding Agent 基础上，围绕工程问题构造验证并交付证据。当前仍优先补齐 Coding Agent 基本功能；工程验证工具、数据准备与证据交付的具体机制留待后续 Feature。现有两个 package、Agent Interface、模型与 Tool 权限边界继续作为技术基线。
 
@@ -47,6 +47,7 @@ Agent 持有消息 transcript、当前流式消息、是否正在运行以及取
 - 取消当前运行，或关闭 Agent 并等待资源释放；
 - 订阅 AgentEvent，并能取消订阅；
 - 通过 `sessions.list/create/open` 切换同 Workspace 会话，使用 `compact()` 主动压缩；
+- 通过 `memory.query/execute` 查询和维护应用记忆，接收 `memory_changed` 事件；
 - 通过 `skills.list/reload/activate` 与 `mcp.list/connect/disconnect/inspect/readResource/getPrompt` 管理外部能力；这些普通函数对象返回安全摘要，不暴露 SDK 或持久化句柄。
 
 Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desktop 建立抽象类和继承层级。生产启动工厂隐藏模型配置解析与 Adapter 构造；Agent 内部可以拆分实现，但内部 seam 不扩大公共 Interface。
@@ -69,7 +70,7 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 ## 事件方向
 
-AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed。
+AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed、memory_changed。
 
 Session 使用 Schema 3 JSONL（兼容 Schema 1/2），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
@@ -93,6 +94,20 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 Skill 使用用户和项目 `.agents/skills`，扩展路径通过 `ANTHIAS_SKILL_DIRS` 传入。目录只保留有界元数据，正文与引用分别按需读取；实际内容作为 Session 来源事实保存，恢复保留已保存版本，文件变化给出诊断。外部指令和参考资料始终计入后续请求预算，压缩不把它们变为真实用户授权。
 
 MCP 使用官方 TypeScript 客户端。配置发现与连接分开，`/mcp connect` 才启动 stdio 进程或 HTTP 连接。工具经 schema 与连接版本校验、现有权限/AutoAllow、开始事实和产物链执行；Plan 拒绝未知外部工具。资源按 URI 读取，模板由用户选择，其内容保持外部来源。配置格式及环境变量引用见 [Quick Start](../quick-start.md)，协议验证范围见 [Feature 006 Report](../specs/feature006-command-skill-mcp-tui/report.md)。
+
+## 记忆与提示词编排
+
+Feature 008 已实现主动记忆和 `/memory` 管理。应用根目录的 `memory/user/`、`memory/experience/<project-id>/` 与 `memory/state/` 分别保存用户条目、项目经验及本地设置。当前 Workspace 与应用数据根分别装配；同仓库工作树按共同 Git 目录归组，各自读取自己的项目根 AGENTS.md，未提交仓库与非 Git Workspace 也可使用记忆。
+
+`memory/` Module 持有存储、修订校验、范围和时效；`tool/memory-tools.ts` 绑定真实用户或已完成 Tool 证据，根校验成员候选，成员条件以自己的工作树取证。人工确认保留原证据来源，后续自动维护不能覆盖用户确认的内容。候选不默认采用，文件或分支条件变化进入待复核，读取不会刷新确认时间。自动开关控制自动维护，Plan 仍允许受管应用记忆维护，Workspace 权限独立检查。
+
+请求文本按固定基础规则、少量通用用户记忆、初始环境、项目规则、Skill 目录、经验索引与少量正文、会话历史及动态来源排列。`tools` 保持独立字段并按名称稳定排序；系统模板不重新拼入变化的正文。来源首次采用形成有界快照，后续真实变化追加新版本；按需正文位于对应完整 Tool 组后，Tool 结果只确认采用或引用，不重复携带正文。语义优先级为真实用户要求、项目规则、有效经验、用户记忆，传输角色不会改变来源身份或授予权限。
+
+Session 保存实际消息与采用事实，memory 保存当前跨会话状态，Context 通过持久 entryId / seq 选择模型投影。Schema 3 的来源与压缩记录增加可选的版本 1 投影元数据，包含触发身份、保留消息身份、来源版本及折叠边界；新实现兼容没有这些字段的旧记录。完整候选校验并写入后才切换投影，不按正文相等猜测消息身份。只读历史保持原事实，显式继续才检查当前来源。
+
+遗忘保留不含正文的抑制标记，后续采用移除相关记忆与受影响摘要；明确停止发送时还过滤相关原始消息的模型投影。已经发送的请求无法撤回，执行未开始的 Tool 前会重新核对撤销状态。存储提交与 Session 采用分别处理，采用失败会如实说明“记忆已保存”，封口当前 Run，恢复时重新对齐。取消不能将已经提交的写入报告为未保存。
+
+来源正文继续计入请求预算，缓存用量只使用 Provider 返回值，未知保持未知。已移除每 Run 12 次和整组 60 次调用截止；30 分钟共享任务时限、32 个 ToolCall / 批、只读四并发和三个成员的限制保持。实现与本地验证范围见 [Feature 008 Report](../specs/feature008-memory-and-prompt-orchestration/report.md)。
 
 ## 设计约束
 

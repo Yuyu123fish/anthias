@@ -68,24 +68,30 @@ describe("read-only Agent Tool Loop", () => {
 
     expect(modelRequests).toHaveLength(4);
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "read_file",
-      "glob",
-      "grep",
-      "read_artifact",
-      "edit_file",
-      "write_file",
-      "execute_command",
-      "agent_spawn",
       "agent_list",
-      "agent_wait",
-      "agent_stop",
       "agent_result",
       "agent_resume",
-      "team",
+      "agent_spawn",
+      "agent_stop",
+      "agent_wait",
+      "edit_file",
+      "execute_command",
       "git",
+      "glob",
+      "grep",
+      "memory",
+      "read_artifact",
+      "read_file",
+      "team",
+      "write_file",
     ]);
-    expect(modelRequests[0]?.systemPrompt).toContain(workspaceRoot);
+    expect(JSON.stringify(modelRequests[0]?.messages)).toContain(
+      JSON.stringify(workspaceRoot).slice(1, -1),
+    );
     expect(modelRequests[3]?.messages.map((message) => message.role)).toEqual([
+      "user",
+      "user",
+      "user",
       "user",
       "assistant",
       "tool",
@@ -141,7 +147,7 @@ describe("read-only Agent Tool Loop", () => {
       .trimEnd()
       .split("\n")
       .map((line) => JSON.parse(line) as unknown);
-    expect(records).toHaveLength(14);
+    expect(records).toHaveLength(17);
     expect(records.at(-1)).toMatchObject({
       type: "run_finished",
       status: "completed",

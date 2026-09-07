@@ -41,6 +41,7 @@ Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复�
 - [Feature 005](specs/feature005-context-engineering/spec.md) 已于 2026-09-05 由开发者验收，包含请求前预算、自动 Compaction、历史与模型上下文分离、Schema 2 恢复索引、按 UTC 时间归档、工具原文及 `read_artifact`、启动时清理两周未使用的会话，以及 AutoAllow 独立审核。`/context` 查看窗口与累计用量；[实施报告](specs/feature005-context-engineering/report.md) 记录实际验证边界。
 - [Feature 006](specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏固定面板与应用内滚动、流式 Markdown、统一 `/` 命令、会话切换与手动压缩、按需加载外部 Skill、显式连接 MCP。当前全屏交互替代 Feature 004 的 scrollback 方案；[实施报告](specs/feature006-command-skill-mcp-tui/report.md) 记录本地验证，等待开发者终端体验验收。
 - [Feature 007](specs/feature007-multi-agent/spec.md) 已实现 SubAgent、AgentTeam 与本地 Git/worktree；复用现有 Agent，最多三个成员，可写成员从固定提交隔离执行。来源授权、Schema 3 历史、显式继续和组清理已完成本地验证，等待开发者验收；使用方式见 [Quick Start](quick-start.md#multiagent-与本地-git)，证据见 [实施报告](specs/feature007-multi-agent/report.md)。
+- [Feature 008](specs/feature008-memory-and-prompt-orchestration/spec.md) 已实现主动记忆、`/memory` 管理、项目 `AGENTS.md` 自动加载、稳定提示词顺序与来源增量，以及历史身份和压缩恢复映射。已移除 12/60 次模型调用截止，保留 30 分钟时限和资源边界；本地验证与真实缓存收益的证据边界见 [实施报告](specs/feature008-memory-and-prompt-orchestration/report.md)，待开发者验收。
 - 工程验证方向尚未进入对应 Feature；Desktop 尚未实现。执行分叉已退出产品核心路线，不再作为必须实现的后续目标。
 
 ## 文档入口

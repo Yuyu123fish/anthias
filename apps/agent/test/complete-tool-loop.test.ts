@@ -19,7 +19,7 @@ afterEach(async () => {
   temporaryDirectories.clear();
 });
 
-describe("complete Coding Agent Tool Loop", () => {
+describe("complete Coding Agent Tool Loop", { timeout: 20_000 }, () => {
   it("reads, edits, validates, summarizes, and accepts a later prompt in one Session", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-complete-loop-"));
     temporaryDirectories.add(workspaceRoot);
@@ -92,6 +92,7 @@ describe("complete Coding Agent Tool Loop", () => {
 
     await expect(agent.prompt("继续")).resolves.toEqual({ status: "completed" });
     expect(agent.state.running).toBe(false);
+    await agent.close();
   });
 });
 

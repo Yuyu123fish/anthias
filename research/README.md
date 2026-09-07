@@ -1,6 +1,6 @@
 # Research
 
-`research/` 只保存为项目级或跨 Feature 决定提供证据的限时调查。属于某个编号 Feature 的 Research 必须放在对应的 `specs/featurexxx-xxxxx/` 目录；具体命名见 [Feature 文档约定](../specs/README.md)。Research 用来回答明确问题，不是产品定义、Feature、Plan 或实施授权。
+`research/` 保存为项目级或跨 Feature 决定提供证据的限时调查，以及历史归档。属于某个编号 Feature 的 Research 必须放在对应的 `specs/featurexxx-xxxxx/` 目录；具体命名见 [Feature 文档约定](../specs/README.md)。Research 用来回答明确问题，不是产品定义、Feature、Plan 或实施授权。
 
 已转入 Feature 的研究：
 
@@ -39,3 +39,4 @@ research/archive/YYYY-MM-DD-topic/
 ## 已归档
 
 - [2026-08-19 初始方向调查](archive/2026-08-19-initial-direction/README.md)
+- [2026-09-06 上下文工程调研](archive/2026-09-06-context-engineering/README.md)：原 Feature 008 已整体搁置；收益证据不足，新增复杂度尚缺乏依据，未进入 Spec 或实施。

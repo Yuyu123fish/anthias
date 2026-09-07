@@ -127,6 +127,9 @@ describe("execute_command Agent Tool Loop", () => {
     expect(sessionRecords.map((record) => record.type)).toEqual([
       "session_header",
       "message",
+      "context_source",
+      "context_source",
+      "context_source",
       "request_usage",
       "message",
       "approval_decision",

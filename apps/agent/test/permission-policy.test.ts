@@ -21,7 +21,7 @@ afterEach(async () => {
 });
 
 describe("Permission Mode", () => {
-  it("shows only read-only tools in Plan and denies a forged side effect", async () => {
+  it("keeps workspace access read-only in Plan while exposing managed memory and denying forged writes", async () => {
     const outsideRoot = await createTemporaryDirectory("anthias-plan-outside-");
     const outsidePath = join(outsideRoot, "blocked.txt");
     const modelRequests: ModelRequest[] = [];
@@ -43,18 +43,19 @@ describe("Permission Mode", () => {
 
     expect(agent.state.permissionMode).toBe("plan");
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "read_file",
-      "glob",
-      "grep",
-      "read_artifact",
-      "agent_spawn",
       "agent_list",
-      "agent_wait",
-      "agent_stop",
       "agent_result",
       "agent_resume",
-      "team",
+      "agent_spawn",
+      "agent_stop",
+      "agent_wait",
       "git",
+      "glob",
+      "grep",
+      "memory",
+      "read_artifact",
+      "read_file",
+      "team",
     ]);
     const gitDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "git");
     expect(gitDefinition?.inputSchema.properties?.action).toMatchObject({
@@ -62,9 +63,9 @@ describe("Permission Mode", () => {
     });
     const spawnDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "agent_spawn");
     expect(spawnDefinition?.inputSchema.properties?.writable).toMatchObject({ const: false });
-    expect(modelRequests[0]?.systemPrompt).toContain("Plan 模式");
-    expect(modelRequests[0]?.systemPrompt).toContain("不得请求或声称已经产生");
-    expect(modelRequests[0]?.systemPrompt).not.toContain("修改后运行相关验证");
+    expect(JSON.stringify(modelRequests[0]?.messages)).toContain("当前权限模式：Plan 模式");
+    expect(JSON.stringify(modelRequests[0]?.messages)).toContain("任务工作区仅允许检查与分析");
+    expect(modelRequests[0]?.systemPrompt).toContain("允许受管的应用记忆维护");
     expect(modelRequests[1]?.messages.at(-1)).toMatchObject({
       role: "tool",
       toolName: "write_file",
@@ -101,18 +102,19 @@ describe("Permission Mode", () => {
     expect(agent.setPermissionMode("agent")).toEqual({ status: "rejected", reason: "busy" });
     expect(agent.state.permissionMode).toBe("plan");
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "read_file",
-      "glob",
-      "grep",
-      "read_artifact",
-      "agent_spawn",
       "agent_list",
-      "agent_wait",
-      "agent_stop",
       "agent_result",
       "agent_resume",
-      "team",
+      "agent_spawn",
+      "agent_stop",
+      "agent_wait",
       "git",
+      "glob",
+      "grep",
+      "memory",
+      "read_artifact",
+      "read_file",
+      "team",
     ]);
 
     releaseModel.resolve();

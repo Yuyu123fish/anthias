@@ -1,9 +1,15 @@
+import type { MemoryControls } from "./memory/index.js";
 import type { CollaborationControls } from "./multi-agent/index.js";
 import type { GitControls } from "./tool/git-tools.js";
 export type ActionResult<T> =
   | Readonly<{ ok: true; value: T }>
   | Readonly<{ ok: false; error: string }>;
-export type AgentOperation = "compacting" | "switching_session" | "updating_capabilities" | null;
+export type AgentOperation =
+  | "compacting"
+  | "switching_session"
+  | "updating_capabilities"
+  | "updating_memory"
+  | null;
 export type SessionSummary = Readonly<{ id: string; createdAt: string; title?: string }>;
 export type SkillSummary = Readonly<{
   id: string;
@@ -33,6 +39,7 @@ export type McpCapabilities = Readonly<{
 }>;
 /** 这些行为由 Agent 持有；交互层只映射命令和展示安全摘要。 */
 export type AgentControls = Readonly<{
+  memory: MemoryControls;
   collaboration: CollaborationControls;
   git: GitControls;
   sessions: Readonly<{

@@ -56,7 +56,7 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 node 'C:\projects\anthias\apps\tui\dist\main.js' --workspace 'D:\你的项目' --mode plan
 ```
 
-`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时为 Agent 模式，`--mode plan` 只允许读取、发现和搜索工作区文件及当前 Session 产物；`--mode auto_allow` 根据真实任务授权独立审核，批准后直接执行，信息不足时转人工确认。
+`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时为 Agent 模式，`--mode plan` 允许读取、发现和搜索工作区文件及当前 Session 产物，也允许受管的 Anthias 记忆维护；任务 Workspace 仍不可写；`--mode auto_allow` 根据真实任务授权独立审核，批准后直接执行，信息不足时转人工确认。
 
 ## 4. 使用 `anthias` 短命令
 
@@ -93,6 +93,7 @@ notepad $PROFILE
 | 新建或恢复会话 | `/new`；`/resume` 列出 ID，`/resume <id>` 打开 |
 | 主动压缩 | `/compact`，只压缩历史投影，不产生额外普通回复 |
 | 查询或切换模式 | `/mode`、`/mode plan`、`/mode agent`、`/mode auto_allow`；只能在空闲时切换 |
+| 记忆管理 | `/memory` 查看；`/memory help` 查看维护命令 |
 | 查看上下文用量 | `/context`，当前窗口与各用途累计用量分别显示 |
 | 阅读与滚动 | 鼠标滚轮、点击轨道或拖动右侧滑块；`PageUp/PageDown`、`Ctrl+Home/End` 继续可用 |
 | 执行过程 | 任务结束后自动折叠；点击执行过程或步骤标题展开、收起，最终回答保持可见 |
@@ -171,6 +172,41 @@ description: 检查项目的接口兼容性与错误处理
 
 模型只获得已连接且符合预算的工具定义。MCP 工具经过当前模式的审批；Plan 拒绝未知外部工具。资源和模板不是新的用户授权。工具预览最多 32 KiB，原文产物最多保留 256 KiB，完整性单独标记；当前不支持 OAuth 登录、自动安装、二进制呈现及 MCP Apps。
 
+## 8. 记忆与项目规则
+
+开始任务或明确继续会话时，Agent 自动加载项目根目录的 `AGENTS.md`，并采用当前有效记忆。Git 项目使用当前工作树的根目录；非 Git 项目使用选定的 Workspace。首版不扫描嵌套规则，文件不存在可以正常工作，读取失败或超过 64 KiB 时会暂停本次请求并显示原因。
+
+记忆统一保存在 **Anthias 仓库根目录的 `memory/`**，当前示例为 `C:\projects\anthias\memory`。它与任务 Workspace、Session 目录分别管理，已排除在版本控制之外：
+
+- `user/` 保存用户偏好、习惯与长期要求，条目可以限定当前项目。
+- `experience/<project-id>/` 保存项目事实、经过验证的做法与适用条件；同一 Git 仓库的 worktree 共享项目身份。
+- `state/` 保存自动记忆开关与写入协调状态。
+
+| 操作 | 用法 |
+| --- | --- |
+| 查看当前项目与通用记忆 | `/memory` |
+| 筛选类别与状态 | `/memory list user candidate`、`/memory list experience review` |
+| 查看全部项目 | `/memory all`，也可追加类别与状态 |
+| 查看正文、来源、条件和时间 | `/memory show <id>` |
+| 保存长期偏好 | `/memory save user global 以后回答先给结论` |
+| 保存项目经验 | `/memory save experience project 测试需要在仓库根目录执行` |
+| 纠正正文 | `/memory correct <id> <版本> <新正文>` |
+| 确认候选 | `/memory confirm <id> <版本>` |
+| 遗忘 | `/memory forget <id> <版本>` |
+| 同时停止发送相关历史内容 | `/memory forget <id> <版本> no-send` |
+| 自动记忆开关 | `/memory on`、`/memory off` |
+| 完整语法 | `/memory help` |
+
+列表显示 `id @版本`；维护时使用最新版本，避免覆盖其他会话的修改。支持的状态为 `active`、`candidate`、`review`、`expired`、`forgotten`，`all` 表示全部状态。查询可在运行中使用，人工维护和开关切换需先停止当前 Run。
+
+自动记忆默认开启。可以直接告诉 Agent“记住，以后回答先给结论”，或要求它查找项目经验；模型通过同一受管入口查询和维护。推断出的偏好先成为候选，用户确认后才可采用；经验引用实际已完成的 Tool 结果。关闭自动记忆仍允许读取和用户明确要求的维护。Plan 模式允许维护 Anthias 记忆，不因此开放工作区写入。
+
+长期偏好没有统一到期天数；临时记忆可带到期时间，经验可关联复核时间、分支和文件内容。到期后退出默认采用，条件变化后进入待复核；读取不会刷新最后确认时间。需要设置这些条件时，通过自然语言明确告诉 Agent 期限和关联文件。确认候选也不会跳过仍不满足的条件。
+
+发生冲突时，先检查范围和有效性，再按“当前真实用户要求 > AGENTS.md > 有效经验记忆 > 用户记忆”处理。普通更新追加来源新版本；遗忘会移除对应记忆采用及受影响摘要，`no-send` 还过滤相关原文的模型投影。原始 Session 仍保留历史事实，不等同于物理删除全部记录。
+
+初始快照采用固定顺序，按需读取的 Skill、MCP 和记忆正文只注入一次。`/context` 继续显示各用途用量；Provider 未返回缓存数据时保留未知，不能据此判断为零命中。详细合同和本地证据见 [Feature 008 Report](specs/feature008-memory-and-prompt-orchestration/report.md)。
+
 ## 启动遇到问题
 
 - **找不到 `anthias`**：先在当前窗口定义第 4 节的函数，或直接使用第 3 节的 Node 绝对入口。
@@ -199,7 +235,7 @@ description: 检查项目的接口兼容性与错误处理
 | 查看仓库和工作区 | `/git status [worktreeID]`、`/git diff [worktreeID]`、`/git worktrees` |
 | 独立创建、核对工作区 | `/git create [已提交ref]`、`/git inspect <worktreeID>` |
 
-SubAgent 完成后释放执行者；Team 成员保留上下文等待下一次明确分派，两者共用三个名额。成员不能继续创建 Agent 或 Team。普通消息只入队，不会唤醒空闲成员；正在执行时会在下次模型请求前接收。主 Agent 和成员的待确认操作统一在 TUI 中呈现，并标出成员来源。
+SubAgent 完成后释放执行者；Team 成员保留上下文等待下一次明确分派，两者共用三个名额。单 Run 的 12 次及根与成员共享的 60 次模型调用截止已移除；仍保留 30 分钟共享任务时限、每批 32 个 ToolCall 和只读四并发。成员不能继续创建 Agent 或 Team。普通消息只入队，不会唤醒空闲成员；正在执行时会在下次模型请求前接收。主 Agent 和成员的待确认操作统一在 TUI 中呈现，并标出成员来源。
 
 可写成员从固定提交创建自己的目录，默认使用创建时的 HEAD；主目录的未提交修改不会带入。目录默认位于 Anthias 的 `data/worktrees/<根SessionID>/`，可用绝对路径环境变量 `ANTHIAS_WORKTREE_DIR` 覆盖。它独立于 `ANTHIAS_SESSION_DIR`，历史不会随 worktree 回收而消失。worktree 只隔离代码目录，外部服务、端口和数据库仍需任务自行安排。
 

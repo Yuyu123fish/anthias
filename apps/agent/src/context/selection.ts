@@ -266,6 +266,12 @@ function selectCheckpointMessageRecords(
   checkpoint: CompactionRecord,
   durableMessageRecords: readonly ContextRecord[],
 ): readonly ContextRecord[] {
+  if (checkpoint.projection) {
+    const retainedIds = new Set(checkpoint.projection.retainedEntryIds);
+    return durableMessageRecords.filter(
+      (record) => retainedIds.has(record.entryId) || record.seq > checkpoint.seq,
+    );
+  }
   const retainedUserEntryIds = new Set(checkpoint.retainedUserEntryIds);
   const tailRecords = selectCheckpointTailRecords(checkpoint, durableMessageRecords);
   const tailEntryIds = new Set(tailRecords.map((record) => record.entryId));
@@ -290,22 +296,15 @@ function associateRawMessages(
   rawMessages: readonly ModelInputMessage[],
   durableMessageRecords: readonly ContextRecord[],
 ): readonly RawMessageAssociation[] {
-  let durableCursor = 0;
+  const byId = new Map(durableMessageRecords.map((record) => [record.entryId, record]));
   return Object.freeze(
     rawMessages.map((message, rawIndex) => {
-      const matchingIndex = durableMessageRecords.findIndex(
-        (record, index) => index >= durableCursor && messageMatchesDurableRecord(message, record),
-      );
-      if (matchingIndex === -1) {
-        return Object.freeze({ rawIndex, message, entryId: null, seq: null });
-      }
-      durableCursor = matchingIndex + 1;
-      const matchingRecord = durableMessageRecords[matchingIndex];
+      const record = message.entryId ? byId.get(message.entryId) : undefined;
       return Object.freeze({
         rawIndex,
         message,
-        entryId: matchingRecord?.entryId ?? null,
-        seq: matchingRecord?.seq ?? null,
+        entryId: record?.entryId ?? null,
+        seq: record?.seq ?? null,
       });
     }),
   );
@@ -330,42 +329,12 @@ function toRawEntries(
   );
 }
 
-function messageMatchesDurableRecord(message: ModelInputMessage, record: ContextRecord): boolean {
-  const durableMessage = toModelInputMessage(record);
-  if (message.role !== durableMessage.role) {
-    return false;
-  }
-  if (message.role === "user" && durableMessage.role === "user") {
-    return message.content === durableMessage.content;
-  }
-  if (message.role === "tool" && durableMessage.role === "tool") {
-    return (
-      message.toolCallId === durableMessage.toolCallId &&
-      message.toolName === durableMessage.toolName &&
-      message.status === durableMessage.status &&
-      message.content === durableMessage.content &&
-      message.truncated === durableMessage.truncated
-    );
-  }
-  if (message.role !== "assistant" || durableMessage.role !== "assistant") {
-    return false;
-  }
-  return (
-    JSON.stringify(message.content.filter((part) => part.type !== "reasoning")) ===
-    JSON.stringify(durableMessage.content)
-  );
-}
-
 function toModelInputMessage(record: ContextRecord): ModelInputMessage {
-  if (record.type === "agent_input") return agentInputMessage(record);
-  const message = fromDurableMessage(record.message);
-  if (message.role !== "assistant") {
-    return message;
-  }
-  return Object.freeze({
-    role: "assistant" as const,
-    content: message.content,
-  });
+  const message =
+    record.type === "agent_input" ? agentInputMessage(record) : fromDurableMessage(record.message);
+  return message.role === "assistant"
+    ? { role: "assistant", content: message.content, entryId: record.entryId }
+    : { ...message, entryId: record.entryId };
 }
 
 function isCompactionHistoryMessage(message: ModelInputMessage): boolean {
@@ -501,24 +470,19 @@ export function includeAgentInputs(
   rawMessages: readonly ModelInputMessage[],
 ): readonly ModelInputMessage[] {
   const messages = [...rawMessages];
-  const messageRecords = records.filter(
-    (record): record is ContextRecord => record.type === "message" || record.type === "agent_input",
+  const byId = new Map(records.map((record) => [record.entryId, record]));
+  const present = new Set(
+    messages.flatMap((message) => (message.entryId ? [message.entryId] : [])),
   );
-  for (const record of messageRecords) {
-    if (record.type !== "agent_input") continue;
-    const inputMessage = agentInputMessage(record);
-    if (
-      messages.some(
-        (message) => message.role === "user" && message.content === inputMessage.content,
-      )
-    )
-      continue;
-    const following = messageRecords.filter((candidate) => candidate.seq > record.seq);
-    const insertAt = messages.findIndex((message) =>
-      following.some((candidate) => messageMatchesDurableRecord(message, candidate)),
+  for (const record of records) {
+    if (record.type !== "agent_input" || present.has(record.entryId)) continue;
+    const insertAt = messages.findIndex(
+      (message) => message.entryId && (byId.get(message.entryId)?.seq ?? 0) > record.seq,
     );
-    if (insertAt < 0) messages.push(inputMessage);
-    else messages.splice(insertAt, 0, inputMessage);
+    const message = { ...agentInputMessage(record), entryId: record.entryId };
+    if (insertAt < 0) messages.push(message);
+    else messages.splice(insertAt, 0, message);
+    present.add(record.entryId);
   }
   return messages;
 }

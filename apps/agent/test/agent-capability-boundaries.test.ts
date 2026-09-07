@@ -212,7 +212,8 @@ describe("Agent capability failure boundaries", () => {
           status: "acquired",
           lease: {
             ...acquisition.lease,
-            async appendContextSource() {
+            async appendContextSource(details) {
+              if (details.kind !== "skill") return acquisition.lease.appendContextSource(details);
               sourceWrites += 1;
               throw new Error("synthetic context source write failure");
             },
@@ -244,7 +245,9 @@ describe("Agent capability failure boundaries", () => {
     expect(agent.state.running).toBe(false);
     expect(agent.state.activeRun).toBeNull();
     expect(events.filter((event) => event.type === "run_end")).toHaveLength(1);
-    expect(session.records.some((record) => record.type === "context_source")).toBe(false);
+    expect(
+      session.records.some((record) => record.type === "context_source" && record.kind === "skill"),
+    ).toBe(false);
     const messageHistory = agent.state.messageHistory;
     const toolEvents = events.filter((event) => event.type === "tool_execution_start").length;
     expect((await agent.prompt("不要再调用模型或工具")).status).toBe("failed");

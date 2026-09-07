@@ -6,6 +6,7 @@ import { join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { type Agent, createAgentWithModelStream } from "../src/agent.js";
+import { memoryHash } from "../src/memory/schema.js";
 import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import type { MemberSummary } from "../src/multi-agent/index.js";
 import { readSessionHistory } from "../src/session/history.js";
@@ -129,6 +130,118 @@ describe("MultiAgent through the Agent interface", () => {
       value(await agent.collaboration.execute({ action: "result", memberId: member.sessionId })),
     ).toContain("bounded member result");
   });
+
+  it("shares project memory identity while binding a candidate to the member worktree evidence", async () => {
+    let count = 0;
+    const evidenceId = randomUUID();
+    const { agent, directory } = await setup(async function* () {
+      count++;
+      if (count === 1)
+        yield {
+          type: "tool_call",
+          toolCallId: randomUUID(),
+          toolName: "write_file",
+          input: { path: "member-only.txt", content: "member verified fact" },
+          invalid: false,
+        };
+      else if (count === 2)
+        yield {
+          type: "tool_call",
+          toolCallId: evidenceId,
+          toolName: "read_file",
+          input: { path: "member-only.txt" },
+          invalid: false,
+        };
+      else if (count === 3)
+        yield {
+          type: "tool_call",
+          toolCallId: randomUUID(),
+          toolName: "memory",
+          input: {
+            action: "save",
+            kind: "experience",
+            content: "成员文件记录 member verified fact",
+            basis: "verified",
+            toolCallId: evidenceId,
+            quote: "member verified fact",
+          },
+          invalid: false,
+        };
+      else {
+        yield { type: "finish", finishReason: "stop" };
+        return;
+      }
+      yield { type: "finish", finishReason: "tool_calls" };
+    }, true);
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested")
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+    });
+    const member = await spawn(agent, "验证成员自己的新文件并提交经验候选", true);
+    await wait(agent, member.sessionId);
+    const queried = await agent.memory.query({ status: "all" });
+    if (!queried.ok) throw new Error(queried.error);
+    const entry = queried.value.entries[0];
+    expect(entry).toMatchObject({
+      status: "candidate",
+      scope: queried.value.projectId,
+      conditions: {
+        files: [{ path: "member-only.txt", fingerprint: memoryHash("member verified fact") }],
+      },
+      source: { kind: "verified", sessionId: member.sessionId },
+    });
+    expect(await readFile(join(member.workspaceRoot, "member-only.txt"), "utf8")).toBe(
+      "member verified fact",
+    );
+    await expect(readFile(join(directory, "member-only.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    if (!entry) throw new Error("candidate");
+    const confirmation = await agent.memory.execute({
+      action: "confirm",
+      id: entry.id,
+      revision: entry.revision,
+    });
+    expect(confirmation.ok && confirmation.value.entries[0]?.status).toBe("review");
+    expect(confirmation.ok && confirmation.value.entries[0]?.source.sessionId).toBe(
+      member.sessionId,
+    );
+    expect(confirmation.ok && confirmation.value.entries[0]?.userConfirmed).toBe(true);
+  }, 30_000);
+
+  it("continues root and member requests beyond the former shared count", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const counts = { root: 0, member: 0 };
+    const { agent } = await setup(async function* (request) {
+      const owner = request.messages.some(
+        (message) => message.role === "user" && message.content === "root budget",
+      )
+        ? "root"
+        : "member";
+      const count = ++counts[owner];
+      if (owner === "member" && count === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      if (owner === "root") release.resolve();
+      if (count <= 32) {
+        yield {
+          type: "tool_call",
+          toolCallId: randomUUID(),
+          toolName: "unknown_tool",
+          input: {},
+          invalid: false,
+        };
+        yield { type: "finish", finishReason: "tool_calls" };
+      } else yield { type: "finish", finishReason: "stop" };
+    });
+    const member = await spawn(agent, "member budget");
+    await entered.promise;
+    expect((await agent.prompt("root budget")).status).toBe("completed");
+    await wait(agent, member.sessionId);
+    expect(counts).toEqual({ root: 33, member: 33 });
+  }, 60_000);
 
   it("isolates writable members and delivers Git results through approved controls", async () => {
     const requests = new Map<string, number>();

@@ -193,6 +193,7 @@ describe("Context selection", () => {
       status: "completed",
     });
     const firstAssistantWithReasoning: ModelInputMessage = Object.freeze({
+      entryId: firstAssistant.entryId,
       role: "assistant" as const,
       content: Object.freeze([
         Object.freeze({ type: "reasoning" as const, text: "当前 Run 的推理" }),
@@ -200,6 +201,7 @@ describe("Context selection", () => {
       ]),
     });
     const secondAssistantWithReasoning: ModelInputMessage = Object.freeze({
+      entryId: secondAssistant.entryId,
       role: "assistant" as const,
       content: Object.freeze([
         Object.freeze({ type: "reasoning" as const, text: "后续推理" }),
@@ -208,9 +210,9 @@ describe("Context selection", () => {
     });
     const rawMessages = Object.freeze([
       createCompactionMessage("旧摘要"),
-      userMessage("初始任务"),
+      { ...userMessage("初始任务"), entryId: firstUser.entryId },
       firstAssistantWithReasoning,
-      userMessage("后续纠正"),
+      { ...userMessage("后续纠正"), entryId: secondUser.entryId },
       secondAssistantWithReasoning,
       userMessage("刚追加但尚未映射的输入"),
     ]);
@@ -232,6 +234,23 @@ describe("Context selection", () => {
     expect(result.messages[2]).toBe(firstAssistantWithReasoning);
     expect(result.messages[4]).toBe(secondAssistantWithReasoning);
     expect(result.messages[5]).toEqual(userMessage("刚追加但尚未映射的输入"));
+  });
+
+  it("distinguishes identical user messages by durable identity instead of text", () => {
+    const first = messageRecord(1, null, randomUUID(), {
+      type: "user",
+      content: [{ type: "text", text: "继续" }],
+    });
+    const second = messageRecord(2, first.entryId, first.runId, {
+      type: "user",
+      content: [{ type: "text", text: "继续" }],
+    });
+    const result = projectContextHistory(
+      [first, second],
+      [{ ...userMessage("继续"), entryId: second.entryId }, userMessage("继续")],
+    );
+    expect(result.entries.map((entry) => entry.entryId)).toEqual([second.entryId]);
+    expect(result.messages).toHaveLength(2);
   });
 
   it("falls back to the previous checkpoint when the newest tail starts inside a Tool group", () => {

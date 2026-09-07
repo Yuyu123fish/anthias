@@ -1,6 +1,7 @@
 import type { Agent, ContextUsage, PermissionMode } from "@anthias/agent";
 import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./content-renderer.js";
+import { runMemoryCommand } from "./memory-view.js";
 import { runCollaborationCommand } from "./multi-agent-view.js";
 
 const COMMANDS = [
@@ -23,6 +24,11 @@ const COMMANDS = [
   { name: "help", argumentHint: "", description: "命令与快捷键" },
   { name: "new", argumentHint: "", description: "新建当前工作区的会话" },
   { name: "resume", argumentHint: "[id]", description: "列出或恢复会话" },
+  {
+    name: "memory",
+    argumentHint: "[list|all|show|save|correct|confirm|forget|on|off|help ...]",
+    description: "查看和维护分层记忆",
+  },
   { name: "context", argumentHint: "", description: "上下文窗口和调用用量" },
   { name: "compact", argumentHint: "", description: "手动压缩上下文" },
   { name: "mode", argumentHint: "[agent|plan|auto_allow]", description: "查看或切换权限模式" },
@@ -84,35 +90,37 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
       ...command,
       async getArgumentCompletions(prefix) {
         const choices =
-          command.name === "mode"
-            ? ["agent", "plan", "auto_allow"]
-            : command.name === "skills"
-              ? ["reload", "clear"]
-              : command.name === "details"
-                ? ["prev", "next"]
-                : command.name === "mcp"
-                  ? ["connect", "disconnect", "inspect", "read", "prompt"]
-                  : command.name === "agent"
-                    ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
-                    : command.name === "team"
-                      ? ["create", "add", "assign", "message", "tasks", "close"]
-                      : command.name === "git"
-                        ? [
-                            "status",
-                            "diff",
-                            "log",
-                            "show",
-                            "branches",
-                            "worktrees",
-                            "create",
-                            "inspect",
-                            "remove",
-                            "commit",
-                            "integrate",
-                            "continue",
-                            "abort",
-                          ]
-                        : [];
+          command.name === "memory"
+            ? ["list", "all", "show", "save", "correct", "confirm", "forget", "on", "off", "help"]
+            : command.name === "mode"
+              ? ["agent", "plan", "auto_allow"]
+              : command.name === "skills"
+                ? ["reload", "clear"]
+                : command.name === "details"
+                  ? ["prev", "next"]
+                  : command.name === "mcp"
+                    ? ["connect", "disconnect", "inspect", "read", "prompt"]
+                    : command.name === "agent"
+                      ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
+                      : command.name === "team"
+                        ? ["create", "add", "assign", "message", "tasks", "close"]
+                        : command.name === "git"
+                          ? [
+                              "status",
+                              "diff",
+                              "log",
+                              "show",
+                              "branches",
+                              "worktrees",
+                              "create",
+                              "inspect",
+                              "remove",
+                              "commit",
+                              "integrate",
+                              "continue",
+                              "abort",
+                            ]
+                          : [];
         if ((command.name === "agent" || command.name === "team") && prefix.includes(" ")) {
           const operation = prefix.split(/\s+/u)[0] ?? "";
           if (
@@ -196,6 +204,10 @@ export async function executeCommand(
   const { agent, notice } = options;
   const argumentsText = command.argumentsText.trim();
   const args = argumentsText ? argumentsText.split(/\s+/u) : [];
+  if (command.name === "memory") {
+    await runMemoryCommand(command.argumentsText, agent, notice);
+    return;
+  }
   if (await runCollaborationCommand(command.name, argumentsText, agent, notice)) return;
   const report = (result: { ok: boolean; error?: string }, success: string) =>
     notice(result.ok ? success : (result.error ?? "操作失败。"));

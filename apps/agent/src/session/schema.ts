@@ -87,8 +87,22 @@ export type PersistedUsage = Readonly<{
   cacheWriteInputTokens?: number | null;
 }>;
 
+export type SourcePlacement = Readonly<{
+  version: 1;
+  initialOrder?: 2 | 3 | 4 | 5 | 6;
+  afterEntryId?: string;
+  memoryIds?: readonly string[];
+}>;
+export type CompactionProjection = Readonly<{
+  version: 1;
+  sourceVersions: readonly Readonly<{ sourceId: string; entryId: string; fingerprint: string }>[];
+  foldedThroughSourceEntryId: string | null;
+  retainedEntryIds: readonly string[];
+}>;
+
 /** 后续 Context 写入成功压缩所需的已确认事实。 */
 export type CompactionDetails = Readonly<{
+  projection?: CompactionProjection;
   summary: string;
   coversThroughEntryId: string;
   firstKeptEntryId: string | null;
@@ -216,6 +230,7 @@ export type SessionUseRecord = SessionEntryBase &
 export type CompactionRecord = SessionEntryBase &
   Readonly<{
     type: "compaction";
+    projection?: CompactionProjection;
     runId?: string;
     summary: string;
     coversThroughEntryId: string;
@@ -256,7 +271,18 @@ export type ApprovalDecisionRecord = SessionEntryBase &
 /** 枚举 Schema 2 允许出现在 Header 之后的持久记录。 */
 export type ContextSourceDetails = Readonly<{
   sourceId: string;
-  kind: "skill" | "skill_reference" | "mcp_resource" | "mcp_prompt";
+  kind:
+    | "skill"
+    | "skill_reference"
+    | "mcp_resource"
+    | "mcp_prompt"
+    | "project_rules"
+    | "user_memory"
+    | "experience_memory"
+    | "memory_index"
+    | "environment"
+    | "skill_directory";
+  projection?: SourcePlacement;
   label: string;
   fingerprint: string;
   content: string | null;
@@ -411,22 +437,38 @@ export function parseSessionRecord(
   }
   if (value.type === "context_source") {
     if (
-      !hasExactKeysWithOptionalRunId(value, [
-        "type",
-        "entryId",
-        "seq",
-        "timestamp",
-        "parentEntryId",
-        "sourceId",
-        "kind",
-        "label",
-        "fingerprint",
-        "content",
-      ]) ||
+      !hasExactKeysWithOptionalRunId(
+        value,
+        [
+          "type",
+          "entryId",
+          "seq",
+          "timestamp",
+          "parentEntryId",
+          "sourceId",
+          "kind",
+          "label",
+          "fingerprint",
+          "content",
+        ],
+        ["projection"],
+      ) ||
+      !(value.projection === undefined || isSourcePlacement(value.projection)) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
       !isNonEmptyString(value.sourceId) ||
       value.sourceId.length > 2048 ||
-      !["skill", "skill_reference", "mcp_resource", "mcp_prompt"].includes(String(value.kind)) ||
+      ![
+        "skill",
+        "skill_reference",
+        "mcp_resource",
+        "mcp_prompt",
+        "project_rules",
+        "user_memory",
+        "experience_memory",
+        "memory_index",
+        "environment",
+        "skill_directory",
+      ].includes(String(value.kind)) ||
       typeof value.label !== "string" ||
       value.label.length > 2048 ||
       typeof value.fingerprint !== "string" ||
@@ -508,21 +550,26 @@ export function parseSessionRecord(
   }
   if (value.type === "compaction") {
     if (
-      !hasExactKeysWithOptionalRunId(value, [
-        "type",
-        "entryId",
-        "seq",
-        "timestamp",
-        "parentEntryId",
-        "summary",
-        "coversThroughEntryId",
-        "firstKeptEntryId",
-        "retainedUserEntryIds",
-        "usageBefore",
-        "inputTokenEstimateAfter",
-        "modelId",
-        "contextVersion",
-      ]) ||
+      !hasExactKeysWithOptionalRunId(
+        value,
+        [
+          "type",
+          "entryId",
+          "seq",
+          "timestamp",
+          "parentEntryId",
+          "summary",
+          "coversThroughEntryId",
+          "firstKeptEntryId",
+          "retainedUserEntryIds",
+          "usageBefore",
+          "inputTokenEstimateAfter",
+          "modelId",
+          "contextVersion",
+        ],
+        ["projection"],
+      ) ||
+      !(value.projection === undefined || isCompactionProjection(value.projection)) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
       typeof value.summary !== "string" ||
       !isUuid(value.coversThroughEntryId) ||
@@ -862,10 +909,64 @@ export function validateSessionRecords(
 
 /** 判断结构有效的 CompactionEntry 是否能作为恢复 checkpoint。 */
 export function isValidCompactionRecord(
-  record: CompactionRecord,
+  record: Pick<
+    CompactionRecord,
+    "projection" | "coversThroughEntryId" | "firstKeptEntryId" | "retainedUserEntryIds"
+  >,
   previousRecordsByEntryId: ReadonlyMap<string, SessionRecord>,
 ): boolean {
+  if (record.projection) {
+    const projection = record.projection;
+    const sources = [...previousRecordsByEntryId.values()].filter(
+      (entry): entry is ContextSourceRecord => entry.type === "context_source",
+    );
+    if ((sources.at(-1)?.entryId ?? null) !== projection.foldedThroughSourceEntryId) return false;
+    const activeSources = new Map<string, ContextSourceRecord>();
+    for (const source of sources) {
+      if (source.content === null) activeSources.delete(source.sourceId);
+      else activeSources.set(source.sourceId, source);
+    }
+    if (
+      activeSources.size !== projection.sourceVersions.length ||
+      new Set(projection.sourceVersions.map((source) => source.sourceId)).size !==
+        activeSources.size ||
+      projection.sourceVersions.some(
+        (source) => activeSources.get(source.sourceId)?.entryId !== source.entryId,
+      )
+    )
+      return false;
+    const retainedIds = new Set(projection.retainedEntryIds);
+    if (
+      retainedIds.size !== projection.retainedEntryIds.length ||
+      record.retainedUserEntryIds.some((id) => !retainedIds.has(id)) ||
+      (record.firstKeptEntryId !== null && !retainedIds.has(record.firstKeptEntryId))
+    )
+      return false;
+    let lastSequence = 0;
+    for (const id of projection.retainedEntryIds) {
+      const retained = previousRecordsByEntryId.get(id);
+      if (!retained || retained.seq <= lastSequence) return false;
+      lastSequence = retained.seq;
+    }
+  }
   return (
+    (record.projection === undefined ||
+      (record.projection.sourceVersions.every((source) => {
+        const saved = previousRecordsByEntryId.get(source.entryId);
+        return (
+          saved?.type === "context_source" &&
+          saved.sourceId === source.sourceId &&
+          saved.fingerprint === source.fingerprint &&
+          saved.content !== null
+        );
+      }) &&
+        (record.projection.foldedThroughSourceEntryId === null ||
+          previousRecordsByEntryId.get(record.projection.foldedThroughSourceEntryId)?.type ===
+            "context_source") &&
+        record.projection.retainedEntryIds.every((id) => {
+          const saved = previousRecordsByEntryId.get(id);
+          return saved?.type === "message" || saved?.type === "agent_input";
+        }))) &&
     previousRecordsByEntryId.has(record.coversThroughEntryId) &&
     (record.firstKeptEntryId === null || previousRecordsByEntryId.has(record.firstKeptEntryId)) &&
     new Set(record.retainedUserEntryIds).size === record.retainedUserEntryIds.length &&
@@ -925,6 +1026,15 @@ function validateFactReferences(
 ): void {
   if (record.type === "compaction") {
     return;
+  }
+  if (record.type === "context_source" && record.projection?.afterEntryId) {
+    const trigger = previousRecordsByEntryId.get(record.projection.afterEntryId);
+    if (
+      trigger?.type !== "message" ||
+      trigger.message.type !== "assistant" ||
+      !trigger.message.content.some((part) => part.type === "tool_call")
+    )
+      throw new Error("上下文来源的 Tool 组引用无效。");
   }
   if (
     record.type === "request_usage" &&
@@ -1162,8 +1272,57 @@ function hasExactKeysWithOptionalApprovalFields(
 function hasExactKeysWithOptionalRunId(
   value: Record<string, unknown>,
   requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
 ): boolean {
-  return hasExactKeys(value, requiredKeys) || hasExactKeys(value, [...requiredKeys, "runId"]);
+  const acceptedKeys = [...requiredKeys, "runId", ...optionalKeys];
+  return (
+    requiredKeys.every((key) => Object.hasOwn(value, key)) &&
+    Object.keys(value).every((key) => acceptedKeys.includes(key))
+  );
+}
+
+function isSourcePlacement(value: unknown): value is SourcePlacement {
+  if (!isPlainObject(value) || value.version !== 1) return false;
+  return (
+    Object.keys(value).every((key) =>
+      ["version", "initialOrder", "afterEntryId", "memoryIds"].includes(key),
+    ) &&
+    (value.initialOrder === undefined ||
+      (typeof value.initialOrder === "number" && [2, 3, 4, 5, 6].includes(value.initialOrder))) &&
+    (value.afterEntryId === undefined || isUuid(value.afterEntryId)) &&
+    (value.memoryIds === undefined ||
+      (Array.isArray(value.memoryIds) &&
+        value.memoryIds.length <= 512 &&
+        value.memoryIds.every((id) => typeof id === "string" && /^[a-f0-9]{32}$/.test(id))))
+  );
+}
+function isCompactionProjection(value: unknown): value is CompactionProjection {
+  return (
+    isPlainObject(value) &&
+    value.version === 1 &&
+    hasExactKeys(value, [
+      "version",
+      "sourceVersions",
+      "foldedThroughSourceEntryId",
+      "retainedEntryIds",
+    ]) &&
+    Array.isArray(value.sourceVersions) &&
+    value.sourceVersions.length <= 1024 &&
+    value.sourceVersions.every(
+      (source) =>
+        isPlainObject(source) &&
+        hasExactKeys(source, ["sourceId", "entryId", "fingerprint"]) &&
+        isNonEmptyString(source.sourceId) &&
+        isUuid(source.entryId) &&
+        typeof source.fingerprint === "string" &&
+        /^[a-f0-9]{64}$/.test(source.fingerprint),
+    ) &&
+    (value.foldedThroughSourceEntryId === null || isUuid(value.foldedThroughSourceEntryId)) &&
+    isUuidArray(value.retainedEntryIds)
+  );
+}
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasValidEntryIdentity(
