@@ -1,8 +1,10 @@
 import type { Agent, ContextUsage, PermissionMode } from "@anthias/agent";
 import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./content-renderer.js";
+import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { runMemoryCommand } from "./memory-view.js";
 import { runCollaborationCommand } from "./multi-agent-view.js";
+import { formatPermissions, type PermissionGrantChoice } from "./permission-view.js";
 
 const COMMANDS = [
   { name: "agents", argumentHint: "", description: "成员、Team 与任务状态" },
@@ -30,6 +32,15 @@ const COMMANDS = [
     description: "查看和维护分层记忆",
   },
   { name: "context", argumentHint: "", description: "上下文窗口和调用用量" },
+  {
+    name: "permissions",
+    argumentHint: "[grant [--remember] [--members]|revoke]",
+    description: "查看、授予或撤销工作区授权",
+  },
+  { name: "approval", argumentHint: "", description: "查看当前执行确认" },
+  { name: "diagnostics", argumentHint: "", description: "查看最近 Run 的安全诊断" },
+  { name: "continue", argumentHint: "[补充要求]", description: "明确继续上一任务，开始新 Run" },
+  { name: "draft", argumentHint: "", description: "恢复未接受的上一份输入" },
   { name: "compact", argumentHint: "", description: "手动压缩上下文" },
   { name: "mode", argumentHint: "[agent|plan|auto_allow]", description: "查看或切换权限模式" },
   { name: "skills", argumentHint: "[reload|clear]", description: "外部 Skill 目录与激活状态" },
@@ -39,7 +50,7 @@ const COMMANDS = [
     argumentHint: "[connect|disconnect|inspect|read|prompt ...]",
     description: "MCP 连接与外部能力",
   },
-  { name: "details", argumentHint: "[prev|next]", description: "查看 Reasoning 和 Tool 详情" },
+  { name: "details", argumentHint: "[prev|next]", description: "查看命令、Reasoning 和 Tool 详情" },
   { name: "exit", argumentHint: "", description: "停止 Agent 并退出" },
 ] as const;
 
@@ -78,7 +89,9 @@ export function commandHelp(): string {
     "鼠标滚轮 / 拖动右侧滑块滚动 · 点击执行过程或步骤标题展开、收起",
     "PageUp / PageDown 滚动 · Ctrl+Home / Ctrl+End 顶部/末尾",
     "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
-    "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。",
+    "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。/approval 返回当前审批。",
+    "工作区授权：/permissions grant [--remember] [--members]，浏览后输入 grant 或 cancel。",
+    "拒绝的输入可用 /draft 恢复；/continue 明确继续上一任务。",
     "// 开头会将一个 / 作为普通文本发送。",
   ].join("\n");
 }
@@ -92,35 +105,43 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
         const choices =
           command.name === "memory"
             ? ["list", "all", "show", "save", "correct", "confirm", "forget", "on", "off", "help"]
-            : command.name === "mode"
-              ? ["agent", "plan", "auto_allow"]
-              : command.name === "skills"
-                ? ["reload", "clear"]
-                : command.name === "details"
-                  ? ["prev", "next"]
-                  : command.name === "mcp"
-                    ? ["connect", "disconnect", "inspect", "read", "prompt"]
-                    : command.name === "agent"
-                      ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
-                      : command.name === "team"
-                        ? ["create", "add", "assign", "message", "tasks", "close"]
-                        : command.name === "git"
-                          ? [
-                              "status",
-                              "diff",
-                              "log",
-                              "show",
-                              "branches",
-                              "worktrees",
-                              "create",
-                              "inspect",
-                              "remove",
-                              "commit",
-                              "integrate",
-                              "continue",
-                              "abort",
-                            ]
-                          : [];
+            : command.name === "permissions"
+              ? [
+                  "grant",
+                  "grant --remember",
+                  "grant --members",
+                  "grant --remember --members",
+                  "revoke",
+                ]
+              : command.name === "mode"
+                ? ["agent", "plan", "auto_allow"]
+                : command.name === "skills"
+                  ? ["reload", "clear"]
+                  : command.name === "details"
+                    ? ["prev", "next"]
+                    : command.name === "mcp"
+                      ? ["connect", "disconnect", "inspect", "read", "prompt"]
+                      : command.name === "agent"
+                        ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
+                        : command.name === "team"
+                          ? ["create", "add", "assign", "message", "tasks", "close"]
+                          : command.name === "git"
+                            ? [
+                                "status",
+                                "diff",
+                                "log",
+                                "show",
+                                "branches",
+                                "worktrees",
+                                "create",
+                                "inspect",
+                                "remove",
+                                "commit",
+                                "integrate",
+                                "continue",
+                                "abort",
+                              ]
+                            : [];
         if ((command.name === "agent" || command.name === "team") && prefix.includes(" ")) {
           const operation = prefix.split(/\s+/u)[0] ?? "";
           if (
@@ -198,6 +219,10 @@ export async function executeCommand(
     agent: Agent;
     notice(text: string): void;
     details(direction?: "prev" | "next"): void;
+    rejected?(): void;
+    recoverDraft?(): void;
+    approval?(): void;
+    permissions?(choice: PermissionGrantChoice): void;
     exit(): void;
   },
 ): Promise<string | undefined> {
@@ -205,13 +230,19 @@ export async function executeCommand(
   const argumentsText = command.argumentsText.trim();
   const args = argumentsText ? argumentsText.split(/\s+/u) : [];
   if (command.name === "memory") {
-    await runMemoryCommand(command.argumentsText, agent, notice);
+    await runMemoryCommand(command.argumentsText, agent, notice, options.rejected);
     return;
   }
-  if (await runCollaborationCommand(command.name, argumentsText, agent, notice)) return;
-  const report = (result: { ok: boolean; error?: string }, success: string) =>
+  if (await runCollaborationCommand(command.name, argumentsText, agent, notice, options.rejected))
+    return;
+  const report = (result: { ok: boolean; error?: string }, success: string) => {
+    if (!result.ok) options.rejected?.();
     notice(result.ok ? success : (result.error ?? "操作失败。"));
-  const invalid = () => notice(`参数无效。使用 /help 查看 /${command.name} 的用法。`);
+  };
+  const invalid = () => {
+    options.rejected?.();
+    notice(`参数无效。使用 /help 查看 /${command.name} 的用法。`);
+  };
   if (command.name.startsWith("skill:")) {
     const identity = command.name.slice(6);
     if (!identity) {
@@ -223,6 +254,45 @@ export async function executeCommand(
     return result.ok && argumentsText ? command.argumentsText : undefined;
   }
   switch (command.name) {
+    case "permissions": {
+      if (args.length === 0) {
+        notice(formatPermissions(agent.permissions.snapshot()));
+      } else if (args[0] === "revoke" && args.length === 1) {
+        const result = await agent.permissions.revoke();
+        notice(
+          result.ok
+            ? "工作区授权已撤销。未开始的动作与待批准请求已失效；已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
+            : result.error,
+        );
+        if (!result.ok) notice(formatPermissions(agent.permissions.snapshot()));
+      } else if (
+        args[0] === "grant" &&
+        args.slice(1).every((argument) => argument === "--remember" || argument === "--members") &&
+        new Set(args.slice(1)).size === args.length - 1
+      ) {
+        options.permissions?.({
+          remember: args.includes("--remember"),
+          includeMembers: args.includes("--members"),
+        });
+      } else invalid();
+      break;
+    }
+    case "diagnostics":
+      if (args.length) invalid();
+      else notice(formatRunDiagnostic(agent.state.lastRunDiagnostic));
+      break;
+    case "continue":
+      return argumentsText
+        ? `继续上一任务。补充要求：\n${command.argumentsText}`
+        : "继续上一任务。先依据已保存消息、工具结果和当前工作区核对剩余工作，保留已经完成的成果，不重复已成功的副作用。";
+    case "draft":
+      if (args.length) invalid();
+      else options.recoverDraft?.();
+      break;
+    case "approval":
+      if (args.length) invalid();
+      else options.approval?.();
+      break;
     case "help":
       if (args.length) invalid();
       else notice(commandHelp());
@@ -242,6 +312,7 @@ export async function executeCommand(
         break;
       }
       const result = await agent.sessions.list();
+      if (!result.ok) options.rejected?.();
       notice(
         result.ok
           ? result.value.length
@@ -274,6 +345,7 @@ export async function executeCommand(
       if (mode === undefined) notice(`当前权限模式：${agent.state.permissionMode}`);
       else {
         const result = agent.setPermissionMode(mode);
+        if (result.status === "rejected") options.rejected?.();
         notice(
           result.status === "accepted"
             ? `权限模式：${result.permissionMode}`
@@ -332,6 +404,7 @@ export async function executeCommand(
         );
       } else if (operation === "inspect" && identity && args.length === 2) {
         const result = await agent.mcp.inspect(identity);
+        if (!result.ok) options.rejected?.();
         notice(
           result.ok
             ? [
@@ -390,6 +463,7 @@ export async function executeCommand(
       else options.exit();
       break;
     default:
+      options.rejected?.();
       notice(
         command.name ? `未知命令 /${command.name}。输入 /help 查看支持的命令。` : commandHelp(),
       );

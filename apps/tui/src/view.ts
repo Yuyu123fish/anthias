@@ -28,6 +28,7 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
+import { formatRunDiagnostic } from "./diagnostic-view.js";
 import {
   createExecutionTurn,
   type ExecutionControl,
@@ -40,7 +41,11 @@ import { createTheme } from "./theme.js";
 export type ConversationView = Readonly<{
   start(): void;
   event(event: AgentEvent): void;
-  notice(text: string): void;
+  notice(text: string, title?: string): void;
+  recoverDraft(): void;
+  reviewPermissions(text: string | null): void;
+  showApproval(): void;
+  canGrantPermissions(): boolean;
   details(direction?: "prev" | "next"): void;
   canApprove(): boolean;
   close(): Promise<void>;
@@ -53,8 +58,14 @@ type Detail = {
   truncated: boolean;
   startedAt: number;
   endedAt?: number;
+};
+type ExecutionDetail = Detail & {
   step: ExecutionStep;
   body: Text;
+  turn: ExecutionTurn;
+  runId?: string;
+  authorization?: string;
+  toolStage?: "input" | "ready" | "approval" | "running" | "retry" | "finished";
 };
 
 /** 长期保留布局、消息组件和滚动容器；AgentEvent 只更新发生变化的内容。 */
@@ -62,7 +73,7 @@ export function createConversationView(options: {
   agent: Agent;
   terminal: Terminal;
   capabilities: TerminalCapabilities;
-  submit(text: string): void;
+  submit(text: string): Promise<boolean>;
   interrupt(): void;
   exit(): void;
   failure(): void;
@@ -77,12 +88,21 @@ export function createConversationView(options: {
   let detailsVisible = false;
   let selectedDetail = 0;
   let submittedEditorText: string | undefined;
+  let draftRevision = 0;
+  const rejectedDrafts: string[] = [];
+  let permissionReview: string | null = null;
+  let panel: "details" | "approval" | "permissions" = "details";
   let approval: ToolApprovalRequest | null = agent.state.pendingToolApproval;
   let approvalUnrenderable = false;
-  let activeAssistant: { content: MarkdownContent; step: ExecutionStep } | undefined;
-  let activeReasoning: Detail | undefined;
+  let activeAssistant:
+    | { content: MarkdownContent; step: ExecutionStep; fullText: string }
+    | undefined;
+  let assistantPrefix = "";
+  let activeReasoning: ExecutionDetail | undefined;
+  let retryStatus: string | null = null;
   let activeTurn: ExecutionTurn | undefined;
-  const executionTurns = new Map<Component, ExecutionTurn>();
+  const executionTurns = new Map<Component, { controls: ExecutionControl[] }>();
+  const currentRunTurns = new Set<ExecutionTurn>();
   let conversationRevision = 0;
   let conversationCache:
     | { width: number; revision: number; lines: string[]; controls: ExecutionControl[] }
@@ -95,7 +115,7 @@ export function createConversationView(options: {
   let renderedConversationRevision = -1;
   let pressedControl: { activate: () => void; dragged: boolean; x: number; y: number } | undefined;
   const details: Detail[] = [];
-  const toolDetails = new Map<string, Detail>();
+  const toolDetails = new Map<string, ExecutionDetail>();
   const markdownContents = new Set<MarkdownContent>();
   const conversation = new Container();
   const detailText = new Text("当前没有详情。", 1, 0);
@@ -109,8 +129,10 @@ export function createConversationView(options: {
     invalidate() {},
     render(width) {
       detailControls = [];
-      if (approval !== null)
+      if (panel === "approval" && approval !== null)
         return [truncateToWidth(theme.coral(" 执行确认 · PageDown 浏览"), width, "")];
+      if (panel === "permissions" && permissionReview !== null)
+        return [truncateToWidth(theme.coral(" 工作区授权 · PageDown 浏览"), width, "")];
       let line = ` 详情 ${details.length ? selectedDetail + 1 : 0}/${details.length} `;
       for (const button of detailButtons) {
         const column = visibleWidth(line);
@@ -133,7 +155,9 @@ export function createConversationView(options: {
     scrollbarStyle: theme.scrollbar,
   });
   let detailContentHeight = 0;
+  let pendingDetailScrollEnd = false;
   let renderedApprovalId: string | undefined;
+  let renderedPermissionReview: string | null = null;
   let renderedTerminalColumns = 0;
   let renderedTerminalRows = 0;
   const detailDocument: Component = {
@@ -143,7 +167,13 @@ export function createConversationView(options: {
     render(width) {
       const lines = detailText.render(width);
       detailContentHeight = lines.length;
-      renderedApprovalId = approval?.toolApprovalRequestId;
+      if (pendingDetailScrollEnd) {
+        detailScroll.updateLayout(lines.length, detailScroll.viewportHeight, requestRender);
+        detailScroll.scrollToEnd();
+        pendingDetailScrollEnd = false;
+      }
+      renderedApprovalId = panel === "approval" ? approval?.toolApprovalRequestId : undefined;
+      renderedPermissionReview = panel === "permissions" ? permissionReview : null;
       renderedTerminalColumns = options.terminal.columns;
       renderedTerminalRows = options.terminal.rows;
       return lines;
@@ -209,9 +239,26 @@ export function createConversationView(options: {
     const promptText = submittedEditorText ?? text;
     submittedEditorText = undefined;
     editor.addToHistory(promptText);
-    options.submit(promptText);
+    const submissionRevision = draftRevision;
+    void options
+      .submit(promptText)
+      .then((accepted) => {
+        if (accepted || closed) return;
+        // 异步拒绝只能恢复提交时的空编辑器，不能覆盖用户随后输入或手动清空的新草稿。
+        if (draftRevision === submissionRevision && editor.getText() === "")
+          editor.setText(promptText);
+        else {
+          rejectedDrafts.push(promptText);
+          appendNotice("输入未接受", "新草稿已保留；输入 /draft 可恢复上一份未接受的输入。");
+        }
+        requestRender();
+      })
+      .catch(options.failure);
   };
-  editor.onChange = () => requestRender();
+  editor.onChange = () => {
+    draftRevision += 1;
+    requestRender();
+  };
   editor.setAutocompleteProvider(createCommandAutocomplete(agent));
   const header: Component = {
     invalidate() {},
@@ -236,24 +283,28 @@ export function createConversationView(options: {
     render(width) {
       const state = agent.state;
       const phase = approval
-        ? "等待确认"
+        ? "等待确认 · /approval"
         : state.operation === "compacting"
           ? "压缩中"
           : state.operation === "switching_session"
             ? "切换会话"
             : state.operation === "updating_capabilities"
               ? "更新外部能力"
-              : activeReasoning
-                ? "思考中"
-                : state.activeAssistantMessage
-                  ? "正在回答"
-                  : state.activeRun?.phase === "reviewing_tool"
-                    ? "自动审批"
-                    : state.activeRun?.phase === "executing_tool"
-                      ? "Tool 运行中"
-                      : state.running
-                        ? "请求模型中"
-                        : "等待输入";
+              : retryStatus !== null
+                ? retryStatus
+                : activeReasoning
+                  ? "思考中"
+                  : state.activeAssistantMessage
+                    ? "正在回答"
+                    : state.activeRun?.phase === "reviewing_tool"
+                      ? "自动审批"
+                      : state.activeRun?.phase === "executing_tool"
+                        ? "Tool 运行中"
+                        : state.activeRun?.phase === "retrying_model"
+                          ? "等待模型重试 · Ctrl+C 停止"
+                          : state.running
+                            ? "请求模型中"
+                            : "等待输入";
       const usage = state.contextUsage;
       const contextText =
         usage.inputTokens === null
@@ -402,6 +453,7 @@ export function createConversationView(options: {
         invalidateConversation();
       });
       executionTurns.set(activeTurn, activeTurn);
+      currentRunTurns.add(activeTurn);
       conversation.addChild(activeTurn);
     }
     return activeTurn;
@@ -428,6 +480,70 @@ export function createConversationView(options: {
     conversation.addChild(new Text(sanitizeTerminalText(text), 1, 0));
     invalidateConversation();
   }
+  function splitPresentation(): void {
+    if (activeAssistant !== undefined) {
+      assistantPrefix = activeAssistant.fullText;
+      activeAssistant = undefined;
+    }
+    activeTurn = undefined;
+  }
+  function currentAssistantText(message: AssistantMessage): string {
+    const fullText = assistantText(message);
+    if (!fullText.startsWith(assistantPrefix)) assistantPrefix = "";
+    return fullText.slice(assistantPrefix.length);
+  }
+  function appendNotice(title: string, text: string): void {
+    splitPresentation();
+    const content = sanitizeTerminalText(text);
+    const preview = summarizeText(content, 4, 420);
+    const long = preview !== content.trim();
+    const detail: Detail | undefined = long
+      ? {
+          id: `notice:${details.length}`,
+          title: sanitizeTerminalText(title),
+          content: content.slice(0, 128 * 1024),
+          truncated: content.length > 128 * 1024,
+          startedAt: now(),
+        }
+      : undefined;
+    if (detail !== undefined) {
+      details.push(detail);
+      if (!detailsVisible) selectedDetail = details.length - 1;
+    }
+    const open = () => {
+      if (detail === undefined) return;
+      selectedDetail = details.indexOf(detail);
+      panel = "details";
+      detailsVisible = true;
+      updateDetails(true);
+    };
+    const component: Component & { controls: ExecutionControl[] } = {
+      controls: [],
+      invalidate() {},
+      render(width) {
+        const label = truncateToWidth(
+          theme.lagoon(` ${sanitizeTerminalText(title)}${long ? " · [详情]" : ""}`),
+          width,
+          "",
+        );
+        component.controls = long
+          ? [{ row: 1, column: 1, width: Math.max(1, visibleWidth(label) - 1), activate: open }]
+          : [];
+        return ["", label, ...new Text(preview, 1, 0).render(width)];
+      },
+    };
+    executionTurns.set(component, component);
+    conversation.addChild(component);
+    invalidateConversation();
+  }
+  function moveDetail(detail: ExecutionDetail): void {
+    const turn = ensureTurn();
+    if (detail.turn === turn) return;
+    const index = detail.turn.steps.indexOf(detail.step);
+    if (index >= 0) detail.turn.steps.splice(index, 1);
+    turn.steps.push(detail.step);
+    detail.turn = turn;
+  }
   function appendExecutionText(title: string, text: string): void {
     if (activeTurn === undefined || activeTurn.status !== "running") {
       appendText(title, text);
@@ -445,13 +561,15 @@ export function createConversationView(options: {
   }
   function appendMessage(message: Message): void {
     if (message.role === "user") {
-      activeTurn?.finish();
+      finishActiveTurn();
+      currentRunTurns.clear();
       activeTurn = undefined;
+      assistantPrefix = "";
       appendText("You", message.content, "coral");
       ensureTurn();
     } else if (message.role === "assistant") {
       const turn = ensureTurn();
-      const text = assistantText(message);
+      const text = currentAssistantText(message);
       const content = newMarkdown(text);
       const step: ExecutionStep = {
         kind: "message",
@@ -464,7 +582,8 @@ export function createConversationView(options: {
       };
       turn.steps.push(step);
       turn.answer = step.hasToolCalls ? undefined : step;
-      if (message.status === "streaming") activeAssistant = { content, step };
+      if (message.status === "streaming")
+        activeAssistant = { content, step, fullText: assistantText(message) };
       invalidateConversation();
     } else
       completeTool(
@@ -481,15 +600,16 @@ export function createConversationView(options: {
       return;
     }
     const { content, step } = activeAssistant;
-    step.text = assistantText(message);
+    step.text = currentAssistantText(message);
+    activeAssistant.fullText = assistantText(message);
     step.hasToolCalls = message.content.some((part) => part.type === "tool_call");
     step.messageStatus = message.status;
     content.setText(step.text);
     ensureTurn().answer = step.hasToolCalls ? undefined : step;
     invalidateConversation();
   }
-  function finishActiveTurn(): void {
-    activeTurn?.finish();
+  function finishActiveTurn(status?: "completed" | "failed" | "aborted"): void {
+    for (const turn of currentRunTurns) turn.finish(status);
   }
   function resetConversation(): void {
     for (const content of markdownContents) content.close();
@@ -498,15 +618,31 @@ export function createConversationView(options: {
     details.length = 0;
     toolDetails.clear();
     executionTurns.clear();
+    currentRunTurns.clear();
+    assistantPrefix = "";
     activeTurn = undefined;
     conversationCache = undefined;
     pressedControl = undefined;
     activeAssistant = undefined;
     activeReasoning = undefined;
+    retryStatus = null;
     approval = agent.state.pendingToolApproval;
     detailsVisible = approval !== null;
+    panel = approval === null ? "details" : "approval";
+    permissionReview = null;
     for (const message of agent.state.messageHistory) appendMessage(message);
     if (!agent.state.running) finishActiveTurn();
+    const lastAssistant = agent.state.messageHistory.findLast(
+      (message) => message.role === "assistant",
+    );
+    const diagnostic = agent.state.lastRunDiagnostic ?? lastAssistant?.diagnostic;
+    if (
+      diagnostic?.category !== "completed" &&
+      (diagnostic != null ||
+        lastAssistant?.status === "failed" ||
+        lastAssistant?.status === "aborted")
+    )
+      appendNotice("最近运行诊断", formatRunDiagnostic(diagnostic));
     if (agent.state.activeAssistantMessage !== null)
       appendMessage(agent.state.activeAssistantMessage);
     if (agent.state.messageHistory.length === 0)
@@ -522,7 +658,7 @@ export function createConversationView(options: {
     detailText.setText(text);
   }
   function updateDetails(resetScroll = false): void {
-    if (approval !== null) {
+    if (panel === "approval" && approval !== null) {
       const text = formatApproval(approval);
       approvalUnrenderable =
         !isApprovalDisplayable(approval) || terminal.columns < 20 || terminal.rows < 8;
@@ -531,6 +667,8 @@ export function createConversationView(options: {
           ? "终端空间不足或审批内容无法完整呈现，无法安全确认。请放大窗口或输入 deny。"
           : text,
       );
+    } else if (panel === "permissions" && permissionReview !== null) {
+      setDetailText(permissionReview);
     } else {
       selectedDetail = Math.max(0, Math.min(selectedDetail, details.length - 1));
       const selected = details[selectedDetail];
@@ -543,14 +681,15 @@ export function createConversationView(options: {
     if (resetScroll) detailScroll.scrollToStart();
     requestRender();
   }
-  function appendDetail(detail: Detail, delta: string): void {
+  function appendDetail(detail: ExecutionDetail, delta: string): void {
+    moveDetail(detail);
     const next = detail.content + sanitizeTerminalText(delta);
     detail.truncated ||= next.length > 128 * 1024;
     detail.content = next.slice(-128 * 1024);
     detail.body.setText(`${detail.truncated ? "[较早详情已省略]\n" : ""}${detail.content}`);
     invalidateConversation();
   }
-  function createDetail(id: string, title: string, content: string): Detail {
+  function createDetail(id: string, title: string, content: string): ExecutionDetail {
     const body = new Text(sanitizeTerminalText(content), 0, 0);
     const step: ExecutionStep = {
       kind: "detail",
@@ -559,8 +698,9 @@ export function createConversationView(options: {
       content: body,
       expanded: true,
     };
-    ensureTurn().steps.push(step);
-    const detail: Detail = {
+    const turn = ensureTurn();
+    turn.steps.push(step);
+    const detail: ExecutionDetail = {
       id,
       title: sanitizeTerminalText(title),
       content: sanitizeTerminalText(content),
@@ -568,11 +708,43 @@ export function createConversationView(options: {
       startedAt: now(),
       step,
       body,
+      turn,
     };
     details.push(detail);
     if (!detailsVisible) selectedDetail = details.length - 1;
     invalidateConversation();
     return detail;
+  }
+  function toolIdentity(id: string, source: { memberSessionId?: string } = {}): string {
+    return `${source.memberSessionId ?? agent.state.sessionId}:${id}`;
+  }
+  function ensureTool(
+    id: string,
+    name: string,
+    source: { memberSessionId?: string; memberName?: string; runId?: string } = {},
+  ): ExecutionDetail {
+    const identity = toolIdentity(id, source);
+    let detail = toolDetails.get(identity);
+    if (detail === undefined) {
+      const member = source.memberSessionId
+        ? ` · 成员 ${source.memberName ?? source.memberSessionId}`
+        : "";
+      detail = createDetail(identity, `${name} [${id.slice(-8)}]${member}`, "");
+      detail.step.expanded = false;
+      detail.toolStage = "ready";
+      toolDetails.set(identity, detail);
+    }
+    if (source.runId !== undefined) detail.runId = source.runId;
+    return detail;
+  }
+  function readyTools(message: AssistantMessage): void {
+    for (const part of message.content) {
+      if (part.type !== "tool_call") continue;
+      const detail = ensureTool(part.toolCallId, part.toolName);
+      if (detail.endedAt !== undefined || detail.step.summary !== undefined) continue;
+      detail.step.title = `${detail.title} · 等待执行`;
+      detail.step.summary = "完整请求已收到，等待校验与执行。";
+    }
   }
   function completeTool(
     id: string,
@@ -580,24 +752,60 @@ export function createConversationView(options: {
     status: string,
     content: string,
     truncated: boolean,
+    source: { memberSessionId?: string; memberName?: string } = {},
   ): void {
-    let detail = toolDetails.get(id);
-    if (detail === undefined) {
-      detail = createDetail(id, `${name} [${id.slice(-8)}]`, "");
-      toolDetails.set(id, detail);
-    }
+    const detail = ensureTool(id, name, source);
     if (detail.endedAt === undefined) {
       detail.truncated ||= truncated;
       appendDetail(detail, `\n[result] ${content}`);
       detail.endedAt = now();
       detail.step.expanded = false;
     }
-    detail.step.title = `${detail.title} · ${sanitizeTerminalText(status)}`;
+    const statuses: Record<string, string> = {
+      completed: "已完成",
+      failed: "失败",
+      denied: "已拒绝",
+      aborted: "已停止",
+      unknown: "结果未知",
+    };
+    detail.step.title = `${detail.title} · ${statuses[status] ?? sanitizeTerminalText(status)}`;
+    detail.toolStage = "finished";
+    detail.step.attention = status !== "completed";
+    detail.step.summary =
+      summarizeText(
+        sanitizeTerminalText(content),
+        status === "completed" ? 2 : 5,
+        status === "completed" ? 200 : 600,
+      ) || (status === "completed" ? "执行完成，无输出。" : "没有可确认的结果，请查看详情。");
+    if (detail.authorization)
+      detail.step.summary = `来源：${detail.authorization}\n${detail.step.summary}`;
+    if (status === "unknown") detail.step.summary += "\n结果未知，不自动重放；先核对实际状态。";
+    invalidateConversation();
+  }
+  function finishUnresolvedTools(sessionId: string, runId: string, reason?: string): void {
+    for (const detail of toolDetails.values()) {
+      if (
+        !detail.id.startsWith(`${sessionId}:`) ||
+        (detail.runId !== undefined && detail.runId !== runId) ||
+        detail.toolStage === "finished" ||
+        detail.toolStage === "retry"
+      )
+        continue;
+      detail.step.title = `${detail.title} · ${detail.toolStage === "running" ? "结果待核对" : "未执行"}`;
+      detail.step.summary =
+        (reason ? reason + "\n" : "") +
+        (detail.toolStage === "running"
+          ? "运行已结束，但未收到该工具的完成结果；先核对实际状态，不自动重放。"
+          : "运行已结束，该请求未进入执行阶段。");
+      detail.step.attention = true;
+      detail.endedAt = now();
+      detail.toolStage = "finished";
+    }
     invalidateConversation();
   }
   function controlAt(x: number, y: number): ExecutionControl | undefined {
     if (
-      approval !== null ||
+      (detailsVisible && panel !== "details") ||
       !hasLayoutSpace(terminal.columns, terminal.rows) ||
       renderedColumns !== terminal.columns ||
       renderedRows !== terminal.rows ||
@@ -618,7 +826,8 @@ export function createConversationView(options: {
       x >= width - 1 ||
       y < headerHeight ||
       y >= headerHeight + conversationScroll.viewportHeight ||
-      renderedConversationRevision !== conversationRevision
+      // 后台内容可能已变脏；只要缓存仍对应屏幕上的帧，点击位置就仍然有效。
+      renderedConversationRevision !== conversationCache?.revision
     )
       return undefined;
     const row = y - headerHeight + conversationScroll.scrollTop;
@@ -671,7 +880,7 @@ export function createConversationView(options: {
     if (
       matchesKey(data, Key.escape) &&
       detailsVisible &&
-      approval === null &&
+      panel === "details" &&
       !editor.isShowingAutocomplete()
     ) {
       detailsVisible = false;
@@ -695,6 +904,7 @@ export function createConversationView(options: {
       return true;
     }
     if (matchesKey(data, Key.ctrl("end"))) {
+      if (detailsVisible) pendingDetailScrollEnd = true;
       scroll.scrollToEnd();
       requestRender();
       return true;
@@ -710,8 +920,12 @@ export function createConversationView(options: {
     return false;
   }
   function toggleDetails(direction?: "prev" | "next"): void {
-    if (direction === undefined) detailsVisible = approval !== null || !detailsVisible;
-    else {
+    if (direction === undefined) {
+      if (detailsVisible && panel !== "details") return;
+      detailsVisible = !detailsVisible;
+      panel = "details";
+    } else {
+      panel = "details";
       detailsVisible = true;
       selectedDetail = Math.max(
         0,
@@ -731,6 +945,13 @@ export function createConversationView(options: {
     },
     event(event) {
       if (closed) return;
+      if (
+        event.memberSessionId === undefined &&
+        ["message_update", "reasoning_start", "tool_preparation", "tool_execution_start"].includes(
+          event.type,
+        )
+      )
+        retryStatus = null;
       switch (event.type) {
         case "session_changed":
           resetConversation();
@@ -742,6 +963,8 @@ export function createConversationView(options: {
           editor.setAutocompleteProvider(createCommandAutocomplete(agent));
           break;
         case "message_start":
+          retryStatus = null;
+          if (event.message.role === "assistant") assistantPrefix = "";
           appendMessage(event.message);
           break;
         case "message_update":
@@ -750,6 +973,7 @@ export function createConversationView(options: {
         case "message_end":
           if (event.message.role === "assistant") {
             updateAssistant(event.message);
+            readyTools(event.message);
             activeAssistant = undefined;
           } else if (event.message.role === "tool")
             completeTool(
@@ -784,19 +1008,41 @@ export function createConversationView(options: {
             invalidateConversation();
           }
           break;
+        case "tool_preparation": {
+          const detail = ensureTool(event.toolCallId, event.toolName, event);
+          moveDetail(detail);
+          if (detail.toolStage === "retry") delete detail.endedAt;
+          detail.toolStage = event.phase;
+          detail.step.title = `${detail.title} · ${event.phase === "input" ? "参数生成中" : "等待执行"}`;
+          detail.step.summary =
+            event.phase === "input"
+              ? "目标尚未完整；参数生成中，不会提前执行。"
+              : "完整请求已收到，等待校验与执行。";
+          invalidateConversation();
+          break;
+        }
+        case "tool_auto_review_start": {
+          const detail = ensureTool(event.toolCallId, event.toolName, event);
+          moveDetail(detail);
+          detail.step.title = `${detail.title} · 自动审核中`;
+          detail.step.summary = "正在核对本次动作的授权；Ctrl+C 可停止。";
+          invalidateConversation();
+          break;
+        }
         case "tool_execution_start": {
           const { activity } = event;
-          const detail = createDetail(
-            activity.toolCallId,
-            `${activity.toolName} [${activity.toolCallId.slice(-8)}]`,
-            activity.summary,
-          );
+          const detail = ensureTool(activity.toolCallId, activity.toolName, event);
+          appendDetail(detail, `\n${activity.summary}`);
+          detail.toolStage = "running";
           detail.step.title = `${detail.title} · 运行中`;
-          toolDetails.set(activity.toolCallId, detail);
+          detail.step.summary =
+            (detail.authorization ? `来源：${detail.authorization}\n` : "") +
+            summarizeText(sanitizeTerminalText(activity.summary)) +
+            "\nCtrl+C 停止";
           break;
         }
         case "tool_execution_update": {
-          const detail = toolDetails.get(event.toolCallId);
+          const detail = toolDetails.get(toolIdentity(event.toolCallId, event));
           if (detail !== undefined) appendDetail(detail, `\n[${event.stream}] ${event.delta}`);
           break;
         }
@@ -807,21 +1053,92 @@ export function createConversationView(options: {
             event.result.status,
             event.result.content,
             event.result.truncated,
+            event,
           );
           if (event.cleanupUncertain)
             appendExecutionText("资源状态", "Tool 资源清理结果不确定，请查看详情。");
           break;
         case "tool_approval_requested":
           approval = event.request;
-          detailsVisible = true;
-          updateDetails(true);
+          {
+            const detail = ensureTool(approval.toolCallId, approval.toolName, approval);
+            moveDetail(detail);
+            detail.toolStage = "approval";
+            detail.step.title = `${detail.title} · 等待批准`;
+            detail.step.summary = `${sanitizeTerminalText(approval.target)}\n${sanitizeTerminalText(approval.riskSummary)}\n/approval 查看动作、来源和授权边界`;
+            invalidateConversation();
+          }
+          if (!detailsVisible) {
+            panel = "approval";
+            detailsVisible = true;
+            updateDetails(true);
+          }
           break;
         case "tool_approval_resolved":
           approval = null;
-          appendExecutionText("执行确认", event.decision);
+          if (panel === "approval") {
+            detailsVisible = false;
+            panel = "details";
+          }
+          {
+            const detail = ensureTool(
+              event.request.toolCallId,
+              event.request.toolName,
+              event.request,
+            );
+            moveDetail(detail);
+            detail.step.title = `${detail.title} · ${event.decision === "approve" ? "批准后复核" : event.decision === "deny" ? "已拒绝" : "审批已失效"}`;
+            detail.step.summary =
+              event.decision === "approve"
+                ? "仅本次具体动作获准，执行前仍会复核。"
+                : event.decision === "deny"
+                  ? "本次动作被用户拒绝。"
+                  : "本次审批已失效，旧批准不能再次执行。";
+            invalidateConversation();
+          }
           break;
-        case "tool_authorization":
-          appendExecutionText(`授权 · ${event.source} · ${event.decision}`, event.reason);
+        case "tool_authorization": {
+          const detail = ensureTool(event.toolCallId, event.toolName, event);
+          const source = {
+            workspace: "工作区授权",
+            user: "本次批准",
+            auto_review: "自动审核",
+            policy: "安全策略",
+          }[event.source];
+          detail.authorization = source;
+          appendDetail(detail, `\n授权来源：${source} · ${event.reason}`);
+          detail.step.summary = `授权来源：${source}\n${sanitizeTerminalText(event.reason)}`;
+          break;
+        }
+        case "model_retry":
+          if (event.phase === "requesting") {
+            for (const detail of toolDetails.values()) {
+              if (
+                !detail.id.startsWith(`${event.memberSessionId ?? agent.state.sessionId}:`) ||
+                detail.toolStage !== "input"
+              )
+                continue;
+              detail.toolStage = "retry";
+              detail.endedAt = now();
+              detail.step.title = `${detail.title} · 准备已中断`;
+              detail.step.summary = "上次请求未形成完整工具参数，未执行；正在重试模型请求。";
+              detail.step.expanded = false;
+            }
+            invalidateConversation();
+          }
+          if (event.memberSessionId === undefined)
+            retryStatus =
+              event.phase === "waiting"
+                ? `等待重试 ${event.retryCount}/2 · Ctrl+C 停止`
+                : `正在重试 ${event.retryCount}/2`;
+          appendNotice(
+            event.memberSessionId
+              ? `成员 ${event.memberName ?? event.memberSessionId} · 模型重试`
+              : "模型重试",
+            event.phase === "waiting"
+              ? `${event.diagnostic.summary}\n等待 ${(event.delayMs / 1000).toFixed(1)} 秒后重试 ${event.retryCount}/2；Ctrl+C 可停止。`
+              : `正在发起重试 ${event.retryCount}/2。`,
+          );
           break;
         case "compaction_start":
           appendExecutionText("Context", "正在压缩上下文，完整历史会保留。");
@@ -836,31 +1153,86 @@ export function createConversationView(options: {
           appendExecutionText("Context", event.error);
           break;
         case "run_end":
-          activeTurn?.finish(event.result.status);
-          if (approval === null) detailsVisible = false;
+          if (event.memberSessionId !== undefined) {
+            finishUnresolvedTools(event.memberSessionId, event.runId, event.diagnostic?.summary);
+            break;
+          }
+          retryStatus = null;
+          finishUnresolvedTools(agent.state.sessionId, event.runId);
+          finishActiveTurn(event.result.status);
           activeAssistant = undefined;
           activeReasoning = undefined;
           invalidateConversation();
-          if (event.result.status === "failed") appendText("运行失败", event.result.error);
-          else if (event.result.status === "aborted")
-            appendText("已停止", "可以继续输入新的任务。");
+          if (event.result.status !== "completed")
+            appendNotice(
+              event.result.status === "failed" ? "运行失败" : "已停止",
+              event.diagnostic
+                ? formatRunDiagnostic(event.diagnostic)
+                : `${event.result.status === "failed" ? event.result.error + "\n" : ""}${formatRunDiagnostic(undefined)}`,
+            );
           break;
       }
       if (detailsVisible) updateDetails();
       requestRender();
     },
-    notice(text) {
-      appendText("Anthias", text);
+    notice(text, title = "Anthias") {
+      appendNotice(title, text);
       // 窄屏详情会覆盖正文；短提示独立呈现，不改变审批内容或阅读位置。
       if (detailsVisible && terminal.columns < 100) {
         tui.flash(sanitizeTerminalText(text).split("\n")[0] ?? "", 4_000);
       }
       requestRender();
     },
+    recoverDraft() {
+      const draft = rejectedDrafts.pop();
+      if (draft === undefined) {
+        appendNotice("草稿", "没有待恢复的输入。");
+        return;
+      }
+      const currentDraft = editor.getExpandedText();
+      if (currentDraft) rejectedDrafts.push(currentDraft);
+      editor.setText(draft);
+      requestRender();
+    },
+    reviewPermissions(text) {
+      permissionReview = text === null ? null : sanitizeTerminalText(text);
+      if (text === null) {
+        if (panel === "permissions") {
+          detailsVisible = false;
+          panel = "details";
+        }
+      } else {
+        panel = "permissions";
+        detailsVisible = true;
+      }
+      updateDetails(true);
+    },
+    showApproval() {
+      if (approval === null) {
+        appendNotice("执行确认", "当前没有待批准请求。");
+        return;
+      }
+      panel = "approval";
+      detailsVisible = true;
+      updateDetails(true);
+    },
+    canGrantPermissions() {
+      return (
+        permissionReview !== null &&
+        renderedPermissionReview === permissionReview &&
+        panel === "permissions" &&
+        hasLayoutSpace(terminal.columns, terminal.rows) &&
+        renderedTerminalColumns === terminal.columns &&
+        renderedTerminalRows === terminal.rows &&
+        detailScroll.viewportHeight > 0 &&
+        detailScroll.scrollTop + detailScroll.viewportHeight >= detailContentHeight
+      );
+    },
     details: toggleDetails,
     canApprove() {
       return (
         approval !== null &&
+        panel === "approval" &&
         !approvalUnrenderable &&
         terminal.columns >= 20 &&
         terminal.rows >= 8 &&
@@ -892,6 +1264,12 @@ export function createConversationView(options: {
   };
 }
 
+function summarizeText(text: string, maxLines = 3, maxCharacters = 300): string {
+  const lines = text.trim().split("\n");
+  const summary = lines.slice(0, maxLines).join("\n").slice(0, maxCharacters);
+  return summary.length < text.trim().length ? summary + "\n…" : summary;
+}
+
 export function formatApproval(request: ToolApprovalRequest): string {
   return sanitizeTerminalText(
     [
@@ -903,6 +1281,7 @@ export function formatApproval(request: ToolApprovalRequest): string {
               request.memberSessionId,
           ]
         : []),
+      ...(request.workspaceRoot ? [`Workspace: ${request.workspaceRoot}`] : []),
       `Tool: ${request.toolName}`,
       `Target: ${request.target}`,
       `Mode: ${request.permissionMode}`,

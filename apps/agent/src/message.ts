@@ -49,11 +49,51 @@ export type ToolArtifactReference = Readonly<{
   incompleteReason?: ToolArtifactIncompleteReason;
 }>;
 
+/** 只保存已经确认的模型与 Run 结束事实，不包含 Provider 原始错误。 */
+export type RunDiagnostic = Readonly<{
+  category:
+    | "completed"
+    | "context_overflow"
+    | "output_limit"
+    | "authentication"
+    | "configuration"
+    | "invalid_request"
+    | "rate_limit"
+    | "network"
+    | "service"
+    | "empty_response"
+    | "content_filter"
+    | "unknown"
+    | "aborted"
+    | "resource_limit"
+    | "storage";
+  summary: string;
+  providerFinishReason:
+    | "stop"
+    | "tool_calls"
+    | "length"
+    | "content_filter"
+    | "error"
+    | "other"
+    | null;
+  usage: Readonly<{
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cachedInputTokens: number | null;
+    cacheWriteInputTokens: number | null;
+  }> | null;
+  retryCount: number | null;
+  abortSource: "user" | "task_deadline" | "shutdown" | "parent" | "internal" | "unknown" | null;
+  httpStatus: number | null;
+  retryStopReason: "exhausted" | "content_delivered" | "wait_too_long" | "deadline" | null;
+}>;
+
 /** 表示活动中或已经终结的一条 Assistant 消息。 */
 export type AssistantMessage = Readonly<{
   role: "assistant";
   content: readonly AssistantContentPart[];
   status: "streaming" | "completed" | "aborted" | "failed";
+  diagnostic?: RunDiagnostic;
 }>;
 
 /** 表示与一个 ToolCall 一一对应、会进入后续模型上下文的结果消息。 */

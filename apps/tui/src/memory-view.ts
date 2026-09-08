@@ -61,10 +61,13 @@ export async function runMemoryCommand(
   argumentsText: string,
   agent: Agent,
   notice: (text: string) => void,
+  rejected: (() => void) | undefined = undefined,
 ) {
   const [operation = "", first, second, ...remaining] = argumentsText.trim().split(/\s+/u);
-  const report = (result: Awaited<ReturnType<Agent["memory"]["query"]>>) =>
+  const report = (result: Awaited<ReturnType<Agent["memory"]["query"]>>) => {
+    if (!result.ok) rejected?.();
     notice(result.ok ? formatMemory(result.value) : result.error);
+  };
   if (operation === "help") {
     notice(MEMORY_HELP);
     return;
@@ -75,6 +78,7 @@ export async function runMemoryCommand(
       (value) => value === second,
     );
     if ((first && !kind) || (second && !status) || remaining.length) {
+      rejected?.();
       notice(MEMORY_HELP);
       return;
     }
@@ -89,6 +93,7 @@ export async function runMemoryCommand(
   }
   if (operation === "show" && first && !second) {
     const result = await agent.memory.query({ id: first, scope: "all", status: "all" });
+    if (!result.ok) rejected?.();
     notice(
       result.ok
         ? result.value.entries.map(formatEntry).join("\n\n") || "未找到记忆。"
@@ -117,6 +122,7 @@ export async function runMemoryCommand(
       const snapshot = await agent.memory.query({ id: first, status: "all" });
       const entry = snapshot.ok ? snapshot.value.entries[0] : undefined;
       if (!entry) {
+        rejected?.();
         notice(snapshot.ok ? "未找到当前范围的记忆。" : snapshot.error);
         return;
       }
@@ -136,10 +142,12 @@ export async function runMemoryCommand(
     )
       action = { action: "forget", id: first, revision, stopSending: remaining[0] === "no-send" };
     else {
+      rejected?.();
       notice(MEMORY_HELP);
       return;
     }
   } else {
+    rejected?.();
     notice(MEMORY_HELP);
     return;
   }

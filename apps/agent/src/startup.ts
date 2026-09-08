@@ -4,6 +4,7 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Agent, createAgentWithModelStream } from "./agent.js";
+import { loadLocalConfiguration } from "./local-config.js";
 import { createMcpConnections } from "./mcp/index.js";
 import { readModelConfig } from "./model/model-config.js";
 import { createOpenAICompatibleModelStream } from "./model/openai-compatible-model.js";
@@ -20,9 +21,11 @@ import {
   SessionWorkspaceMismatchError,
 } from "./session/index.js";
 import { createSkillLibrary } from "./skill/index.js";
+import { createWebSearchTools } from "./tool/web-search.js";
 
 /** 表示生产 Agent 已成功装配或以安全文本启动失败。 */
 export type AgentCreationFailureReason =
+  | "local_configuration"
   | "model_configuration"
   | "workspace_unavailable"
   | "session_busy"
@@ -43,6 +46,7 @@ export type AgentCreationResult = Readonly<{ ok: true; agent: Agent }> | AgentCr
 /** 配置生产 Agent 的环境、工作区以及可选 Session。 */
 export type CreateAgentFromEnvironmentOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
+  onConfigurationWarning?: ((message: string) => void) | undefined;
   workspaceRoot: string;
   sessionDirectory: string;
   memoryDirectory?: string;
@@ -52,13 +56,23 @@ export type CreateAgentFromEnvironmentOptions = Readonly<{
 
 /** 先校验模型配置，再创建或打开 Session 并装配生产 Agent。 */
 export async function createAgentFromEnvironment({
-  environment = process.env,
+  environment: processEnvironment = process.env,
+  onConfigurationWarning,
   workspaceRoot,
   sessionDirectory,
   memoryDirectory = fileURLToPath(new URL("../../../memory", import.meta.url)),
   sessionId,
   permissionMode,
 }: CreateAgentFromEnvironmentOptions): Promise<AgentCreationResult> {
+  const localConfiguration = await loadLocalConfiguration({
+    environment: processEnvironment,
+    permissionMode,
+    onConfigurationWarning,
+  });
+  if (!localConfiguration.ok) {
+    return createAgentCreationFailure("local_configuration", localConfiguration.error);
+  }
+  const environment = localConfiguration.environment;
   const modelConfigResult = readModelConfig(environment);
   if (!modelConfigResult.ok) {
     return createAgentCreationFailure("model_configuration", modelConfigResult.error);
@@ -124,6 +138,9 @@ export async function createAgentFromEnvironment({
       const agent = createAgentWithModelStream({
         modelStream,
         memoryDirectory,
+        permissionDirectory: fileURLToPath(new URL("../../../data/permissions", import.meta.url)),
+        protectedPaths: [fileURLToPath(new URL("../../../.env", import.meta.url))],
+        managedTools: createWebSearchTools({ apiKey: environment.SEARCHAPI_API_KEY }),
         ...(worktreeDirectory ? { worktreeDirectory: resolve(worktreeDirectory) } : {}),
         skills,
         mcp,
@@ -132,7 +149,7 @@ export async function createAgentFromEnvironment({
           budget: modelConfigResult.config.contextBudget,
         },
         session,
-        permissionMode,
+        permissionMode: localConfiguration.permissionMode,
         startCleanup: (report) => startSessionCleanup(normalizedSessionDirectory, report),
       });
       if (sessionId !== undefined) await agent.skills.reload();

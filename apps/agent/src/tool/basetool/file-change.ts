@@ -21,6 +21,7 @@ import {
 import {
   arePathsEqual,
   isPathSameOrInside,
+  isReservedToolPath,
   type ToolWorkspace,
   validateWorkspaceRelativePath,
 } from "../workspace-path.js";
@@ -344,7 +345,7 @@ function assertAllowedPath(
   workspace: ToolWorkspace,
   scope: "workspace" | "external",
 ): void {
-  if (isPathSameOrInside(workspace.sessionDirectory, targetPath)) {
+  if (isReservedToolPath(targetPath, workspace)) {
     throw new Error("文件 Tool path 命中 Session 保留目录。");
   }
   if (scope === "workspace") {

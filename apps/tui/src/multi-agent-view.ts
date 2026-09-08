@@ -68,6 +68,7 @@ export async function runCollaborationCommand(
   args: string,
   agent: Agent,
   notice: (text: string) => void,
+  rejected: (() => void) | undefined = undefined,
 ): Promise<boolean> {
   if (!["agents", "agent", "team", "git"].includes(name)) return false;
   const tokens = args.trim().split(/\s+/u).filter(Boolean);
@@ -79,11 +80,14 @@ export async function runCollaborationCommand(
   }
   async function dispatch(action: CollaborationAction) {
     const result = await agent.collaboration.execute(action);
+    if (!result.ok) rejected?.();
     notice(result.ok ? renderResult(result.value) : result.error);
   }
   if (name === "agents" || (name === "team" && (!operation || operation === "tasks"))) {
-    if (name === "agents" && tokens.length) notice("用法：/agents");
-    else notice(formatCollaboration(agent.collaboration.snapshot()));
+    if (name === "agents" && tokens.length) {
+      rejected?.();
+      notice("用法：/agents");
+    } else notice(formatCollaboration(agent.collaboration.snapshot()));
     return true;
   }
   try {
@@ -127,6 +131,7 @@ export async function runCollaborationCommand(
         action = { ...input, action: "commit" } as GitAction;
       } else throw new Error("使用 /help 查看 Git 命令。");
       const result = await agent.git.execute(action);
+      if (!result.ok) rejected?.();
       notice(result.ok ? renderResult(result.value) : result.error);
       return true;
     }
@@ -187,6 +192,7 @@ export async function runCollaborationCommand(
       await dispatch({ action: "message", memberId: tokens[1], content: after(2) });
     } else throw new Error("使用 /help 查看成员和 Team 命令。");
   } catch (error) {
+    rejected?.();
     notice(error instanceof Error ? error.message : "命令参数无效。");
   }
   return true;

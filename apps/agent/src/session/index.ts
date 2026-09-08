@@ -900,6 +900,7 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
                     parentEntryId,
                     runId,
                     status: details.status,
+                    ...(details.diagnostic === undefined ? {} : { diagnostic: details.diagnostic }),
                   }),
                 () => {
                   runFinished = true;

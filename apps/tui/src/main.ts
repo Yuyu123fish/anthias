@@ -9,7 +9,7 @@ import { resolveStartupPaths, StartupPathError, type StartupPaths } from "./star
 async function main(): Promise<number> {
   let sessionId: string | undefined;
   let requestedWorkspace: string | undefined;
-  let permissionMode: PermissionMode = "agent";
+  let permissionMode: PermissionMode | undefined;
   try {
     const parsedArguments = parseArgs({
       args: process.argv.slice(2),
@@ -32,7 +32,7 @@ async function main(): Promise<number> {
     ) {
       throw new Error("invalid mode");
     }
-    permissionMode = requestedMode ?? "agent";
+    permissionMode = requestedMode;
   } catch {
     process.stderr.write(
       "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan|auto_allow>。\n",
@@ -60,12 +60,14 @@ async function main(): Promise<number> {
           workspaceRoot: startupPaths.workspaceRoot,
           sessionDirectory: startupPaths.sessionDirectory,
           permissionMode,
+          onConfigurationWarning: (message) => process.stderr.write(`${message}\n`),
         }
       : {
           workspaceRoot: startupPaths.workspaceRoot,
           sessionDirectory: startupPaths.sessionDirectory,
           sessionId,
           permissionMode,
+          onConfigurationWarning: (message) => process.stderr.write(`${message}\n`),
         },
   );
   if (!agentCreationResult.ok) {

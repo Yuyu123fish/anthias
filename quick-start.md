@@ -16,28 +16,35 @@ pnpm build
 
 `pnpm build` 会生成 `apps/tui/dist/main.js`。修改或更新源码后重新构建；启动读取的是构建产物。
 
-## 2. 配置模型
+## 2. 在 Anthias 根目录配置一次
 
-Anthias 使用 OpenAI-compatible Chat Completions 接口。若当前终端已配置以下三个环境变量，可以跳过本节；否则在准备启动 Anthias 的 PowerShell 窗口中输入：
+Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录把 [.env-example](.env-example) 复制为 `.env`，填写自己的连接配置；已有 `.env` 时直接编辑。首次启动时若文件不存在，程序也会生成一份不含凭据的模板，并在模型配置不完整时提示缺少的变量。
+
+| 变量 | 填写内容 |
+| --- | --- |
+| `ANTHIAS_MODEL_BASE_URL` | 服务提供的 API 基础地址，不要附加 `/chat/completions` |
+| `ANTHIAS_MODEL_ID` | 服务实际支持的模型 ID |
+| `ANTHIAS_MODEL_API_KEY` | 自己的 API Key |
+| `SEARCHAPI_API_KEY` | 可选；留空只影响网页搜索 |
+| `ANTHIAS_PERMISSION_MODE` | `agent`、`plan` 或 `auto_allow`；模板默认 `agent` |
+
+这份 `.env` 只从 Anthias 自身的项目或安装根目录加载，与启动时的当前目录、`--workspace` 和恢复的 Session 无关；不会读取任务项目里的同名文件。已有文件不会被启动流程覆盖，`.env` 已排除在版本控制之外。填写后重新启动即可采用；不要提交真实值。
+
+同名变量以进程环境覆盖 `.env`，进程里的显式空值也不会回退到文件中的 Key。模式优先级为 **`--mode` → 进程中的 `ANTHIAS_PERMISSION_MODE` → 根 `.env` → `agent`**。非法模式会提示错误。运行中的 `/mode` 只改变当前 Agent，不改写文件，也不授予工作区权限。
+
+DeepSeek V4 Flash 的日常参考配置为 Base URL `https://api.deepseek.com`、模型 ID `deepseek-v4-flash`，窗口能力内置。其他模型若没有内置能力数据，还需在 `.env` 中取消 `ANTHIAS_MODEL_CONTEXT_WINDOW` 的注释，并填写服务明确声明的窗口。
+
+安全余量固定为 20,000 token。普通回答、摘要输出和保留原文的目标默认分别为 16,000、8,000 和 32,000 token；需要调整时填写 `ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS`。`ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 用于声明模型输出能力，配置超限会在进入交互前说明。
+
+`.env` 支持 `NAME=value`、单行引号值和注释，不展开变量或执行命令。配置错误只显示变量名、文件位置或行号。无法创建文件但进程环境已经提供完整配置时，程序会提示并继续启动。
+
+仍可仅在当前 PowerShell 窗口临时配置，例如：
 
 ```powershell
 $env:ANTHIAS_MODEL_BASE_URL = Read-Host 'OpenAI-compatible Base URL'
 $env:ANTHIAS_MODEL_ID = Read-Host '模型 ID'
 $env:ANTHIAS_MODEL_API_KEY = Read-Host 'API Key' -MaskInput
 ```
-
-Base URL 使用模型服务提供的 API 基础地址，不要附加 `/chat/completions`。模型 ID 使用该服务实际支持的值。
-
-
-DeepSeek V4 Flash 可使用 Base URL https://api.deepseek.com 与模型 ID deepseek-v4-flash，窗口能力内置。其他模型若没有内置能力数据，还需设置模型服务明确声明的窗口，例如：
-
-```powershell
-$env:ANTHIAS_MODEL_CONTEXT_WINDOW = Read-Host '模型上下文窗口 token 数'
-```
-
-安全余量固定为 20,000，不需要按模型手工配置。普通回答、摘要输出和保留原文的目标默认分别为 16,000、8,000 和 32,000 token；需要调整时使用 ANTHIAS_RESPONSE_MAX_TOKENS、ANTHIAS_COMPACTION_MAX_TOKENS、ANTHIAS_CONTEXT_KEEP_TOKENS。ANTHIAS_MODEL_MAX_OUTPUT_TOKENS 用于声明模型输出能力，配置超限会在启动前说明。
-
-这些设置只在当前终端及其子进程中生效，新开窗口需要重新配置。API Key 不会回显，也不要把真实值写进仓库文档或提交。Anthias 不会自动读取 `.env` 文件。
 
 ## 3. 从任意目录直接启动
 
@@ -56,7 +63,7 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 node 'C:\projects\anthias\apps\tui\dist\main.js' --workspace 'D:\你的项目' --mode plan
 ```
 
-`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时为 Agent 模式，`--mode plan` 允许读取、发现和搜索工作区文件及当前 Session 产物，也允许受管的 Anthias 记忆维护；任务 Workspace 仍不可写；`--mode auto_allow` 根据真实任务授权独立审核，批准后直接执行，信息不足时转人工确认。
+`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时采用第 2 节的默认配置。`plan` 允许读取、发现和搜索工作区文件、Session 产物及已配置的网页搜索，也允许受管的 Anthias 记忆维护；任务 Workspace 仍不可写。`auto_allow` 先核对当前限制和已明确授予的工作区权限，未命中授权的动作再独立审核，信息不足时转人工确认。
 
 ## 4. 使用 `anthias` 短命令
 
@@ -82,7 +89,7 @@ if (-not (Test-Path -LiteralPath $PROFILE)) {
 notepad $PROFILE
 ```
 
-保存后重开 PowerShell，或运行 `. $PROFILE` 加载。Profile 中只放启动函数；模型环境变量仍按上一节配置。仓库移动后，需要同步修改函数里的入口路径。
+保存后重开 PowerShell，或运行 `. $PROFILE` 加载。Profile 中只放启动函数；连接配置由 Anthias 根 `.env` 加载。仓库移动后，需要同步修改函数里的入口路径。
 
 ## 5. 常用操作与 Session
 
@@ -93,10 +100,14 @@ notepad $PROFILE
 | 新建或恢复会话 | `/new`；`/resume` 列出 ID，`/resume <id>` 打开 |
 | 主动压缩 | `/compact`，只压缩历史投影，不产生额外普通回复 |
 | 查询或切换模式 | `/mode`、`/mode plan`、`/mode agent`、`/mode auto_allow`；只能在空闲时切换 |
+| 工作区授权 | `/permissions` 查看；授予与撤销见下文 |
+| 最近停止原因 | `/diagnostics` 查看安全分类、已知用量与重试事实 |
+| 明确继续 | `/continue [补充要求]`，采用已保存事实开始新的 Run |
+| 恢复未接受输入 | `/draft`，用于当前交互 TUI 中保留的草稿 |
 | 记忆管理 | `/memory` 查看；`/memory help` 查看维护命令 |
 | 查看上下文用量 | `/context`，当前窗口与各用途累计用量分别显示 |
 | 阅读与滚动 | 鼠标滚轮、点击轨道或拖动右侧滑块；`PageUp/PageDown`、`Ctrl+Home/End` 继续可用 |
-| 执行过程 | 任务结束后自动折叠；点击执行过程或步骤标题展开、收起，最终回答保持可见 |
+| 执行过程 | 显示工具准备、审批和执行进度；成功过程可折叠，失败原因默认可见，最终回答保持可见 |
 | 详情面板 | `/details` 或 `Ctrl+T` 打开；点击 `[<]`、`[>]` 切换详情，`[x]` 关闭；窄屏占满正文区 |
 | 批准当前副作用 | 完整阅读审批详情后输入 `approve`；详情未读完时阻止确认 |
 | 拒绝当前副作用 | 输入 `deny` |
@@ -122,6 +133,38 @@ $env:ANTHIAS_SESSION_DIR = 'D:\AnthiasData\conversation'
 会话以 UTC 日期和创建时间戳分目录保存；日志、索引与工具产物归属于同一个 Session。每次启动会在后台检查最近使用时间，两周未使用且没有活动使用者的会话及其产物会被清理；协作会话按根和成员成组检查，未交付资源会阻止清理。压缩保留完整历史，只缩减模型输入；TUI 显示过程和结果，成功后自动继续。
 
 Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬拒绝规则的命令无法通过确认放行。命令以当前用户权限运行，没有 OS 沙箱，Workspace 和命令 `cwd` 不代表文件或网络隔离。
+
+### 工作区授权
+
+需要减少重复审批时，先使用 `/mode auto_allow`，再输入：
+
+```text
+/permissions grant --remember
+```
+
+这一步只打开授权范围。核对完整 Workspace、文件范围、命令及工作目录，浏览面板到底部后另行输入 `grant` 才授予；输入 `cancel` 取消。省略 `--remember` 只授予本次会话；选择记住后，同一规范工作区重新启动可复用。`/permissions` 随时显示当前范围、来源及保存错误。
+
+该范围包含工作区内的普通文件创建与编辑，以及面板列明的构建、测试、检查和 lint 命令，例如 `pnpm build`、`pnpm test`、`npm run check`。命令入口、完整参数和工作目录均需匹配；额外参数、其他入口、重定向或动态拼装仍需审核。它不包含外部路径写入、破坏性清理、Git 提交或远端发布。Agent 模式仍逐动作确认，Plan 仍只读；只在 AutoAllow 模式消费这份授权。
+
+确实希望成员继承时，使用 `/permissions grant --remember --members`，阅读后同样输入 `grant`。仅本次会话的 `--members` 覆盖当前任务创建并登记的成员 worktree；同时选择 `--remember` 时，还包括今后从同一根工作区发起任务所创建并登记的成员 worktree。不选择 `--members` 就不继承，也不会扩展到相邻目录或任意工作树。
+
+`/permissions revoke` 可在运行中撤销：尚未开始的根与成员动作、待批准请求失效；已经开始的动作可用 `Ctrl+C` 停止，已经产生的副作用不回滚。授权记录由 Agent 保存在 Anthias `data/permissions/`，与 Session、记忆和项目规则分开。保存失败会分别说明本次会话是否生效、跨启动设置是否保存；以 `/permissions` 的实际结果为准。
+
+### 失败、重试与继续
+
+`/diagnostics` 显示最近 Run 的安全分类、已知 HTTP 状态、Provider 结束原因、中止来源、用量和自动重试次数。旧 Session 没有记录的字段保持未知，不补猜历史停止原因。
+
+一次普通模型生成只会针对明确的暂时网络、限流或服务错误最多额外重试两次，等待时间和次数在 TUI 可见。已经显示正文、Reasoning、工具参数片段，或收到完整 ToolCall 后不会自动重试；认证、配置、未知错误和输出截止也不重试。压缩、审批与 Tool 执行不套用这套重试。服务要求等待超过 30 秒、剩余任务时间不足或用户停止时，后续请求终止；重试不重置共享任务时限。
+
+停止后先查看诊断，再用 `/continue` 或 `/continue 缩小剩余范围` 明确继续。它会保留已完成消息、Tool 结果和产物，开始新的 Run 核对剩余工作；恢复与回放不会自动重放历史工具、审批或 Git 操作。
+
+输入被 busy 或状态拒绝时会保留为可编辑草稿；如果等待期间已经输入新内容，新草稿不会被覆盖，可用 `/draft` 取回上一份未接受的输入。此恢复入口只属于当前交互 TUI，不是跨退出保存；普通管道输入需要重新输入任务。运行中不支持的输入不会隐式排队。
+
+### 网页搜索
+
+在 Anthias 根 `.env` 填写可选的 `SEARCHAPI_API_KEY` 并重启后，可以直接要求 Agent“搜索相关官方文档并给出来源”。Agent 使用内建 `web_search`，不需要连接 MCP，也没有单独的 `/search` 命令。未配置时其余 Coding 能力仍可启动，实际搜索会说明缺少的变量。
+
+搜索固定使用 SearchAPI Google，接受非空 query 和可选正整数 page，默认第一页，不自动翻页或抓取全文。查询最多 2000 字符，一次响应最多 1 MiB，呈现结果最多 20 条、总计 60 KiB；请求超时为 15 秒，支持 `Ctrl+C` 取消。结果含标题、链接、摘要和来源；这些是外部不可信事实，不构成授权，只有摘要时不能声称已经阅读全文。不要把项目文件、密钥或完整会话放进查询。
 
 ## 6. 接入外部 Skill
 
@@ -211,11 +254,13 @@ description: 检查项目的接口兼容性与错误处理
 
 - **找不到 `anthias`**：先在当前窗口定义第 4 节的函数，或直接使用第 3 节的 Node 绝对入口。
 - **找不到 `dist/main.js` 或依赖**：回 Anthias 仓库安装依赖并执行 `pnpm build`，保留完整仓库及其依赖目录。
-- **提示缺少模型配置**：检查当前终端是否设置了第 2 节的连接配置及自定义模型的窗口容量；单独放置 `.env` 文件不会生效。
+- **提示缺少模型配置**：检查 Anthias 根 `.env` 的第 2 节变量、自定义模型窗口，以及进程环境是否覆盖了文件配置；任务工作区里的 `.env` 不参与加载。
+- **配置文件或默认模式无效**：按提示检查变量、文件位置或行号；不要把 Key 粘贴到错误反馈中。`/mode` 不会修复或保存根配置。
+- **搜索不可用**：检查 `SEARCHAPI_API_KEY`，或按结果中的认证、限流、配额、超时提示处理；其余 Coding 功能不依赖搜索配置。
 - **Workspace 与预期不一致**：从目标目录直接调用 CLI，或显式使用 `--workspace`。根目录的 `pnpm start` 会通过 pnpm 进入 TUI 包目录；它适合开发脚本调用，不应用来隐式选择外部工作区。
 - **Session Workspace 不匹配或正在使用**：使用原 Workspace 恢复，并先退出占用该 Session 的另一个 Anthias 进程。
 
-日常开发验证在仓库根目录运行 `pnpm verify`。它使用确定性本地测试；真实模型可用性需要在正确配置后另外确认。
+日常开发验证在仓库根目录运行 `pnpm verify`。它使用确定性本地测试。Feature 009 的配置、搜索、授权与交互能力已实现，待开发者验收；本 Feature 未完成真实模型或 SearchAPI 调用、Windows Terminal 主观体验验收，不能用本地模拟结果代替。
 
 ## MultiAgent 与本地 Git
 

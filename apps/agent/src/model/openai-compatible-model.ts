@@ -64,6 +64,30 @@ async function* streamModelEvents(
       stepUsage = normalizeModelUsage(streamPart.usage);
       continue;
     }
+    if (
+      streamPart.type === "tool-input-start" &&
+      typeof streamPart.id === "string" &&
+      typeof streamPart.toolName === "string"
+    ) {
+      yield Object.freeze({
+        type: "tool_input_start",
+        toolCallId: streamPart.id,
+        toolName: streamPart.toolName,
+      });
+      continue;
+    }
+    if (
+      streamPart.type === "tool-input-delta" &&
+      typeof streamPart.id === "string" &&
+      typeof streamPart.delta === "string"
+    ) {
+      yield Object.freeze({
+        type: "tool_input_delta",
+        toolCallId: streamPart.id,
+        delta: streamPart.delta,
+      });
+      continue;
+    }
     if (streamPart.type === "reasoning-start") {
       yield Object.freeze({ type: "reasoning_start" });
       continue;
@@ -195,7 +219,7 @@ function normalizeModelError(error: unknown): ModelRequestError {
   if (error instanceof ModelRequestError) return error;
   const apiError = APICallError.isInstance(error) ? error : null;
   let errorData = asRecord(apiError?.data) ?? asRecord(error);
-  if (apiError?.responseBody !== undefined) {
+  if (apiError?.responseBody !== undefined && apiError.responseBody.length <= 65_536) {
     try {
       errorData = asRecord(JSON.parse(apiError.responseBody)) ?? errorData;
     } catch {
@@ -204,6 +228,14 @@ function normalizeModelError(error: unknown): ModelRequestError {
   }
   const details = asRecord(errorData?.error) ?? errorData;
   const errorCode = details?.code;
+  const httpStatus =
+    typeof apiError?.statusCode === "number" &&
+    Number.isInteger(apiError.statusCode) &&
+    apiError.statusCode >= 100 &&
+    apiError.statusCode <= 599
+      ? apiError.statusCode
+      : null;
+  const retryAfterMs = parseRetryAfter(apiError?.responseHeaders);
   if (
     typeof errorCode === "string" &&
     [
@@ -214,7 +246,7 @@ function normalizeModelError(error: unknown): ModelRequestError {
       "input_token_limit_exceeded",
     ].includes(errorCode)
   ) {
-    return new ModelRequestError("context_overflow");
+    return new ModelRequestError("context_overflow", { httpStatus });
   }
   if (
     apiError !== null &&
@@ -223,7 +255,63 @@ function normalizeModelError(error: unknown): ModelRequestError {
       apiError.message,
     )
   ) {
-    return new ModelRequestError("context_overflow");
+    return new ModelRequestError("context_overflow", { httpStatus });
   }
-  return new ModelRequestError("model_error");
+  if (
+    [
+      "insufficient_quota",
+      "model_not_found",
+      "invalid_model",
+      "billing_hard_limit_reached",
+    ].includes(String(errorCode))
+  ) {
+    return new ModelRequestError("configuration", { httpStatus });
+  }
+  if (httpStatus === 401 || httpStatus === 403)
+    return new ModelRequestError("authentication", { httpStatus });
+  if (httpStatus === 404) return new ModelRequestError("configuration", { httpStatus });
+  if (httpStatus === 429) return new ModelRequestError("rate_limit", { httpStatus, retryAfterMs });
+  if (httpStatus !== null && [408, 425, 500, 502, 503, 504].includes(httpStatus))
+    return new ModelRequestError("service", { httpStatus, retryAfterMs });
+  if (httpStatus !== null && httpStatus >= 400 && httpStatus < 500)
+    return new ModelRequestError("invalid_request", { httpStatus });
+  const networkCodes = new Set([
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET",
+  ]);
+  let cause = asRecord(error);
+  for (let depth = 0; cause !== null && depth < 4; depth++) {
+    if (typeof cause.code === "string" && networkCodes.has(cause.code))
+      return new ModelRequestError("network", { httpStatus });
+    if (cause.name === "AbortError")
+      return new ModelRequestError("aborted", { httpStatus, abortSource: "internal" });
+    cause = asRecord(cause.cause);
+  }
+  return new ModelRequestError("unknown", { httpStatus });
+}
+
+/** Retry-After 仅转为有界数值事实；保留过长等待供上层明确拒绝自动恢复。 */
+function parseRetryAfter(headers: Record<string, string> | undefined): number | null {
+  const value = Object.entries(headers ?? {}).find(
+    ([name]) => name.toLowerCase() === "retry-after",
+  )?.[1];
+  if (value === undefined || value.length > 128) return null;
+  if (/^\d+(?:\.\d+)?$/.test(value.trim())) {
+    const milliseconds = Number(value.trim()) * 1000;
+    return Number.isFinite(milliseconds) && milliseconds >= 0
+      ? Math.min(milliseconds, 86_400_000)
+      : null;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? Math.min(86_400_000, Math.max(0, timestamp - Date.now()))
+    : null;
 }

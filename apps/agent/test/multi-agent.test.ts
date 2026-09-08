@@ -234,7 +234,10 @@ describe("MultiAgent through the Agent interface", () => {
           invalid: false,
         };
         yield { type: "finish", finishReason: "tool_calls" };
-      } else yield { type: "finish", finishReason: "stop" };
+      } else {
+        yield { type: "text_delta", delta: "请求已完成" };
+        yield { type: "finish", finishReason: "stop" };
+      }
     });
     const member = await spawn(agent, "member budget");
     await entered.promise;

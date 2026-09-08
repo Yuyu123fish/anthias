@@ -73,6 +73,32 @@ export function createFakeAgent() {
         value: { automatic: true, projectId: "test-project", entries: [], diagnostics: [] },
       })),
     },
+    permissions: {
+      snapshot: vi.fn(() => ({
+        workspaceRoot: state.workspaceRoot,
+        grant: null,
+        revoked: false,
+        availableCommands: [{ command: "pnpm test", cwd: "." }],
+      })),
+      grant: vi.fn(async (choice) => ({
+        ok: true as const,
+        value: {
+          workspaceRoot: state.workspaceRoot,
+          revoked: false,
+          grant: { ...choice, files: true, commands: [{ command: "pnpm test", cwd: "." }] },
+          availableCommands: [{ command: "pnpm test", cwd: "." }],
+        },
+      })),
+      revoke: vi.fn(async () => ({
+        ok: true as const,
+        value: {
+          workspaceRoot: state.workspaceRoot,
+          grant: null,
+          revoked: true,
+          availableCommands: [{ command: "pnpm test", cwd: "." }],
+        },
+      })),
+    },
     git: { execute: vi.fn(async () => ({ ok: true as const, value: "clean" })) },
     sessions: {
       list: vi.fn<Agent["sessions"]["list"]>(async () => ({

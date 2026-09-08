@@ -29,6 +29,7 @@ export type {
   AssistantTextPart,
   AssistantToolCallPart,
   Message,
+  RunDiagnostic,
   ToolResultMessage,
   UserMessage,
 } from "./message.js";
@@ -39,6 +40,11 @@ export type {
   TeamSummary,
   TeamTask,
 } from "./multi-agent/index.js";
+export type {
+  WorkspaceCommand,
+  WorkspaceGrant,
+  WorkspacePermissionSnapshot,
+} from "./permission/workspace-permissions.js";
 export {
   type AgentCreationFailure,
   type AgentCreationFailureReason,

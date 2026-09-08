@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { AssistantMessage, Message } from "@anthias/agent";
+import type { AssistantMessage, Message, PromptResult, RunDiagnostic } from "@anthias/agent";
 import { Markdown } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TerminalCapabilities } from "../src/content-renderer.js";
@@ -169,7 +169,7 @@ describe("Anthias TUI", () => {
         toolCallId: "inspect-1",
         toolName: "read_file",
         status: "completed",
-        content: "Specific file contents",
+        content: "Read completed\nFirst preview line\nSpecific file contents",
         truncated: false,
       },
     });
@@ -181,9 +181,9 @@ describe("Anthias TUI", () => {
     harness.emit({ type: "run_end", runId: "fold-run", result: { status: "completed" } });
     await screenContains(harness.terminal, "执行过程");
     expect(harness.terminal.text()).toContain("The final answer is ready.");
-    expect(harness.terminal.text()).not.toContain("read_file");
+    expect(harness.terminal.text()).toContain("Read completed");
     clickText(harness.terminal, "执行过程");
-    await screenContains(harness.terminal, "read_file");
+    await screenContains(harness.terminal, "Reasoning");
     expect(harness.terminal.text()).not.toContain("Specific file contents");
     clickText(harness.terminal, "read_file");
     await screenContains(harness.terminal, "Specific file contents");
@@ -195,8 +195,9 @@ describe("Anthias TUI", () => {
     clickText(harness.terminal, "执行过程");
     await vi.waitFor(async () => {
       await harness.terminal.flush();
-      expect(harness.terminal.text()).not.toContain("read_file");
+      expect(harness.terminal.text()).not.toContain("Specific file contents");
     });
+    expect(harness.terminal.text()).toContain("Read completed");
     expect(harness.terminal.text()).toContain("The final answer is ready.");
   });
 
@@ -331,9 +332,9 @@ describe("Anthias TUI", () => {
     harness.terminal.mouse(32, processTitle.x + 1, processTitle.y);
     harness.terminal.mouse(0, processTitle.x + 1, processTitle.y, true);
     await harness.terminal.flush();
-    expect(harness.terminal.text()).not.toContain("read_file");
+    expect(harness.terminal.text()).not.toContain("Intermediate plan 0");
     clickText(harness.terminal, "执行过程");
-    await screenContains(harness.terminal, "[call-0]");
+    await screenContains(harness.terminal, "中间回复");
     expect(harness.terminal.locate("执行过程").y).toBe(processTitle.y);
     clickText(harness.terminal, "中间回复");
     await screenContains(harness.terminal, "Intermediate plan 0");
@@ -346,7 +347,7 @@ describe("Anthias TUI", () => {
     clickText(harness.terminal, "[call-0]");
     await screenContains(harness.terminal, "Result 0 line 0");
     expect(harness.terminal.locate("[call-0]").y).toBe(stepTitle.y);
-    expect(harness.terminal.text()).not.toContain("Separate result 0");
+    expect(harness.terminal.text()).not.toContain("Result 0 line 59");
     const content = harness.terminal.locate("Result 0 line 0");
     harness.terminal.mouse(0, content.x, content.y);
     harness.terminal.mouse(32, content.x + 5, content.y);
@@ -376,13 +377,13 @@ describe("Anthias TUI", () => {
     clickText(harness.terminal, "[call-0]");
     await vi.waitFor(async () => {
       await harness.terminal.flush();
-      expect(harness.terminal.text()).not.toContain("Result 0 line 0");
+      expect(harness.terminal.text()).not.toContain("Result 0 line 3");
     });
     clickText(harness.terminal, "[next-0]");
     await screenContains(harness.terminal, "Separate result 0");
   });
 
-  it("retains failed and stopped process status and closes intermediate details at run end", async () => {
+  it("retains failed and stopped status without closing user-opened details at run end", async () => {
     const harness = createHarness(true, 80, 26);
     await screenContains(harness.terminal, "Workspace:");
     for (const status of ["failed", "aborted"] as const) {
@@ -403,6 +404,8 @@ describe("Anthias TUI", () => {
         runId: status,
         result: status === "failed" ? { status, error: "Local failure" } : { status },
       });
+      await screenContains(harness.terminal, `Retained ${status} reasoning`);
+      harness.terminal.send("\u0014");
       await screenContains(harness.terminal, `Partial answer ${status}`);
       expect(harness.terminal.text()).not.toContain(`Retained ${status} reasoning`);
       expect(harness.terminal.text()).toContain(
@@ -596,4 +599,336 @@ describe("Anthias TUI", () => {
     expect(harness.agent.close).toHaveBeenCalledOnce();
     expect(harness.terminal.terminal.stop).toHaveBeenCalledOnce();
   });
+});
+
+describe("daily usage interactions", () => {
+  it("keeps streamed progress after command results and bounds long command output", async () => {
+    const harness = createHarness(true, 110, 32);
+    await screenContains(harness.terminal, "Workspace:");
+    harness.setState({ running: true });
+    harness.emit({ type: "message_start", message: { role: "user", content: "Build the page" } });
+    harness.emit({ type: "message_start", message: assistant("BEFORE_COMMAND") });
+    harness.terminal.send("/context");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "/context");
+    harness.emit({
+      type: "message_update",
+      message: assistant("BEFORE_COMMAND\n\nAFTER_COMMAND"),
+      delta: "\n\nAFTER_COMMAND",
+    });
+    await screenContains(harness.terminal, "AFTER_COMMAND");
+    expect(harness.terminal.locate("AFTER_COMMAND").y).toBeGreaterThan(
+      harness.terminal.locate("/context").y,
+    );
+    expect(harness.terminal.text().match(/BEFORE_COMMAND/gu)).toHaveLength(1);
+    harness.terminal.send("/help");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "/help · [详情]");
+    expect(harness.terminal.text()).not.toContain("Shift+Enter");
+    clickText(harness.terminal, "/help · [详情]");
+    await screenContains(harness.terminal, "详情 2/2");
+    harness.terminal.send("\u001b[1;5F");
+    await screenContains(harness.terminal, "Shift+Enter");
+    harness.terminal.send("\u001b");
+    await screenContains(harness.terminal, "AFTER_COMMAND");
+    harness.emit({
+      type: "message_update",
+      message: assistant("BEFORE_COMMAND\n\nAFTER_COMMAND\n\nLATEST_PROGRESS"),
+      delta: "\n\nLATEST_PROGRESS",
+    });
+    await screenContains(harness.terminal, "LATEST_PROGRESS");
+    expect(harness.terminal.locate("LATEST_PROGRESS").y).toBeGreaterThan(
+      harness.terminal.locate("/help ·").y,
+    );
+  });
+
+  it("restores rejected multiline input and protects a newer draft from asynchronous rejection", async () => {
+    const harness = createHarness(true, 100, 30);
+    await screenContains(harness.terminal, "Workspace:");
+    vi.mocked(harness.agent.prompt).mockResolvedValueOnce({ status: "rejected", reason: "busy" });
+    harness.terminal.send("\u001b[200~第一行草稿\n第二行草稿\u001b[201~");
+    harness.terminal.send("\r");
+    await vi.waitFor(async () => {
+      await harness.terminal.flush();
+      expect(harness.terminal.text().split("\n").slice(-6).join("\n")).toContain("第二行草稿");
+    });
+    harness.input.end();
+    await harness.result;
+
+    const next = createHarness(true, 100, 30);
+    const rejection = Promise.withResolvers<PromptResult>();
+    vi.mocked(next.agent.prompt).mockReturnValueOnce(rejection.promise);
+    await screenContains(next.terminal, "Workspace:");
+    next.terminal.send("PREVIOUS_DRAFT");
+    next.terminal.send("\r");
+    next.terminal.send("NEW_DRAFT");
+    rejection.resolve({ status: "rejected", reason: "session_busy" });
+    await screenContains(next.terminal, "/draft");
+    expect(next.terminal.text().split("\n").slice(-4).join("\n")).toContain("NEW_DRAFT");
+    next.terminal.send("\u0015");
+    next.terminal.send("/draft");
+    next.terminal.send("\r");
+    await vi.waitFor(async () => {
+      await next.terminal.flush();
+      expect(next.terminal.text().split("\n").slice(-4).join("\n")).toContain("PREVIOUS_DRAFT");
+    });
+  });
+
+  it("tracks tool preparation, approval and failure with one card and keeps member identities separate", async () => {
+    const harness = createHarness(true, 140, 42);
+    await screenContains(harness.terminal, "Workspace:");
+    harness.emit({ type: "message_start", message: { role: "user", content: "Edit files" } });
+    harness.emit({
+      type: "tool_preparation",
+      runId: "run-1",
+      toolCallId: "shared-call",
+      toolName: "write_file",
+      phase: "input",
+    });
+    await screenContains(harness.terminal, "参数生成中");
+    harness.emit({
+      type: "tool_preparation",
+      runId: "run-1",
+      toolCallId: "shared-call",
+      toolName: "write_file",
+      phase: "ready",
+    });
+    await screenContains(harness.terminal, "等待执行");
+    harness.emit({
+      type: "tool_preparation",
+      runId: "member-run",
+      toolCallId: "shared-call",
+      toolName: "read_file",
+      phase: "ready",
+      memberSessionId: "member-1",
+      memberName: "Checker",
+    });
+    const request = { ...approvalRequest(), toolCallId: "shared-call", toolName: "write_file" };
+    harness.setState({ pendingToolApproval: request, running: true });
+    harness.emit({ type: "tool_approval_requested", request });
+    await screenContains(harness.terminal, "等待批准");
+    harness.setState({ pendingToolApproval: null });
+    harness.emit({ type: "tool_approval_resolved", request, decision: "approve" });
+    harness.emit({
+      type: "tool_execution_start",
+      activity: { toolCallId: "shared-call", toolName: "write_file", summary: "note.md" },
+    });
+    const result = {
+      role: "tool" as const,
+      toolCallId: "shared-call",
+      toolName: "write_file",
+      status: "failed" as const,
+      content: "Expected a workspace-relative path; outside target rejected.",
+      truncated: false,
+    };
+    harness.emit({
+      type: "tool_execution_end",
+      toolCallId: "shared-call",
+      toolName: "write_file",
+      result,
+      cleanupUncertain: false,
+    });
+    harness.emit({ type: "message_end", message: result });
+    harness.emit({
+      type: "run_end",
+      runId: "run-1",
+      result: { status: "failed", error: "Safe local failure" },
+    });
+    await screenContains(harness.terminal, "outside target rejected");
+    expect(harness.terminal.text()).toContain("成员 Checker");
+    expect(harness.terminal.text().match(/write_file \[red-call\]/gu)).toHaveLength(1);
+    harness.terminal.send("\u0014");
+    await screenContains(harness.terminal, "详情 2/2");
+  });
+
+  it("requires an explicit reviewed grant and keeps revocation available during a run", async () => {
+    const harness = createHarness(true, 110, 30);
+    await screenContains(harness.terminal, "Workspace:");
+    harness.setState({ running: true });
+    harness.terminal.send("/permissions grant --remember --members");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "工作区授权");
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+    harness.terminal.send("\u001b[1;5F");
+    await screenContains(harness.terminal, "当前系统用户");
+    expect(harness.terminal.text()).toContain("OS 沙箱");
+    harness.terminal.send("grant");
+    harness.terminal.send("\r");
+    await vi.waitFor(() =>
+      expect(harness.agent.permissions.grant).toHaveBeenCalledWith({
+        remember: true,
+        includeMembers: true,
+      }),
+    );
+    expect(harness.agent.setPermissionMode).not.toHaveBeenCalled();
+    harness.terminal.send("/permissions revoke");
+    harness.terminal.send("\r");
+    await vi.waitFor(() => expect(harness.agent.permissions.revoke).toHaveBeenCalledOnce());
+    await screenContains(harness.terminal, "已产生副作用不回滚");
+    expect(harness.agent.prompt).not.toHaveBeenCalled();
+  });
+
+  it("shows safe retry and restored failure diagnostics and continues only after user input", async () => {
+    const harness = createHarness(true, 120, 36);
+    await screenContains(harness.terminal, "Workspace:");
+    const diagnostic: RunDiagnostic = {
+      category: "network",
+      summary: "模型请求遇到暂时网络错误。",
+      providerFinishReason: null,
+      usage: null,
+      retryCount: 1,
+      abortSource: null,
+      httpStatus: null,
+      retryStopReason: "exhausted",
+    };
+    harness.setState({ running: true });
+    harness.emit({
+      type: "tool_preparation",
+      runId: "retry-run",
+      toolCallId: "retry-input",
+      toolName: "read_file",
+      phase: "input",
+    });
+    harness.emit({
+      type: "model_retry",
+      runId: "retry-run",
+      phase: "waiting",
+      retryCount: 1,
+      delayMs: 500,
+      diagnostic,
+    });
+    await screenContains(harness.terminal, "重试 1/2");
+    harness.emit({
+      type: "model_retry",
+      runId: "retry-run",
+      phase: "requesting",
+      retryCount: 1,
+      delayMs: 0,
+      diagnostic,
+    });
+    await screenContains(harness.terminal, "准备已中断");
+    harness.emit({
+      type: "tool_preparation",
+      runId: "retry-run",
+      toolCallId: "retry-input",
+      toolName: "read_file",
+      phase: "input",
+    });
+    await screenContains(harness.terminal, "参数生成中");
+    expect(harness.terminal.text().split("read_file [ry-input]")).toHaveLength(2);
+    harness.signals.emit("SIGINT");
+    expect(harness.agent.abort).toHaveBeenCalledOnce();
+    harness.setState({ running: false, lastRunDiagnostic: diagnostic });
+    harness.emit({
+      type: "run_end",
+      runId: "retry-run",
+      result: { status: "failed", error: diagnostic.summary },
+      diagnostic,
+    });
+    await screenContains(harness.terminal, "输入 /continue");
+    expect(harness.agent.prompt).not.toHaveBeenCalled();
+    harness.emit({ type: "session_changed", sessionId: harness.agent.state.sessionId });
+    await screenContains(harness.terminal, "最近运行诊断");
+    harness.terminal.send("\u0014");
+    await screenContains(harness.terminal, "输入 未知");
+    harness.terminal.send("\u0014");
+    harness.terminal.send("/continue 保留完成的文件");
+    harness.terminal.send("\r");
+    await vi.waitFor(() =>
+      expect(harness.agent.prompt).toHaveBeenCalledWith("继续上一任务。补充要求：\n保留完成的文件"),
+    );
+  });
+});
+
+describe("permission review feedback", () => {
+  it("keeps current reading open until approval is explicitly selected", async () => {
+    const harness = createHarness(true, 80, 28);
+    await screenContains(harness.terminal, "Workspace:");
+    harness.terminal.send("/help");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "/help · [详情]");
+    clickText(harness.terminal, "/help · [详情]");
+    await screenContains(harness.terminal, "详情 1/1");
+    const request = approvalRequest();
+    harness.setState({ pendingToolApproval: request, running: true });
+    harness.emit({ type: "tool_approval_requested", request });
+    await screenContains(harness.terminal, "详情 1/2");
+    expect(harness.terminal.text()).not.toContain("Risk:");
+    harness.terminal.send("/approval");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "Risk:");
+    expect(harness.agent.respondToToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed remembered save with the actual session scope", async () => {
+    const harness = createHarness(true, 110, 38);
+    await screenContains(harness.terminal, "Workspace:");
+    vi.mocked(harness.agent.permissions.grant).mockResolvedValueOnce({
+      ok: false,
+      error: "本次会话授权已生效，但跨启动设置未保存。",
+    });
+    harness.terminal.send("/permissions grant --remember");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "完整浏览后输入 grant");
+    vi.mocked(harness.agent.permissions.snapshot).mockReturnValue({
+      workspaceRoot: harness.agent.state.workspaceRoot,
+      revoked: false,
+      grant: {
+        remember: false,
+        includeMembers: false,
+        files: true,
+        commands: [{ command: "pnpm test", cwd: "." }],
+      },
+      availableCommands: [{ command: "pnpm test", cwd: "." }],
+    });
+    harness.terminal.send("\u001b[1;5F");
+    harness.terminal.send("grant");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "跨启动设置未保存");
+    await screenContains(harness.terminal, "有效范围：仅本次会话");
+    expect(harness.terminal.text()).not.toContain("已生效并记住");
+  });
+});
+
+it("ends only unfinished member tools when a member fails while the root keeps streaming", async () => {
+  const harness = createHarness(true, 130, 40);
+  await screenContains(harness.terminal, "Workspace:");
+  harness.setState({ running: true, activeRun: { runId: "root-run", phase: "requesting_model" } });
+  harness.emit({ type: "message_start", message: { role: "user", content: "Root task" } });
+  harness.emit({ type: "message_start", message: assistant("ROOT_STREAM") });
+  harness.emit({
+    type: "tool_preparation",
+    runId: "root-run",
+    toolCallId: "root-tool",
+    toolName: "read_file",
+    phase: "input",
+  });
+  harness.emit({
+    type: "tool_preparation",
+    runId: "member-run",
+    toolCallId: "member-tool",
+    toolName: "grep",
+    phase: "input",
+    memberSessionId: "member-1",
+    memberName: "Checker",
+  });
+  await screenContains(harness.terminal, "成员 Checker");
+  harness.emit({
+    type: "run_end",
+    runId: "member-run",
+    memberSessionId: "member-1",
+    memberName: "Checker",
+    result: { status: "failed", error: "Member model failed before completing parameters" },
+  });
+  await screenContains(harness.terminal, "grep [ber-tool] · 成员 Checker · 未执行");
+  expect(harness.terminal.text()).toContain("read_file [oot-tool] · 参数生成中");
+  expect(harness.terminal.text()).toContain("执行过程 · 2 步 · 运行中");
+  harness.emit({
+    type: "message_update",
+    message: assistant("ROOT_STREAM_CONTINUES"),
+    delta: "_CONTINUES",
+  });
+  await screenContains(harness.terminal, "ROOT_STREAM_CONTINUES");
+  expect(harness.agent.state.lastRunDiagnostic).toBeUndefined();
+  expect(harness.agent.abort).not.toHaveBeenCalled();
 });

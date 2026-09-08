@@ -172,12 +172,73 @@ describe("createOpenAICompatibleModelStream", () => {
             new AbortController().signal,
           ),
         ),
-      ).rejects.toMatchObject({ reason: "model_error", message: "模型请求失败。" });
+      ).rejects.toMatchObject({
+        reason: "model_error",
+        diagnostic: { category: "service", httpStatus: 500 },
+      });
       expect(requestCount).toBe(1);
       expect(consoleError).not.toHaveBeenCalled();
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it.each([
+    [400, "invalid_request"],
+    [401, "authentication"],
+    [404, "configuration"],
+    [429, "rate_limit"],
+    [503, "service"],
+  ] as const)(
+    "normalizes HTTP %s without retaining raw provider details",
+    async (httpStatus, category) => {
+      const server = await startServer((_request, response) => {
+        response.writeHead(httpStatus, { "content-type": "application/json", "retry-after": "31" });
+        response.end(
+          JSON.stringify({
+            error: { message: "fake-secret raw response https://user:password@example.invalid" },
+          }),
+        );
+      });
+      const address = server.address() as AddressInfo;
+      const modelStream = createOpenAICompatibleModelStream({
+        baseURL: `http://127.0.0.1:${address.port}/v1`,
+        modelId: "test-model",
+        apiKey: "test-key",
+      });
+      const error = await collect(
+        modelStream(
+          { systemPrompt: "test", messages: [{ role: "user", content: "inspect" }], tools: [] },
+          new AbortController().signal,
+        ),
+      ).catch((error: unknown) => error);
+      expect(error).toMatchObject({ diagnostic: { category, httpStatus } });
+      if (category === "rate_limit" || category === "service")
+        expect(error).toMatchObject({ retryAfterMs: 31_000 });
+      expect(JSON.stringify(error)).not.toMatch(/fake-secret|password|raw response/);
+    },
+  );
+
+  it("classifies a refused loopback connection as a temporary network failure", async () => {
+    const server = await startServer((_request, response) => {
+      response.end();
+    });
+    const address = server.address() as AddressInfo;
+    await closeServer(server);
+    servers.delete(server);
+    const modelStream = createOpenAICompatibleModelStream({
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      modelId: "test-model",
+      apiKey: "test-key",
+    });
+    await expect(
+      collect(
+        modelStream(
+          { systemPrompt: "test", messages: [{ role: "user", content: "inspect" }], tools: [] },
+          new AbortController().signal,
+        ),
+      ),
+    ).rejects.toMatchObject({ diagnostic: { category: "network", httpStatus: null } });
   });
 
   it("preserves valid and invalid tool calls as Agent events without executing them", async () => {
@@ -230,6 +291,26 @@ describe("createOpenAICompatibleModelStream", () => {
     );
 
     expect(modelEvents).toEqual([
+      {
+        type: "tool_input_start",
+        toolCallId: "00000000-0000-4000-8000-000000000010",
+        toolName: "read_file",
+      },
+      {
+        type: "tool_input_delta",
+        toolCallId: "00000000-0000-4000-8000-000000000010",
+        delta: '{"path":"README.md"}',
+      },
+      {
+        type: "tool_input_start",
+        toolCallId: "00000000-0000-4000-8000-000000000011",
+        toolName: "unknown_tool",
+      },
+      {
+        type: "tool_input_delta",
+        toolCallId: "00000000-0000-4000-8000-000000000011",
+        delta: '{"value":1}',
+      },
       {
         type: "tool_call",
         toolCallId: "00000000-0000-4000-8000-000000000010",
@@ -554,7 +635,7 @@ describe("createOpenAICompatibleModelStream", () => {
       expect(outcome).toBeInstanceOf(ModelRequestError);
       expect(outcome).toMatchObject({
         reason: "context_overflow",
-        message: "模型上下文容量不足。",
+        diagnostic: { category: "context_overflow", httpStatus: 400 },
       });
       expect(String(outcome)).not.toContain("sensitive");
     },

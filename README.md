@@ -18,15 +18,15 @@ TUI 直接调用 Agent，并订阅 Agent 发布的事件。未来 Desktop 可以
 
 ## 启动
 
-首次使用请阅读 [Quick Start](quick-start.md)，完成依赖安装、构建和模型配置。构建完成后，可以在希望 Agent 操作的任意目录启动：
+首次使用请阅读 [Quick Start](quick-start.md)，完成依赖安装、构建，并在 Anthias 根目录的 `.env` 配置模型。仓库提供 [.env-example](.env-example)；首次启动缺少 `.env` 时会生成无凭据模板，已有文件不覆盖。构建完成后，可以在希望 Agent 操作的任意目录启动：
 
 ```powershell
 node 'C:\projects\anthias\apps\tui\dist\main.js'
 ```
 
-把上面的仓库路径替换为你的实际路径。省略 `--workspace` 时使用调用命令的当前目录，也可以传入 `--workspace 'D:\你的项目'`；`--mode plan` 以只读模式启动，`--mode auto_allow` 启用独立自动审核。Session 默认集中保存在 Anthias 仓库的 `data/conversation/`。
+把上面的仓库路径替换为你的实际路径。省略 `--workspace` 时使用调用命令的当前目录，也可以传入 `--workspace 'D:\你的项目'`。根 `.env` 与任务工作区无关，进程环境覆盖文件；模式优先级为 `--mode` → 进程环境 → 根 `.env` → `agent`。`--mode plan` 以只读模式启动；`--mode auto_allow` 采用已明确授予的工作区权限，未命中的动作再独立审核。Session 默认集中保存在 Anthias 仓库的 `data/conversation/`。
 
-Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复和常见启动问题。
+需要记住日常工作区授权时，使用 `/permissions grant --remember`，浏览范围后另行输入 `grant`；`--members` 可明确包含登记成员 worktree，`/permissions revoke` 可撤销。可选的 `SEARCHAPI_API_KEY` 启用网页搜索。Quick Start 包含详细范围、PowerShell `anthias` 短命令、Session 恢复和故障处理。
 
 ## 当前状态
 
@@ -42,11 +42,12 @@ Quick Start 还包含 PowerShell `anthias` 短命令的配置、Session 恢复�
 - [Feature 006](specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏固定面板与应用内滚动、流式 Markdown、统一 `/` 命令、会话切换与手动压缩、按需加载外部 Skill、显式连接 MCP。当前全屏交互替代 Feature 004 的 scrollback 方案；[实施报告](specs/feature006-command-skill-mcp-tui/report.md) 记录本地验证，等待开发者终端体验验收。
 - [Feature 007](specs/feature007-multi-agent/spec.md) 已实现 SubAgent、AgentTeam 与本地 Git/worktree；复用现有 Agent，最多三个成员，可写成员从固定提交隔离执行。来源授权、Schema 3 历史、显式继续和组清理已完成本地验证，等待开发者验收；使用方式见 [Quick Start](quick-start.md#multiagent-与本地-git)，证据见 [实施报告](specs/feature007-multi-agent/report.md)。
 - [Feature 008](specs/feature008-memory-and-prompt-orchestration/spec.md) 已实现主动记忆、`/memory` 管理、项目 `AGENTS.md` 自动加载、稳定提示词顺序与来源增量，以及历史身份和压缩恢复映射。已移除 12/60 次模型调用截止，保留 30 分钟时限和资源边界；本地验证与真实缓存收益的证据边界见 [实施报告](specs/feature008-memory-and-prompt-orchestration/report.md)，待开发者验收。
+- [Feature 009](specs/feature009-usage-stability/spec.md) 已实现根 `.env` 配置、SearchAPI 网页搜索、可记住与撤销的工作区授权，以及命令顺序、工具过程和输入草稿修复；`/diagnostics` 查看安全停止原因，`/continue` 明确继续，`/draft` 恢复未接受输入。普通模型生成仅在未交付内容时对明确暂时错误最多额外重试两次，Tool 副作用不自动重试。本地验证见 [实施报告](specs/feature009-usage-stability/report.md)，当前待开发者验收；本 Feature 未进行真实模型、SearchAPI 调用或 Windows Terminal 主观体验验收。
 - 工程验证方向尚未进入对应 Feature；Desktop 尚未实现。执行分叉已退出产品核心路线，不再作为必须实现的后续目标。
 
 ## 文档入口
 
-- [Quick Start](quick-start.md)：安装、模型配置、任意目录启动和 Session 恢复。
+- [Quick Start](quick-start.md)：安装、根配置、工作区授权、网页搜索、任意目录启动和 Session 恢复。
 - [产品定义](docs/product-definition.md)：产品路线、交互形态、核心术语与当前边界。
 - [技术基线](docs/technical-baseline.md)：当前 TypeScript、Agent、TUI、事件和模型方向。
 - [开发流程](docs/development-workflow.md)：讨论、Spec、Plan、实施与验收的协作方式。

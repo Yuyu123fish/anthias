@@ -68,7 +68,7 @@ export function createMultiAgent(options: {
   permissionMode(): PermissionMode;
   changed(snapshot: CollaborationSnapshot): void;
   memberEvent(member: MemberSummary, event: AgentEvent): void;
-  abortRoot(): void;
+  abortRoot(source?: "parent" | "shutdown" | "task_deadline"): void;
 }) {
   const team = createAgentTeam(options.root);
   const deliveries = new Map<string, Delivery>();
@@ -153,9 +153,9 @@ export function createMultiAgent(options: {
     serialization = result.catch(() => undefined);
     return result;
   }
-  function abort() {
-    members.abort();
-    options.abortRoot();
+  function abort(source: "parent" | "shutdown" | "task_deadline" = "parent") {
+    members.abort(source);
+    options.abortRoot(source);
   }
   function beginTask() {
     if (members.busy()) return;
@@ -165,16 +165,21 @@ export function createMultiAgent(options: {
     budgetTimer = setTimeout(() => {
       limitNotice = "整组运行已达到三十分钟上限，请明确新的任务后继续。";
       changed();
-      abort();
+      abort("task_deadline");
     }, 30 * 60_000);
     budgetTimer.unref?.();
   }
   const modelStream: ModelStream = async function* (request, signal) {
     if (deadline === 0) beginTask();
-    if (closed || signal.aborted || Date.now() >= deadline) {
+    signal.throwIfAborted();
+    if (closed) {
+      abort("shutdown");
+      throw new Error("Agent 已关闭。");
+    }
+    if (Date.now() >= deadline) {
       limitNotice = "整组运行时限已达到上限，请明确新的任务后继续。";
       changed();
-      abort();
+      abort("task_deadline");
       throw new Error(limitNotice);
     }
     yield* options.modelStream(request, signal);
@@ -429,6 +434,7 @@ export function createMultiAgent(options: {
     snapshot,
     modelStream,
     beginTask,
+    remainingTaskTimeMs: () => (deadline === 0 ? 30 * 60_000 : Math.max(0, deadline - Date.now())),
     drain,
     execute,
     busy: members.busy,

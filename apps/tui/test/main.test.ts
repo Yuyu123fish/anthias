@@ -4,6 +4,7 @@ import {
   glob,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -14,10 +15,17 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveStartupPaths } from "../src/startup.js";
 
 const temporaryDirectories = new Set<string>();
+let isolatedMainPath: string;
+let isolatedAnthiasRoot: string;
+
+beforeEach(async () => {
+  isolatedAnthiasRoot = await createIsolatedAnthiasProject();
+  isolatedMainPath = join(isolatedAnthiasRoot, "apps", "tui", "dist", "main.js");
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -112,12 +120,62 @@ describe("Anthias CLI", () => {
     });
   });
 
+  it("loads one root configuration from another workspace and honors process and CLI modes", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-cli-root-config-");
+    const configuration = [
+      "ANTHIAS_MODEL_BASE_URL=https://example.com/v1",
+      "ANTHIAS_MODEL_ID=fixture-model",
+      "ANTHIAS_MODEL_CONTEXT_WINDOW=128000",
+      "ANTHIAS_MODEL_API_KEY=synthetic-root-model-key",
+      "ANTHIAS_PERMISSION_MODE=auto_allow",
+      "",
+    ].join("\n");
+    await writeFile(join(isolatedAnthiasRoot, ".env"), configuration);
+    await writeFile(
+      join(workspaceRoot, ".env"),
+      "ANTHIAS_PERMISSION_MODE=invalid-workspace-mode\n",
+    );
+    const environment = createTestProcessEnvironment();
+    const fromFile = spawnCli([], environment, workspaceRoot, "/mode plan\n/exit\n");
+    expect(fromFile.status).toBe(0);
+    expect(fromFile.stdout).toContain("Mode: AutoAllow\n");
+    expect(fromFile.stderr).toBe("");
+    const fromProcess = spawnCli(
+      [],
+      { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+      workspaceRoot,
+      "/exit\n",
+    );
+    expect(fromProcess.status).toBe(0);
+    expect(fromProcess.stdout).toContain("Mode: Plan\n");
+    const fromCli = spawnCli(
+      ["--mode", "agent"],
+      { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+      workspaceRoot,
+      "/exit\n",
+    );
+    expect(fromCli.stdout).toContain("Mode: Agent\n");
+    const emptyKey = spawnCli(
+      [],
+      { ...environment, ANTHIAS_MODEL_API_KEY: "" },
+      workspaceRoot,
+      "/exit\n",
+    );
+    expect(emptyKey.status).toBe(1);
+    expect(emptyKey.stderr).toContain("ANTHIAS_MODEL_API_KEY");
+    expect(JSON.stringify([fromFile, fromProcess, fromCli, emptyKey])).not.toContain(
+      "synthetic-root-model-key",
+    );
+    expect(await readFile(join(isolatedAnthiasRoot, ".env"), "utf8")).toBe(configuration);
+  });
   it("creates a Session without arguments and reopens the same UUID", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-reopen-");
     const normalizedWorkspaceRoot = await realpath(workspaceRoot);
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = {
-      ...process.env,
+      ...createTestProcessEnvironment(),
+      SEARCHAPI_API_KEY: "",
+      ANTHIAS_PERMISSION_MODE: "agent",
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
       ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
@@ -172,16 +230,12 @@ describe("Anthias CLI", () => {
 
   it("exits after /exit while the parent keeps the input pipe open", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-open-input-");
-    const child = spawn(
-      process.execPath,
-      [fileURLToPath(new URL("../dist/main.js", import.meta.url))],
-      {
-        cwd: workspaceRoot,
-        env: createModelEnvironment(join(workspaceRoot, "sessions")),
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+    const child = spawn(process.execPath, [isolatedMainPath], {
+      cwd: workspaceRoot,
+      env: createModelEnvironment(join(workspaceRoot, "sessions")),
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     let sentExit = false;
@@ -225,7 +279,9 @@ describe("Anthias CLI", () => {
       "sessions",
     );
     const environment: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...createTestProcessEnvironment(),
+      SEARCHAPI_API_KEY: "",
+      ANTHIAS_PERMISSION_MODE: "agent",
       ANTHIAS_SESSION_DIR: sessionDirectory,
     };
     delete environment.ANTHIAS_MODEL_BASE_URL;
@@ -240,7 +296,7 @@ describe("Anthias CLI", () => {
   });
 
   it("rejects unknown CLI arguments before startup", () => {
-    const processResult = spawnCli(["--unknown"], { ...process.env });
+    const processResult = spawnCli(["--unknown"], { ...createTestProcessEnvironment() });
 
     expect(processResult.status).toBe(1);
     expect(processResult.stderr).toContain("命令行参数无效");
@@ -277,7 +333,9 @@ describe("Anthias CLI", () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = {
-      ...process.env,
+      ...createTestProcessEnvironment(),
+      SEARCHAPI_API_KEY: "",
+      ANTHIAS_PERMISSION_MODE: "agent",
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
       ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
@@ -303,7 +361,9 @@ describe("Anthias CLI", () => {
       "sessions",
     );
     const processResult = spawnCli(["--session", "../outside"], {
-      ...process.env,
+      ...createTestProcessEnvironment(),
+      SEARCHAPI_API_KEY: "",
+      ANTHIAS_PERMISSION_MODE: "agent",
       ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
       ANTHIAS_MODEL_ID: "model-id",
       ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
@@ -321,7 +381,7 @@ function spawnCli(
   environment: NodeJS.ProcessEnv,
   cwd?: string,
   input?: string,
-  mainPath = fileURLToPath(new URL("../dist/main.js", import.meta.url)),
+  mainPath = isolatedMainPath,
 ) {
   return spawnSync(process.execPath, [mainPath, ...arguments_], {
     cwd,
@@ -344,9 +404,37 @@ async function createIsolatedAnthiasProject(): Promise<string> {
     `${JSON.stringify({ name: "anthias", private: true, type: "module" })}\n`,
     "utf8",
   );
+  const isolatedAgentRoot = join(anthiasProjectRoot, "apps", "agent");
+  await mkdir(isolatedAgentRoot, { recursive: true });
+  await cp(
+    fileURLToPath(new URL("../../agent/dist", import.meta.url)),
+    join(isolatedAgentRoot, "dist"),
+    { recursive: true },
+  );
+  await cp(
+    fileURLToPath(new URL("../../agent/package.json", import.meta.url)),
+    join(isolatedAgentRoot, "package.json"),
+  );
   await symlink(
-    fileURLToPath(new URL("../node_modules", import.meta.url)),
-    join(isolatedTuiRoot, "node_modules"),
+    fileURLToPath(new URL("../../agent/node_modules", import.meta.url)),
+    join(isolatedAgentRoot, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const originalTuiModules = fileURLToPath(new URL("../node_modules", import.meta.url));
+  const isolatedTuiModules = join(isolatedTuiRoot, "node_modules");
+  await mkdir(join(isolatedTuiModules, "@anthias"), { recursive: true });
+  for (const name of await readdir(originalTuiModules)) {
+    if (name === "@anthias" || name.startsWith(".")) continue;
+    await symlink(
+      join(originalTuiModules, name),
+      join(isolatedTuiModules, name),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  }
+  // Agent 也必须来自隔离安装目录，避免其配置模块读取开发者项目中的真实 .env。
+  await symlink(
+    isolatedAgentRoot,
+    join(isolatedTuiModules, "@anthias", "agent"),
     process.platform === "win32" ? "junction" : "dir",
   );
   return anthiasProjectRoot;
@@ -358,9 +446,30 @@ async function createTemporaryDirectory(prefix: string): Promise<string> {
   return temporaryDirectory;
 }
 
+function createTestProcessEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const name of [
+    "SystemRoot",
+    "WINDIR",
+    "PATH",
+    "Path",
+    "PATHEXT",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "SHELL",
+    "HOME",
+    "USERPROFILE",
+  ]) {
+    if (process.env[name] !== undefined) environment[name] = process.env[name];
+  }
+  return environment;
+}
 function createModelEnvironment(sessionDirectory?: string): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...createTestProcessEnvironment(),
+    SEARCHAPI_API_KEY: "",
+    ANTHIAS_PERMISSION_MODE: "agent",
     ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
     ANTHIAS_MODEL_ID: "model-id",
     ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",

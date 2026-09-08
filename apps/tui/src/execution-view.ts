@@ -1,4 +1,4 @@
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { createTheme } from "./theme.js";
 
 export type ExecutionStep = {
@@ -9,6 +9,8 @@ export type ExecutionStep = {
   expanded: boolean;
   hasToolCalls?: boolean;
   messageStatus?: "streaming" | "completed" | "failed" | "aborted";
+  summary?: string;
+  attention?: boolean;
 };
 
 export type ExecutionControl = Readonly<{
@@ -83,21 +85,27 @@ export function createExecutionTurn(
           1,
           toggleTurn,
         );
-        if (turn.expanded) {
-          for (const step of steps) {
-            let toggle = stepToggles.get(step);
-            if (toggle === undefined) {
-              toggle = () => {
-                step.expanded = !step.expanded;
-                changed();
-              };
-              stepToggles.set(step, toggle);
-            }
-            heading(theme.lagoon(`${marker(step.expanded)} ${step.title}`), 3, toggle);
-            if (step.expanded) {
-              for (const line of step.content.render(Math.max(1, width - 4)))
-                lines.push(`    ${line}`);
-            }
+        for (const step of steps.filter((candidate) => turn.expanded || candidate.summary)) {
+          let toggle = stepToggles.get(step);
+          if (toggle === undefined) {
+            toggle = () => {
+              step.expanded = !step.expanded;
+              changed();
+            };
+            stepToggles.set(step, toggle);
+          }
+          heading(
+            (step.attention ? theme.coral : theme.lagoon)(`${marker(step.expanded)} ${step.title}`),
+            3,
+            toggle,
+          );
+          if (!step.expanded && step.summary) {
+            for (const line of new Text(step.summary, 0, 0).render(Math.max(1, width - 4)))
+              lines.push(`    ${line}`);
+          }
+          if (step.expanded) {
+            for (const line of step.content.render(Math.max(1, width - 4)))
+              lines.push(`    ${line}`);
           }
         }
       }

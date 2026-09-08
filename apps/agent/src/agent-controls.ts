@@ -1,5 +1,6 @@
 import type { MemoryControls } from "./memory/index.js";
 import type { CollaborationControls } from "./multi-agent/index.js";
+import type { WorkspacePermissionControls } from "./permission/workspace-permissions.js";
 import type { GitControls } from "./tool/git-tools.js";
 export type ActionResult<T> =
   | Readonly<{ ok: true; value: T }>
@@ -39,6 +40,7 @@ export type McpCapabilities = Readonly<{
 }>;
 /** 这些行为由 Agent 持有；交互层只映射命令和展示安全摘要。 */
 export type AgentControls = Readonly<{
+  permissions: WorkspacePermissionControls;
   memory: MemoryControls;
   collaboration: CollaborationControls;
   git: GitControls;

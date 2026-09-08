@@ -1,3 +1,4 @@
+import { retryModelStream } from "../model/model-retry.js";
 import {
   type ModelRequest,
   ModelRequestError,
@@ -134,6 +135,7 @@ export function createContextController(options: {
     manual?: boolean;
     extendRequest?: (request: ModelRequest) => ModelRequest;
     beforeRequest?: (signal: AbortSignal) => Promise<void>;
+    remainingTaskTimeMs?: () => number;
     emit: (event: ContextEvent) => void;
     onFailure: (error: string) => void;
     onStorageFailure: () => void;
@@ -357,17 +359,25 @@ export function createContextController(options: {
         }
         if (measure().inputTokens >= threshold) await compact(false);
         let overflowRecoveryAttempted = false;
+        const retryState = { retryCount: 0, deliveredContent: false };
         for (;;) {
           if (abortSignal.aborted) return;
           if (measure().inputTokens >= threshold) throw new Error(CAPACITY_ERROR);
-          let recorded = false;
           let emitted = false;
           try {
-            for await (const event of modelStream(request, abortSignal)) {
+            for await (const event of retryModelStream({
+              modelStream,
+              request,
+              abortSignal,
+              state: retryState,
+              ...(run.remainingTaskTimeMs === undefined
+                ? {}
+                : { remainingTaskTimeMs: run.remainingTaskTimeMs }),
+              onAttemptFinished: (usage) =>
+                recordUsage("response", requestEntryId, contextVersion, usage),
+            })) {
               if (event.type === "finish") {
                 await sources?.checkExecution(abortSignal);
-                recorded = true;
-                await recordUsage("response", requestEntryId, contextVersion, event.usage);
                 usageAnchor =
                   event.finishReason === "stop" || event.finishReason === "tool_calls"
                     ? createUsageAnchor(request, contextVersion, event.usage)
@@ -377,21 +387,19 @@ export function createContextController(options: {
                   source = "calibrated";
                   run.emit({ type: "context_usage", usage: snapshot() });
                 }
-              } else {
+              } else if (
+                event.type === "tool_call" ||
+                ((event.type === "text_delta" ||
+                  event.type === "reasoning_delta" ||
+                  event.type === "tool_input_delta") &&
+                  event.delta.length > 0)
+              ) {
                 emitted = true;
               }
               yield event;
             }
-            if (!recorded) {
-              recorded = true;
-              await recordUsage("response", requestEntryId, contextVersion, undefined);
-            }
             return;
           } catch (error) {
-            if (!recorded) {
-              recorded = true;
-              await recordUsage("response", requestEntryId, contextVersion, undefined);
-            }
             if (
               error instanceof ModelRequestError &&
               error.reason === "context_overflow" &&
@@ -404,12 +412,10 @@ export function createContextController(options: {
               continue;
             }
             throw error;
-          } finally {
-            // 消费者在 finish 后提前关闭 iterator 时也由当前 Run 收口调用事实。
-            if (!recorded) await recordUsage("response", requestEntryId, contextVersion, undefined);
           }
         }
       } catch (error) {
+        if (error instanceof ModelRequestError) throw error;
         if (!abortSignal.aborted) {
           const safeError =
             error instanceof Error &&
@@ -419,6 +425,9 @@ export function createContextController(options: {
                 ? COMPACTION_ERROR
                 : "模型请求失败，请检查模型配置或稍后重试。";
           run.onFailure(safeError);
+        }
+        if (error instanceof Error && error.message === CAPACITY_ERROR) {
+          throw new ModelRequestError("context_overflow", { retryCount: null });
         }
         throw error;
       }

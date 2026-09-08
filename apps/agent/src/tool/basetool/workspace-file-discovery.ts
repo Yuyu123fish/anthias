@@ -33,10 +33,10 @@ export async function discoverWorkspaceFiles(
   }
   const files: ResolvedWorkspacePath[] = [];
   let truncated = false;
-  const sessionExcludePatterns = createSessionGlobExclusions(
-    base.absolutePath,
+  const sessionExcludePatterns = [
     workspace.sessionDirectory,
-  );
+    ...(workspace.protectedPaths ?? []),
+  ].flatMap((directory) => createSessionGlobExclusions(base.absolutePath, directory));
   for await (const candidate of nodeGlob(pattern, {
     cwd: base.absolutePath,
     exclude: sessionExcludePatterns,

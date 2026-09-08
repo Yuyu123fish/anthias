@@ -6,9 +6,11 @@ import {
   isToolCallPart,
   type JsonValue,
   type Message,
+  type RunDiagnostic,
   type ToolResultMessage,
 } from "../message.js";
 import type { ModelToolDefinition } from "../tool/definitions.js";
+import { createRunDiagnostic } from "./model-diagnostics.js";
 
 /** 表示只在当前 Run 的 Provider continuation 中存活的 Reasoning 文本。 */
 type ModelReasoningPart = Readonly<{
@@ -38,14 +40,27 @@ export type ModelUsage = Readonly<{
   cacheWriteInputTokens: number | null;
 }>;
 
-/** 将 Provider 失败收窄为 Context 可判断的安全原因，不携带原始响应。 */
+/** 原始 Provider 异常在 Adapter 内结束，只允许固定安全分类穿过 Model Stream。 */
 export class ModelRequestError extends Error {
   readonly reason: "context_overflow" | "model_error";
+  readonly diagnostic: RunDiagnostic;
+  readonly retryAfterMs: number | null;
 
-  constructor(reason: "context_overflow" | "model_error") {
-    super(reason === "context_overflow" ? "模型上下文容量不足。" : "模型请求失败。");
+  constructor(
+    category: RunDiagnostic["category"] | "model_error",
+    details: Partial<Omit<RunDiagnostic, "category" | "summary">> & {
+      retryAfterMs?: number | null;
+    } = {},
+  ) {
+    const diagnostic = createRunDiagnostic(
+      category === "model_error" ? "unknown" : category,
+      details,
+    );
+    super(diagnostic.summary);
     this.name = "ModelRequestError";
-    this.reason = reason;
+    this.reason = category === "context_overflow" ? "context_overflow" : "model_error";
+    this.diagnostic = diagnostic;
+    this.retryAfterMs = details.retryAfterMs ?? null;
   }
 }
 
@@ -69,6 +84,15 @@ export type ModelFinishReason =
 
 /** 枚举生产 Adapter 和确定性测试 Adapter 产生的结构化事件。 */
 export type ModelStreamEvent =
+  | Readonly<{ type: "tool_input_start"; toolCallId: string; toolName: string }>
+  | Readonly<{ type: "tool_input_delta"; toolCallId: string; delta: string }>
+  | Readonly<{
+      type: "model_retry";
+      phase: "waiting" | "requesting";
+      retryCount: 1 | 2;
+      delayMs: number;
+      diagnostic: RunDiagnostic;
+    }>
   | Readonly<{
       type: "reasoning_start";
     }>
@@ -94,10 +118,18 @@ export type ModelStreamEvent =
       type: "finish";
       finishReason: ModelFinishReason;
       usage?: ModelUsage;
+      retryCount?: number;
     }>;
 
 /** 枚举流式组装边界交给 Agent Loop 的当前 AssistantMessage。 */
 export type AssistantMessageStreamEvent =
+  | Readonly<{
+      type: "tool_preparation";
+      toolCallId: string;
+      toolName: string;
+      phase: "input" | "ready";
+    }>
+  | Extract<ModelStreamEvent, { type: "model_retry" }>
   | Readonly<{
       type: "start";
       partialAssistantMessage: AssistantMessage;
@@ -145,6 +177,12 @@ export async function* streamAssistantMessage(
   const durableContent: AssistantContentPart[] = [];
   const modelContent: ModelAssistantContentPart[] = [];
   const toolCallIds = new Set<string>();
+  const providerToolCallIds = new Map<string, string>();
+  const preparingToolCallIds = new Set<string>();
+  let failure: RunDiagnostic | null = null;
+  let usage: ModelUsage | null = null;
+  let retryCount = 0;
+  let hasInputFragments = false;
   let finishReason: ModelFinishReason | null = null;
   let reasoningState: "idle" | "pending" | "active" = "idle";
   let activeReasoningPartIndex: number | null = null;
@@ -159,6 +197,40 @@ export async function* streamAssistantMessage(
       for await (const modelEvent of modelStream(modelRequest, abortSignal)) {
         if (abortSignal.aborted) {
           break;
+        }
+        if (modelEvent.type === "model_retry") {
+          if (modelEvent.phase === "requesting") {
+            retryCount = modelEvent.retryCount;
+            preparingToolCallIds.clear();
+          }
+          yield modelEvent;
+          continue;
+        }
+        if (modelEvent.type === "tool_input_start") {
+          const toolCallId = resolveToolCallId(
+            modelEvent.toolCallId,
+            providerToolCallIds,
+            toolCallIds,
+          );
+          if (!preparingToolCallIds.has(toolCallId)) {
+            preparingToolCallIds.add(toolCallId);
+            yield Object.freeze({
+              type: "tool_preparation",
+              toolCallId,
+              toolName: modelEvent.toolName,
+              phase: "input",
+            });
+          }
+          continue;
+        }
+        if (modelEvent.type === "tool_input_delta") {
+          if (modelEvent.delta.length > 0) {
+            hasInputFragments = true;
+            preparingToolCallIds.add(
+              resolveToolCallId(modelEvent.toolCallId, providerToolCallIds, toolCallIds),
+            );
+          }
+          continue;
         }
         if (modelEvent.type === "reasoning_start") {
           if (reasoningState === "active") {
@@ -220,7 +292,14 @@ export async function* streamAssistantMessage(
           continue;
         }
         if (modelEvent.type === "tool_call") {
-          const toolCall = normalizeToolCall(modelEvent, toolCallIds);
+          const toolCall = normalizeToolCall(modelEvent, toolCallIds, providerToolCallIds);
+          preparingToolCallIds.delete(toolCall.toolCallId);
+          yield Object.freeze({
+            type: "tool_preparation",
+            toolCallId: toolCall.toolCallId,
+            toolName: toolCall.toolName,
+            phase: "ready",
+          });
           toolCallIds.add(toolCall.toolCallId);
           durableContent.push(toolCall);
           modelContent.push(toolCall);
@@ -233,24 +312,63 @@ export async function* streamAssistantMessage(
         }
 
         finishReason = modelEvent.finishReason;
+        usage = modelEvent.usage ?? null;
+        retryCount = modelEvent.retryCount ?? retryCount;
         break;
       }
     }
-  } catch {
-    // Provider 错误只决定本条消息失败，原始异常不得越过 Model Stream seam。
+  } catch (error) {
+    failure =
+      error instanceof ModelRequestError ? error.diagnostic : createRunDiagnostic("unknown");
+    retryCount = failure.retryCount ?? retryCount;
   }
 
   if (reasoningState === "active") {
     yield Object.freeze({ type: "reasoning_end" });
   }
 
-  const status: AssistantMessage["status"] = abortSignal.aborted
-    ? "aborted"
-    : finishReason !== null &&
-        isSuccessfulAssistantFinish(finishReason, durableContent.some(isToolCallPart))
-      ? "completed"
-      : "failed";
-  const finalMessage = createAssistantMessage(durableContent, status);
+  const hasToolCall = durableContent.some(isToolCallPart);
+  const hasText = durableContent.some(
+    (part) => part.type === "text" && part.text.trim().length > 0,
+  );
+  const successful =
+    finishReason !== null &&
+    isSuccessfulAssistantFinish(finishReason, hasToolCall) &&
+    preparingToolCallIds.size === 0 &&
+    (hasText || hasToolCall);
+  const status: AssistantMessage["status"] =
+    abortSignal.aborted || failure?.category === "aborted"
+      ? "aborted"
+      : successful && failure === null
+        ? "completed"
+        : "failed";
+  const category: RunDiagnostic["category"] =
+    status === "aborted"
+      ? "aborted"
+      : (failure?.category ??
+        (finishReason === "length"
+          ? "output_limit"
+          : finishReason === "content_filter"
+            ? "content_filter"
+            : successful
+              ? "completed"
+              : !hasText &&
+                  !hasToolCall &&
+                  !hasInputFragments &&
+                  (finishReason === null || finishReason === "stop")
+                ? "empty_response"
+                : "unknown"));
+  const diagnostic = createRunDiagnostic(category, {
+    ...(failure ?? {}),
+    providerFinishReason: finishReason,
+    usage,
+    retryCount,
+    abortSource: status === "aborted" ? (failure?.abortSource ?? "unknown") : null,
+  });
+  const finalMessage = Object.freeze({
+    ...createAssistantMessage(durableContent, status),
+    diagnostic,
+  });
   yield Object.freeze({
     type: "finish",
     message: finalMessage,
@@ -308,11 +426,13 @@ function createAssistantMessage(
 function normalizeToolCall(
   modelToolCall: Extract<ModelStreamEvent, { type: "tool_call" }>,
   existingToolCallIds: ReadonlySet<string>,
+  providerToolCallIds: Map<string, string>,
 ): AssistantToolCallPart {
-  const toolCallId =
-    isUuid(modelToolCall.toolCallId) && !existingToolCallIds.has(modelToolCall.toolCallId)
-      ? modelToolCall.toolCallId
-      : randomUUID();
+  const toolCallId = resolveToolCallId(
+    modelToolCall.toolCallId,
+    providerToolCallIds,
+    existingToolCallIds,
+  );
   const jsonInput = toJsonValue(modelToolCall.input);
   return Object.freeze({
     type: "tool_call",
@@ -354,4 +474,17 @@ function toJsonValue(value: unknown): Readonly<{ valid: boolean; value: JsonValu
 /** 判断字符串是否为当前消息 Schema 接受的 UUID v4。 */
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+}
+
+/** Provider 身份可以不是 UUID；准备阶段与完整 ToolCall 共用一次确定的本地映射。 */
+function resolveToolCallId(
+  providerId: string,
+  ids: Map<string, string>,
+  completed: ReadonlySet<string>,
+): string {
+  const existing = ids.get(providerId);
+  if (existing !== undefined && !completed.has(existing)) return existing;
+  const id = isUuid(providerId) && !completed.has(providerId) ? providerId : randomUUID();
+  ids.set(providerId, id);
+  return id;
 }

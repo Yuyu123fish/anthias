@@ -1,3 +1,4 @@
+import { realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 
@@ -5,6 +6,7 @@ import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 export type ToolWorkspace = Readonly<{
   workspaceRoot: string;
   sessionDirectory: string;
+  protectedPaths?: readonly string[];
 }>;
 
 /** 保存一个经过真实路径校验的工作区文件或目录。 */
@@ -34,12 +36,32 @@ export async function resolveExistingAbsoluteWorkspacePath(
   if (!isPathSameOrInside(workspace.workspaceRoot, actualPath)) {
     throw new Error("Tool path 越出工作区。");
   }
-  if (isPathSameOrInside(workspace.sessionDirectory, actualPath)) {
+  if (isReservedToolPath(actualPath, workspace)) {
     throw new Error("Tool path 命中 Session 保留目录。");
   }
   return Object.freeze({
     absolutePath: actualPath,
     relativePath: normalizeWorkspaceRelativePath(relative(workspace.workspaceRoot, actualPath)),
+  });
+}
+
+/** 应用配置与授权记录不可由固定 Tool 读取或写入；真实路径和文件身份同时防止别名绕过。 */
+export function isReservedToolPath(targetPath: string, workspace: ToolWorkspace): boolean {
+  return [workspace.sessionDirectory, ...(workspace.protectedPaths ?? [])].some((directory) => {
+    if (isPathSameOrInside(directory, targetPath)) return true;
+    try {
+      if (isPathSameOrInside(realpathSync(directory), targetPath)) return true;
+      const protectedStat = statSync(directory);
+      const targetStat = statSync(targetPath);
+      return (
+        protectedStat.isFile() &&
+        protectedStat.ino !== 0 &&
+        protectedStat.ino === targetStat.ino &&
+        protectedStat.dev === targetStat.dev
+      );
+    } catch {
+      return false;
+    }
   });
 }
 

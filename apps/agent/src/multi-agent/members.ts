@@ -157,7 +157,18 @@ export function createMembers(options: {
     const mode = member.summary.writable ? options.permissionMode() : "plan";
     member.agent = options.createMember(session, mode);
     member.unsubscribe = member.agent.subscribe((event) => options.event(member.summary, event));
-    member.controller.signal.addEventListener("abort", () => member.agent?.abort(), { once: true });
+    member.controller.signal.addEventListener(
+      "abort",
+      () =>
+        member.agent?.abort(
+          member.controller.signal.reason === "task_deadline"
+            ? "task_deadline"
+            : member.controller.signal.reason === "shutdown"
+              ? "shutdown"
+              : "parent",
+        ),
+      { once: true },
+    );
   }
   function start(member: MemberOwnership, input: AgentInputDetails) {
     const agent = member.agent;
@@ -434,18 +445,18 @@ export function createMembers(options: {
       }
       return member.summary;
     },
-    abort() {
+    abort(source: "parent" | "shutdown" | "task_deadline" = "parent") {
       for (const member of members.values()) {
-        member.controller.abort();
-        member.agent?.abort();
+        member.controller.abort(source);
+        member.agent?.abort(source);
       }
       notify();
     },
     async close() {
       closing = true;
       for (const member of members.values()) {
-        member.controller.abort();
-        member.agent?.abort();
+        member.controller.abort("shutdown");
+        member.agent?.abort("shutdown");
       }
       const results = await Promise.allSettled(
         [...members.values()].map(async (member) => {

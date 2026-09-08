@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003、005 已验收；Feature 006–008 已实现并完成本地验证，开发者体验验收仍待完成；真实外部调用证据按各 Feature Report 区分。
+状态：Feature 003、005 已验收；Feature 006–008 已实现并完成本地验证；Feature 009 已实现，待开发者验收。本 Feature 未进行真实模型、SearchAPI 调用或 Windows Terminal 主观体验验收；历史真实外部调用证据仍按各 Feature Report 区分。
 
 2026-09-06，产品方向调整为在 Coding Agent 基础上，围绕工程问题构造验证并交付证据。当前仍优先补齐 Coding Agent 基本功能；工程验证工具、数据准备与证据交付的具体机制留待后续 Feature。现有两个 package、Agent Interface、模型与 Tool 权限边界继续作为技术基线。
 
@@ -39,11 +39,12 @@ Feature 001 已根据 Node.js 24 环境固定 TypeScript、Vitest、Biome 与 AI
 
 Agent 持有消息 transcript、当前流式消息、是否正在运行以及取消所需的资源。对调用者只提供以下行为：
 
-- 通过生产启动工厂从本地环境创建 Agent，并返回安全的配置结果；
+- 通过生产启动工厂从 Anthias 根 `.env` 与进程环境创建 Agent，并返回安全的配置结果；
 - 读取当前只读 state；
 - 提交一条 prompt；
 - 在空闲时查看或切换 Agent / Plan / AutoAllow 权限模式；
 - 响应当前待决的 Tool approval；
+- 通过 `permissions.snapshot/grant/revoke` 查看、明确授予或撤销工作区授权；
 - 取消当前运行，或关闭 Agent 并等待资源释放；
 - 订阅 AgentEvent，并能取消订阅；
 - 通过 `sessions.list/create/open` 切换同 Workspace 会话，使用 `compact()` 主动压缩；
@@ -54,13 +55,15 @@ Agent 由普通工厂函数创建，不为 Provider、TUI、测试或未来 Desk
 
 ### 模型适配器
 
-Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 AbortSignal 转换为一次模型流，并把模型输出转换为 Agent 可消费的增量。生产实现使用 OpenAI-compatible 接口；Agent 内部测试使用确定性本地流。两者形成当前唯一真实可替换 seam，但该 seam 不向 TUI 或未来 Desktop 暴露。
+Model Adapter 位于 Agent Module 内部，把 Agent 的消息 transcript 和 AbortSignal 转换为一次模型流，并把模型输出转换为 Agent 可消费的增量。生产实现使用 OpenAI-compatible 接口；Agent 内部测试使用确定性本地流。Model Stream 是模型交互的内部 seam，不向 TUI 或未来 Desktop 暴露。
 
 ### TUI 适配器
 
 TUI 负责终端输入、输出和用户停止操作。它接收已经创建好的 Agent，直接调用 Agent，并订阅 AgentEvent；它不读取模型配置，不依赖 AI SDK，不构造 Model Stream，也不自行推进 Agent 生命周期或维护第二份业务状态。
 
 当前 TUI 复用 `@earendil-works/pi-tui` 的 `TuiAltScreen`、Editor、ScrollView 与 Markdown。全屏固定 Workspace、输入和状态，正文由应用内滚动；模型事件按顺序更新呈现状态，合并到差量同步帧，未闭合代码块立即显示。用户向上阅读时保留位置，回到末尾才恢复跟随；宽屏详情与正文并列，窄屏覆盖。正文与详情的可见滑块支持点击和拖动。任务结束后，思考、Tool 与中间消息折叠到执行过程，最终回答保持可见；执行过程与单个步骤可鼠标展开/收起，审批仍独立呈现。伸展区域显式声明布局尺寸，正文按宽度和内容版本缓存最终安全行，普通滚动复用已完成的渲染。退出恢复终端模式、光标与监听器。
+
+命令结果按实际发生顺序插入正文，后续 Agent 进展继续向下呈现；工具参数准备、待审批、执行和失败分别可见，失败原因默认保留。异步拒绝仅在编辑器未发生新修改时恢复原输入，否则保留当前草稿，并通过 `/draft` 找回未接受的输入。`/diagnostics` 显示 Agent 提供的安全诊断，`/continue` 将明确继续意图提交为新的 Run；TUI 不重放历史工具或自行重试模型。
 
 文件引用继续经过 Workspace 校验；外部文本先安全化，lazy Shiki 失败或延迟不阻塞输入。Unicode 宽度使用 pi TUI 的实现，非 TTY 仍为无控制序列的纯文本路径。CLI 从任意 cwd 或 --workspace 启动，Agent 的 Workspace 与 Anthias data/conversation 分别装配。
 
@@ -70,13 +73,17 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 ## 事件方向
 
-AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed、memory_changed。
+AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed、memory_changed、permissions_changed；工具参数阶段和 model_retry 表达正在发生的准备及等待，TUI 只呈现这些事件，不自行发起执行。
 
-Session 使用 Schema 3 JSONL（兼容 Schema 1/2），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
+Session 使用 Schema 3 JSONL（兼容 Schema 1/2），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和带可选安全诊断的 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
 ## 模型配置方向
 
-Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取以下配置：
+Agent 的生产启动工厂从自身模块所在的安装根目录加载 `.env`；任务 cwd、`--workspace` 与 Session 恢复均不改变配置来源。缺少文件时独占创建无凭据模板，仓库提供 `.env-example`，已有文件不覆盖。文件支持单行字面值、引号与注释，不进行变量展开；格式和读取失败只返回安全位置或变量名。无法创建文件但进程环境足够时通过启动警告继续运行。
+
+同名值以进程环境覆盖文件，显式空值也不会取得文件中的密钥。模式按显式 `--mode` → 进程 `ANTHIAS_PERMISSION_MODE` → 根 `.env` → `agent` 选择，非法模式拒绝启动；`/mode` 只改变当前 Agent，不写回默认值，也不授予权限。
+
+Model Adapter 的必需配置为：
 
 - ANTHIAS_MODEL_BASE_URL
 - ANTHIAS_MODEL_ID
@@ -89,7 +96,29 @@ Agent 的生产启动工厂为首个真实 Model Adapter 从本地环境读取�
 
 上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史。恢复索引与 JSONL 分开，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 的审核是同一模型的独立请求，最多 8,000 输入 / 2,000 输出，不能调用工具或把摘要、工具结果当成授权。
 
+## 失败、重试与继续
+
+Agent 保存 `RunDiagnostic` 的固定分类、已知结束原因、HTTP 状态、用量、重试次数与中止来源，不保存原始请求、响应体、带凭据 URL 或任意异常堆栈。Session 恢复保留这些已知字段，旧记录缺失时显示未知。
+
+一次普通生成只有在未交付正文、Reasoning、工具参数片段，也未收到完整 ToolCall 时，才对明确的暂时网络、限流或服务失败最多额外重试两次。等待至少为 500 ms、1000 ms，并服从已知 Retry-After；服务要求超过 30 秒或任务剩余时间不足时停止重试。等待和下一次请求都接受同一取消信号，重试不重置共享任务截止。
+
+认证、配置、无效请求、未知错误和输出截止不自动重试；Tool、压缩与 AutoAllow 审核也不经过这套请求重试。上下文溢出沿用有界压缩恢复，普通生成及其压缩恢复共享尝试预算。自动恢复不适用或耗尽后保留已完成事实，等待用户输入 `/continue [补充要求]` 或新的要求。继续开始新的 Run，历史回放不触发工具、审批或 Git 副作用。
+
+## 工作区授权
+
+授权由 Agent 持有，生产记录保存在 Anthias 根 `data/permissions/`，与 Session、模型可维护记忆和项目规则分离。只有用户通过独立交互才能新增或扩大授权；AGENTS.md、搜索结果、MCP 内容和其他 Agent 消息不成为授权入口。记录绑定规范化工作区，不按父目录或仓库名称扩展。
+
+`/permissions grant [--remember] [--members]` 先展示当前范围，完整浏览后另行输入 `grant` 才调用 Agent 的授予行为，`cancel` 取消。授权包含工作区内普通文件创建与编辑，以及面板列出的完整命令、参数和 cwd。当前命令范围是 pnpm/npm/yarn 的固定构建、测试、检查和 lint 入口；无法按字面解析、额外参数或未列入口转 AutoAllow 审核，不因当前目录匹配而自动放行。
+
+只有 `auto_allow` 消费授权：先应用硬禁止和当前限制，再核对最终文件路径、命令和有效授权，未命中时独立审核。`agent` 保留逐动作确认，`plan` 保持只读。命中来源随审批事实保存，但历史事实不能恢复旧权限。文件与命令仍以当前系统用户权限运行，cwd 和 worktree 不构成 OS 隔离。
+
+仅本次会话的 `--members` 包含当前任务创建并登记的成员 worktree；同时记住时，包含以后从同一根工作区发起任务所创建并登记的成员 worktree。不选择则不继承。`/permissions revoke` 先使根与成员尚未开始的动作和待审批失效，再保存撤销；已开始动作需要停止，已产生副作用不能回滚。授权或撤销保存失败时分别呈现当前会话与跨启动的实际结果，不宣称已经记住。
+
 ## 外部能力
+
+内建 `web_search` 固定使用 SearchAPI Google 的 `https://www.searchapi.io/api/v1/search`，凭据来自可选 `SEARCHAPI_API_KEY`，仅通过 Bearer Header 发送，模型不能替换端点。它以内部工具扩展接入根与成员，Plan 可用，并沿用只读有界并发、生命周期事件和取消。缺少搜索配置仅使此工具不可用，不阻断其他 Coding 能力启动。
+
+输入为最多 2000 字符的非空 query 和可选正整数 page；不自动翻页或读取全文。响应最多 1 MiB，保留最多 20 条、总计 60 KiB 的标题、URL、摘要和来源，单次请求超时 15 秒。服务错误只映射为安全结果，响应中的凭据回显被移除；结果作为带来源的不可信摘要进入上下文，不提升权限，最终主张需引用相应链接。
 
 Skill 使用用户和项目 `.agents/skills`，扩展路径通过 `ANTHIAS_SKILL_DIRS` 传入。目录只保留有界元数据，正文与引用分别按需读取；实际内容作为 Session 来源事实保存，恢复保留已保存版本，文件变化给出诊断。外部指令和参考资料始终计入后续请求预算，压缩不把它们变为真实用户授权。
 
@@ -112,7 +141,7 @@ Session 保存实际消息与采用事实，memory 保存当前跨会话状态�
 ## 设计约束
 
 - 优先形成深 Module：TUI、测试和未来 Desktop 使用同一个小 Interface，不穿透 Agent 内部步骤。
-- 只有真实变化才建立 seam；当前只保留 Agent Module 内部的生产 Model Adapter 与确定性测试 Adapter。
+- 只有真实变化才建立 seam；Model Stream 和搜索请求的测试注入留在 Agent Module 内部，不扩张 Provider 体系或公开配置入口。
 - Agent 状态只有一份。交互层可以保存渲染数据，但不能成为生命周期权威。
 - 普通函数和判别联合足以表达的行为，不增加类层级、Registry、Manager 或通用框架。
 - 取消、进程信号、终端状态、模型流和后续 Tool 资源必须有明确持有者与释放时机。
@@ -122,8 +151,8 @@ Session 保存实际消息与采用事实，memory 保存当前跨会话状态�
 
 - 旧 Workspace 内 Session 的可选迁移能力；当前实现明确不自动扫描或迁移；
 - 长历史检索与 Session 持久化扩展；
-- 可复用授权、OS 沙箱、低权限执行和网络隔离；
-- 多 Provider、模型切换、重试和 Provider 专属能力；
+- OS 沙箱、低权限执行和网络隔离；
+- 多 Provider、模型切换和 Provider 专属能力；
 - Desktop 框架、进程模型和传输协议；
 - Coding Agent 基础功能的具体使用场景与系统提示词；
 - 工程验证所需的工具接入、场景数据准备、验证程序与证据关联机制；具体接口、存储格式和工具选型尚未确认。

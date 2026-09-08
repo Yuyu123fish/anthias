@@ -53,17 +53,21 @@ const ALL_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
       path: { type: "string", minLength: 1 },
     },
   }),
-  defineTool("grep", "按正则搜索工作区内 UTF-8 文本文件。", {
-    type: "object",
-    additionalProperties: false,
-    required: ["pattern"],
-    properties: {
-      pattern: { type: "string" },
-      path: { type: "string", minLength: 1 },
-      filePattern: { type: "string", minLength: 1 },
-      contextLines: { type: "integer", minimum: 0, maximum: 10 },
+  defineTool(
+    "grep",
+    '按正则搜索工作区内 UTF-8 文本文件。path 必须是工作区相对目录；搜索单个文件用 filePattern，例如 path="."、filePattern="index.html"。',
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["pattern"],
+      properties: {
+        pattern: { type: "string" },
+        path: { type: "string", minLength: 1 },
+        filePattern: { type: "string", minLength: 1 },
+        contextLines: { type: "integer", minimum: 0, maximum: 10 },
+      },
     },
-  }),
+  ),
   defineTool("read_artifact", "读取当前 Session 已引用的 Tool 原文产物。", {
     type: "object",
     additionalProperties: false,
@@ -75,27 +79,31 @@ const ALL_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
       search: { type: "string", minLength: 1 },
     },
   }),
-  defineTool("edit_file", "对已有 UTF-8 文本文件执行一组精确替换。", {
-    type: "object",
-    additionalProperties: false,
-    required: ["path", "replacements"],
-    properties: {
-      path: { type: "string", minLength: 1 },
-      replacements: {
-        type: "array",
-        minItems: 1,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["oldText", "newText"],
-          properties: {
-            oldText: { type: "string", minLength: 1 },
-            newText: { type: "string" },
+  defineTool(
+    "edit_file",
+    "对已有 UTF-8 文本文件执行一组精确替换。replacements 是对象数组，每项必须包含 oldText 与 newText；不能直接传字符串或单个对象。",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["path", "replacements"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        replacements: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["oldText", "newText"],
+            properties: {
+              oldText: { type: "string", minLength: 1 },
+              newText: { type: "string" },
+            },
           },
         },
       },
     },
-  }),
+  ),
   defineTool("write_file", "创建 UTF-8 文本文件或完整覆盖已有文件。", {
     type: "object",
     additionalProperties: false,
@@ -105,16 +113,20 @@ const ALL_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
       content: { type: "string" },
     },
   }),
-  defineTool("execute_command", "在 Session 固定 Shell 中执行一次性非交互命令。", {
-    type: "object",
-    additionalProperties: false,
-    required: ["command"],
-    properties: {
-      command: { type: "string", minLength: 1 },
-      cwd: { type: "string", minLength: 1 },
-      timeoutMs: { type: "integer", minimum: 1000, maximum: 1800000 },
+  defineTool(
+    "execute_command",
+    "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["command"],
+      properties: {
+        command: { type: "string", minLength: 1 },
+        cwd: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: 1800000 },
+      },
     },
-  }),
+  ),
 ]);
 
 /** Agent 模式向模型暴露的七个固定 Tool Schema。 */

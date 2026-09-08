@@ -9,9 +9,11 @@ import {
   type AssistantToolCallPart,
   isToolCallPart,
   type Message,
+  type RunDiagnostic,
   type ToolArtifactReference,
   type ToolResultMessage,
 } from "./message.js";
+import { createRunDiagnostic } from "./model/model-diagnostics.js";
 import {
   type ModelFinishReason,
   type ModelInputMessage,
@@ -33,10 +35,12 @@ import type {
 export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
 
 /** 枚举 Agent Loop 停止迭代时可以交给 Run 的结果。 */
-export type AgentLoopResult =
+export type AgentLoopResult = (
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "aborted" }>
-  | Readonly<{ status: "failed"; error: string }>;
+  | Readonly<{ status: "failed"; error: string }>
+) &
+  Readonly<{ diagnostic?: RunDiagnostic }>;
 
 /** 表示 Agent Loop 等到的一次确认标识及最终决定。 */
 export type AgentLoopToolApproval = Readonly<{
@@ -46,6 +50,19 @@ export type AgentLoopToolApproval = Readonly<{
 
 /** 枚举 Agent Loop 交给 Run 持久化或发布的有序事实。 */
 export type AgentLoopEvent =
+  | Readonly<{
+      type: "tool_preparation";
+      toolCallId: string;
+      toolName: string;
+      phase: "input" | "ready";
+    }>
+  | Readonly<{
+      type: "model_retry";
+      phase: "waiting" | "requesting";
+      retryCount: 1 | 2;
+      delayMs: number;
+      diagnostic: RunDiagnostic;
+    }>
   | Readonly<{ type: "tool_policy_denied"; toolCall: AssistantToolCallPart; reason: string }>
   | Readonly<{
       type: "reasoning_start";
@@ -150,7 +167,6 @@ const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重
 const TOOL_CALL_BATCH_LIMIT = 32;
 const READ_ONLY_TOOL_CONCURRENCY_LIMIT = 4;
 const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
-const ABORTED_LOOP_RESULT = Object.freeze({ status: "aborted" } as const);
 const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
 const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
   status: "failed",
@@ -160,6 +176,17 @@ const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
 /** 推进 Model → Tool → Model；取消、任务时限和批次资源限制分别由所属层持有。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = [...options.messages];
+  let runRetryCount = 0;
+  let latestDiagnostic: RunDiagnostic | undefined;
+  const abortedResult = (): AgentLoopResult =>
+    Object.freeze({
+      status: "aborted",
+      diagnostic: createRunDiagnostic("aborted", {
+        ...(latestDiagnostic ?? {}),
+        retryCount: runRetryCount,
+        abortSource: latestDiagnostic?.abortSource ?? "unknown",
+      }),
+    });
   const transientModelMessages = new Map<
     AssistantMessage,
     Extract<ModelInputMessage, { role: "assistant" }>
@@ -167,7 +194,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
   while (true) {
     if (options.abortController.signal.aborted) {
-      return ABORTED_LOOP_RESULT;
+      return abortedResult();
     }
     options.updatePhase("requesting_model");
     const assistantRequest = await streamAssistantResponse(
@@ -175,19 +202,33 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       transientModelMessages,
       options,
     );
+    if (assistantRequest.message.diagnostic !== undefined) {
+      runRetryCount += assistantRequest.message.diagnostic.retryCount ?? 0;
+      latestDiagnostic = createRunDiagnostic(assistantRequest.message.diagnostic.category, {
+        ...assistantRequest.message.diagnostic,
+        retryCount: runRetryCount,
+      });
+    }
     if (assistantRequest.message.status === "aborted") {
       await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-      return ABORTED_LOOP_RESULT;
+      return abortedResult();
     }
     if (assistantRequest.message.status === "failed") {
       await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
-      return FAILED_LOOP_RESULT;
+      return {
+        status: "failed",
+        error: latestDiagnostic?.summary ?? SAFE_MODEL_ERROR,
+        ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
+      };
     }
 
     // 获取 ToolCall 列表
     const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
     if (toolCalls.length === 0) {
-      return assistantRequest.finishReason === "stop" ? COMPLETED_LOOP_RESULT : FAILED_LOOP_RESULT;
+      return {
+        ...(assistantRequest.finishReason === "stop" ? COMPLETED_LOOP_RESULT : FAILED_LOOP_RESULT),
+        ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
+      };
     }
     if (assistantRequest.finishReason !== "tool_calls") {
       await appendToolResults(
@@ -197,7 +238,11 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         messageHistory,
         options,
       );
-      return FAILED_LOOP_RESULT;
+      return {
+        status: "failed",
+        error: latestDiagnostic?.summary ?? SAFE_MODEL_ERROR,
+        ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
+      };
     }
     if (toolCalls.length > TOOL_CALL_BATCH_LIMIT) {
       await appendToolResults(
@@ -207,7 +252,13 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         messageHistory,
         options,
       );
-      return TOOL_CALL_BATCH_LIMIT_RESULT;
+      return {
+        ...TOOL_CALL_BATCH_LIMIT_RESULT,
+        diagnostic: createRunDiagnostic("resource_limit", {
+          ...(latestDiagnostic ?? {}),
+          retryCount: runRetryCount,
+        }),
+      };
     }
 
     const plannedToolCalls = toolCalls.map((toolCall, sourceIndex) =>
@@ -235,7 +286,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         );
       }
       if (options.abortController.signal.aborted) {
-        return ABORTED_LOOP_RESULT;
+        return abortedResult();
       }
       continue;
     }
@@ -266,7 +317,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
           options,
           toolResultBudget,
         );
-        return ABORTED_LOOP_RESULT;
+        return abortedResult();
       }
     }
   }
@@ -303,6 +354,10 @@ async function streamAssistantResponse(
     modelRequest,
     options.abortController.signal,
   )) {
+    if (messageEvent.type === "tool_preparation" || messageEvent.type === "model_retry") {
+      await options.emit(messageEvent);
+      continue;
+    }
     if (messageEvent.type === "reasoning_start") {
       await options.emit({ type: "reasoning_start" });
       continue;

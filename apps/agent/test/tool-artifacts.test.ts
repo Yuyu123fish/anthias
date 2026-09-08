@@ -320,7 +320,7 @@ describe("Session Tool artifacts", () => {
           throw new Error("approval is not expected");
         },
       }),
-    ).resolves.toEqual({ status: "completed" });
+    ).resolves.toMatchObject({ status: "completed", diagnostic: { category: "completed" } });
     const results = events
       .filter(
         (event): event is Extract<AgentLoopEvent, { type: "tool_result" }> =>

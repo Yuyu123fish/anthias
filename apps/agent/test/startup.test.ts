@@ -1,16 +1,25 @@
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type Agent,
   createAgentFromEnvironment as createProductionAgentFromEnvironment,
 } from "../src/index.js";
+import * as localConfiguration from "../src/local-config.js";
 import { locateSessionStorage } from "../src/session/locations.js";
 import { getSessionLockDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
 const activeAgents = new Set<Agent>();
+const loadLocalConfiguration = localConfiguration.loadLocalConfiguration;
+
+beforeEach(async () => {
+  const anthiasRoot = await createTemporaryDirectory("anthias-startup-config-");
+  vi.spyOn(localConfiguration, "loadLocalConfiguration").mockImplementation((options) =>
+    loadLocalConfiguration({ ...options, anthiasRoot }),
+  );
+});
 
 afterEach(async () => {
   await Promise.all([...activeAgents].map((agent) => agent.close()));
@@ -21,6 +30,7 @@ afterEach(async () => {
     ),
   );
   temporaryDirectories.clear();
+  vi.restoreAllMocks();
 });
 
 describe("createAgentFromEnvironment", () => {
@@ -89,7 +99,7 @@ describe("createAgentFromEnvironment", () => {
 
     expect(creationResult.ok).toBe(true);
     if (creationResult.ok) {
-      expect(creationResult.agent.state).toEqual({
+      expect(creationResult.agent.state).toMatchObject({
         operation: null,
         collaboration: {
           rootSessionId: creationResult.agent.state.sessionId,

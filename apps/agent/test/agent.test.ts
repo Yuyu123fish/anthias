@@ -266,7 +266,7 @@ describe("Agent", () => {
     const promptResult = await agent.prompt("你好");
 
     expect(promptResult).toEqual({ status: "completed" });
-    expect(agent.state).toEqual({
+    expect(agent.state).toMatchObject({
       operation: null,
       collaboration: { rootSessionId: agent.state.sessionId, members: [], team: null, tasks: [] },
       messageHistory: [
@@ -497,7 +497,7 @@ describe("Agent", () => {
     await expect(firstPromptResult).resolves.toEqual({ status: "aborted" });
     await streamCleanupFinished.promise;
     const finalAssistantMessage = agent.state.messageHistory.at(-1);
-    expect(finalAssistantMessage).toEqual({
+    expect(finalAssistantMessage).toMatchObject({
       role: "assistant",
       content: [{ type: "text", text: "partial" }],
       status: "aborted",
@@ -531,7 +531,7 @@ describe("Agent", () => {
       expect(failedPromptResult.error).not.toContain("secret-value");
       expect(agent.state.lastError).toBe(failedPromptResult.error);
     }
-    expect(agent.state.messageHistory.at(-1)).toEqual({
+    expect(agent.state.messageHistory.at(-1)).toMatchObject({
       role: "assistant",
       content: [{ type: "text", text: "partial" }],
       status: "failed",
@@ -749,12 +749,22 @@ describe("Agent", () => {
       },
     });
     const eventTypes: string[] = [];
-    agent.subscribe((event) => eventTypes.push(event.type));
+    const terminalEvents: AgentEvent[] = [];
+    agent.subscribe((event) => {
+      eventTypes.push(event.type);
+      if (event.type === "run_end") terminalEvents.push(event);
+    });
 
     const firstPromptResult = await agent.prompt("first");
     const secondPromptResult = await agent.prompt("must not start");
 
     expect(firstPromptResult.status).toBe("failed");
+    expect(agent.state.lastRunDiagnostic?.category).toBe("storage");
+    expect(terminalEvents[0]).toMatchObject({
+      type: "run_end",
+      result: { status: "failed" },
+      diagnostic: { category: "storage", summary: "Session 写入失败，请检查本地存储后重试。" },
+    });
     expect(secondPromptResult).toEqual(firstPromptResult);
     expect(appendedMessageCount).toBe(2);
     expect(appendedRunFinishedCount).toBe(1);
@@ -937,7 +947,7 @@ describe("Agent", () => {
       },
     });
 
-    expect(reopenedAgent.state.messageHistory).toEqual([
+    expect(reopenedAgent.state.messageHistory).toMatchObject([
       { role: "user", content: "first question" },
       {
         role: "assistant",

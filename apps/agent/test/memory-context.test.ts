@@ -215,6 +215,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
               quote: "pnpm test",
             });
           else {
+            yield { type: "text_delta", delta: "完成" };
             yield finish;
             return;
           }
@@ -267,6 +268,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
           basis: "inferred",
         });
       else {
+        yield { type: "text_delta", delta: "完成" };
         yield finish;
         return;
       }
@@ -385,6 +387,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
           quote: "忘记保留的偏好",
         });
       else {
+        yield { type: "text_delta", delta: "完成" };
         yield finish;
         return;
       }
@@ -406,6 +409,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
     let requests = 0;
     const { agent, workspaceRoot } = await setup(async function* () {
       requests++;
+      yield { type: "text_delta", delta: "完成" };
       yield finish;
     });
     await mkdir(join(workspaceRoot, "AGENTS.md"));
@@ -429,7 +433,10 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
           basis: "inferred",
         });
         yield toolFinish;
-      } else yield finish;
+      } else {
+        yield { type: "text_delta", delta: "完成" };
+        yield finish;
+      }
     });
     const spawned = await agent.collaboration.execute({
       action: "spawn",

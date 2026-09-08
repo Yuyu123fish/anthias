@@ -248,6 +248,36 @@ describe("Context integration", () => {
     expect(agent.state.contextUsage.requests.response.inputTokens).toBeNull();
   });
 
+  it("shares retry attempts across the existing single overflow compaction recovery", async () => {
+    const session = await seed();
+    const purposes: string[] = [];
+    let responses = 0;
+    const agent = create(
+      session,
+      async function* (request) {
+        purposes.push(request.purpose ?? "");
+        if (request.purpose === "compaction") {
+          yield { type: "text_delta", delta: summary };
+          yield { type: "finish", finishReason: "stop", usage };
+          return;
+        }
+        responses++;
+        if (responses === 2) throw new ModelRequestError("context_overflow");
+        throw new ModelRequestError("service", { httpStatus: 503 });
+      },
+      5000,
+    );
+    expect((await agent.prompt("请继续，保留我的表达。")).status).toBe("failed");
+    expect(purposes).toEqual(["response", "response", "compaction", "response", "response"]);
+    expect(session.records.filter((record) => record.type === "compaction")).toHaveLength(1);
+    expect(agent.state.contextUsage.requests.response.requests).toBe(4);
+    expect(agent.state.lastRunDiagnostic).toMatchObject({
+      category: "service",
+      retryCount: 2,
+      retryStopReason: "exhausted",
+    });
+  });
+
   it("rejects an oversized latest user message before a model call", async () => {
     const session = await seed();
     let calls = 0;

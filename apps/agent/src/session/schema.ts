@@ -3,6 +3,7 @@ import type {
   AssistantMessage,
   JsonValue,
   Message,
+  RunDiagnostic,
   ToolResultMessage,
   UserMessage,
 } from "../message.js";
@@ -17,6 +18,7 @@ export type SessionShell = Readonly<{
 /** 描述当前 Run 写入终态记录所需的终态。 */
 export type RunFinishedDetails = Readonly<{
   status: "completed" | "aborted" | "failed";
+  diagnostic?: RunDiagnostic;
 }>;
 
 /** 描述一个已经批准、即将在本地发生副作用的 ToolCall。 */
@@ -126,7 +128,7 @@ export type ApprovalDecisionDetails = Readonly<{
   toolCallId: string;
   toolName: string;
   permissionMode: "agent" | "plan" | "auto_allow";
-  decisionSource: "user" | "auto_review" | "policy";
+  decisionSource: "user" | "auto_review" | "policy" | "workspace";
   decision: "allowed" | "denied" | "needs_user";
   reason: string;
   authorizationEntryIds: readonly string[];
@@ -178,6 +180,7 @@ type DurableMessage =
       type: "assistant";
       content: readonly (DurableTextPart | DurableToolCallPart)[];
       status: "completed" | "aborted" | "failed";
+      diagnostic?: RunDiagnostic;
     }>
   | Readonly<{
       type: "tool_result";
@@ -219,6 +222,7 @@ export type RunFinishedRecord = SessionEntryBase &
     type: "run_finished";
     runId: string;
     status: "completed" | "aborted" | "failed" | "interrupted";
+    diagnostic?: RunDiagnostic;
   }>;
 
 export type SessionUseRecord = SessionEntryBase &
@@ -531,8 +535,10 @@ export function parseSessionRecord(
         "parentEntryId",
         "runId",
         "status",
+        ...(value.diagnostic === undefined ? [] : ["diagnostic"]),
       ]) ||
       !isUuid(value.runId) ||
+      !(value.diagnostic === undefined || isRunDiagnostic(value.diagnostic)) ||
       !isRunFinishedStatus(value.status)
     ) {
       throw new Error("Session RunFinishedRecord 无效。");
@@ -1161,6 +1167,9 @@ export function toDurableMessage(message: Message): DurableMessage {
     type: "assistant",
     content: Object.freeze(message.content.map(toDurableAssistantPart)),
     status: message.status,
+    ...(message.diagnostic === undefined
+      ? {}
+      : { diagnostic: snapshotRunDiagnostic(message.diagnostic) }),
   });
 }
 
@@ -1189,6 +1198,9 @@ export function fromDurableMessage(message: DurableMessage): Message {
     role: "assistant",
     content: Object.freeze(message.content.map(fromDurableAssistantPart)),
     status: message.status,
+    ...(message.diagnostic === undefined
+      ? {}
+      : { diagnostic: snapshotRunDiagnostic(message.diagnostic) }),
   } satisfies AssistantMessage);
 }
 
@@ -1352,7 +1364,13 @@ function isDurableMessage(value: unknown): value is DurableMessage {
   }
   if (message.type === "assistant") {
     return (
-      hasExactKeys(message, ["type", "content", "status"]) &&
+      hasExactKeys(message, [
+        "type",
+        "content",
+        "status",
+        ...(message.diagnostic === undefined ? [] : ["diagnostic"]),
+      ]) &&
+      (message.diagnostic === undefined || isRunDiagnostic(message.diagnostic)) &&
       Array.isArray(message.content) &&
       message.content.every((part) => isTextPart(part) || isToolCallPart(part)) &&
       isAssistantTerminalStatus(message.status)
@@ -1473,7 +1491,7 @@ function isPermissionMode(value: unknown): value is ApprovalDecisionDetails["per
 }
 
 function isDecisionSource(value: unknown): value is ApprovalDecisionDetails["decisionSource"] {
-  return value === "user" || value === "auto_review" || value === "policy";
+  return value === "user" || value === "auto_review" || value === "policy" || value === "workspace";
 }
 
 function isApprovalDecision(value: unknown): value is ApprovalDecisionDetails["decision"] {
@@ -1660,4 +1678,72 @@ export function areSameShell(recordedShell: SessionShell, shell: SessionShell): 
     recordedShell.arguments.length === shell.arguments.length &&
     recordedShell.arguments.every((argument, index) => argument === shell.arguments[index])
   );
+}
+
+/** 新诊断字段有界且只接受安全枚举；缺字段的旧记录保持未知，不推断历史原因。 */
+export function isRunDiagnostic(value: unknown): value is RunDiagnostic {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const diagnostic = value as Record<string, unknown>;
+  if (
+    !hasExactKeys(diagnostic, [
+      "category",
+      "summary",
+      "providerFinishReason",
+      "usage",
+      "retryCount",
+      "abortSource",
+      "httpStatus",
+      "retryStopReason",
+    ])
+  )
+    return false;
+  return (
+    [
+      "completed",
+      "context_overflow",
+      "output_limit",
+      "authentication",
+      "configuration",
+      "invalid_request",
+      "rate_limit",
+      "network",
+      "service",
+      "empty_response",
+      "content_filter",
+      "unknown",
+      "aborted",
+      "resource_limit",
+      "storage",
+    ].includes(String(diagnostic.category)) &&
+    typeof diagnostic.summary === "string" &&
+    diagnostic.summary.length <= 2048 &&
+    (diagnostic.providerFinishReason === null ||
+      ["stop", "tool_calls", "length", "content_filter", "error", "other"].includes(
+        String(diagnostic.providerFinishReason),
+      )) &&
+    (diagnostic.usage === null ||
+      (isPersistedUsage(diagnostic.usage) &&
+        Object.hasOwn(diagnostic.usage, "cacheWriteInputTokens"))) &&
+    (diagnostic.retryCount === null || isNonNegativeSafeInteger(diagnostic.retryCount)) &&
+    (diagnostic.abortSource === null ||
+      ["user", "task_deadline", "shutdown", "parent", "internal", "unknown"].includes(
+        String(diagnostic.abortSource),
+      )) &&
+    (diagnostic.httpStatus === null ||
+      (typeof diagnostic.httpStatus === "number" &&
+        Number.isInteger(diagnostic.httpStatus) &&
+        diagnostic.httpStatus >= 100 &&
+        diagnostic.httpStatus <= 599)) &&
+    (diagnostic.retryStopReason === null ||
+      ["exhausted", "content_delivered", "wait_too_long", "deadline"].includes(
+        String(diagnostic.retryStopReason),
+      ))
+  );
+}
+
+function snapshotRunDiagnostic(diagnostic: RunDiagnostic): RunDiagnostic {
+  return Object.freeze({
+    ...diagnostic,
+    usage: diagnostic.usage === null ? null : Object.freeze({ ...diagnostic.usage }),
+  });
 }
