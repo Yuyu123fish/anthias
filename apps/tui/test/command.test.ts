@@ -219,6 +219,26 @@ describe("slash commands", () => {
     expect(agent.permissions.grant).not.toHaveBeenCalled();
   });
 
+  it("keeps FullAccess explicit when workspace authorization is revoked", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    const options = { agent, notice, details() {}, exit() {} };
+    await executeCommand({ type: "command", name: "mode", argumentsText: "full_access" }, options);
+    expect(agent.setPermissionMode).toHaveBeenCalledWith("full_access");
+    expect(notice).toHaveBeenCalledWith(expect.stringContaining("访问能力不等于任务授权"));
+    await executeCommand(
+      { type: "command", name: "permissions", argumentsText: "revoke" },
+      options,
+    );
+    expect(agent.permissions.revoke).toHaveBeenCalledOnce();
+    expect(agent.state.permissionMode).toBe("full_access");
+    expect(notice).toHaveBeenLastCalledWith(expect.stringContaining("FullAccess 仍然生效"));
+    await executeCommand({ type: "command", name: "permissions", argumentsText: "" }, options);
+    expect(notice).toHaveBeenLastCalledWith(expect.stringContaining("权限模式：FullAccess"));
+    expect(agent.prompt).not.toHaveBeenCalled();
+    expect(agent.respondToToolApproval).not.toHaveBeenCalled();
+  });
+
   it("returns the original skill task only after successful activation", async () => {
     const { agent } = createFakeAgent();
     const options = { agent, notice: vi.fn(), details() {}, exit() {} };

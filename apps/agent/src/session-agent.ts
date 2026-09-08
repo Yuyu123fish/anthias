@@ -358,7 +358,7 @@ export function createSessionAgent({
       }
     },
   });
-  const external = createExternalCapabilities({ sources, skills, mcp, artifactStore });
+  const external = createExternalCapabilities({ sources, skills, mcp });
   const contextController = createContextController({
     session,
     modelStream,
@@ -655,6 +655,19 @@ export function createSessionAgent({
     if (currentRun.abortController.signal.aborted)
       return { toolApprovalRequestId: randomUUID(), decision: "aborted" };
     const fingerprint = approvalPlan.actionFingerprint;
+    if (currentRun.permissionMode === "full_access") {
+      const toolApprovalRequestId = randomUUID();
+      // 完整访问来自本次 Run 的显式模式；不绑定 AutoAllow 的工作区授权撤销版本。
+      await saveToolAuthorization(currentRun, toolCall, {
+        source: "policy",
+        decision: "allowed",
+        reason: "用户已显式启用 Full Access，本次动作跳过人工与模型审批。",
+        authorizationEntryIds: [],
+        actionFingerprint: fingerprint,
+        toolApprovalRequestId,
+      });
+      return { toolApprovalRequestId, decision: "approve" };
+    }
     const permissionRevision = workspacePermissions?.revision();
     if (permissionRevision)
       currentRun.toolAuthorizationRevisions.set(toolCall.toolCallId, permissionRevision);
@@ -931,6 +944,7 @@ export function createSessionAgent({
         ],
         permissionMode: currentRun.permissionMode,
         toolRunner,
+        artifactStore,
         abortController: currentRun.abortController,
         emit: (event) => processAgentLoopEvent(currentRun, event),
         updatePhase: (phase) => updateRunPhase(currentRun, phase),

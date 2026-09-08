@@ -7,6 +7,7 @@ export type ToolWorkspace = Readonly<{
   workspaceRoot: string;
   sessionDirectory: string;
   protectedPaths?: readonly string[];
+  allowExternalPaths?: boolean;
 }>;
 
 /** 保存一个经过真实路径校验的工作区文件或目录。 */
@@ -15,25 +16,32 @@ export type ResolvedWorkspacePath = Readonly<{
   relativePath: string;
 }>;
 
-/** 解析一个工作区相对路径并执行真实路径与保留目录校验。 */
+/** 按当前调用的访问范围解析路径；完整访问仍保留应用数据保护。 */
 export async function resolveExistingWorkspacePath(
   requestedPath: string,
   workspace: ToolWorkspace,
 ): Promise<ResolvedWorkspacePath> {
-  validateWorkspaceRelativePath(requestedPath, "Tool path");
+  if (workspace.allowExternalPaths === true) {
+    if (requestedPath.length === 0) throw new Error("Tool path 不能为空。");
+  } else {
+    validateWorkspaceRelativePath(requestedPath, "Tool path");
+  }
   return resolveExistingAbsoluteWorkspacePath(
     resolve(workspace.workspaceRoot, requestedPath),
     workspace,
   );
 }
 
-/** 校验一个已组合的绝对路径仍位于工作区且未进入 Session 保留目录。 */
+/** 真实路径复核不得因开放外部访问而跳过应用配置、授权与 Session 保护。 */
 export async function resolveExistingAbsoluteWorkspacePath(
   candidatePath: string,
   workspace: ToolWorkspace,
 ): Promise<ResolvedWorkspacePath> {
   const actualPath = await realpath(candidatePath);
-  if (!isPathSameOrInside(workspace.workspaceRoot, actualPath)) {
+  if (
+    workspace.allowExternalPaths !== true &&
+    !isPathSameOrInside(workspace.workspaceRoot, actualPath)
+  ) {
     throw new Error("Tool path 越出工作区。");
   }
   if (isReservedToolPath(actualPath, workspace)) {

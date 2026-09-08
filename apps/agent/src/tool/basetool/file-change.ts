@@ -213,18 +213,24 @@ async function resolveFileTarget(
   requestedPath: string,
   workspace: ToolWorkspace,
 ): Promise<ResolvedFileTarget> {
+  const allowExternalPaths = workspace.allowExternalPaths === true;
   const absoluteRequest = isAbsolute(requestedPath) || win32.isAbsolute(requestedPath);
-  if (!absoluteRequest) {
+  if (!absoluteRequest && !allowExternalPaths) {
     validateWorkspaceRelativePath(requestedPath, "文件 Tool path");
   }
   const lexicalTargetPath = resolve(
     absoluteRequest ? requestedPath : resolve(workspace.workspaceRoot, requestedPath),
   );
-  const scope = isPathSameOrInside(workspace.workspaceRoot, lexicalTargetPath)
+  let scope: "workspace" | "external" = isPathSameOrInside(
+    workspace.workspaceRoot,
+    lexicalTargetPath,
+  )
     ? "workspace"
     : "external";
   if (absoluteRequest && scope === "external") {
     validateExternalAbsoluteFilePath(requestedPath);
+  } else if (allowExternalPaths && scope === "external") {
+    validateExternalAbsoluteFilePath(lexicalTargetPath);
   }
   const lexicalParentPath = dirname(lexicalTargetPath);
   const parentRealPath = await realpath(lexicalParentPath);
@@ -232,16 +238,20 @@ async function resolveFileTarget(
   if (!parentStats.isDirectory()) {
     throw new Error("文件 Tool 的父路径不是目录。");
   }
-  if (scope === "external" && !arePathsEqual(lexicalParentPath, parentRealPath)) {
+  if (
+    !allowExternalPaths &&
+    scope === "external" &&
+    !arePathsEqual(lexicalParentPath, parentRealPath)
+  ) {
     throw new Error("外部文件路径不能经过 Symbolic Link 或 Reparse Point。");
   }
-  assertAllowedPath(parentRealPath, workspace, scope);
   const targetPath = join(parentRealPath, basename(lexicalTargetPath));
-  const displayPath =
-    scope === "workspace"
-      ? normalizeRelativePath(relative(workspace.workspaceRoot, targetPath))
-      : targetPath;
-  const parentIdentity = fileSystemIdentity(parentStats);
+  if (allowExternalPaths) {
+    scope = isPathSameOrInside(workspace.workspaceRoot, targetPath) ? "workspace" : "external";
+    if (scope === "external") validateExternalAbsoluteFilePath(targetPath);
+  }
+  assertAllowedPath(parentRealPath, workspace, scope);
+  assertAllowedPath(targetPath, workspace, scope);
   let targetStats: Awaited<ReturnType<typeof lstat>> | null = null;
   try {
     targetStats = await lstat(targetPath);
@@ -251,12 +261,14 @@ async function resolveFileTarget(
     }
   }
   if (targetStats === null) {
-    assertAllowedPath(targetPath, workspace, scope);
     return Object.freeze({
       absolutePath: targetPath,
-      displayPath,
+      displayPath:
+        scope === "workspace"
+          ? normalizeRelativePath(relative(workspace.workspaceRoot, targetPath))
+          : targetPath,
       parentRealPath,
-      parentIdentity,
+      parentIdentity: fileSystemIdentity(parentStats),
       exists: false,
       originalContent: "",
       fingerprint: Object.freeze({ kind: "missing" }),
@@ -265,14 +277,25 @@ async function resolveFileTarget(
     });
   }
 
-  if (targetStats.isSymbolicLink()) {
+  if (targetStats.isSymbolicLink() && !allowExternalPaths) {
     throw new Error("文件 Tool 目标不能是 Symbolic Link 或 Reparse Point。");
   }
   const targetRealPath = await realpath(targetPath);
-  if (scope === "external" && !arePathsEqual(targetPath, targetRealPath)) {
+  if (!allowExternalPaths && scope === "external" && !arePathsEqual(targetPath, targetRealPath)) {
     throw new Error("外部文件路径不能经过 Symbolic Link 或 Reparse Point。");
   }
+  if (allowExternalPaths) {
+    scope = isPathSameOrInside(workspace.workspaceRoot, targetRealPath) ? "workspace" : "external";
+    if (scope === "external") validateExternalAbsoluteFilePath(targetRealPath);
+  }
   assertAllowedPath(targetRealPath, workspace, scope);
+  // 链接入口的父目录不持有实际写入目标；复核必须绑定最终真实父目录的身份。
+  const targetParentRealPath = dirname(targetRealPath);
+  const targetParentStats = await lstat(targetParentRealPath);
+  if (!targetParentStats.isDirectory()) {
+    throw new Error("文件 Tool 的父路径不是目录。");
+  }
+  assertAllowedPath(targetParentRealPath, workspace, scope);
   const actualStats = await stat(targetRealPath);
   if (!actualStats.isFile()) {
     throw new Error("文件 Tool 目标不是普通文件。");
@@ -284,8 +307,8 @@ async function resolveFileTarget(
       scope === "workspace"
         ? normalizeRelativePath(relative(workspace.workspaceRoot, targetRealPath))
         : targetRealPath,
-    parentRealPath: dirname(targetRealPath),
-    parentIdentity,
+    parentRealPath: targetParentRealPath,
+    parentIdentity: fileSystemIdentity(targetParentStats),
     exists: true,
     originalContent: decodeStrictUtf8(originalBytes),
     fingerprint: fingerprintBytes(originalBytes, actualStats),
@@ -345,6 +368,19 @@ function assertAllowedPath(
   workspace: ToolWorkspace,
   scope: "workspace" | "external",
 ): void {
+  // Windows 设备名可能被文件系统报告为不存在，必须在创建临时文件前拒绝。
+  if (
+    process.platform === "win32" &&
+    targetPath
+      .split(/[\\/]/u)
+      .some((pathSegment) =>
+        /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/iu.test(
+          pathSegment.split(".")[0]?.trimEnd() ?? "",
+        ),
+      )
+  ) {
+    throw new Error("文件 Tool path 不接受设备文件。");
+  }
   if (isReservedToolPath(targetPath, workspace)) {
     throw new Error("文件 Tool path 命中 Session 保留目录。");
   }
@@ -354,7 +390,7 @@ function assertAllowedPath(
     }
     return;
   }
-  if (isProtectedSystemPath(targetPath)) {
+  if (workspace.allowExternalPaths !== true && isProtectedSystemPath(targetPath)) {
     throw new Error("外部文件 path 命中系统保护目录。");
   }
   if (arePathsEqual(parse(targetPath).root, targetPath)) {

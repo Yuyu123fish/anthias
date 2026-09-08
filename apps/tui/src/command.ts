@@ -1,13 +1,14 @@
 import type { Agent, ContextUsage, PermissionMode, WorkspaceCommand } from "@anthias/agent";
-import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
+import type { AutocompleteProvider, SlashCommand } from "@earendil-works/pi-tui";
+import { createInputAutocomplete } from "./autocomplete.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { runMemoryCommand } from "./memory-view.js";
 import { runCollaborationCommand } from "./multi-agent-view.js";
 import {
   formatPermissions,
-  missingWorkspaceGrantNotice,
   type PermissionGrantChoice,
+  permissionModeNotice,
 } from "./permission-view.js";
 
 const COMMANDS = [
@@ -46,7 +47,11 @@ const COMMANDS = [
   { name: "continue", argumentHint: "[补充要求]", description: "明确继续上一任务，开始新 Run" },
   { name: "draft", argumentHint: "", description: "恢复未接受的上一份输入" },
   { name: "compact", argumentHint: "", description: "手动压缩上下文" },
-  { name: "mode", argumentHint: "[agent|plan|auto_allow]", description: "查看或切换权限模式" },
+  {
+    name: "mode",
+    argumentHint: "[agent|plan|auto_allow|full_access]",
+    description: "查看或切换权限模式",
+  },
   { name: "skills", argumentHint: "[reload|clear]", description: "外部 Skill 目录与激活状态" },
   { name: "skill:name", argumentHint: "[任务]", description: "激活指定 Skill，可附带用户任务" },
   {
@@ -95,6 +100,8 @@ export function commandHelp(): string {
     "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
     "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。/approval 返回当前审批。",
     "工作区授权：/permissions grant [--remember] [--members]，浏览后输入 grant 或 cancel。",
+    "FullAccess 跳过人工与自动审核，可访问工作区外文件；当前没有 OS 沙箱。",
+    "工作区授权及其撤销只影响 auto_allow；退出 FullAccess 请在空闲时使用 /mode 切换模式。",
     "/permissions command [--remember] [--members] [--prefix] [--cwd <相对目录>] -- <完整命令或前缀>",
     "--cwd 支持带引号的目录；-- 后保留命令引号。--prefix 允许入口后续任意字面参数或脚本，浏览合并范围后再确认。",
     "拒绝的输入可用 /draft 恢复；/continue 明确继续上一任务。",
@@ -103,7 +110,7 @@ export function commandHelp(): string {
 }
 
 /** 菜单、参数提示与 /help 使用同一命令目录。 */
-export function createCommandAutocomplete(agent: Agent): CombinedAutocompleteProvider {
+export function createCommandAutocomplete(agent: Agent): AutocompleteProvider {
   const commands: SlashCommand[] = COMMANDS.filter((command) => command.name !== "skill:name").map(
     (command) => ({
       ...command,
@@ -122,7 +129,7 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
                   "revoke",
                 ]
               : command.name === "mode"
-                ? ["agent", "plan", "auto_allow"]
+                ? ["agent", "plan", "auto_allow", "full_access"]
                 : command.name === "skills"
                   ? ["reload", "clear"]
                   : command.name === "details"
@@ -217,7 +224,7 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
       argumentHint: "[任务]",
     });
   }
-  return new CombinedAutocompleteProvider(commands, agent.state.workspaceRoot);
+  return createInputAutocomplete(commands, agent.state.workspaceRoot);
 }
 
 /** 命令只把语义操作交给 Agent，不持有 Session 或外部能力生命周期。 */
@@ -264,15 +271,18 @@ export async function executeCommand(
   switch (command.name) {
     case "permissions": {
       if (args.length === 0) {
-        notice(formatPermissions(agent.permissions.snapshot()));
+        notice(formatPermissions(agent.permissions.snapshot(), agent.state.permissionMode));
       } else if (args[0] === "revoke" && args.length === 1) {
         const result = await agent.permissions.revoke();
         notice(
           result.ok
-            ? "工作区授权已撤销。未开始的动作与待批准请求已失效；已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
+            ? agent.state.permissionMode === "full_access"
+              ? "工作区授权已撤销，仅影响 auto_allow。FullAccess 仍然生效；需在空闲时使用 /mode agent、/mode plan 或 /mode auto_allow 退出。已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
+              : "工作区授权已撤销。未开始的动作与待批准请求已失效；已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
             : result.error,
         );
-        if (!result.ok) notice(formatPermissions(agent.permissions.snapshot()));
+        if (!result.ok)
+          notice(formatPermissions(agent.permissions.snapshot(), agent.state.permissionMode));
       } else if (args[0] === "command") {
         const addition = parsePermissionCommand(command.argumentsText.trimStart().slice(7));
         if (addition === null) {
@@ -376,7 +386,7 @@ export async function executeCommand(
         notice(
           [
             `当前权限模式：${agent.state.permissionMode}`,
-            missingWorkspaceGrantNotice(agent.state.permissionMode, agent.permissions.snapshot()),
+            permissionModeNotice(agent.state.permissionMode, agent.permissions.snapshot()),
           ]
             .filter(Boolean)
             .join("\n"),
@@ -388,7 +398,7 @@ export async function executeCommand(
           result.status === "accepted"
             ? [
                 `权限模式：${result.permissionMode}`,
-                missingWorkspaceGrantNotice(result.permissionMode, agent.permissions.snapshot()),
+                permissionModeNotice(result.permissionMode, agent.permissions.snapshot()),
               ]
                 .filter(Boolean)
                 .join("\n")
@@ -530,7 +540,7 @@ export function formatContextUsage(usage: ContextUsage): string {
 }
 
 function isPermissionMode(value: string): value is PermissionMode {
-  return value === "agent" || value === "plan" || value === "auto_allow";
+  return value === "agent" || value === "plan" || value === "auto_allow" || value === "full_access";
 }
 
 /** 只解析授权入口的选项；分隔符之后的 Shell 文本交给 Agent 校验，保留原始引号。 */

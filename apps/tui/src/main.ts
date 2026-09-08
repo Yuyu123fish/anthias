@@ -28,14 +28,15 @@ async function main(): Promise<number> {
       requestedMode !== undefined &&
       requestedMode !== "agent" &&
       requestedMode !== "plan" &&
-      requestedMode !== "auto_allow"
+      requestedMode !== "auto_allow" &&
+      requestedMode !== "full_access"
     ) {
       throw new Error("invalid mode");
     }
     permissionMode = requestedMode;
   } catch {
     process.stderr.write(
-      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan|auto_allow>。\n",
+      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan|auto_allow|full_access>。\n",
     );
     return 1;
   }

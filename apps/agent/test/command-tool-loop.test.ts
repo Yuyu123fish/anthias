@@ -255,6 +255,17 @@ describe("execute_command Agent Tool Loop", () => {
       expect(Buffer.byteLength(toolResult.content, "utf8")).toBeLessThanOrEqual(64 * 1024);
       expect(toolResult.content.split("\n").length).toBeLessThanOrEqual(2_000);
     }
+    const artifactTexts = await Promise.all(
+      toolResults.map((result) => {
+        if (result.artifact === undefined) throw new Error("expected command artifact");
+        return readFile(
+          join(session.storageDirectory, "artifacts", result.artifact.artifactId + ".txt"),
+          "utf8",
+        );
+      }),
+    );
+    expect(artifactTexts[0]).toBe("x".repeat(70_000));
+    expect(artifactTexts[1]?.replaceAll("\r\n", "\n")).toBe("x\n".repeat(2_100));
     expect(await readFile(join(workspaceRoot, "bytes-drained.txt"), "utf8")).toContain("yes");
     expect(await readFile(join(workspaceRoot, "lines-drained.txt"), "utf8")).toContain("yes");
     expect(modelRequestCount).toBe(3);
@@ -270,8 +281,8 @@ describe("execute_command Agent Tool Loop", () => {
     await writeFile(join(session.storageDirectory, "artifacts"), "blocked");
     const command =
       shell.kind === "powershell"
-        ? "Write-Output 'drained'; Set-Content -LiteralPath 'drain-after-artifact-failure.txt' -Value 'yes'"
-        : "printf 'drained\\n'; printf 'yes\\n' > drain-after-artifact-failure.txt";
+        ? "Write-Output 'drained'; [Console]::Out.Write(('x' * 70000)); Set-Content -LiteralPath 'drain-after-artifact-failure.txt' -Value 'yes'"
+        : "printf 'drained\\n'; head -c 70000 /dev/zero | tr '\\0' x; printf 'yes\\n' > drain-after-artifact-failure.txt";
     const modelStream: ModelStream = async function* () {
       yield {
         type: "tool_call",
@@ -308,6 +319,7 @@ describe("execute_command Agent Tool Loop", () => {
     expect(toolResult).toMatchObject({ status: "completed" });
     expect(toolResult?.content).toContain("drained");
     expect(toolResult?.artifact).toBeUndefined();
+    expect(toolResult?.content).toContain("原文产物未保存");
     await agent.close();
   });
 

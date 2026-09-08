@@ -23,7 +23,7 @@ export function managedToolPlan(
   prepare: (signal?: AbortSignal) => Promise<ManagedOperation>,
 ): ToolCallPlan {
   return {
-    scheduling: "source_order_serial",
+    scheduling: "serial",
     waitForPreparationOnAbort: true,
     abortedPreparationContent: "操作准备已取消。",
     async prepare(signal) {

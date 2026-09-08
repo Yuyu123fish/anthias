@@ -54,7 +54,7 @@ export function createWebSearchTools({
     createPlan(call): ToolCallPlan | null {
       if (call.toolName !== "web_search") return null;
       return {
-        scheduling: "parallel_read_only",
+        scheduling: "parallel",
         abortedPreparationContent: "网页搜索已取消，未发起请求。",
         async prepare(signal) {
           if (signal?.aborted) {

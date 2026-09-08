@@ -1,5 +1,4 @@
 import type { AssistantToolCallPart } from "../../message.js";
-import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isOptionalIntegerInRange,
@@ -27,8 +26,11 @@ type GrepToolInput = Readonly<{
 }>;
 
 /** 只检查 grep 的运行时输入形状，不访问文件系统。 */
-export function validateGrepToolCallInput(toolCall: AssistantToolCallPart): string | null {
-  const inputResult = parseGrepToolInput(toolCall);
+export function validateGrepToolCallInput(
+  toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
+): string | null {
+  const inputResult = parseGrepToolInput(toolCall, workspace);
   return inputResult.ok ? null : inputResult.error;
 }
 
@@ -37,12 +39,11 @@ export async function executeGrepTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
-  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
   }
-  const inputResult = parseGrepToolInput(toolCall);
+  const inputResult = parseGrepToolInput(toolCall, workspace);
   if (!inputResult.ok) {
     return failedToolResult(inputResult.error);
   }
@@ -100,18 +101,12 @@ export async function executeGrepTool(
       }
     }
     resultLines.splice(2, 0, `skippedNonUtf8OrBinaryFiles: ${skippedFileCount}`);
-    if (artifactWriter !== undefined) {
-      for (const line of resultLines) {
-        await artifactWriter.write(line + "\n");
-      }
-      if (discoveredFiles.truncated) {
-        artifactWriter.markIncomplete("source_failed");
-      }
-    }
     const rendered = boundToolOutput(resultLines);
     return Object.freeze({
       status: "completed",
       content: rendered.content,
+      originalContent: resultLines.join("\n"),
+      ...(resultTruncated ? { sourceIncomplete: "source_failed" as const } : {}),
       truncated: resultTruncated || rendered.truncated,
     });
   } catch (error) {
@@ -124,6 +119,7 @@ export async function executeGrepTool(
 /** 解析 grep 的精确输入，拒绝未知字段和错误类型。 */
 function parseGrepToolInput(
   toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
 ): Readonly<{ ok: true; input: GrepToolInput }> | Readonly<{ ok: false; error: string }> {
   if (toolCall.invalid || toolCall.toolName !== "grep") {
     return Object.freeze({
@@ -147,7 +143,8 @@ function parseGrepToolInput(
   let searchPattern: RegExp;
   try {
     searchPattern = new RegExp(input.pattern, "u");
-    validateWorkspaceRelativePath(input.path ?? ".", "grep path");
+    if (!workspace?.allowExternalPaths)
+      validateWorkspaceRelativePath(input.path ?? ".", "grep path");
     validateWorkspaceRelativePath(input.filePattern ?? "**/*", "grep filePattern");
   } catch (error) {
     return Object.freeze({

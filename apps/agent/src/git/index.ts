@@ -153,7 +153,7 @@ type IntegrationOperationInput = Omit<
     integrationCommit?: string | undefined;
     error?: string | undefined;
   }>;
-type WorkingState = Readonly<{
+type WorkingTreeChangeSet = Readonly<{
   staged: readonly string[];
   unstaged: readonly string[];
   unmerged: readonly string[];
@@ -698,9 +698,9 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
           ...(signal === undefined ? {} : { signal }),
         });
       } catch (error) {
-        const state = await readWorkingState(target.root);
-        assertIntegrationOwnsState(state, allowedPaths);
-        if (state.unmerged.length > 0) {
+        const workingTreeChanges = await readWorkingTreeChanges(target.root);
+        assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, allowedPaths);
+        if (workingTreeChanges.unmerged.length > 0) {
           const conflicted: IntegrationOperation = Object.freeze({
             ...intent,
             phase: "conflicted",
@@ -708,9 +708,9 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
           });
           await appendOperation(operationId, toJsonValue(conflicted));
           if (error instanceof GitCommandAbortedError) throw error;
-          return integrationResult(conflicted, state.unmerged);
+          return integrationResult(conflicted, workingTreeChanges.unmerged);
         }
-        if (hasWorkingState(state)) {
+        if (hasWorkingTreeChanges(workingTreeChanges)) {
           const uncertain: IntegrationOperation = Object.freeze({
             ...intent,
             error: `操作结果需要核对：${safeErrorMessage(error)}`,
@@ -728,14 +728,18 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
       if ((await resolveCommit(target.root, "HEAD", signal)) !== target.head) {
         throw new Error("集成期间目标 HEAD 已变化，结果需要人工核对。");
       }
-      const state = await readWorkingState(target.root, signal);
-      assertIntegrationOwnsState(state, allowedPaths);
-      if (state.unmerged.length > 0) {
+      const workingTreeChanges = await readWorkingTreeChanges(target.root, signal);
+      assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, allowedPaths);
+      if (workingTreeChanges.unmerged.length > 0) {
         const conflicted: IntegrationOperation = Object.freeze({ ...intent, phase: "conflicted" });
         await appendOperation(operationId, toJsonValue(conflicted));
-        return integrationResult(conflicted, state.unmerged);
+        return integrationResult(conflicted, workingTreeChanges.unmerged);
       }
-      if (state.staged.length === 0 || state.unstaged.length > 0 || state.untracked.length > 0) {
+      if (
+        workingTreeChanges.staged.length === 0 ||
+        workingTreeChanges.unstaged.length > 0 ||
+        workingTreeChanges.untracked.length > 0
+      ) {
         throw new Error("集成没有形成可独立核对的暂存结果。");
       }
       const stagedTree = await writeTree(target.root, signal);
@@ -765,10 +769,10 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
       ) {
         throw new Error("集成目标的 HEAD 或仓库身份已经变化，拒绝继续修改。");
       }
-      const state = await readWorkingState(target.root, signal);
-      assertIntegrationOwnsState(state, operation.allowedPaths);
+      const workingTreeChanges = await readWorkingTreeChanges(target.root, signal);
+      assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, operation.allowedPaths);
       if (input.action === "abort") {
-        await abortIntegration(target.root, operation, state, signal);
+        await abortIntegration(target.root, operation, workingTreeChanges, signal);
         const aborted: IntegrationOperation = Object.freeze({ ...operation, phase: "aborted" });
         await appendOperation(operation.operationId, toJsonValue(aborted));
         return Object.freeze({
@@ -778,9 +782,10 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
         });
       }
 
-      if (state.unmerged.length > 0) throw new Error("仍有未解决的冲突，不能继续集成。");
-      if (state.staged.length === 0) throw new Error("没有待提交的集成结果。");
-      if (state.unstaged.length > 0 || state.untracked.length > 0) {
+      if (workingTreeChanges.unmerged.length > 0)
+        throw new Error("仍有未解决的冲突，不能继续集成。");
+      if (workingTreeChanges.staged.length === 0) throw new Error("没有待提交的集成结果。");
+      if (workingTreeChanges.unstaged.length > 0 || workingTreeChanges.untracked.length > 0) {
         throw new Error("集成路径仍含未暂存或未跟踪内容，不能继续。");
       }
       if (operation.phase === "staged" && operation.stagedTree !== undefined) {
@@ -983,12 +988,12 @@ async function captureApprovalControl(options: {
       options.signal,
     );
   } else {
-    const state = await readWorkingState(repository.root, options.signal);
+    const workingTreeChanges = await readWorkingTreeChanges(repository.root, options.signal);
     const changedPaths = new Set([
-      ...state.staged,
-      ...state.unstaged,
-      ...state.unmerged,
-      ...state.untracked,
+      ...workingTreeChanges.staged,
+      ...workingTreeChanges.unstaged,
+      ...workingTreeChanges.unmerged,
+      ...workingTreeChanges.untracked,
     ]);
     if (options.includeIgnored) {
       for (const path of await listGitPaths(
@@ -1373,7 +1378,10 @@ async function assertNoUntrackedIntegrationCollisions(
   }
 }
 
-async function readWorkingState(root: string, signal?: AbortSignal): Promise<WorkingState> {
+async function readWorkingTreeChanges(
+  root: string,
+  signal?: AbortSignal,
+): Promise<WorkingTreeChangeSet> {
   const [staged, unstaged, unmerged, untracked] = await Promise.all([
     listGitPaths(root, ["diff", "--cached", "--name-only", "-z", "--"], signal),
     listGitPaths(root, ["diff", "--name-only", "-z", "--"], signal),
@@ -1399,12 +1407,15 @@ async function listGitPaths(
   return Object.freeze(splitNull(result.stdout).map((path) => path.replaceAll("\\", "/")));
 }
 
-function assertIntegrationOwnsState(state: WorkingState, allowedPaths: readonly string[]): void {
+function assertIntegrationOwnsWorkingTreeChanges(
+  workingTreeChanges: WorkingTreeChangeSet,
+  allowedPaths: readonly string[],
+): void {
   const paths = new Set([
-    ...state.staged,
-    ...state.unstaged,
-    ...state.unmerged,
-    ...state.untracked,
+    ...workingTreeChanges.staged,
+    ...workingTreeChanges.unstaged,
+    ...workingTreeChanges.unmerged,
+    ...workingTreeChanges.untracked,
   ]);
   if ([...paths].some((path) => !isCoveredByRequests(path, allowedPaths))) {
     throw new Error("根工作区出现不属于当前成果的修改，拒绝继续集成。");
@@ -1414,16 +1425,16 @@ function assertIntegrationOwnsState(state: WorkingState, allowedPaths: readonly 
 async function abortIntegration(
   root: string,
   operation: IntegrationOperation,
-  state: WorkingState,
+  workingTreeChanges: WorkingTreeChangeSet,
   signal?: AbortSignal,
 ): Promise<void> {
-  if (!hasWorkingState(state)) return;
-  if (state.untracked.length > 0) {
+  if (!hasWorkingTreeChanges(workingTreeChanges)) return;
+  if (workingTreeChanges.untracked.length > 0) {
     throw new Error("集成期间出现未跟踪文件，需先人工核对，不能自动中止。");
   }
   if (operation.phase === "staged" && operation.stagedTree !== undefined) {
     const currentTree = await writeTree(root, signal);
-    if (currentTree !== operation.stagedTree || state.unstaged.length > 0) {
+    if (currentTree !== operation.stagedTree || workingTreeChanges.unstaged.length > 0) {
       throw new Error("集成暂存结果已经变化，不能自动中止。");
     }
   }
@@ -1471,8 +1482,8 @@ async function writeTree(root: string, signal?: AbortSignal): Promise<string> {
 }
 
 async function isClean(root: string, signal?: AbortSignal): Promise<boolean> {
-  const state = await readWorkingState(root, signal);
-  return !hasWorkingState(state);
+  const workingTreeChanges = await readWorkingTreeChanges(root, signal);
+  return !hasWorkingTreeChanges(workingTreeChanges);
 }
 
 async function isCleanForRemoval(root: string, signal?: AbortSignal): Promise<boolean> {
@@ -1607,12 +1618,12 @@ function splitNull(value: string): string[] {
   return value.split("\0").filter((entry) => entry.length > 0);
 }
 
-function hasWorkingState(state: WorkingState): boolean {
+function hasWorkingTreeChanges(workingTreeChanges: WorkingTreeChangeSet): boolean {
   return (
-    state.staged.length > 0 ||
-    state.unstaged.length > 0 ||
-    state.unmerged.length > 0 ||
-    state.untracked.length > 0
+    workingTreeChanges.staged.length > 0 ||
+    workingTreeChanges.unstaged.length > 0 ||
+    workingTreeChanges.unmerged.length > 0 ||
+    workingTreeChanges.untracked.length > 0
   );
 }
 

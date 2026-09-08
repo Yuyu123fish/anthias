@@ -82,6 +82,20 @@ function userText(request: ModelRequest) {
 }
 
 describe("MultiAgent through the Agent interface", () => {
+  it("keeps a read-only member in Plan under a Full Access root", async () => {
+    const requests: ModelRequest[] = [];
+    const { agent } = await setup(async function* (request) {
+      requests.push(request);
+      yield { type: "text_delta", delta: "read-only result" };
+      yield { type: "finish", finishReason: "stop" };
+    });
+    expect(agent.setPermissionMode("full_access").status).toBe("accepted");
+    const member = await spawn(agent, "inspect only");
+    await wait(agent, member.sessionId);
+    expect(requests[0]?.tools.some((tool) => tool.name === "write_file")).toBe(false);
+    expect(JSON.stringify(requests[0]?.messages)).toContain("当前权限模式：Plan 模式");
+  });
+
   it("persists delegation as sourced input and rejects recursive creation even when forged", async () => {
     const requests: ModelRequest[] = [];
     const { agent, session, sessionDirectory } = await setup(async function* (request) {
@@ -501,77 +515,81 @@ describe("MultiAgent through the Agent interface", () => {
       "root approved result",
     );
   }, 30_000);
-  it("applies a changed root permission mode to retained team members", async () => {
-    let approvalReviews = 0;
-    let memberResponses = 0;
-    const usage = {
-      inputTokens: 80,
-      outputTokens: 20,
-      cachedInputTokens: null,
-      cacheWriteInputTokens: null,
-    };
-    const { agent } = await setup(async function* (request) {
-      if (request.purpose === "approval") {
-        approvalReviews++;
-        const message = request.messages[0];
-        if (message?.role !== "user") throw new Error("missing review payload");
-        const payload = JSON.parse(message.content) as {
-          authorizationSources: Array<{ entryId: string }>;
-        };
-        yield {
-          type: "text_delta",
-          delta: JSON.stringify({
-            decision: "allow",
-            reason: "真实用户允许当前任务。",
-            authorizationEntryIds: payload.authorizationSources.map((source) => source.entryId),
+  it.each(["agent", "full_access"] as const)(
+    "applies changed root mode %s to retained writable members",
+    async (nextMode) => {
+      let approvalReviews = 0;
+      let memberResponses = 0;
+      const usage = {
+        inputTokens: 80,
+        outputTokens: 20,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: null,
+      };
+      const { agent } = await setup(async function* (request) {
+        if (request.purpose === "approval") {
+          approvalReviews++;
+          const message = request.messages[0];
+          if (message?.role !== "user") throw new Error("missing review payload");
+          const payload = JSON.parse(message.content) as {
+            authorizationSources: Array<{ entryId: string }>;
+          };
+          yield {
+            type: "text_delta",
+            delta: JSON.stringify({
+              decision: "allow",
+              reason: "真实用户允许当前任务。",
+              authorizationEntryIds: payload.authorizationSources.map((source) => source.entryId),
+            }),
+          };
+          yield { type: "finish", finishReason: "stop", usage };
+        } else if (memberResponses++ === 1) {
+          yield {
+            type: "tool_call",
+            toolCallId: randomUUID(),
+            toolName: "write_file",
+            input: { path: "shared.txt", content: "second task result" },
+            invalid: false,
+          };
+          yield { type: "finish", finishReason: "tool_calls", usage };
+        } else {
+          yield { type: "text_delta", delta: "done" };
+          yield { type: "finish", finishReason: "stop", usage };
+        }
+      }, true);
+      agent.setPermissionMode("auto_allow");
+      const manualMemberApprovals: string[] = [];
+      agent.subscribe((event) => {
+        if (event.type === "tool_approval_requested") {
+          if (event.request.memberSessionId)
+            manualMemberApprovals.push(event.request.memberSessionId);
+          agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+        }
+      });
+      value(await agent.collaboration.execute({ action: "team_create", name: "Permissions" }));
+      const member = JSON.parse(
+        value(
+          await agent.collaboration.execute({
+            action: "team_add",
+            task: "first task",
+            writable: true,
           }),
-        };
-        yield { type: "finish", finishReason: "stop", usage };
-      } else if (memberResponses++ === 1) {
-        yield {
-          type: "tool_call",
-          toolCallId: randomUUID(),
-          toolName: "write_file",
-          input: { path: "shared.txt", content: "second task result" },
-          invalid: false,
-        };
-        yield { type: "finish", finishReason: "tool_calls", usage };
-      } else {
-        yield { type: "text_delta", delta: "done" };
-        yield { type: "finish", finishReason: "stop", usage };
-      }
-    }, true);
-    agent.setPermissionMode("auto_allow");
-    const manualMemberApprovals: string[] = [];
-    agent.subscribe((event) => {
-      if (event.type === "tool_approval_requested") {
-        if (event.request.memberSessionId)
-          manualMemberApprovals.push(event.request.memberSessionId);
-        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
-      }
-    });
-    value(await agent.collaboration.execute({ action: "team_create", name: "Permissions" }));
-    const member = JSON.parse(
+        ),
+      ) as MemberSummary;
+      await wait(agent, member.sessionId);
+      const previousReviews = approvalReviews;
+      expect(agent.setPermissionMode(nextMode).status).toBe("accepted");
       value(
         await agent.collaboration.execute({
-          action: "team_add",
-          task: "first task",
-          writable: true,
+          action: "task_assign",
+          memberId: member.sessionId,
+          task: "second task",
         }),
-      ),
-    ) as MemberSummary;
-    await wait(agent, member.sessionId);
-    const previousReviews = approvalReviews;
-    expect(agent.setPermissionMode("agent").status).toBe("accepted");
-    value(
-      await agent.collaboration.execute({
-        action: "task_assign",
-        memberId: member.sessionId,
-        task: "second task",
-      }),
-    );
-    await wait(agent, member.sessionId);
-    expect(manualMemberApprovals).toEqual([member.sessionId]);
-    expect(approvalReviews).toBe(previousReviews);
-  }, 30_000);
+      );
+      await wait(agent, member.sessionId);
+      expect(manualMemberApprovals).toEqual(nextMode === "agent" ? [member.sessionId] : []);
+      expect(approvalReviews).toBe(previousReviews);
+    },
+    30_000,
+  );
 });

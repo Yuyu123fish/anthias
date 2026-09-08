@@ -1,7 +1,7 @@
 import { lstat, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { PermissionMode } from "./permission/permission-mode.js";
+import { isPermissionMode, type PermissionMode } from "./permission/permission-mode.js";
 
 export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env-example 可提交，填入凭据的 .env 不提交。
 # 只读取 Anthias 根目录的 .env，不读取任务工作区中的同名文件。
@@ -27,7 +27,8 @@ ANTHIAS_MODEL_API_KEY=
 # 可选；缺少此 Key 只影响 web_search。
 SEARCHAPI_API_KEY=
 
-# agent / plan / auto_allow；改为 auto_allow 后仍需明确授予工作区权限。
+# agent / plan / auto_allow / full_access；AutoAllow 按工作区授权或真实用户要求审核。
+# Full Access 跳过人工和模型审批，可访问系统用户权限内的工作区外文件；没有 OS 沙箱。
 # --mode 优先于此默认值；运行中的 /mode 不改写本文件。
 ANTHIAS_PERMISSION_MODE=agent
 `;
@@ -100,10 +101,10 @@ function resolveConfiguration(
   // spread 保留进程中显式空串或 undefined；它们都不能重新取得文件中的密钥。
   const environment = { ...fileEnvironment, ...processEnvironment };
   const permissionMode = explicitMode ?? environment.ANTHIAS_PERMISSION_MODE ?? "agent";
-  if (permissionMode !== "agent" && permissionMode !== "plan" && permissionMode !== "auto_allow") {
+  if (!isPermissionMode(permissionMode)) {
     return {
       ok: false,
-      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、plan 或 auto_allow。",
+      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、plan、auto_allow 或 full_access。",
     };
   }
   return { ok: true, environment, permissionMode };

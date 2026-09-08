@@ -80,6 +80,77 @@ function allowed(session: Session): ModelStream {
   };
 }
 
+it("skips both approval paths in Full Access despite workspace revocation and reopens without inheriting it", async () => {
+  const session = await createFixture();
+  let responseCount = 0;
+  let approvalRequests = 0;
+  let manualApprovals = 0;
+  let revocation: ReturnType<typeof agent.permissions.revoke> | undefined;
+  const agent = createAgentWithModelStream({
+    session,
+    permissionMode: "full_access",
+    modelStream: async function* (request) {
+      if (request.purpose === "approval") {
+        approvalRequests++;
+        throw new Error("Full Access must not call the reviewer");
+      }
+      if (responseCount++ === 0) {
+        yield {
+          ...toolCall({ path: "full.txt", content: "full access fixture" }),
+          type: "tool_call",
+        };
+        yield { type: "finish", finishReason: "tool_calls", usage };
+      } else {
+        yield { type: "text_delta", delta: "done" };
+        yield { type: "finish", finishReason: "stop", usage };
+      }
+    },
+  });
+  cleanup.push(() => agent.close());
+  agent.subscribe((event) => {
+    if (event.type === "tool_approval_requested") {
+      manualApprovals++;
+      agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
+    }
+    if (
+      event.type === "tool_authorization" &&
+      event.source === "policy" &&
+      event.decision === "allowed"
+    ) {
+      revocation = agent.permissions.revoke();
+    }
+  });
+  expect((await agent.prompt("写入 full.txt。")).status).toBe("completed");
+  await revocation;
+  expect(approvalRequests).toBe(0);
+  expect(manualApprovals).toBe(0);
+  expect(agent.permissions.snapshot().revoked).toBe(true);
+  expect(await readFile(join(session.workspaceRoot, "full.txt"), "utf8")).toBe(
+    "full access fixture",
+  );
+  await agent.close();
+  const reopened = await openSession({
+    sessionId: session.sessionId,
+    workspaceRoot: session.workspaceRoot,
+    sessionDirectory: session.sessionDirectory,
+    shell,
+  });
+  cleanup.push(() => reopened.close());
+  expect(reopened.records.find((record) => record.type === "approval_decision")).toMatchObject({
+    permissionMode: "full_access",
+    decisionSource: "policy",
+    decision: "allowed",
+  });
+  const reopenedAgent = createAgentWithModelStream({
+    session: reopened,
+    modelStream: () => {
+      throw new Error("history must not run the model");
+    },
+  });
+  cleanup.push(() => reopenedAgent.close());
+  expect(reopenedAgent.state.permissionMode).toBe("agent");
+});
+
 describe("AutoAllow Agent integration", () => {
   it("does not review a repeated action after the user has denied its first call", async () => {
     const session = await createFixture();

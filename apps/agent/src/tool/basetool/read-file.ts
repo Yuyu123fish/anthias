@@ -1,6 +1,5 @@
 import { stat } from "node:fs/promises";
 import type { AssistantToolCallPart } from "../../message.js";
-import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
@@ -8,8 +7,8 @@ import {
   isRecord,
 } from "../input-validation.js";
 import {
-  boundToolOutput,
   failedToolResult,
+  renderToolFilePage,
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
@@ -28,8 +27,11 @@ type ReadFileToolInput = Readonly<{
 }>;
 
 /** 只检查 read_file 的运行时输入形状，不访问文件系统。 */
-export function validateReadFileToolCallInput(toolCall: AssistantToolCallPart): string | null {
-  const inputResult = parseReadFileToolInput(toolCall);
+export function validateReadFileToolCallInput(
+  toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
+): string | null {
+  const inputResult = parseReadFileToolInput(toolCall, workspace);
   return inputResult.ok ? null : inputResult.error;
 }
 
@@ -38,12 +40,11 @@ export async function executeReadFileTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
-  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
   }
-  const inputResult = parseReadFileToolInput(toolCall);
+  const inputResult = parseReadFileToolInput(toolCall, workspace);
   if (!inputResult.ok) {
     return failedToolResult(inputResult.error);
   }
@@ -54,33 +55,25 @@ export async function executeReadFileTool(
       return failedToolResult(`read_file 目标不是文件：${target.relativePath}`);
     }
     const text = await readStrictUtf8File(target.absolutePath);
-    if (artifactWriter !== undefined) {
-      const bytes = Buffer.from(text, "utf8");
-      for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
-        await artifactWriter.write(bytes.subarray(offset, offset + 64 * 1024));
-      }
-    }
     if (abortSignal.aborted) {
       return failedToolResult("Tool 执行已停止。");
     }
     const lines = splitTextLines(text);
     const startIndex = Math.min(inputResult.input.startLine - 1, lines.length);
     const selectedLines = lines.slice(startIndex, startIndex + inputResult.input.lineCount);
-    const endLine = selectedLines.length === 0 ? startIndex : startIndex + selectedLines.length;
     const hasMoreLines = startIndex + selectedLines.length < lines.length;
-    const rendered = boundToolOutput([
-      `path: ${target.relativePath}`,
-      `lines: ${
-        selectedLines.length === 0 ? "none" : `${startIndex + 1}-${endLine}`
-      } of ${lines.length}`,
-      `nextStartLine: ${hasMoreLines ? endLine + 1 : "none"}`,
-      "---",
-      ...selectedLines.map((line, index) => `${startIndex + index + 1}| ${line}`),
-    ]);
+
+    const filePage = {
+      path: target.relativePath,
+      startLine: startIndex + 1,
+      totalLines: lines.length,
+      lines: selectedLines,
+    };
     return Object.freeze({
       status: "completed",
-      content: rendered.content,
-      truncated: hasMoreLines || rendered.truncated,
+      content: renderToolFilePage(filePage),
+      filePage,
+      truncated: hasMoreLines,
     });
   } catch (error) {
     return abortSignal.aborted
@@ -92,6 +85,7 @@ export async function executeReadFileTool(
 /** 解析 read_file 的精确输入，拒绝未知字段和错误类型。 */
 function parseReadFileToolInput(
   toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
 ): Readonly<{ ok: true; input: ReadFileToolInput }> | Readonly<{ ok: false; error: string }> {
   if (toolCall.invalid || toolCall.toolName !== "read_file") {
     return Object.freeze({
@@ -112,7 +106,7 @@ function parseReadFileToolInput(
     return Object.freeze({ ok: false, error: "read_file 输入不符合 Schema。" });
   }
   try {
-    validateWorkspaceRelativePath(input.path, "read_file path");
+    if (!workspace?.allowExternalPaths) validateWorkspaceRelativePath(input.path, "read_file path");
   } catch (error) {
     return Object.freeze({
       ok: false,

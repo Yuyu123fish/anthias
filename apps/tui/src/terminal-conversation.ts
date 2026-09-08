@@ -12,8 +12,9 @@ import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { collaborationStatus } from "./multi-agent-view.js";
 import {
   formatPermissions,
-  missingWorkspaceGrantNotice,
   type PermissionGrantChoice,
+  permissionModeLabel,
+  permissionModeNotice,
 } from "./permission-view.js";
 import { createTerminal } from "./terminal.js";
 import {
@@ -46,7 +47,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   const output = options.output ?? process.stdout;
   const signalSource = options.signalSource ?? process;
   const interactive = options.terminal !== undefined || (isTty(input) && isTty(output));
-  const completion = Promise.withResolvers<number>();
+  const tuiExitPromiseResolvers = Promise.withResolvers<number>();
   let view: ConversationView | undefined;
   let readlineInterface: Interface | undefined;
   let exiting = false;
@@ -55,8 +56,8 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   let plainDetailsVisible = false;
   let latestPlainDetails = "";
   let submissionPending = false;
-  let pendingGrant: { choice: PermissionGrantChoice; scope: string } | undefined;
-  const plainToolResults = new Set<string>();
+  let pendingWorkspaceGrantReview: { choice: PermissionGrantChoice; scope: string } | undefined;
+  const renderedPlainToolResultIds = new Set<string>();
   let unsubscribe = () => {};
 
   function write(text: string): void {
@@ -97,7 +98,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     } catch {
       exitCode = 1;
     }
-    completion.resolve(exitCode);
+    tuiExitPromiseResolvers.resolve(exitCode);
   }
   function eof(): void {
     void exit();
@@ -109,15 +110,18 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   async function submit(text: string): Promise<boolean> {
     if (exiting) return true;
     const confirmation = text.trim().toLowerCase();
-    if (pendingGrant !== undefined && (confirmation === "grant" || confirmation === "cancel")) {
+    if (
+      pendingWorkspaceGrantReview !== undefined &&
+      (confirmation === "grant" || confirmation === "cancel")
+    ) {
       if (confirmation === "cancel") {
-        pendingGrant = undefined;
+        pendingWorkspaceGrantReview = undefined;
         view?.reviewPermissions(null);
         notice("已取消，没有新增工作区授权。", "/permissions");
         return true;
       }
       if (agent.state.pendingToolApproval !== null) {
-        pendingGrant = undefined;
+        pendingWorkspaceGrantReview = undefined;
         view?.reviewPermissions(null);
         notice(
           "当前有待执行的工具审批，请用 /approval 处理后重新查看授权范围。grant 不会批准当前动作。",
@@ -130,8 +134,8 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         return true;
       }
       const currentSnapshot = agent.permissions.snapshot();
-      if (pendingGrant.scope !== permissionScope(currentSnapshot)) {
-        pendingGrant = undefined;
+      if (pendingWorkspaceGrantReview.scope !== permissionScope(currentSnapshot)) {
+        pendingWorkspaceGrantReview = undefined;
         view?.reviewPermissions(null);
         notice(
           "工作区或当前授权状态已变化，请重新执行 /permissions grant 或 /permissions command 查看范围。",
@@ -139,8 +143,8 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         );
         return true;
       }
-      const choice = pendingGrant.choice;
-      pendingGrant = undefined;
+      const choice = pendingWorkspaceGrantReview.choice;
+      pendingWorkspaceGrantReview = undefined;
       view?.reviewPermissions(null);
       try {
         const result = await agent.permissions.grant(choice);
@@ -151,32 +155,42 @@ export function runTui(options: RunTuiOptions): Promise<number> {
           "/permissions",
         );
         if (!result.ok)
-          notice(formatPermissions(agent.permissions.snapshot()), "/permissions 当前状态");
+          notice(
+            formatPermissions(agent.permissions.snapshot(), agent.state.permissionMode),
+            "/permissions 当前状态",
+          );
       } catch {
         notice("授权操作未完成，请查看 /permissions 核对当前实际范围。", "/permissions");
       }
       return true;
     }
-    const approval = agent.state.pendingToolApproval;
+    const pendingToolApprovalRequest = agent.state.pendingToolApproval;
     const approvalAnswer = text.trim().toLowerCase();
-    if (approval !== null && approvalAnswer === "grant") {
+    if (pendingToolApprovalRequest !== null && approvalAnswer === "grant") {
       notice(
         "grant 不会批准当前工具动作；请用 /approval 查看后输入 approve 或 deny。",
         "/permissions",
       );
       return true;
     }
-    if (approval !== null && (approvalAnswer === "approve" || approvalAnswer === "deny")) {
+    if (
+      pendingToolApprovalRequest !== null &&
+      (approvalAnswer === "approve" || approvalAnswer === "deny")
+    ) {
       if (
         approvalAnswer === "approve" &&
-        (!isApprovalDisplayable(approval) || (view !== undefined && !view.canApprove()))
+        (!isApprovalDisplayable(pendingToolApprovalRequest) ||
+          (view !== undefined && !view.canApprove()))
       ) {
         notice(
           "请先使用 /approval 浏览完整审批详情到底部；空间不足时请放大终端。也可以输入 deny 拒绝。",
         );
         return true;
       }
-      const result = agent.respondToToolApproval(approval.toolApprovalRequestId, approvalAnswer);
+      const result = agent.respondToToolApproval(
+        pendingToolApprovalRequest.toolApprovalRequestId,
+        approvalAnswer,
+      );
       if (result.status === "rejected") notice("该审批已失效，请查看当前请求。");
       return true;
     }
@@ -187,7 +201,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       if (parsed.type === "command") {
         const title = `/${parsed.name}`;
         if (parsed.name === "permissions" && parsed.argumentsText.trim() === "revoke") {
-          pendingGrant = undefined;
+          pendingWorkspaceGrantReview = undefined;
           view?.reviewPermissions(null);
         }
         if (
@@ -209,9 +223,11 @@ export function runTui(options: RunTuiOptions): Promise<number> {
           approval() {
             if (view !== undefined) view.showApproval();
             else {
-              const currentApproval = agent.state.pendingToolApproval;
+              const currentToolApprovalRequest = agent.state.pendingToolApproval;
               notice(
-                currentApproval === null ? "当前没有待批准请求。" : formatApproval(currentApproval),
+                currentToolApprovalRequest === null
+                  ? "当前没有待批准请求。"
+                  : formatApproval(currentToolApprovalRequest),
                 "/approval",
               );
             }
@@ -219,7 +235,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
           permissions(choice) {
             if (agent.state.pendingToolApproval !== null) {
               commandRejected = true;
-              pendingGrant = undefined;
+              pendingWorkspaceGrantReview = undefined;
               view?.reviewPermissions(null);
               notice(
                 "当前有待执行的工具审批，请先用 /approval 处理；新增工作区授权不会批准当前动作。",
@@ -228,11 +244,11 @@ export function runTui(options: RunTuiOptions): Promise<number> {
               return;
             }
             const snapshot = agent.permissions.snapshot();
-            pendingGrant = {
+            pendingWorkspaceGrantReview = {
               choice,
               scope: permissionScope(snapshot),
             };
-            const text = formatPermissions(snapshot, choice);
+            const text = formatPermissions(snapshot, agent.state.permissionMode, choice);
             if (view !== undefined) view.reviewPermissions(text);
             else notice(text, "/permissions");
           },
@@ -298,8 +314,8 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     memberName?: string,
   ): void {
     const identity = `${memberSessionId ?? agent.state.sessionId}:${message.toolCallId}`;
-    if (plainToolResults.has(identity)) return;
-    plainToolResults.add(identity);
+    if (renderedPlainToolResultIds.has(identity)) return;
+    renderedPlainToolResultIds.add(identity);
     const member = memberSessionId ? ` · 成员 ${memberName ?? memberSessionId}` : "";
     const status = {
       completed: "已完成",
@@ -322,10 +338,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         write("\n" + collaborationStatus(event.snapshot).replace(/^ · /u, "") + "\n");
         break;
       case "session_changed":
-        pendingGrant = undefined;
-        plainToolResults.clear();
+        pendingWorkspaceGrantReview = undefined;
+        renderedPlainToolResultIds.clear();
         write(
-          `\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${{ agent: "Agent", plan: "Plan", auto_allow: "AutoAllow" }[agent.state.permissionMode]}\n`,
+          `\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n`,
         );
         for (const message of agent.state.messageHistory) plainMessage(message);
         latestPlainDetails = "";
@@ -439,14 +455,14 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       });
     } else {
       write(
-        `><> Anthias\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${{ agent: "Agent", plan: "Plan", auto_allow: "AutoAllow" }[agent.state.permissionMode]}\n/help 查看命令\n`,
+        `><> Anthias\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n/help 查看命令\n`,
       );
       for (const message of agent.state.messageHistory) plainMessage(message);
-      const permissionNotice = missingWorkspaceGrantNotice(
+      const permissionNotice = permissionModeNotice(
         agent.state.permissionMode,
         agent.permissions.snapshot(),
       );
-      if (permissionNotice !== null) notice(permissionNotice, "工作区授权");
+      if (permissionNotice !== null) notice(permissionNotice, "权限模式");
       if (
         agent.state.lastRunDiagnostic?.category !== "completed" &&
         agent.state.lastRunDiagnostic != null
@@ -465,9 +481,9 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     unsubscribe = agent.subscribe((event) => {
       if (exiting) return;
       try {
-        if (event.type === "session_changed") pendingGrant = undefined;
-        if (event.type === "tool_approval_requested" && pendingGrant !== undefined) {
-          pendingGrant = undefined;
+        if (event.type === "session_changed") pendingWorkspaceGrantReview = undefined;
+        if (event.type === "tool_approval_requested" && pendingWorkspaceGrantReview !== undefined) {
+          pendingWorkspaceGrantReview = undefined;
           view?.reviewPermissions(null);
           notice(
             "工具执行正在等待确认，已取消尚未确认的工作区授权；请用 /approval 处理后重新查看授权范围。",
@@ -488,7 +504,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   } catch {
     void exit(1);
   }
-  return completion.promise;
+  return tuiExitPromiseResolvers.promise;
 }
 
 function appendBounded(previous: string, addition: string): string {

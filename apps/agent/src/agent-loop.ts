@@ -23,13 +23,16 @@ import {
   toModelInputMessage,
 } from "./model/model-stream.js";
 import type { PermissionMode } from "./permission/permission-mode.js";
+import type { SessionArtifactStore } from "./session/artifacts.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
+import { finalizeToolResult } from "./tool/tool-result.js";
 import type {
   PreparedToolExecution,
   ToolApprovalPlan,
   ToolCallPlan,
   ToolRunner,
 } from "./tool/tool-runner.js";
+import { selectConcurrentToolBatch } from "./tool/tool-scheduling.js";
 
 /** 枚举 Agent Loop 当前正在推进的活动阶段。 */
 export type AgentLoopPhase = "requesting_model" | "awaiting_tool_approval" | "executing_tool";
@@ -121,6 +124,7 @@ export type RunAgentLoopOptions = Readonly<{
   toolDefinitions: readonly ModelToolDefinition[];
   permissionMode: PermissionMode;
   toolRunner: ToolRunner;
+  artifactStore?: SessionArtifactStore;
   abortController: AbortController;
   emit(event: AgentLoopEvent): Promise<void>;
   updatePhase(phase: AgentLoopPhase): void;
@@ -131,7 +135,7 @@ export type RunAgentLoopOptions = Readonly<{
 }>;
 
 /** 表示一次模型请求形成的 AssistantMessage 与完成原因。 */
-type AssistantRequestResult = Readonly<{
+type AssistantResponseResult = Readonly<{
   message: AssistantMessage;
   modelInputMessage: Extract<ModelInputMessage, { role: "assistant" }>;
   finishReason: ModelFinishReason | null;
@@ -165,7 +169,7 @@ type ToolResultBudget = {
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const TOOL_CALL_BATCH_LIMIT = 32;
-const READ_ONLY_TOOL_CONCURRENCY_LIMIT = 4;
+const TOOL_CONCURRENCY_LIMIT = 4;
 const COMPLETED_LOOP_RESULT = Object.freeze({ status: "completed" } as const);
 const FAILED_LOOP_RESULT = Object.freeze({ status: "failed", error: SAFE_MODEL_ERROR } as const);
 const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
@@ -197,24 +201,24 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       return abortedResult();
     }
     options.updatePhase("requesting_model");
-    const assistantRequest = await streamAssistantResponse(
+    const assistantResponseResult = await streamAssistantResponse(
       messageHistory,
       transientModelMessages,
       options,
     );
-    if (assistantRequest.message.diagnostic !== undefined) {
-      runRetryCount += assistantRequest.message.diagnostic.retryCount ?? 0;
-      latestDiagnostic = createRunDiagnostic(assistantRequest.message.diagnostic.category, {
-        ...assistantRequest.message.diagnostic,
+    if (assistantResponseResult.message.diagnostic !== undefined) {
+      runRetryCount += assistantResponseResult.message.diagnostic.retryCount ?? 0;
+      latestDiagnostic = createRunDiagnostic(assistantResponseResult.message.diagnostic.category, {
+        ...assistantResponseResult.message.diagnostic,
         retryCount: runRetryCount,
       });
     }
-    if (assistantRequest.message.status === "aborted") {
-      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
+    if (assistantResponseResult.message.status === "aborted") {
+      await appendUnresolvedToolResults(assistantResponseResult.message, messageHistory, options);
       return abortedResult();
     }
-    if (assistantRequest.message.status === "failed") {
-      await appendUnresolvedToolResults(assistantRequest.message, messageHistory, options);
+    if (assistantResponseResult.message.status === "failed") {
+      await appendUnresolvedToolResults(assistantResponseResult.message, messageHistory, options);
       return {
         status: "failed",
         error: latestDiagnostic?.summary ?? SAFE_MODEL_ERROR,
@@ -223,14 +227,16 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     }
 
     // 获取 ToolCall 列表
-    const toolCalls = assistantRequest.message.content.filter(isToolCallPart);
+    const toolCalls = assistantResponseResult.message.content.filter(isToolCallPart);
     if (toolCalls.length === 0) {
       return {
-        ...(assistantRequest.finishReason === "stop" ? COMPLETED_LOOP_RESULT : FAILED_LOOP_RESULT),
+        ...(assistantResponseResult.finishReason === "stop"
+          ? COMPLETED_LOOP_RESULT
+          : FAILED_LOOP_RESULT),
         ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
       };
     }
-    if (assistantRequest.finishReason !== "tool_calls") {
+    if (assistantResponseResult.finishReason !== "tool_calls") {
       await appendToolResults(
         toolCalls,
         "aborted",
@@ -268,49 +274,32 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         plan: options.toolRunner.createPlan(toolCall, options.permissionMode),
       }),
     );
-    const parallelReadOnlyBatch = plannedToolCalls.every(
-      ({ plan }) => plan.scheduling === "parallel_read_only",
-    );
-    if (parallelReadOnlyBatch) {
-      const toolResultBudget = createToolResultBudget(plannedToolCalls.length);
-      const toolResultMessages = await executeParallelReadOnlyBatch(
-        plannedToolCalls,
+
+    const toolResultBudget = createToolResultBudget(plannedToolCalls.length);
+    for (let offset = 0; offset < plannedToolCalls.length; ) {
+      const selectedPlans = selectConcurrentToolBatch(
+        plannedToolCalls.map(({ plan }) => plan),
+        offset,
+      );
+      const batch = plannedToolCalls
+        .slice(offset, offset + selectedPlans.length)
+        .map((plannedToolCall, sourceIndex) => ({ ...plannedToolCall, sourceIndex }));
+      const toolResults = await executeConcurrentToolBatch(
+        batch,
         options,
         toolResultBudget.tokenBudgetPerResult,
       );
-      for (const toolResultMessage of toolResultMessages) {
+      for (const toolResult of toolResults) {
         await appendToolResultMessage(
-          boundToolResultForBudget(toolResultMessage, toolResultBudget),
+          boundToolResultForBudget(toolResult, toolResultBudget),
           messageHistory,
           options,
         );
       }
-      if (options.abortController.signal.aborted) {
-        return abortedResult();
-      }
-      continue;
-    }
-
-    const toolResultBudget = createToolResultBudget(plannedToolCalls.length);
-    for (let toolIndex = 0; toolIndex < plannedToolCalls.length; toolIndex += 1) {
-      const plannedToolCall = plannedToolCalls[toolIndex];
-      if (plannedToolCall === undefined) {
-        throw new Error("ToolCall 顺序状态缺失。");
-      }
-      const toolResultMessage = await formToolResultMessage(
-        plannedToolCall,
-        options,
-        null,
-        toolResultBudget.tokenBudgetPerResult,
-      );
-      await appendToolResultMessage(
-        boundToolResultForBudget(toolResultMessage, toolResultBudget),
-        messageHistory,
-        options,
-      );
+      offset += batch.length;
       if (options.abortController.signal.aborted) {
         await appendToolResults(
-          plannedToolCalls.slice(toolIndex + 1).map(({ toolCall }) => toolCall),
+          plannedToolCalls.slice(offset).map(({ toolCall }) => toolCall),
           "aborted",
           "Run 已停止，调用未执行。",
           messageHistory,
@@ -328,7 +317,7 @@ async function streamAssistantResponse(
   messageHistory: Message[],
   transientModelMessages: Map<AssistantMessage, Extract<ModelInputMessage, { role: "assistant" }>>,
   options: RunAgentLoopOptions,
-): Promise<AssistantRequestResult> {
+): Promise<AssistantResponseResult> {
   let finalMessage: AssistantMessage | null = null;
   let finalModelInputMessage: Extract<ModelInputMessage, { role: "assistant" }> | null = null;
   let finishReason: ModelFinishReason | null = null;
@@ -405,7 +394,7 @@ async function streamAssistantResponse(
 }
 
 /** 按源索引保存并发结果，并为未领取调用补齐 aborted 消息。 */
-async function executeParallelReadOnlyBatch(
+async function executeConcurrentToolBatch(
   plannedToolCalls: readonly PlannedToolCall[],
   options: RunAgentLoopOptions,
   resultTokenBudget: number,
@@ -428,17 +417,29 @@ async function executeParallelReadOnlyBatch(
       if (plannedToolCall === undefined) {
         throw new Error("ToolCall 并发队列状态缺失。");
       }
-      toolResultMessages[sourceIndex] = await formToolResultMessage(
-        plannedToolCall,
-        options,
-        startGate,
-        resultTokenBudget,
-      );
+
+      try {
+        toolResultMessages[sourceIndex] = await formToolResultMessage(
+          plannedToolCall,
+          options,
+          startGate,
+          resultTokenBudget,
+        );
+      } catch (error) {
+        options.abortController.abort();
+        await skipExecutionStart(sourceIndex, startGate);
+        throw error;
+      }
     }
   }
 
-  const workerCount = Math.min(READ_ONLY_TOOL_CONCURRENCY_LIMIT, plannedToolCalls.length);
-  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  const workerCount = Math.min(TOOL_CONCURRENCY_LIMIT, plannedToolCalls.length);
+  // 持久化或事件失败时先取消并收齐其他 worker，不能让副作用逃出 Run 生命周期。
+  const workerResults = await Promise.allSettled(
+    Array.from({ length: workerCount }, () => runWorker()),
+  );
+  const failedWorker = workerResults.find((result) => result.status === "rejected");
+  if (failedWorker?.status === "rejected") throw failedWorker.reason;
   for (const plannedToolCall of plannedToolCalls) {
     toolResultMessages[plannedToolCall.sourceIndex] ??= createAbortedToolResultMessage(
       plannedToolCall.toolCall,
@@ -516,19 +517,13 @@ async function executePreparedToolCall(
   let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
-    if (startGate !== null) {
-      await skipExecutionStart(sourceIndex, startGate);
-      return createToolResultMessage(toolCall, {
-        status: "failed",
-        content: "只读并发计划不能请求副作用确认。",
-        truncated: false,
-      });
-    }
+    await startGate?.waitForTurn(sourceIndex);
     // 需要人工确认的 ToolCall，切换到等待人工确认阶段
     options.updatePhase("awaiting_tool_approval");
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
     toolApprovalRequestId = approval.toolApprovalRequestId;
     if (approval.decision !== "approve" || options.abortController.signal.aborted) {
+      await skipExecutionStart(sourceIndex, startGate);
       return createToolResultMessage(toolCall, {
         status: approval.decision === "deny" ? "denied" : "aborted",
         content:
@@ -545,7 +540,6 @@ async function executePreparedToolCall(
     return createAbortedToolResultMessage(toolCall, preparedExecution.executionUnavailableContent);
   }
 
-  options.updatePhase("executing_tool");
   const executionStarted = await publishExecutionStart(
     plannedToolCall,
     toolApprovalRequestId,
@@ -583,6 +577,17 @@ async function executePreparedToolCall(
     });
   }
 
+  const finalizedResult = await finalizeToolResult(
+    toolCall.toolCallId,
+    executionResult,
+    options.artifactStore,
+    resultTokenBudget,
+    executionResult.status === "completed"
+      ? "completed"
+      : options.abortController.signal.aborted
+        ? "aborted"
+        : "failed",
+  );
   const toolResultMessage = createToolResultMessage(toolCall, {
     status:
       executionResult.status === "completed"
@@ -590,16 +595,16 @@ async function executePreparedToolCall(
         : options.abortController.signal.aborted
           ? "aborted"
           : "failed",
-    content: executionResult.content,
-    truncated: executionResult.truncated,
-    ...(executionResult.artifact === undefined ? {} : { artifact: executionResult.artifact }),
+    content: finalizedResult.content,
+    truncated: finalizedResult.truncated,
+    ...(finalizedResult.artifact === undefined ? {} : { artifact: finalizedResult.artifact }),
   });
   await options.emit({
     type: "tool_execution_end",
     toolCallId: toolCall.toolCallId,
     toolName: toolCall.toolName,
     result: toolResultMessage,
-    cleanupUncertain: executionResult.cleanupUncertain,
+    cleanupUncertain: executionResult.cleanupUncertain || finalizedResult.cleanupUncertain === true,
   });
   return toolResultMessage;
 }
@@ -722,6 +727,7 @@ async function publishExecutionStart(
     if (options.abortController.signal.aborted) {
       return false;
     }
+    options.updatePhase("executing_tool");
     await options.emit({
       type: "tool_execution_start",
       toolCall: plannedToolCall.toolCall,
@@ -793,13 +799,7 @@ function boundToolResultForBudget(
     0,
     Math.min(toolResultBudget.tokenBudgetPerResult, toolResultBudget.remainingTokens),
   );
-  const artifactMetadata = addArtifactMetadata(
-    toolResultMessage.status,
-    toolResultMessage.artifact,
-  );
-  const metadataWithSeparatorTokens =
-    artifactMetadata.length === 0 ? 0 : estimateTextTokens(`${artifactMetadata}\n`);
-  const contentTokenBudget = Math.max(0, availableTokenBudget - metadataWithSeparatorTokens);
+  const contentTokenBudget = availableTokenBudget;
   const boundedContent = boundTextToTokenBudget(
     toolResultMessage.content,
     contentTokenBudget,
@@ -808,17 +808,7 @@ function boundToolResultForBudget(
       toolResultMessage.artifact !== undefined,
     ),
   );
-  let resultContent =
-    artifactMetadata.length === 0
-      ? boundedContent.content
-      : artifactMetadata +
-        (boundedContent.content.length === 0 ? "" : `\n${boundedContent.content}`);
-  if (resultContent.length === 0) {
-    resultContent =
-      toolResultMessage.artifact === undefined
-        ? getTerminalStateContent(toolResultMessage.status)
-        : artifactMetadata;
-  }
+  const resultContent = boundedContent.content || getTerminalStateContent(toolResultMessage.status);
   const consumedTokens = Math.min(availableTokenBudget, estimateTextTokens(resultContent));
   toolResultBudget.remainingTokens = Math.max(0, toolResultBudget.remainingTokens - consumedTokens);
   toolResultBudget.remainingResults = Math.max(0, toolResultBudget.remainingResults - 1);
@@ -827,25 +817,6 @@ function boundToolResultForBudget(
     content: resultContent,
     truncated: toolResultMessage.truncated || boundedContent.truncated,
   });
-}
-/** 将产物引用置于正文前，确保预算截断不会丢失回读入口。 */
-function addArtifactMetadata(
-  status: ToolResultMessage["status"],
-  artifact: ToolArtifactReference | undefined,
-): string {
-  if (artifact === undefined) {
-    return "";
-  }
-  return [
-    `toolStatus: ${status}`,
-    `artifactId: ${artifact.artifactId}`,
-    `artifactBytes: ${artifact.byteLength}`,
-    `artifactComplete: ${artifact.complete}`,
-    ...(artifact.complete
-      ? []
-      : [`artifactIncompleteReason: ${artifact.incompleteReason ?? "unknown"}`]),
-    "可使用 read_artifact 通过 artifactId 分页读取已保存原文。",
-  ].join("\n");
 }
 /** 预算截断时区分可回读、部分保存和完全未保存的结果。 */
 function getToolResultTruncationMarker(content: string, artifactAvailable: boolean): string {

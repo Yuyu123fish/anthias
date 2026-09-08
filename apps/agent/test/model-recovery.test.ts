@@ -32,6 +32,69 @@ afterEach(async () => {
 });
 
 describe("bounded ordinary model recovery", () => {
+  it.each(["span", "delta"] as const)(
+    "retains an empty reasoning %s only in the current model message",
+    async (source) => {
+      const events = await collect(
+        streamAssistantMessage(
+          async function* () {
+            if (source === "span") yield { type: "reasoning_start" };
+            yield { type: "reasoning_delta", delta: "" };
+            if (source === "span") yield { type: "reasoning_end" };
+            yield { type: "text_delta", delta: "answer" };
+            yield { type: "finish", finishReason: "stop" };
+          },
+          request,
+          new AbortController().signal,
+        ),
+      );
+      expect(events.map((event) => event.type)).toEqual(["start", "update", "finish"]);
+      expect(events.at(-1)).toMatchObject({
+        message: { content: [{ type: "text", text: "answer" }], status: "completed" },
+        modelInputMessage: {
+          content: [
+            { type: "reasoning", text: "" },
+            { type: "text", text: "answer" },
+          ],
+        },
+      });
+    },
+  );
+
+  it("discards empty reasoning from a failed attempt before retrying", async () => {
+    vi.useFakeTimers();
+    let requestCount = 0;
+    const rawModelStream: ModelStream = async function* () {
+      requestCount += 1;
+      if (requestCount === 1) {
+        yield { type: "reasoning_start" };
+        yield { type: "reasoning_delta", delta: "" };
+        throw new ModelRequestError("service");
+      }
+      yield { type: "text_delta", delta: "answer" };
+      yield { type: "finish", finishReason: "stop" };
+    };
+    const completion = collect(
+      streamAssistantMessage(
+        (modelRequest, abortSignal) =>
+          retryModelStream({
+            modelStream: rawModelStream,
+            request: modelRequest,
+            abortSignal,
+            state: { retryCount: 0, deliveredContent: false },
+          }),
+        request,
+        new AbortController().signal,
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    expect((await completion).at(-1)).toMatchObject({
+      message: { status: "completed", diagnostic: { retryCount: 1 } },
+      modelInputMessage: { content: [{ type: "text", text: "answer" }] },
+    });
+    expect(requestCount).toBe(2);
+  });
+
   it("retries two temporary failures and counts every real request once", async () => {
     vi.useFakeTimers();
     let requests = 0;

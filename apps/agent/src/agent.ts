@@ -242,15 +242,15 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     if (currentAgent.state.running)
       return { ok: false, error: "主 Agent 正在执行，请等待或停止后再发起操作。" };
     currentRuntime.coordinator.beginTask();
-    const result = await currentAgent.runTool(toolName, input);
-    if (result.status !== "completed")
+    const toolRunPromptResult = await currentAgent.runTool(toolName, input);
+    if (toolRunPromptResult.status !== "completed")
       return {
         ok: false,
         error:
-          result.status === "failed"
-            ? result.error
-            : result.status === "rejected"
-              ? result.reason
+          toolRunPromptResult.status === "failed"
+            ? toolRunPromptResult.error
+            : toolRunPromptResult.status === "rejected"
+              ? toolRunPromptResult.reason
               : "操作已停止。",
       };
     const toolResult = currentAgent.state.messageHistory.findLast(

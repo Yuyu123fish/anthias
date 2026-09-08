@@ -329,7 +329,7 @@ describe("Anthias CLI", () => {
     await expect(stat(absoluteSessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("accepts Plan and AutoAllow modes and rejects an unknown mode before startup", async () => {
+  it("accepts Plan, AutoAllow and FullAccess modes and rejects an unknown mode before startup", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = {
@@ -350,9 +350,13 @@ describe("Anthias CLI", () => {
     const autoResult = spawnCli(["--mode", "auto_allow"], environment, workspaceRoot, "/exit\n");
     expect(autoResult.status).toBe(0);
     expect(autoResult.stdout).toContain("Mode: AutoAllow\n");
+    const fullResult = spawnCli(["--mode", "full_access"], environment, workspaceRoot, "/exit\n");
+    expect(fullResult.status).toBe(0);
+    expect(fullResult.stdout).toContain("Mode: FullAccess\n");
+    expect(fullResult.stdout).toContain("访问能力不等于任务授权");
     const invalidResult = spawnCli(["--mode", "unsafe"], environment, workspaceRoot);
     expect(invalidResult.status).toBe(1);
-    expect(invalidResult.stderr).toContain("--mode <agent|plan|auto_allow>");
+    expect(invalidResult.stderr).toContain("--mode <agent|plan|auto_allow|full_access>");
   });
 
   it("rejects an invalid --session UUID without a model request", async () => {

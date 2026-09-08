@@ -636,7 +636,7 @@ describe("daily usage interactions", () => {
     clickText(harness.terminal, "/help · [详情]");
     await screenContains(harness.terminal, "详情 2/2");
     harness.terminal.send("\u001b[1;5F");
-    await screenContains(harness.terminal, "Shift+Enter");
+    await screenContains(harness.terminal, "// 开头会将一个 /");
     harness.terminal.send("\u001b");
     await screenContains(harness.terminal, "AFTER_COMMAND");
     harness.emit({
@@ -758,6 +758,28 @@ describe("daily usage interactions", () => {
       if (interactive) await screenContains(harness.terminal, "自动审核不等于工作区授权");
       else await vi.waitFor(() => expect(harness.plain()).toContain("自动审核不等于工作区授权"));
       expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+      expect(harness.agent.prompt).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, false])(
+    "shows FullAccess and explains how to leave it with interactive=%s",
+    async (interactive) => {
+      const harness = createHarness(interactive, 130, 32, undefined, {
+        permissionMode: "full_access",
+      });
+      if (interactive) await screenContains(harness.terminal, "访问能力不等于任务授权");
+      else await vi.waitFor(() => expect(harness.plain()).toContain("Mode: FullAccess"));
+      if (interactive) {
+        harness.terminal.send("/permissions revoke");
+        harness.terminal.send("\r");
+        await screenContains(harness.terminal, "FullAccess 仍然生效");
+      } else {
+        harness.input.write("/permissions revoke\n");
+        await vi.waitFor(() => expect(harness.plain()).toContain("FullAccess 仍然生效"));
+      }
+      expect(harness.agent.state.permissionMode).toBe("full_access");
+      expect(harness.agent.setPermissionMode).not.toHaveBeenCalled();
       expect(harness.agent.prompt).not.toHaveBeenCalled();
     },
   );

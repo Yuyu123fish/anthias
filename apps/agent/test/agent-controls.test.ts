@@ -228,7 +228,13 @@ describe("Agent capability controls", () => {
     expect((await agent.prompt("调用这个 MCP 工具")).status).toBe("completed");
     expect(called).toBe(1);
     const toolMessage = session.messageHistory.find((message) => message.role === "tool");
-    expect(toolMessage?.role === "tool" && toolMessage.artifact?.complete).toBe(true);
+    expect(toolMessage).toMatchObject({
+      role: "tool",
+      status: "completed",
+      content: "result",
+      truncated: false,
+    });
+    expect(toolMessage?.artifact).toBeUndefined();
   });
 });
 

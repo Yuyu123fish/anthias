@@ -1,12 +1,9 @@
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
 import type { PermissionMode } from "../permission/permission-mode.js";
 import { decideToolPolicy, type ToolPolicyDecision } from "../permission/tool-policy.js";
-import type {
-  ArtifactSourceStatus,
-  ArtifactWriter,
-  SessionArtifactStore,
-} from "../session/artifacts.js";
+import type { SessionArtifactStore } from "../session/artifacts.js";
 import type { SessionShell } from "../session/index.js";
 import { prepareEditFileTool, validateEditFileToolCallInput } from "./basetool/edit-file.js";
 import {
@@ -87,18 +84,20 @@ type ImmediateToolResult = Readonly<{
   truncated: boolean;
 }>;
 
-type ToolExecutionOutcome = ToolExecutionResult &
-  Readonly<{
-    cleanupUncertain?: boolean;
-  }>;
-
 /** 表示 ToolCall 已形成可执行计划，或可以立即返回安全结果。 */
 export type ToolCallPreparation =
   | Readonly<{ ok: true; preparedExecution: PreparedToolExecution }>
   | Readonly<{ ok: false; result: ImmediateToolResult }>;
 
 /** 描述单个调用对整个 Tool Batch 调度方式的要求。 */
-export type ToolCallScheduling = "parallel_read_only" | "source_order_serial";
+export type ToolCallScheduling =
+  | "parallel"
+  | "serial"
+  | Readonly<{
+      path: string;
+      access: "read" | "write";
+      recursive?: boolean;
+    }>;
 
 /** 隐藏具体 Tool 分派，并提供统一的无副作用预检入口。 */
 export type ToolCallPlan = Readonly<{
@@ -118,7 +117,13 @@ export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
   });
   return Object.freeze({
     createPlan: (toolCall, permissionMode) =>
-      createToolCallPlan(toolCall, permissionMode, runnerOptions),
+      createToolCallPlan(toolCall, permissionMode, {
+        ...runnerOptions,
+        workspace: {
+          ...runnerOptions.workspace,
+          allowExternalPaths: permissionMode === "full_access",
+        },
+      }),
   });
 }
 
@@ -129,40 +134,37 @@ function createToolCallPlan(
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   if (toolCall.toolName === "read_file") {
-    const validationError = validateReadFileToolCallInput(toolCall);
+    const validationError = validateReadFileToolCallInput(toolCall, options.workspace);
     return validationError === null
       ? createReadOnlyToolCallPlan(
           toolCall,
           "read_file",
           permissionMode,
           options.workspace,
-          options.artifactStore,
           executeReadFileTool,
         )
       : createRejectedToolCallPlan(validationError);
   }
   if (toolCall.toolName === "glob") {
-    const validationError = validateGlobToolCallInput(toolCall);
+    const validationError = validateGlobToolCallInput(toolCall, options.workspace);
     return validationError === null
       ? createReadOnlyToolCallPlan(
           toolCall,
           "glob",
           permissionMode,
           options.workspace,
-          options.artifactStore,
           executeGlobTool,
         )
       : createRejectedToolCallPlan(validationError);
   }
   if (toolCall.toolName === "grep") {
-    const validationError = validateGrepToolCallInput(toolCall);
+    const validationError = validateGrepToolCallInput(toolCall, options.workspace);
     return validationError === null
       ? createReadOnlyToolCallPlan(
           toolCall,
           "grep",
           permissionMode,
           options.workspace,
-          options.artifactStore,
           executeGrepTool,
         )
       : createRejectedToolCallPlan(validationError);
@@ -224,12 +226,10 @@ function createReadOnlyToolCallPlan(
   toolName: ReadOnlyToolName,
   permissionMode: PermissionMode,
   workspace: ToolWorkspace,
-  artifactStore: SessionArtifactStore | undefined,
   executeTool: (
     toolCall: AssistantToolCallPart,
     workspace: ToolWorkspace,
     abortSignal: AbortSignal,
-    artifactWriter?: ArtifactWriter,
   ) => Promise<ToolExecutionResult>,
 ): ToolCallPlan {
   const policyDecision = decideToolPolicy({ permissionMode, toolName });
@@ -237,7 +237,7 @@ function createReadOnlyToolCallPlan(
     return createPolicyDeniedPlan(policyDecision);
   }
   return Object.freeze({
-    scheduling: "parallel_read_only",
+    scheduling: fileAccess(toolCall, workspace, "read"),
     abortedPreparationContent: "Tool 执行已停止。",
     prepare: () =>
       Promise.resolve(
@@ -248,32 +248,14 @@ function createReadOnlyToolCallPlan(
             activitySummary: createReadOnlyToolActivitySummary(toolCall, toolName),
             executionUnavailableContent: "Run 已停止，Tool 未执行。",
             async execute(abortSignal: AbortSignal) {
-              let artifactWriter: ArtifactWriter | undefined;
               try {
-                artifactWriter = artifactStore?.createWriter(toolCall.toolCallId);
+                return {
+                  ...(await executeTool(toolCall, workspace, abortSignal)),
+                  cleanupUncertain: false,
+                };
               } catch {
-                artifactWriter = undefined;
+                return failedExecution(false);
               }
-              let executionResult: ToolExecutionResult;
-              try {
-                executionResult = await executeTool(
-                  toolCall,
-                  workspace,
-                  abortSignal,
-                  artifactWriter,
-                );
-              } catch {
-                executionResult = Object.freeze({
-                  status: "failed",
-                  content: "Tool 执行失败。",
-                  truncated: false,
-                });
-              }
-              return attachArtifactResult(
-                executionResult,
-                artifactWriter,
-                toArtifactSourceStatus(executionResult.status, abortSignal),
-              );
             },
           }),
         }),
@@ -292,7 +274,7 @@ function createFileToolCallPlan(
   ) => Promise<PreparedFileResult>,
 ): ToolCallPlan {
   return Object.freeze({
-    scheduling: "source_order_serial",
+    scheduling: fileAccess(toolCall, workspace, "write"),
     abortedPreparationContent: "Run 已停止，文件未写入。",
     async prepare() {
       const preparedResult = await prepareTool(toolCall, workspace);
@@ -305,7 +287,7 @@ function createFileToolCallPlan(
         toolName: preparedTool.toolName,
         externalFile: preparedTool.scope === "external",
       });
-      if (policyDecision.kind !== "ask") {
+      if (policyDecision.kind === "deny") {
         return Object.freeze({ ok: false, result: policyResult(policyDecision) });
       }
       return Object.freeze({
@@ -337,7 +319,7 @@ function createCommandToolCallPlan(
   options: CreateToolRunnerOptions,
 ): ToolCallPlan {
   return Object.freeze({
-    scheduling: "source_order_serial",
+    scheduling: "serial",
     abortedPreparationContent: "Run 已停止，命令未启动。",
     async prepare() {
       const preparedResult = await prepareCommandTool(toolCall, options.workspace, options.shell);
@@ -353,9 +335,6 @@ function createCommandToolCallPlan(
       if (policyDecision.kind === "deny") {
         return Object.freeze({ ok: false, result: policyResult(policyDecision) });
       }
-      if (policyDecision.kind !== "ask") {
-        throw new Error("execute_command Policy 必须是 ask 或 deny。");
-      }
       return Object.freeze({
         ok: true,
         preparedExecution: Object.freeze({
@@ -368,30 +347,10 @@ function createCommandToolCallPlan(
             abortSignal: AbortSignal,
             publishUpdate: (update: ToolExecutionUpdate) => void,
           ) {
-            let artifactWriter: ArtifactWriter | undefined;
             try {
-              artifactWriter = options.artifactStore?.createWriter(toolCall.toolCallId);
+              return await executePreparedCommand(preparedTool, abortSignal, publishUpdate);
             } catch {
-              artifactWriter = undefined;
-            }
-            try {
-              const executionResult = await executePreparedCommand(
-                preparedTool,
-                abortSignal,
-                publishUpdate,
-                artifactWriter,
-              );
-              return attachArtifactResult(
-                executionResult,
-                artifactWriter,
-                toArtifactSourceStatus(executionResult.status, abortSignal),
-              );
-            } catch {
-              return attachArtifactResult(
-                failedExecution(true),
-                artifactWriter,
-                toArtifactSourceStatus("failed", abortSignal),
-              );
+              return failedExecution(true);
             }
           },
         }),
@@ -448,7 +407,7 @@ function createReadArtifactToolCallPlan(
     return createPolicyDeniedPlan(policyDecision);
   }
   return Object.freeze({
-    scheduling: "parallel_read_only",
+    scheduling: "parallel",
     abortedPreparationContent: "Tool 执行已停止。",
     prepare: () =>
       Promise.resolve(
@@ -498,7 +457,7 @@ function createToolActivitySummary(summary: string): string {
 /** 创建 Permission 或 hard danger 的不可批准结果。 */
 function createPolicyDeniedPlan(policyDecision: ToolPolicyDecision): ToolCallPlan {
   return Object.freeze({
-    scheduling: "source_order_serial",
+    scheduling: "serial",
     abortedPreparationContent: "Tool 未执行。",
     prepare: () =>
       Promise.resolve(Object.freeze({ ok: false, result: policyResult(policyDecision) })),
@@ -508,7 +467,7 @@ function createPolicyDeniedPlan(policyDecision: ToolPolicyDecision): ToolCallPla
 /** 创建无效输入或未知 Tool 的直接失败计划。 */
 function createRejectedToolCallPlan(content: string): ToolCallPlan {
   return Object.freeze({
-    scheduling: "source_order_serial",
+    scheduling: "serial",
     abortedPreparationContent: "Tool 未执行。",
     prepare: () =>
       Promise.resolve(
@@ -564,44 +523,17 @@ function failedExecution(
   });
 }
 
-/** 在 Agent Loop 预算收口前统一保留已产生的原文，小产物仍受 Session 配额和清理约束。 */
-async function attachArtifactResult(
-  executionResult: ToolExecutionOutcome,
-  artifactWriter: ArtifactWriter | undefined,
-  sourceStatus: ArtifactSourceStatus,
-): Promise<ToolExecutionOutcome & Readonly<{ cleanupUncertain: boolean }>> {
-  const cleanupUncertain = executionResult.cleanupUncertain === true;
-  if (artifactWriter === undefined) {
-    // store 关闭、ToolCall ID 无效，或 createWriter 抛错
-    return Object.freeze({ ...executionResult, cleanupUncertain });
-  }
-  const pendingOrWrittenByteLength = artifactWriter.byteLength + artifactWriter.pendingByteLength;
-  // 有待写入字节、结果被截断、有未完成标记都应保留原文
-  const retainArtifact =
-    pendingOrWrittenByteLength > 0 || executionResult.truncated || artifactWriter.hasIncomplete;
-  let artifactReference: Awaited<ReturnType<ArtifactWriter["finish"]>>;
-  try {
-    artifactReference = await artifactWriter.finish(sourceStatus, retainArtifact);
-  } catch {
-    artifactReference = null;
-  }
-  if (artifactReference === null) {
-    return Object.freeze({
-      ...executionResult,
-      content:
-        retainArtifact && artifactWriter.hasIncomplete
-          ? `${executionResult.content}\n...[原文产物未完整保存]`
-          : executionResult.content,
-      truncated: executionResult.truncated || (retainArtifact && artifactWriter.hasIncomplete),
-      cleanupUncertain,
-    });
-  }
-  return Object.freeze({ ...executionResult, artifact: artifactReference, cleanupUncertain });
-}
-
-function toArtifactSourceStatus(
-  status: ToolExecutionResult["status"],
-  abortSignal: AbortSignal,
-): ArtifactSourceStatus {
-  return abortSignal.aborted ? "aborted" : status === "completed" ? "completed" : "failed";
+function fileAccess(
+  toolCall: AssistantToolCallPart,
+  workspace: ToolWorkspace,
+  access: "read" | "write",
+): ToolCallScheduling {
+  const input = toolCall.input;
+  if (!isRecord(input)) return "serial";
+  const path = typeof input.path === "string" ? input.path : ".";
+  return {
+    path: resolve(workspace.workspaceRoot, path),
+    access,
+    recursive: toolCall.toolName === "glob" || toolCall.toolName === "grep",
+  };
 }

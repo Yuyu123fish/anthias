@@ -132,7 +132,7 @@ export type RequestUsageDetails = Readonly<{
 export type ApprovalDecisionDetails = Readonly<{
   toolCallId: string;
   toolName: string;
-  permissionMode: "agent" | "plan" | "auto_allow";
+  permissionMode: "agent" | "plan" | "auto_allow" | "full_access";
   decisionSource: "user" | "auto_review" | "policy" | "workspace";
   decision: "allowed" | "denied" | "needs_user";
   reason: string;
@@ -860,16 +860,13 @@ export function validateSessionRecords(
         approvalDecisionsByToolCall.get(record.toolCallId) ?? [],
       );
       const referencedToolCall = toolCalls.get(record.toolCallId);
-      const firstUnresolvedToolCallId = activeRunToolCallIds.find(
-        (toolCallId) => !toolCalls.get(toolCallId)?.resolved,
-      );
+      // 同一批次可有多个已批准但未完成的副作用，结果仍在独立分支按源顺序校验。
       if (
         referencedToolCall === undefined ||
         referencedToolCall.runId !== record.runId ||
         referencedToolCall.toolName !== record.toolName ||
         referencedToolCall.started ||
         referencedToolCall.resolved ||
-        firstUnresolvedToolCallId !== record.toolCallId ||
         toolApprovalRequestIds.has(record.toolApprovalRequestId)
       ) {
         throw new Error("Session ToolExecutionStarted 引用无效或重复。");
@@ -1493,7 +1490,7 @@ function isRequestUsagePurpose(value: unknown): value is RequestUsageDetails["pu
 }
 
 function isPermissionMode(value: unknown): value is ApprovalDecisionDetails["permissionMode"] {
-  return value === "agent" || value === "plan" || value === "auto_allow";
+  return value === "agent" || value === "plan" || value === "auto_allow" || value === "full_access";
 }
 
 function isDecisionSource(value: unknown): value is ApprovalDecisionDetails["decisionSource"] {

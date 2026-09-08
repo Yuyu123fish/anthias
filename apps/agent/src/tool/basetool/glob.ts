@@ -1,5 +1,4 @@
 import type { AssistantToolCallPart } from "../../message.js";
-import type { ArtifactWriter } from "../../session/artifacts.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,
@@ -22,8 +21,11 @@ type GlobToolInput = Readonly<{
 }>;
 
 /** 只检查 glob 的运行时输入形状，不访问文件系统。 */
-export function validateGlobToolCallInput(toolCall: AssistantToolCallPart): string | null {
-  const inputResult = parseGlobToolInput(toolCall);
+export function validateGlobToolCallInput(
+  toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
+): string | null {
+  const inputResult = parseGlobToolInput(toolCall, workspace);
   return inputResult.ok ? null : inputResult.error;
 }
 
@@ -32,12 +34,11 @@ export async function executeGlobTool(
   toolCall: AssistantToolCallPart,
   workspace: ToolWorkspace,
   abortSignal: AbortSignal,
-  artifactWriter?: ArtifactWriter,
 ): Promise<ToolExecutionResult> {
   if (abortSignal.aborted) {
     return failedToolResult("Tool 执行已停止。");
   }
-  const inputResult = parseGlobToolInput(toolCall);
+  const inputResult = parseGlobToolInput(toolCall, workspace);
   if (!inputResult.ok) {
     return failedToolResult(inputResult.error);
   }
@@ -48,22 +49,17 @@ export async function executeGlobTool(
       workspace,
       abortSignal,
     );
-    const rendered = boundToolOutput([
+    const resultLines = [
       `pattern: ${inputResult.input.pattern}`,
       `base: ${inputResult.input.path}`,
       ...discoveredFiles.paths.map((file) => file.relativePath),
-    ]);
-    if (artifactWriter !== undefined) {
-      for (const file of discoveredFiles.paths) {
-        await artifactWriter.write(file.relativePath + "\n");
-      }
-      if (discoveredFiles.truncated) {
-        artifactWriter.markIncomplete("source_failed");
-      }
-    }
+    ];
+    const rendered = boundToolOutput(resultLines);
     return Object.freeze({
       status: "completed",
       content: rendered.content,
+      originalContent: resultLines.join("\n"),
+      ...(discoveredFiles.truncated ? { sourceIncomplete: "source_failed" as const } : {}),
       truncated: discoveredFiles.truncated || rendered.truncated,
     });
   } catch (error) {
@@ -76,6 +72,7 @@ export async function executeGlobTool(
 /** 解析 glob 的精确输入，拒绝未知字段和错误类型。 */
 function parseGlobToolInput(
   toolCall: AssistantToolCallPart,
+  workspace?: ToolWorkspace,
 ): Readonly<{ ok: true; input: GlobToolInput }> | Readonly<{ ok: false; error: string }> {
   if (toolCall.invalid || toolCall.toolName !== "glob") {
     return Object.freeze({
@@ -96,7 +93,8 @@ function parseGlobToolInput(
   }
   try {
     validateWorkspaceRelativePath(input.pattern, "glob pattern");
-    validateWorkspaceRelativePath(input.path ?? ".", "glob path");
+    if (!workspace?.allowExternalPaths)
+      validateWorkspaceRelativePath(input.path ?? ".", "glob path");
   } catch (error) {
     return Object.freeze({
       ok: false,

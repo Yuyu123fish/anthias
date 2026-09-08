@@ -37,7 +37,7 @@ export type ArtifactReadResult = Readonly<{
 export type ArtifactSourceStatus = "completed" | "failed" | "aborted";
 
 /** 一个 ToolCall 绑定的流式产物写入能力。 */
-export type ArtifactWriter = Readonly<{
+type ArtifactWriter = Readonly<{
   artifactId: string;
   toolCallId: string;
   readonly byteLength: number;
@@ -53,7 +53,12 @@ export type ArtifactWriter = Readonly<{
 
 /** Agent 为当前 Session 持有的产物能力。 */
 export type SessionArtifactStore = Readonly<{
-  createWriter(toolCallId: string): ArtifactWriter;
+  save(
+    toolCallId: string,
+    source: string | AsyncIterable<Uint8Array>,
+    sourceStatus?: ArtifactSourceStatus,
+    incompleteReason?: ToolArtifactIncompleteReason,
+  ): Promise<ToolArtifactReference | null>;
   registerReference(reference: ToolArtifactReference): void;
   readArtifact(
     request: ArtifactReadRequest,
@@ -421,7 +426,30 @@ export function createSessionArtifactStore(
   }
 
   return Object.freeze({
-    createWriter,
+    async save(toolCallId, source, sourceStatus = "completed", incompleteReason) {
+      const writer = createWriter(toolCallId);
+      try {
+        if (typeof source === "string") {
+          const bytes = Buffer.from(source, "utf8");
+          for (
+            let offset = 0;
+            offset < bytes.length && !writer.hasIncomplete;
+            offset += 64 * 1024
+          ) {
+            await writer.write(bytes.subarray(offset, offset + 64 * 1024));
+          }
+        } else {
+          for await (const chunk of source) {
+            await writer.write(chunk);
+            if (writer.hasIncomplete) break;
+          }
+        }
+      } catch {
+        writer.markIncomplete("source_failed");
+      }
+      if (incompleteReason !== undefined) writer.markIncomplete(incompleteReason);
+      return writer.finish(sourceStatus);
+    },
     registerReference,
     readArtifact,
     close,

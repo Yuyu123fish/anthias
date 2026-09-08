@@ -39,6 +39,13 @@ type AuthorizationSource = Readonly<{
   content: string;
 }>;
 
+type AssistantContext = Readonly<{
+  entryId: string;
+  seq: number;
+  source: "assistant";
+  content: string;
+}>;
+
 const APPROVAL_INPUT_TOKEN_LIMIT = 8_000;
 const APPROVAL_OUTPUT_TOKEN_LIMIT = 2_000;
 const APPROVAL_OUTPUT_CHARACTER_LIMIT = 8_000;
@@ -86,11 +93,39 @@ export async function reviewToolApproval(
   if (authorizationSources.length === 0) {
     return needsUser("没有可完整核验的真实用户授权，请人工确认。");
   }
-  const modelRequest = createReviewRequest(options, authorizationSources);
+  const authorizationRequest = createReviewRequest(options, authorizationSources);
   // 不截断或挑选部分用户原文，否则可能丢失仍有效的任务或后续限制。
-  if (estimateModelRequestTokens(modelRequest) > inputTokenLimit) {
+  if (estimateModelRequestTokens(authorizationRequest) > inputTokenLimit) {
     return needsUser(
       "全部真实用户原文与当前动作超过自动审核输入预算，无法完整核验任务及更新限制，请人工确认。",
+    );
+  }
+  // 用户之前的 Assistant 文本只解释编号或指代，不能自行成为授权；当前动作的自述不混入。
+  const lastUserSequence = authorizationSources.at(-1)?.seq ?? 0;
+  const assistantContext: AssistantContext[] = [];
+  for (const record of options.records) {
+    if (
+      record.seq >= lastUserSequence ||
+      record.type !== "message" ||
+      record.message.type !== "assistant"
+    )
+      continue;
+    const content = record.message.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("");
+    if (content.length > 0)
+      assistantContext.push({
+        entryId: record.entryId,
+        seq: record.seq,
+        source: "assistant",
+        content,
+      });
+  }
+  const modelRequest = createReviewRequest(options, authorizationSources, assistantContext);
+  if (estimateModelRequestTokens(modelRequest) > inputTokenLimit) {
+    return needsUser(
+      "完整用户授权与指代上下文超过自动审核输入预算，不能裁剪方案后判断授权，请人工确认。",
     );
   }
   if (options.abortSignal.aborted) {
@@ -163,6 +198,7 @@ export async function reviewToolApproval(
 function createReviewRequest(
   options: ReviewToolApprovalOptions,
   authorizationSources: readonly AuthorizationSource[],
+  assistantContext: readonly AssistantContext[] = [],
 ): ModelRequest {
   return Object.freeze({
     purpose: "approval",
@@ -186,6 +222,7 @@ function createReviewRequest(
             actionFingerprint: options.approvalPlan.actionFingerprint,
           },
           authorizationSources,
+          assistantContext,
         }),
       }),
     ]),

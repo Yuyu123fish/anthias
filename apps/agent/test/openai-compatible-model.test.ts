@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { access, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -5,11 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
+import { createContextBudget } from "../src/context/budget.js";
 import { readModelConfig } from "../src/model/model-config.js";
 import { ModelRequestError } from "../src/model/model-stream.js";
 import { createOpenAICompatibleModelStream } from "../src/model/openai-compatible-model.js";
+import { COMPACTION_SECTION_TITLES } from "../src/prompts/compaction-prompt.js";
 import {
   createSession,
+  openSession,
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
@@ -75,6 +79,221 @@ describe("createOpenAICompatibleModelStream", () => {
       { type: "text_delta", delta: "done" },
       { type: "finish", finishReason: "stop", usage: UNKNOWN_USAGE },
     ]);
+  });
+
+  it("preserves explicit empty reasoning without padding unrelated plain history", async () => {
+    let requestBody: { messages: Record<string, unknown>[] } | undefined;
+    const server = await startServer(async (request, response) => {
+      requestBody = JSON.parse(await readBody(request));
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      writeChunk(response, "done");
+      writeFinish(response, "stop");
+      response.end("data: [DONE]\n\n");
+    });
+    const address = server.address() as AddressInfo;
+    const modelStream = createOpenAICompatibleModelStream({
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      modelId: "test-model",
+      apiKey: "test-key",
+    });
+    await collect(
+      modelStream(
+        {
+          systemPrompt: "rules",
+          messages: [
+            { role: "user", content: "first" },
+            { role: "assistant", content: [{ type: "text", text: "plain" }] },
+            { role: "user", content: "second" },
+            {
+              role: "assistant",
+              content: [
+                { type: "reasoning", text: "" },
+                { type: "text", text: "empty" },
+              ],
+            },
+            { role: "user", content: "third" },
+            {
+              role: "assistant",
+              content: [
+                { type: "reasoning", text: "" },
+                { type: "reasoning", text: "first " },
+                { type: "reasoning", text: "second" },
+                { type: "text", text: "reasoned" },
+              ],
+            },
+            { role: "user", content: "continue" },
+          ],
+          tools: [],
+        },
+        new AbortController().signal,
+      ),
+    );
+    const assistantMessages = requestBody?.messages.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(assistantMessages).toEqual([
+      { role: "assistant", content: "plain" },
+      { role: "assistant", content: "empty", reasoning_content: "" },
+      { role: "assistant", content: "reasoned", reasoning_content: "first second" },
+    ]);
+  });
+
+  it("keeps tool reasoning valid across continuation, new runs, compaction and recovery", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-reasoning-continuation-"));
+    temporaryDirectories.add(workspaceRoot);
+    await writeFile(join(workspaceRoot, "note.txt"), "local source", "utf8");
+    const sessionDirectory = join(workspaceRoot, "sessions");
+    const shell = { kind: "powershell" as const, executable: "pwsh", arguments: [] };
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    const leaseResult = await session.acquireRun(randomUUID());
+    if (leaseResult.status !== "acquired") throw new Error("expected lease");
+    await leaseResult.lease.appendMessage({ role: "user", content: "old source ".repeat(3_000) });
+    await leaseResult.lease.appendMessage({
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "text", text: "previous plain answer" }],
+    });
+    await leaseResult.lease.appendRunFinished({ status: "completed" });
+    await leaseResult.lease.release();
+    const reasoningMarker = "CURRENT_RUN_REASONING";
+    const toolCallIds = Array.from({ length: 3 }, () => randomUUID());
+    const requestBodies: Array<{
+      messages: Array<{
+        role: string;
+        content?: string;
+        reasoning_content?: string;
+        tool_calls?: Array<{ id: string }>;
+        tool_call_id?: string;
+      }>;
+      tools?: unknown[];
+    }> = [];
+    const summary = COMPACTION_SECTION_TITLES.map((title) => `## ${title}\n已保留历史事实。`).join(
+      "\n\n",
+    );
+    const server = await startServer(async (request, response) => {
+      const requestBody = JSON.parse(await readBody(request)) as (typeof requestBodies)[number];
+      requestBodies.push(requestBody);
+      if (
+        requestBody.tools?.length &&
+        requestBody.messages.some(
+          (message) =>
+            message.role === "assistant" && typeof message.reasoning_content !== "string",
+        )
+      ) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            error: { code: "missing_reasoning_content", message: "reasoning required" },
+          }),
+        );
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      const toolCallId = toolCallIds[requestBodies.length - 1];
+      if (toolCallId !== undefined) {
+        if (requestBodies.length === 1) writeReasoningChunk(response, "");
+        if (requestBodies.length === 3) writeReasoningChunk(response, reasoningMarker);
+        writeToolCalls(response, [
+          { toolCallId, toolName: "read_file", input: '{"path":"note.txt"}' },
+        ]);
+        writeFinish(response, "tool_calls");
+      } else {
+        writeChunk(response, requestBody.tools?.length ? "读取完成。" : summary);
+        writeFinish(response, "stop");
+      }
+      response.end("data: [DONE]\n\n");
+    });
+    const address = server.address() as AddressInfo;
+    const modelStream = createOpenAICompatibleModelStream({
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+      modelId: "test-model",
+      apiKey: "test-key",
+    });
+    const modelContext = {
+      modelId: "test-model",
+      budget: createContextBudget(
+        { contextWindow: 128_000 },
+        { responseOutputTokens: 512, summaryOutputTokens: 512, retainedTokens: 4_000 },
+      ),
+    };
+    const agent = createAgentWithModelStream({ session, modelStream, modelContext });
+    const executionEvents: AgentEvent[] = [];
+    agent.subscribe((event) => executionEvents.push(event));
+    try {
+      expect(await agent.prompt("读取 note.txt 三次")).toEqual({ status: "completed" });
+      expect(requestBodies).toHaveLength(4);
+      const continuationToolMessages = requestBodies[3]?.messages.filter(
+        (message) => message.tool_calls,
+      );
+      expect(continuationToolMessages?.map((message) => message.reasoning_content)).toEqual([
+        "",
+        "",
+        reasoningMarker,
+      ]);
+      expect(
+        requestBodies[3]?.messages
+          .filter((message) => message.role === "tool")
+          .map((message) => message.tool_call_id),
+      ).toEqual(toolCallIds);
+      expect(await agent.prompt("解释已有结果")).toEqual({ status: "completed" });
+      expect(requestBodies).toHaveLength(5);
+      expect(JSON.stringify(requestBodies[4])).not.toContain(reasoningMarker);
+
+      expect(JSON.stringify(agent.state)).not.toContain(reasoningMarker);
+    } finally {
+      await agent.close();
+    }
+    const reopenedSession = await openSession({
+      workspaceRoot,
+      sessionDirectory,
+      shell,
+      sessionId: session.sessionId,
+    });
+    const restoredAgent = createAgentWithModelStream({
+      session: reopenedSession,
+      modelStream,
+      modelContext,
+    });
+    restoredAgent.subscribe((event) => executionEvents.push(event));
+    try {
+      expect(requestBodies).toHaveLength(5);
+      expect(await restoredAgent.prompt("恢复后继续")).toEqual({ status: "completed" });
+      expect(requestBodies).toHaveLength(6);
+      expect(requestBodies[5]?.messages.filter((message) => message.role === "tool")).toHaveLength(
+        3,
+      );
+      expect(await restoredAgent.compact()).toEqual({ ok: true, value: undefined });
+      expect(reopenedSession.records.some((record) => record.type === "compaction")).toBe(true);
+      expect(requestBodies).toHaveLength(7);
+      expect(requestBodies[6]?.messages.map((message) => message.role)).toEqual(["system", "user"]);
+      expect(requestBodies[6]?.tools ?? []).toEqual([]);
+      expect(await restoredAgent.prompt("压缩后继续")).toEqual({ status: "completed" });
+      expect(requestBodies).toHaveLength(8);
+      expect(
+        requestBodies[7]?.messages.some((message) => message.content?.includes("已保存历史的摘要")),
+      ).toBe(true);
+      expect(requestBodies[7]?.messages.filter((message) => message.role === "tool")).toEqual([]);
+      expect(
+        restoredAgent.state.messageHistory.filter((message) => message.role === "tool"),
+      ).toHaveLength(3);
+      expect(executionEvents.filter((event) => event.type === "tool_execution_start")).toHaveLength(
+        3,
+      );
+      expect(executionEvents.some((event) => event.type === "model_retry")).toBe(false);
+      for (const requestBody of requestBodies.slice(4)) {
+        expect(JSON.stringify(requestBody)).not.toContain(reasoningMarker);
+        for (const message of requestBody.messages.filter(
+          (message) => message.role === "assistant",
+        )) {
+          expect(message.reasoning_content).toBe("");
+        }
+      }
+      expect(await readFile(join(session.storageDirectory, "session.jsonl"), "utf8")).not.toContain(
+        reasoningMarker,
+      );
+    } finally {
+      await restoredAgent.close();
+    }
   });
 
   it("streams text through one local OpenAI-compatible request", async () => {

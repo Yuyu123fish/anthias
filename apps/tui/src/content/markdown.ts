@@ -28,14 +28,14 @@ export function createMarkdownContent(options: {
   codeHighlighter?: CodeHighlighter;
 }): MarkdownContent {
   const { capabilities } = options;
-  const fileReferences = new Map<string, Promise<ResolvedFileReference | null>>();
+  const fileReferencePromises = new Map<string, Promise<ResolvedFileReference | null>>();
   const allowedFileUrls = new Set<string>();
   const highlightedBlocks = new Map<string, string[]>();
-  const pendingHighlights = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingHighlightTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let currentText = "";
   let revision = 0;
   let closed = false;
-  let fileTimer: ReturnType<typeof setTimeout> | undefined;
+  let fileDecorationTimer: ReturnType<typeof setTimeout> | undefined;
   const theme: MarkdownTheme = {
     ...createTheme(capabilities).markdown,
     highlightCode(code, language = "") {
@@ -47,23 +47,23 @@ export function createMarkdownContent(options: {
         language &&
         Buffer.byteLength(code) <= 64 * 1024 &&
         code.split("\n").length <= 2_000 &&
-        !pendingHighlights.has(key) &&
+        !pendingHighlightTimers.has(key) &&
         !closed
       ) {
         // 限制排队高亮的版本数；同一正文中的多个代码块仍能独立完成。
-        if (pendingHighlights.size >= 8) {
-          const oldest = pendingHighlights.entries().next().value;
+        if (pendingHighlightTimers.size >= 8) {
+          const oldest = pendingHighlightTimers.entries().next().value;
           if (oldest !== undefined) {
             clearTimeout(oldest[1]);
-            pendingHighlights.delete(oldest[0]);
+            pendingHighlightTimers.delete(oldest[0]);
           }
         }
         const timer = setTimeout(() => {
-          pendingHighlights.delete(key);
+          pendingHighlightTimers.delete(key);
           void highlight(code, language, key);
         }, 60);
         timer.unref();
-        pendingHighlights.set(key, timer);
+        pendingHighlightTimers.set(key, timer);
       }
       return code.split("\n");
     },
@@ -75,12 +75,14 @@ export function createMarkdownContent(options: {
       const highlighter =
         options.codeHighlighter ??
         (await import("../syntax-highlighter.js")).highlightCodeWithShiki;
-      const tokens = await highlighter(code, language);
+      const highlightedCodeLines = await highlighter(code, language);
       if (closed) return;
-      const source = tokens?.map((line) => line.map((token) => token.text).join("")).join("\n");
+      const source = highlightedCodeLines
+        ?.map((line) => line.map((token) => token.text).join(""))
+        .join("\n");
       const lines =
-        source === code && tokens !== null
-          ? tokens.map((line) =>
+        source === code && highlightedCodeLines !== null
+          ? highlightedCodeLines.map((line) =>
               line
                 .map((token) =>
                   token.color === null
@@ -103,9 +105,9 @@ export function createMarkdownContent(options: {
   }
 
   async function decorateFiles(text: string, capturedRevision: number): Promise<void> {
-    const workspacePath = realpath(options.workspaceRoot);
+    const workspaceRealPathPromise = realpath(options.workspaceRoot);
     // realpath 的拒绝只进入受控文件解析结果，不成为无订阅的 Promise rejection。
-    void workspacePath.catch(() => undefined);
+    void workspaceRealPathPromise.catch(() => undefined);
     const lines = text.split("\n");
     let fence: string | undefined;
     const renderedLines: string[] = [];
@@ -126,18 +128,18 @@ export function createMarkdownContent(options: {
       let previousEnd = 0;
       for (const match of matches) {
         const candidate = (match[2] ?? match[4] ?? "").replace(/^<|>$/gu, "");
-        let reference = fileReferences.get(candidate);
-        if (reference === undefined && fileReferences.size < 128) {
-          reference = resolveWorkspaceFileReference(candidate, workspacePath);
-          fileReferences.set(candidate, reference);
+        let fileReferencePromise = fileReferencePromises.get(candidate);
+        if (fileReferencePromise === undefined && fileReferencePromises.size < 128) {
+          fileReferencePromise = resolveWorkspaceFileReference(candidate, workspaceRealPathPromise);
+          fileReferencePromises.set(candidate, fileReferencePromise);
         }
-        const file = await reference;
+        const resolvedFileReference = await fileReferencePromise;
         resolvedLine += line.slice(previousEnd, match.index);
-        if (file != null) {
-          allowedFileUrls.add(file.fileUrl);
+        if (resolvedFileReference != null) {
+          allowedFileUrls.add(resolvedFileReference.fileUrl);
           const markerText = capabilities.unicode ? "▧" : "[file]";
-          const label = `${markerText} ${file.relativePath}${file.line === undefined ? "" : `:${file.line}`}${file.column === undefined ? "" : `:${file.column}`}`;
-          resolvedLine += `[${label.replace(/[[\]\\]/gu, "\\$&")}](${file.fileUrl})`;
+          const label = `${markerText} ${resolvedFileReference.relativePath}${resolvedFileReference.line === undefined ? "" : `:${resolvedFileReference.line}`}${resolvedFileReference.column === undefined ? "" : `:${resolvedFileReference.column}`}`;
+          resolvedLine += `[${label.replace(/[[\]\\]/gu, "\\$&")}](${resolvedFileReference.fileUrl})`;
         } else resolvedLine += match[0];
         previousEnd = match.index + match[0].length;
       }
@@ -156,13 +158,13 @@ export function createMarkdownContent(options: {
       currentText = safeText;
       revision += 1;
       markdown.setText(safeText);
-      if (fileTimer !== undefined) clearTimeout(fileTimer);
+      if (fileDecorationTimer !== undefined) clearTimeout(fileDecorationTimer);
       const capturedRevision = revision;
-      fileTimer = setTimeout(() => {
-        fileTimer = undefined;
+      fileDecorationTimer = setTimeout(() => {
+        fileDecorationTimer = undefined;
         void decorateFiles(safeText, capturedRevision).catch(() => undefined);
       }, 80);
-      fileTimer.unref();
+      fileDecorationTimer.unref();
     },
     render(width) {
       return markdown.render(width).map((line) => {
@@ -184,9 +186,9 @@ export function createMarkdownContent(options: {
     },
     close() {
       closed = true;
-      if (fileTimer !== undefined) clearTimeout(fileTimer);
-      for (const timer of pendingHighlights.values()) clearTimeout(timer);
-      pendingHighlights.clear();
+      if (fileDecorationTimer !== undefined) clearTimeout(fileDecorationTimer);
+      for (const timer of pendingHighlightTimers.values()) clearTimeout(timer);
+      pendingHighlightTimers.clear();
     },
   };
 }

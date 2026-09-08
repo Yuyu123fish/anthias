@@ -8,7 +8,6 @@ import type { McpConnections, McpContent } from "./mcp/index.js";
 import type { AssistantToolCallPart } from "./message.js";
 import type { ModelRequest } from "./model/model-stream.js";
 import type { PermissionMode } from "./permission/permission-mode.js";
-import type { SessionArtifactStore } from "./session/artifacts.js";
 import type { SkillContent, SkillLibrary } from "./skill/index.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 import { isRecord } from "./tool/input-validation.js";
@@ -22,7 +21,6 @@ export function createExternalCapabilities(options: {
   sources: ContextSources;
   skills: SkillLibrary | undefined;
   mcp: McpConnections | undefined;
-  artifactStore: SessionArtifactStore;
 }) {
   const activeSources = options.sources.active;
   const skillDiagnostics = new Map<string, string>();
@@ -232,7 +230,7 @@ export function createExternalCapabilities(options: {
 
   function rejected(content: string, denied = false): ToolCallPlan {
     return {
-      scheduling: "source_order_serial",
+      scheduling: "serial",
       abortedPreparationContent: "外部能力未执行。",
       prepare: async () => ({
         ok: false,
@@ -276,7 +274,7 @@ export function createExternalCapabilities(options: {
     }
     const fingerprint = digest(JSON.stringify({ tool: mcpTool, input }));
     return {
-      scheduling: "source_order_serial",
+      scheduling: "serial",
       abortedPreparationContent: "外部能力未执行。",
       prepare: async () => ({
         ok: true,
@@ -297,7 +295,7 @@ export function createExternalCapabilities(options: {
             ? `${mcpTool.serverId} / ${mcpTool.originalName}`
             : call.toolName,
           executionUnavailableContent: "Run 已停止，外部能力未执行。",
-          async execute(signal, _publishUpdate, resultTokenBudget) {
+          async execute(signal, _publishUpdate, _resultTokenBudget) {
             if (signal.aborted)
               return {
                 status: "failed",
@@ -357,23 +355,14 @@ export function createExternalCapabilities(options: {
                     truncated: false,
                     cleanupUncertain: true,
                   };
-                const writer = options.artifactStore.createWriter(call.toolCallId);
-                await writer.write(result.value.originalText ?? result.value.text);
-                if (result.value.sourceTruncated) writer.markIncomplete("source_failed");
-                const artifact = await writer.finish(
-                  result.value.isError ? "failed" : "completed",
-                  true,
-                );
-                const maxCharacters = Math.min(
-                  32768,
-                  Math.max(256, (resultTokenBudget ?? 4000) * 2),
-                );
-                const preview = result.value.text.slice(0, maxCharacters);
                 return {
                   status: result.value.isError ? "failed" : "completed",
-                  content: preview,
-                  truncated: result.value.truncated || preview.length < result.value.text.length,
-                  ...(artifact ? { artifact } : {}),
+                  content: result.value.text,
+                  originalContent: result.value.originalText ?? result.value.text,
+                  ...(result.value.sourceTruncated
+                    ? { sourceIncomplete: "source_failed" as const }
+                    : {}),
+                  truncated: result.value.truncated,
                   cleanupUncertain: false,
                 };
               }

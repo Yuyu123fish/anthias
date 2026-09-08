@@ -64,10 +64,12 @@ export function createOpenAICompatibleModelStream({
           }),
         ]),
       );
-      const streamResult = streamText({
+      const modelStreamResult = streamText({
         model: provider.chatModel(modelId),
         system: modelRequest.systemPrompt,
-        messages: modelRequest.messages.map(toProviderMessage),
+        messages: modelRequest.messages.map((message) =>
+          toProviderMessage(message, modelRequest.tools.length > 0),
+        ),
         tools: modelTools,
         abortSignal,
         maxRetries: 0,
@@ -81,7 +83,7 @@ export function createOpenAICompatibleModelStream({
       });
 
       // fullStream 保留 error part，Adapter 才能在不暴露 Provider 细节时可靠地让本轮失败。
-      yield* streamModelEvents(streamResult.fullStream);
+      yield* streamModelEvents(modelStreamResult.fullStream);
     } catch (error) {
       throw normalizeModelError(error, summarizeModelRequest(modelRequest, maxOutputTokens));
     }
@@ -167,11 +169,17 @@ async function* streamModelEvents(
 }
 
 /** 将 Agent 自有消息投影转换为 AI SDK ModelMessage。 */
-function toProviderMessage(message: ModelInputMessage): ModelMessage {
+function toProviderMessage(message: ModelInputMessage, hasRequestTools: boolean): ModelMessage {
   if (message.role === "user") {
     return { role: "user", content: message.content };
   }
   if (message.role === "assistant") {
+    const hasReasoningText = message.content.some(
+      (part) => part.type === "reasoning" && part.text.length > 0,
+    );
+    const requiresEmptyReasoning =
+      !hasReasoningText &&
+      (hasRequestTools || message.content.some((part) => part.type !== "text"));
     return {
       role: "assistant",
       content: message.content.map((part) => {
@@ -188,6 +196,10 @@ function toProviderMessage(message: ModelInputMessage): ModelMessage {
           input: part.input,
         };
       }),
+      // SDK 会省略空 Reasoning；工具上下文中的历史 Assistant 也需显式空串，非空原文仍由内容转换保留。
+      ...(requiresEmptyReasoning
+        ? { providerOptions: { openaiCompatible: { reasoning_content: "" } } }
+        : {}),
     };
   }
   return {

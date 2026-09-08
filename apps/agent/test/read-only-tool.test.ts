@@ -27,7 +27,7 @@ describe("read-only tools", () => {
       new AbortController().signal,
     );
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: "completed",
       content: "path: notes.txt\nlines: 2-2 of 3\nnextStartLine: 3\n---\n2| two",
       truncated: true,

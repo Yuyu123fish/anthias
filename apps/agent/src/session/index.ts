@@ -467,7 +467,7 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
   let sessionChanged = false;
   let closed = false;
   let closePromise: Promise<void> | null = null;
-  let activeLeaseCompletion: Promise<void> | null = null;
+  let activeLeaseReleasePromise: Promise<void> | null = null;
   type RecordFactory = (sequence: number, parentEntryId: string | null) => SessionRecord;
   type RecordAppender = (
     createRecord: RecordFactory,
@@ -482,15 +482,15 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
     markInitialInputScheduled(): void;
     hasScheduledFinish(): boolean;
   }> | null = null;
-  const pendingRunAcquisitionCompletions = new Set<Promise<void>>();
-  let sessionAppendQueue: Promise<void> = Promise.resolve();
+  const pendingRunAcquisitionPromises = new Set<Promise<void>>();
+  let sessionAppendTailPromise: Promise<void> = Promise.resolve();
 
   function enqueueSessionAppend<Result>(operation: () => Promise<Result>): Promise<Result> {
     if (closed) {
       return Promise.reject(new Error("Session 已关闭，不能追加持久事实。"));
     }
-    const appendPromise = sessionAppendQueue.then(operation);
-    sessionAppendQueue = appendPromise.then(
+    const appendPromise = sessionAppendTailPromise.then(operation);
+    sessionAppendTailPromise = appendPromise.then(
       () => undefined,
       () => undefined,
     );
@@ -507,14 +507,14 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
         // 取得引用后不再 await，立即入其队列，避免 release 清空 appender 后继续使用旧 lease。
         return appendToRun(appender);
       }
-      const acquisitions = [...pendingRunAcquisitionCompletions];
-      if (acquisitions.length > 0) {
-        await Promise.all(acquisitions);
+      const runAcquisitionPromises = [...pendingRunAcquisitionPromises];
+      if (runAcquisitionPromises.length > 0) {
+        await Promise.all(runAcquisitionPromises);
         continue;
       }
-      const leaseCompletion = activeLeaseCompletion;
-      if (leaseCompletion !== null) {
-        await leaseCompletion;
+      const leaseReleasePromise = activeLeaseReleasePromise;
+      if (leaseReleasePromise !== null) {
+        await leaseReleasePromise;
         continue;
       }
       return appendWithLock();
@@ -747,9 +747,10 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
         throw new Error("Session 已关闭，不能开始新的 Run。");
       }
       return enqueueSessionAppend<SessionRunAcquisition>(async () => {
-        const releasingLeaseCompletion = activeRunAppend === null ? activeLeaseCompletion : null;
-        if (releasingLeaseCompletion !== null) {
-          await releasingLeaseCompletion;
+        const pendingLeaseReleasePromise =
+          activeRunAppend === null ? activeLeaseReleasePromise : null;
+        if (pendingLeaseReleasePromise !== null) {
+          await pendingLeaseReleasePromise;
         }
         if (closed) {
           return Object.freeze({ status: "rejected", reason: "session_busy" });
@@ -758,11 +759,11 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
           return Object.freeze({ status: "rejected", reason: "session_changed" });
         }
 
-        let resolveAcquisitionCompletion!: () => void;
-        const acquisitionCompletion = new Promise<void>((resolve) => {
-          resolveAcquisitionCompletion = resolve;
+        let resolveRunAcquisitionPromise!: () => void;
+        const runAcquisitionPromise = new Promise<void>((resolve) => {
+          resolveRunAcquisitionPromise = resolve;
         });
-        pendingRunAcquisitionCompletions.add(acquisitionCompletion);
+        pendingRunAcquisitionPromises.add(runAcquisitionPromise);
         let ownership: SessionLockOwnership | null = null;
         try {
           try {
@@ -792,11 +793,11 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
           let initialRunInputScheduled = false;
           let runFinishScheduled = false;
           let appendFailure: unknown = null;
-          let resolveLeaseCompletion!: () => void;
-          activeLeaseCompletion = new Promise<void>((resolve) => {
-            resolveLeaseCompletion = resolve;
+          let resolveLeaseReleasePromise!: () => void;
+          activeLeaseReleasePromise = new Promise<void>((resolve) => {
+            resolveLeaseReleasePromise = resolve;
           });
-          let appendQueue: Promise<void> = Promise.resolve();
+          let runAppendTailPromise: Promise<void> = Promise.resolve();
 
           const enqueueRecord: RecordAppender = (
             createRecord,
@@ -810,7 +811,7 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
             if (appendFailure !== null) {
               return Promise.reject(new Error("Session Run 先前的持久写入已经失败。"));
             }
-            const appendPromise = appendQueue.then(async () => {
+            const appendPromise = runAppendTailPromise.then(async () => {
               if (appendFailure !== null) {
                 throw new Error("Session Run 先前的持久写入已经失败。");
               }
@@ -822,7 +823,7 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
                 throw error;
               }
             });
-            appendQueue = appendPromise.catch(() => undefined);
+            runAppendTailPromise = appendPromise.catch(() => undefined);
             return appendPromise;
           };
 
@@ -936,7 +937,7 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
                 activeRunAppend = null;
               }
               try {
-                await appendQueue;
+                await runAppendTailPromise;
                 if (!runFinished || appendFailure !== null) {
                   sessionChanged = true;
                 }
@@ -944,8 +945,8 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
                 try {
                   await releaseSessionLock(leaseOwnership);
                 } finally {
-                  resolveLeaseCompletion();
-                  activeLeaseCompletion = null;
+                  resolveLeaseReleasePromise();
+                  activeLeaseReleasePromise = null;
                 }
               }
             },
@@ -958,8 +959,8 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
               await releaseSessionLock(ownership);
             }
           } finally {
-            resolveAcquisitionCompletion();
-            pendingRunAcquisitionCompletions.delete(acquisitionCompletion);
+            resolveRunAcquisitionPromise();
+            pendingRunAcquisitionPromises.delete(runAcquisitionPromise);
           }
         }
       });
@@ -999,12 +1000,12 @@ function createSessionRuntime(options: SessionRuntimeOptions): Session {
         return closePromise;
       }
       closed = true;
-      const acquisitionsAtClose = [...pendingRunAcquisitionCompletions];
+      const runAcquisitionPromisesAtClose = [...pendingRunAcquisitionPromises];
       closePromise = (async () => {
         try {
-          await Promise.all(acquisitionsAtClose);
-          await sessionAppendQueue;
-          await activeLeaseCompletion;
+          await Promise.all(runAcquisitionPromisesAtClose);
+          await sessionAppendTailPromise;
+          await activeLeaseReleasePromise;
         } finally {
           await releaseSessionUsageMarker(options.usageMarker);
         }

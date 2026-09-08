@@ -87,6 +87,32 @@ describe("Anthias local configuration", () => {
     ).toMatchObject({ ok: false, error: expect.stringContaining("ANTHIAS_PERMISSION_MODE") });
   });
 
+  it("accepts explicit Full Access while preserving configuration precedence and the default", async () => {
+    const anthiasRoot = await temporaryRoot();
+    expect(await loadLocalConfiguration({ anthiasRoot, environment: {} })).toMatchObject({
+      ok: true,
+      permissionMode: "agent",
+    });
+    await writeFile(join(anthiasRoot, ".env"), "ANTHIAS_PERMISSION_MODE=full_access\n");
+    expect(await loadLocalConfiguration({ anthiasRoot, environment: {} })).toMatchObject({
+      ok: true,
+      permissionMode: "full_access",
+    });
+    expect(
+      await loadLocalConfiguration({
+        anthiasRoot,
+        environment: { ANTHIAS_PERMISSION_MODE: "plan" },
+      }),
+    ).toMatchObject({ ok: true, permissionMode: "plan" });
+    expect(
+      await loadLocalConfiguration({
+        anthiasRoot,
+        environment: { ANTHIAS_PERMISSION_MODE: "plan" },
+        permissionMode: "full_access",
+      }),
+    ).toMatchObject({ ok: true, permissionMode: "full_access" });
+  });
+
   it("rejects malformed values without exposing configuration text", async () => {
     const anthiasRoot = await temporaryRoot();
     await writeFile(join(anthiasRoot, ".env"), 'ANTHIAS_MODEL_API_KEY="synthetic-unclosed-key\n');

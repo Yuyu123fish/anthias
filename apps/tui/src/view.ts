@@ -36,7 +36,7 @@ import {
   type ExecutionTurn,
 } from "./execution-view.js";
 import { collaborationStatus } from "./multi-agent-view.js";
-import { missingWorkspaceGrantNotice } from "./permission-view.js";
+import { permissionModeNotice } from "./permission-view.js";
 import { createTheme } from "./theme.js";
 
 export type ConversationView = Readonly<{
@@ -91,17 +91,17 @@ export function createConversationView(options: {
   let submittedEditorText: string | undefined;
   let draftRevision = 0;
   const rejectedDrafts: string[] = [];
-  let permissionReview: string | null = null;
+  let workspaceGrantReviewText: string | null = null;
   let panel: "details" | "approval" | "permissions" = "details";
-  let approval: ToolApprovalRequest | null = agent.state.pendingToolApproval;
+  let pendingToolApprovalRequest: ToolApprovalRequest | null = agent.state.pendingToolApproval;
   let approvalUnrenderable = false;
-  let activeAssistant:
+  let activeAssistantView:
     | { content: MarkdownContent; step: ExecutionStep; fullText: string }
     | undefined;
-  let assistantPrefix = "";
-  let activeReasoning: ExecutionDetail | undefined;
-  let retryStatus: string | null = null;
-  let activeTurn: ExecutionTurn | undefined;
+  let renderedAssistantTextPrefix = "";
+  let activeReasoningDetail: ExecutionDetail | undefined;
+  let retryStatusText: string | null = null;
+  let activeExecutionTurn: ExecutionTurn | undefined;
   const executionTurns = new Map<Component, { controls: ExecutionControl[] }>();
   const currentRunTurns = new Set<ExecutionTurn>();
   let conversationRevision = 0;
@@ -130,9 +130,9 @@ export function createConversationView(options: {
     invalidate() {},
     render(width) {
       detailControls = [];
-      if (panel === "approval" && approval !== null)
+      if (panel === "approval" && pendingToolApprovalRequest !== null)
         return [truncateToWidth(theme.coral(" 执行确认 · PageDown 浏览"), width, "")];
-      if (panel === "permissions" && permissionReview !== null)
+      if (panel === "permissions" && workspaceGrantReviewText !== null)
         return [truncateToWidth(theme.coral(" 工作区授权 · PageDown 浏览"), width, "")];
       let line = ` 详情 ${details.length ? selectedDetail + 1 : 0}/${details.length} `;
       for (const button of detailButtons) {
@@ -157,8 +157,8 @@ export function createConversationView(options: {
   });
   let detailContentHeight = 0;
   let pendingDetailScrollEnd = false;
-  let renderedApprovalId: string | undefined;
-  let renderedPermissionReview: string | null = null;
+  let renderedToolApprovalRequestId: string | undefined;
+  let renderedWorkspaceGrantReviewText: string | null = null;
   let renderedTerminalColumns = 0;
   let renderedTerminalRows = 0;
   const detailDocument: Component = {
@@ -173,8 +173,9 @@ export function createConversationView(options: {
         detailScroll.scrollToEnd();
         pendingDetailScrollEnd = false;
       }
-      renderedApprovalId = panel === "approval" ? approval?.toolApprovalRequestId : undefined;
-      renderedPermissionReview = panel === "permissions" ? permissionReview : null;
+      renderedToolApprovalRequestId =
+        panel === "approval" ? pendingToolApprovalRequest?.toolApprovalRequestId : undefined;
+      renderedWorkspaceGrantReviewText = panel === "permissions" ? workspaceGrantReviewText : null;
       renderedTerminalColumns = options.terminal.columns;
       renderedTerminalRows = options.terminal.rows;
       return lines;
@@ -202,7 +203,7 @@ export function createConversationView(options: {
         },
         () => {
           pressedControl = undefined;
-          if (approval !== null) updateDetails();
+          if (pendingToolApprovalRequest !== null) updateDetails();
           onResize();
         },
       );
@@ -283,7 +284,7 @@ export function createConversationView(options: {
     invalidate() {},
     render(width) {
       const state = agent.state;
-      const phase = approval
+      const phase = pendingToolApprovalRequest
         ? "等待确认 · /approval"
         : state.operation === "compacting"
           ? "压缩中"
@@ -291,9 +292,9 @@ export function createConversationView(options: {
             ? "切换会话"
             : state.operation === "updating_capabilities"
               ? "更新外部能力"
-              : retryStatus !== null
-                ? retryStatus
-                : activeReasoning
+              : retryStatusText !== null
+                ? retryStatusText
+                : activeReasoningDetail
                   ? "思考中"
                   : state.activeAssistantMessage
                     ? "正在回答"
@@ -448,16 +449,16 @@ export function createConversationView(options: {
     requestRender();
   }
   function ensureTurn(): ExecutionTurn {
-    if (activeTurn === undefined) {
-      activeTurn = createExecutionTurn(theme, capabilities.unicode, () => {
+    if (activeExecutionTurn === undefined) {
+      activeExecutionTurn = createExecutionTurn(theme, capabilities.unicode, () => {
         pendingScrollTop = conversationScroll.scrollTop;
         invalidateConversation();
       });
-      executionTurns.set(activeTurn, activeTurn);
-      currentRunTurns.add(activeTurn);
-      conversation.addChild(activeTurn);
+      executionTurns.set(activeExecutionTurn, activeExecutionTurn);
+      currentRunTurns.add(activeExecutionTurn);
+      conversation.addChild(activeExecutionTurn);
     }
-    return activeTurn;
+    return activeExecutionTurn;
   }
   function newMarkdown(text: string): MarkdownContent {
     const content = createMarkdownContent({
@@ -482,16 +483,16 @@ export function createConversationView(options: {
     invalidateConversation();
   }
   function splitPresentation(): void {
-    if (activeAssistant !== undefined) {
-      assistantPrefix = activeAssistant.fullText;
-      activeAssistant = undefined;
+    if (activeAssistantView !== undefined) {
+      renderedAssistantTextPrefix = activeAssistantView.fullText;
+      activeAssistantView = undefined;
     }
-    activeTurn = undefined;
+    activeExecutionTurn = undefined;
   }
   function currentAssistantText(message: AssistantMessage): string {
     const fullText = assistantText(message);
-    if (!fullText.startsWith(assistantPrefix)) assistantPrefix = "";
-    return fullText.slice(assistantPrefix.length);
+    if (!fullText.startsWith(renderedAssistantTextPrefix)) renderedAssistantTextPrefix = "";
+    return fullText.slice(renderedAssistantTextPrefix.length);
   }
   function appendNotice(title: string, text: string): void {
     splitPresentation();
@@ -546,12 +547,12 @@ export function createConversationView(options: {
     detail.turn = turn;
   }
   function appendExecutionText(title: string, text: string): void {
-    if (activeTurn === undefined || activeTurn.status !== "running") {
+    if (activeExecutionTurn === undefined || activeExecutionTurn.status !== "running") {
       appendText(title, text);
       return;
     }
     const content = sanitizeTerminalText(text);
-    activeTurn.steps.push({
+    activeExecutionTurn.steps.push({
       kind: "detail",
       title: sanitizeTerminalText(title),
       text: content,
@@ -564,8 +565,8 @@ export function createConversationView(options: {
     if (message.role === "user") {
       finishActiveTurn();
       currentRunTurns.clear();
-      activeTurn = undefined;
-      assistantPrefix = "";
+      activeExecutionTurn = undefined;
+      renderedAssistantTextPrefix = "";
       appendText("You", message.content, "coral");
       ensureTurn();
     } else if (message.role === "assistant") {
@@ -584,7 +585,7 @@ export function createConversationView(options: {
       turn.steps.push(step);
       turn.answer = step.hasToolCalls ? undefined : step;
       if (message.status === "streaming")
-        activeAssistant = { content, step, fullText: assistantText(message) };
+        activeAssistantView = { content, step, fullText: assistantText(message) };
       invalidateConversation();
     } else
       completeTool(
@@ -596,13 +597,13 @@ export function createConversationView(options: {
       );
   }
   function updateAssistant(message: AssistantMessage): void {
-    if (activeAssistant === undefined) {
+    if (activeAssistantView === undefined) {
       appendMessage(message);
       return;
     }
-    const { content, step } = activeAssistant;
+    const { content, step } = activeAssistantView;
     step.text = currentAssistantText(message);
-    activeAssistant.fullText = assistantText(message);
+    activeAssistantView.fullText = assistantText(message);
     step.hasToolCalls = message.content.some((part) => part.type === "tool_call");
     step.messageStatus = message.status;
     content.setText(step.text);
@@ -620,39 +621,39 @@ export function createConversationView(options: {
     toolDetails.clear();
     executionTurns.clear();
     currentRunTurns.clear();
-    assistantPrefix = "";
-    activeTurn = undefined;
+    renderedAssistantTextPrefix = "";
+    activeExecutionTurn = undefined;
     conversationCache = undefined;
     pressedControl = undefined;
-    activeAssistant = undefined;
-    activeReasoning = undefined;
-    retryStatus = null;
-    approval = agent.state.pendingToolApproval;
-    detailsVisible = approval !== null;
-    panel = approval === null ? "details" : "approval";
-    permissionReview = null;
+    activeAssistantView = undefined;
+    activeReasoningDetail = undefined;
+    retryStatusText = null;
+    pendingToolApprovalRequest = agent.state.pendingToolApproval;
+    detailsVisible = pendingToolApprovalRequest !== null;
+    panel = pendingToolApprovalRequest === null ? "details" : "approval";
+    workspaceGrantReviewText = null;
     for (const message of agent.state.messageHistory) appendMessage(message);
     if (!agent.state.running) finishActiveTurn();
-    const lastAssistant = agent.state.messageHistory.findLast(
+    const lastAssistantMessage = agent.state.messageHistory.findLast(
       (message) => message.role === "assistant",
     );
-    const diagnostic = agent.state.lastRunDiagnostic ?? lastAssistant?.diagnostic;
+    const diagnostic = agent.state.lastRunDiagnostic ?? lastAssistantMessage?.diagnostic;
     if (
       diagnostic?.category !== "completed" &&
       (diagnostic != null ||
-        lastAssistant?.status === "failed" ||
-        lastAssistant?.status === "aborted")
+        lastAssistantMessage?.status === "failed" ||
+        lastAssistantMessage?.status === "aborted")
     )
       appendNotice("最近运行诊断", formatRunDiagnostic(diagnostic));
     if (agent.state.activeAssistantMessage !== null)
       appendMessage(agent.state.activeAssistantMessage);
     if (agent.state.messageHistory.length === 0)
       appendText("开始工作", "描述你的任务，或输入 / 查看命令。", "muted");
-    const permissionNotice = missingWorkspaceGrantNotice(
+    const permissionNotice = permissionModeNotice(
       agent.state.permissionMode,
       agent.permissions.snapshot(),
     );
-    if (permissionNotice !== null) appendNotice("工作区授权", permissionNotice);
+    if (permissionNotice !== null) appendNotice("权限模式", permissionNotice);
     conversationScroll.scrollToEnd();
     invalidateConversation();
     updateDetails();
@@ -664,17 +665,19 @@ export function createConversationView(options: {
     detailText.setText(text);
   }
   function updateDetails(resetScroll = false): void {
-    if (panel === "approval" && approval !== null) {
-      const text = formatApproval(approval);
+    if (panel === "approval" && pendingToolApprovalRequest !== null) {
+      const text = formatApproval(pendingToolApprovalRequest);
       approvalUnrenderable =
-        !isApprovalDisplayable(approval) || terminal.columns < 20 || terminal.rows < 8;
+        !isApprovalDisplayable(pendingToolApprovalRequest) ||
+        terminal.columns < 20 ||
+        terminal.rows < 8;
       setDetailText(
         approvalUnrenderable
           ? "终端空间不足或审批内容无法完整呈现，无法安全确认。请放大窗口或输入 deny。"
           : text,
       );
-    } else if (panel === "permissions" && permissionReview !== null) {
-      setDetailText(permissionReview);
+    } else if (panel === "permissions" && workspaceGrantReviewText !== null) {
+      setDetailText(workspaceGrantReviewText);
     } else {
       selectedDetail = Math.max(0, Math.min(selectedDetail, details.length - 1));
       const selected = details[selectedDetail];
@@ -919,7 +922,7 @@ export function createConversationView(options: {
       const inputText = editor.getExpandedText();
       const safeExitInput =
         inputText.trim() === "/exit" ||
-        (approval !== null && inputText.trim().toLowerCase() === "deny");
+        (pendingToolApprovalRequest !== null && inputText.trim().toLowerCase() === "deny");
       if (!hasLayoutSpace(terminal.columns, terminal.rows) && !safeExitInput) return true;
       submittedEditorText = inputText;
     }
@@ -957,7 +960,7 @@ export function createConversationView(options: {
           event.type,
         )
       )
-        retryStatus = null;
+        retryStatusText = null;
       switch (event.type) {
         case "session_changed":
           resetConversation();
@@ -969,8 +972,8 @@ export function createConversationView(options: {
           editor.setAutocompleteProvider(createCommandAutocomplete(agent));
           break;
         case "message_start":
-          retryStatus = null;
-          if (event.message.role === "assistant") assistantPrefix = "";
+          retryStatusText = null;
+          if (event.message.role === "assistant") renderedAssistantTextPrefix = "";
           appendMessage(event.message);
           break;
         case "message_update":
@@ -980,7 +983,7 @@ export function createConversationView(options: {
           if (event.message.role === "assistant") {
             updateAssistant(event.message);
             readyTools(event.message);
-            activeAssistant = undefined;
+            activeAssistantView = undefined;
           } else if (event.message.role === "tool")
             completeTool(
               event.message.toolCallId,
@@ -991,26 +994,26 @@ export function createConversationView(options: {
             );
           break;
         case "reasoning_start": {
-          activeReasoning = createDetail(
+          activeReasoningDetail = createDetail(
             `reasoning:${event.runId}:${details.length}`,
             "Reasoning",
             "",
           );
-          activeReasoning.step.title = "Reasoning · 思考中";
+          activeReasoningDetail.step.title = "Reasoning · 思考中";
           break;
         }
         case "reasoning_update":
-          if (activeReasoning !== undefined) {
-            appendDetail(activeReasoning, event.delta);
-            activeReasoning.step.title = `Reasoning · ${((now() - activeReasoning.startedAt) / 1000).toFixed(1)}s`;
+          if (activeReasoningDetail !== undefined) {
+            appendDetail(activeReasoningDetail, event.delta);
+            activeReasoningDetail.step.title = `Reasoning · ${((now() - activeReasoningDetail.startedAt) / 1000).toFixed(1)}s`;
           }
           break;
         case "reasoning_end":
-          if (activeReasoning !== undefined) {
-            activeReasoning.endedAt = now();
-            activeReasoning.step.title = `Reasoning · 已思考 ${((activeReasoning.endedAt - activeReasoning.startedAt) / 1000).toFixed(1)}s`;
-            activeReasoning.step.expanded = false;
-            activeReasoning = undefined;
+          if (activeReasoningDetail !== undefined) {
+            activeReasoningDetail.endedAt = now();
+            activeReasoningDetail.step.title = `Reasoning · 已思考 ${((activeReasoningDetail.endedAt - activeReasoningDetail.startedAt) / 1000).toFixed(1)}s`;
+            activeReasoningDetail.step.expanded = false;
+            activeReasoningDetail = undefined;
             invalidateConversation();
           }
           break;
@@ -1065,13 +1068,17 @@ export function createConversationView(options: {
             appendExecutionText("资源状态", "Tool 资源清理结果不确定，请查看详情。");
           break;
         case "tool_approval_requested":
-          approval = event.request;
+          pendingToolApprovalRequest = event.request;
           {
-            const detail = ensureTool(approval.toolCallId, approval.toolName, approval);
+            const detail = ensureTool(
+              pendingToolApprovalRequest.toolCallId,
+              pendingToolApprovalRequest.toolName,
+              pendingToolApprovalRequest,
+            );
             moveDetail(detail);
             detail.toolStage = "approval";
             detail.step.title = `${detail.title} · 等待批准`;
-            detail.step.summary = `${sanitizeTerminalText(approval.target)}\n${sanitizeTerminalText(approval.riskSummary)}\n/approval 查看动作、来源和授权边界`;
+            detail.step.summary = `${sanitizeTerminalText(pendingToolApprovalRequest.target)}\n${sanitizeTerminalText(pendingToolApprovalRequest.riskSummary)}\n/approval 查看动作、来源和授权边界`;
             invalidateConversation();
           }
           if (!detailsVisible) {
@@ -1081,7 +1088,7 @@ export function createConversationView(options: {
           }
           break;
         case "tool_approval_resolved":
-          approval = null;
+          pendingToolApprovalRequest = null;
           if (panel === "approval") {
             detailsVisible = false;
             panel = "details";
@@ -1133,7 +1140,7 @@ export function createConversationView(options: {
             invalidateConversation();
           }
           if (event.memberSessionId === undefined)
-            retryStatus =
+            retryStatusText =
               event.phase === "waiting"
                 ? `等待重试 ${event.retryCount}/2 · Ctrl+C 停止`
                 : `正在重试 ${event.retryCount}/2`;
@@ -1163,11 +1170,11 @@ export function createConversationView(options: {
             finishUnresolvedTools(event.memberSessionId, event.runId, event.diagnostic?.summary);
             break;
           }
-          retryStatus = null;
+          retryStatusText = null;
           finishUnresolvedTools(agent.state.sessionId, event.runId);
           finishActiveTurn(event.result.status);
-          activeAssistant = undefined;
-          activeReasoning = undefined;
+          activeAssistantView = undefined;
+          activeReasoningDetail = undefined;
           invalidateConversation();
           if (event.result.status !== "completed")
             appendNotice(
@@ -1201,7 +1208,7 @@ export function createConversationView(options: {
       requestRender();
     },
     reviewPermissions(text) {
-      permissionReview = text === null ? null : sanitizeTerminalText(text);
+      workspaceGrantReviewText = text === null ? null : sanitizeTerminalText(text);
       if (text === null) {
         if (panel === "permissions") {
           detailsVisible = false;
@@ -1214,7 +1221,7 @@ export function createConversationView(options: {
       updateDetails(true);
     },
     showApproval() {
-      if (approval === null) {
+      if (pendingToolApprovalRequest === null) {
         appendNotice("执行确认", "当前没有待批准请求。");
         return;
       }
@@ -1224,8 +1231,8 @@ export function createConversationView(options: {
     },
     canGrantPermissions() {
       return (
-        permissionReview !== null &&
-        renderedPermissionReview === permissionReview &&
+        workspaceGrantReviewText !== null &&
+        renderedWorkspaceGrantReviewText === workspaceGrantReviewText &&
         panel === "permissions" &&
         hasLayoutSpace(terminal.columns, terminal.rows) &&
         renderedTerminalColumns === terminal.columns &&
@@ -1237,12 +1244,12 @@ export function createConversationView(options: {
     details: toggleDetails,
     canApprove() {
       return (
-        approval !== null &&
+        pendingToolApprovalRequest !== null &&
         panel === "approval" &&
         !approvalUnrenderable &&
         terminal.columns >= 20 &&
         terminal.rows >= 8 &&
-        renderedApprovalId === approval.toolApprovalRequestId &&
+        renderedToolApprovalRequestId === pendingToolApprovalRequest.toolApprovalRequestId &&
         renderedTerminalColumns === terminal.columns &&
         renderedTerminalRows === terminal.rows &&
         detailScroll.viewportHeight > 0 &&
@@ -1276,25 +1283,27 @@ function summarizeText(text: string, maxLines = 3, maxCharacters = 300): string 
   return summary.length < text.trim().length ? summary + "\n…" : summary;
 }
 
-export function formatApproval(request: ToolApprovalRequest): string {
+export function formatApproval(toolApprovalRequest: ToolApprovalRequest): string {
   return sanitizeTerminalText(
     [
-      ...(request.memberSessionId
+      ...(toolApprovalRequest.memberSessionId
         ? [
             "成员: " +
-              (request.memberName ?? request.memberSessionId) +
+              (toolApprovalRequest.memberName ?? toolApprovalRequest.memberSessionId) +
               " · " +
-              request.memberSessionId,
+              toolApprovalRequest.memberSessionId,
           ]
         : []),
-      ...(request.workspaceRoot ? [`Workspace: ${request.workspaceRoot}`] : []),
-      `Tool: ${request.toolName}`,
-      `Target: ${request.target}`,
-      `Mode: ${request.permissionMode}`,
-      `Risk: ${request.riskSummary}`,
-      `Boundary: ${request.executionBoundary}`,
+      ...(toolApprovalRequest.workspaceRoot
+        ? [`Workspace: ${toolApprovalRequest.workspaceRoot}`]
+        : []),
+      `Tool: ${toolApprovalRequest.toolName}`,
+      `Target: ${toolApprovalRequest.target}`,
+      `Mode: ${toolApprovalRequest.permissionMode}`,
+      `Risk: ${toolApprovalRequest.riskSummary}`,
+      `Boundary: ${toolApprovalRequest.executionBoundary}`,
       "",
-      request.preview,
+      toolApprovalRequest.preview,
       "",
       "以上为本次执行的完整预览。输入 approve 确认，或 deny 拒绝。",
     ].join("\n"),
@@ -1308,7 +1317,7 @@ function assistantText(message: AssistantMessage): string {
     .join("");
 }
 
-export function isApprovalDisplayable(request: ToolApprovalRequest): boolean {
-  const original = Object.values(request).join("\n").replace(/\r\n?/gu, "\n");
+export function isApprovalDisplayable(toolApprovalRequest: ToolApprovalRequest): boolean {
+  const original = Object.values(toolApprovalRequest).join("\n").replace(/\r\n?/gu, "\n");
   return original.length <= 256 * 1024 && sanitizeTerminalText(original) === original;
 }

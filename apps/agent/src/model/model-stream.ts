@@ -178,9 +178,9 @@ export async function* streamAssistantMessage(
   const durableContent: AssistantContentPart[] = [];
   const modelContent: ModelAssistantContentPart[] = [];
   const toolCallIds = new Set<string>();
-  const providerToolCallIds = new Map<string, string>();
+  const toolCallIdByProviderId = new Map<string, string>();
   const preparingToolCallIds = new Set<string>();
-  let failure: RunDiagnostic | null = null;
+  let failureDiagnostic: RunDiagnostic | null = null;
   let usage: ModelUsage | null = null;
   let retryCount = 0;
   let hasInputFragments = false;
@@ -203,6 +203,10 @@ export async function* streamAssistantMessage(
           if (modelEvent.phase === "requesting") {
             retryCount = modelEvent.retryCount;
             preparingToolCallIds.clear();
+            // 可重试请求没有交付内容；失败尝试的空 Reasoning span 不能带入下一次响应。
+            modelContent.length = 0;
+            reasoningState = "idle";
+            activeReasoningPartIndex = null;
           }
           yield modelEvent;
           continue;
@@ -210,7 +214,7 @@ export async function* streamAssistantMessage(
         if (modelEvent.type === "tool_input_start") {
           const toolCallId = resolveToolCallId(
             modelEvent.toolCallId,
-            providerToolCallIds,
+            toolCallIdByProviderId,
             toolCallIds,
           );
           if (!preparingToolCallIds.has(toolCallId)) {
@@ -228,7 +232,7 @@ export async function* streamAssistantMessage(
           if (modelEvent.delta.length > 0) {
             hasInputFragments = true;
             preparingToolCallIds.add(
-              resolveToolCallId(modelEvent.toolCallId, providerToolCallIds, toolCallIds),
+              resolveToolCallId(modelEvent.toolCallId, toolCallIdByProviderId, toolCallIds),
             );
           }
           continue;
@@ -238,21 +242,22 @@ export async function* streamAssistantMessage(
             yield Object.freeze({ type: "reasoning_end" });
           }
           reasoningState = "pending";
-          activeReasoningPartIndex = null;
+          activeReasoningPartIndex = modelContent.length;
+          modelContent.push(Object.freeze({ type: "reasoning", text: "" }));
           continue;
         }
         if (modelEvent.type === "reasoning_delta") {
+          // 空值仍是协议事实，但没有可呈现文本时不发布可见 Reasoning 事件。
+          if (activeReasoningPartIndex === null) {
+            activeReasoningPartIndex = modelContent.length;
+            modelContent.push(Object.freeze({ type: "reasoning", text: "" }));
+          }
           if (modelEvent.delta.length === 0) {
             continue;
           }
           if (reasoningState !== "active") {
             reasoningState = "active";
-            activeReasoningPartIndex = modelContent.length;
-            modelContent.push(Object.freeze({ type: "reasoning", text: "" }));
             yield Object.freeze({ type: "reasoning_start" });
-          }
-          if (activeReasoningPartIndex === null) {
-            throw new Error("Reasoning span 缺少活动内容位置。");
           }
           const activeReasoningPart = modelContent[activeReasoningPartIndex];
           if (activeReasoningPart?.type !== "reasoning") {
@@ -293,7 +298,7 @@ export async function* streamAssistantMessage(
           continue;
         }
         if (modelEvent.type === "tool_call") {
-          const toolCall = normalizeToolCall(modelEvent, toolCallIds, providerToolCallIds);
+          const toolCall = normalizeToolCall(modelEvent, toolCallIds, toolCallIdByProviderId);
           preparingToolCallIds.delete(toolCall.toolCallId);
           yield Object.freeze({
             type: "tool_preparation",
@@ -319,9 +324,9 @@ export async function* streamAssistantMessage(
       }
     }
   } catch (error) {
-    failure =
+    failureDiagnostic =
       error instanceof ModelRequestError ? error.diagnostic : createRunDiagnostic("unknown");
-    retryCount = failure.retryCount ?? retryCount;
+    retryCount = failureDiagnostic.retryCount ?? retryCount;
   }
 
   if (reasoningState === "active") {
@@ -338,15 +343,15 @@ export async function* streamAssistantMessage(
     preparingToolCallIds.size === 0 &&
     (hasText || hasToolCall);
   const status: AssistantMessage["status"] =
-    abortSignal.aborted || failure?.category === "aborted"
+    abortSignal.aborted || failureDiagnostic?.category === "aborted"
       ? "aborted"
-      : successful && failure === null
+      : successful && failureDiagnostic === null
         ? "completed"
         : "failed";
   const category: RunDiagnostic["category"] =
     status === "aborted"
       ? "aborted"
-      : (failure?.category ??
+      : (failureDiagnostic?.category ??
         (finishReason === "length"
           ? "output_limit"
           : finishReason === "content_filter"
@@ -360,19 +365,19 @@ export async function* streamAssistantMessage(
                 ? "empty_response"
                 : "unknown"));
   const diagnostic = createRunDiagnostic(category, {
-    ...(failure ?? {}),
+    ...(failureDiagnostic ?? {}),
     providerFinishReason: finishReason,
     usage,
     retryCount,
-    abortSource: status === "aborted" ? (failure?.abortSource ?? "unknown") : null,
+    abortSource: status === "aborted" ? (failureDiagnostic?.abortSource ?? "unknown") : null,
   });
-  const finalMessage = Object.freeze({
+  const finalAssistantMessage = Object.freeze({
     ...createAssistantMessage(durableContent, status),
     diagnostic,
   });
   yield Object.freeze({
     type: "finish",
-    message: finalMessage,
+    message: finalAssistantMessage,
     modelInputMessage: Object.freeze({
       role: "assistant",
       content: Object.freeze([...modelContent]),
@@ -427,11 +432,11 @@ function createAssistantMessage(
 function normalizeToolCall(
   modelToolCall: Extract<ModelStreamEvent, { type: "tool_call" }>,
   existingToolCallIds: ReadonlySet<string>,
-  providerToolCallIds: Map<string, string>,
+  toolCallIdByProviderId: Map<string, string>,
 ): AssistantToolCallPart {
   const toolCallId = resolveToolCallId(
     modelToolCall.toolCallId,
-    providerToolCallIds,
+    toolCallIdByProviderId,
     existingToolCallIds,
   );
   const jsonInput = toJsonValue(modelToolCall.input);
@@ -479,13 +484,17 @@ function isUuid(value: string): boolean {
 
 /** Provider 身份可以不是 UUID；准备阶段与完整 ToolCall 共用一次确定的本地映射。 */
 function resolveToolCallId(
-  providerId: string,
-  ids: Map<string, string>,
-  completed: ReadonlySet<string>,
+  providerToolCallId: string,
+  toolCallIdByProviderId: Map<string, string>,
+  completedToolCallIds: ReadonlySet<string>,
 ): string {
-  const existing = ids.get(providerId);
-  if (existing !== undefined && !completed.has(existing)) return existing;
-  const id = isUuid(providerId) && !completed.has(providerId) ? providerId : randomUUID();
-  ids.set(providerId, id);
-  return id;
+  const existingToolCallId = toolCallIdByProviderId.get(providerToolCallId);
+  if (existingToolCallId !== undefined && !completedToolCallIds.has(existingToolCallId))
+    return existingToolCallId;
+  const toolCallId =
+    isUuid(providerToolCallId) && !completedToolCallIds.has(providerToolCallId)
+      ? providerToolCallId
+      : randomUUID();
+  toolCallIdByProviderId.set(providerToolCallId, toolCallId);
+  return toolCallId;
 }

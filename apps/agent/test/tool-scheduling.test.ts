@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,10 +7,13 @@ import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import {
   createSession,
+  openSession,
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
-import type { ToolRunner } from "../src/tool/tool-runner.js";
+import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
+
+import { selectConcurrentToolBatch } from "../src/tool/tool-scheduling.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -22,6 +25,200 @@ afterEach(async () => {
 });
 
 describe("Tool batch scheduling", () => {
+  it("serializes file aliases and recursive searches while allowing independent targets", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-resource-alias-"));
+    temporaryDirectories.add(workspaceRoot);
+    const directory = join(workspaceRoot, "real");
+    const alias = join(workspaceRoot, "alias");
+    await mkdir(directory);
+    await writeFile(join(directory, "a.txt"), "original");
+    await symlink(directory, alias, "junction");
+    await link(join(directory, "a.txt"), join(directory, "hard.txt"));
+    const write = { scheduling: { path: join(directory, "a.txt"), access: "write" as const } };
+    const read = (path: string, recursive = false) => ({
+      scheduling: { path, access: "read" as const, recursive },
+    });
+    expect(selectConcurrentToolBatch([write, read(join(alias, "a.txt"))], 0)).toHaveLength(1);
+    expect(selectConcurrentToolBatch([write, read(join(directory, "hard.txt"))], 0)).toHaveLength(
+      1,
+    );
+    expect(selectConcurrentToolBatch([write, read(alias, true)], 0)).toHaveLength(1);
+    expect(
+      selectConcurrentToolBatch([write, read(join(workspaceRoot, "other-search"), true)], 0),
+    ).toHaveLength(1);
+    expect(selectConcurrentToolBatch([write, read(join(directory, "b.txt"))], 0)).toHaveLength(2);
+    expect(
+      selectConcurrentToolBatch(
+        [write, { scheduling: "serial" as const }, read(join(directory, "b.txt"))],
+        0,
+      ),
+    ).toHaveLength(1);
+    if (process.platform === "win32") {
+      expect(selectConcurrentToolBatch([write, read(join(directory, "A.TXT"))], 0)).toHaveLength(1);
+    }
+  });
+
+  it("keeps a pending write approval visible while an independent reader waits to start", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-mixed-approval-"));
+    temporaryDirectories.add(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const shell = await resolveSessionShell(process.env);
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    await writeFile(join(workspaceRoot, "read.txt"), "read me", "utf8");
+    let requests = 0;
+    const modelStream: ModelStream = async function* () {
+      if (++requests === 1) {
+        yield toolCallEvent(1, "write_file", { path: "write.txt", content: "written" });
+        yield toolCallEvent(2, "read_file", { path: "read.txt" });
+        yield finishEvent("tool_calls");
+      } else {
+        yield { type: "text_delta", delta: "done" };
+        yield finishEvent("stop");
+      }
+    };
+    const agent = createAgentWithModelStream({ modelStream, session });
+    const pendingResult = agent.prompt("写入并读取");
+    try {
+      await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(agent.state.activeRun?.phase).toBe("awaiting_tool_approval");
+      const request = agent.state.pendingToolApproval;
+      if (request === null) throw new Error("missing approval");
+      expect(agent.respondToToolApproval(request.toolApprovalRequestId, "approve")).toEqual({
+        status: "accepted",
+      });
+      await expect(pendingResult).resolves.toEqual({ status: "completed" });
+    } finally {
+      agent.abort();
+      await agent.close();
+    }
+  });
+
+  it("runs independent writes together and prepares conflicting writes after their predecessors", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-write-scheduling-"));
+    temporaryDirectories.add(workspaceRoot);
+    const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+    const shell = await resolveSessionShell(process.env);
+    const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+    const baseRunner = createToolRunner({ workspace: { workspaceRoot, sessionDirectory }, shell });
+    const firstWritesStarted = Promise.withResolvers<void>();
+    const preparedIds: string[] = [];
+    let activeWrites = 0;
+    let maximumActiveWrites = 0;
+    const modelRequests: ModelRequest[] = [];
+    const modelStream: ModelStream = async function* (request) {
+      modelRequests.push(request);
+      if (modelRequests.length === 1) {
+        yield toolCallEvent(1, "write_file", { path: "a.txt", content: "one" });
+        yield toolCallEvent(2, "write_file", { path: "b.txt", content: "other" });
+        yield toolCallEvent(3, "edit_file", {
+          path: "a.txt",
+          replacements: [{ oldText: "one", newText: "two" }],
+        });
+        yield toolCallEvent(4, "read_file", { path: "a.txt" });
+        yield finishEvent("tool_calls");
+      } else {
+        yield { type: "text_delta", delta: "done" };
+        yield finishEvent("stop");
+      }
+    };
+    const toolRunner: ToolRunner = {
+      createPlan(call, mode) {
+        const plan = baseRunner.createPlan(call, mode);
+        return {
+          ...plan,
+          async prepare(signal) {
+            preparedIds.push(call.toolCallId);
+            const preparation = await plan.prepare(signal);
+            if (!preparation.ok || call.toolName !== "write_file") return preparation;
+            return {
+              ...preparation,
+              preparedExecution: {
+                ...preparation.preparedExecution,
+                async execute(...args) {
+                  activeWrites++;
+                  maximumActiveWrites = Math.max(maximumActiveWrites, activeWrites);
+                  if (activeWrites === 2) firstWritesStarted.resolve();
+                  await Promise.race([
+                    firstWritesStarted.promise,
+                    new Promise<never>((_, reject) => {
+                      const timeout = setTimeout(
+                        () => reject(new Error("independent writes did not overlap")),
+                        1500,
+                      );
+                      void firstWritesStarted.promise.finally(() => clearTimeout(timeout));
+                    }),
+                  ]);
+                  try {
+                    return await preparation.preparedExecution.execute(...args);
+                  } finally {
+                    activeWrites--;
+                  }
+                },
+              },
+            };
+          },
+        };
+      },
+    };
+    const agent = createAgentWithModelStream({ modelStream, session, toolRunner });
+    let pendingApprovals = 0;
+    let maximumPendingApprovals = 0;
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        pendingApprovals++;
+        maximumPendingApprovals = Math.max(maximumPendingApprovals, pendingApprovals);
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
+        pendingApprovals--;
+      }
+    });
+    try {
+      await expect(agent.prompt("写入不同文件后继续编辑并读取")).resolves.toEqual({
+        status: "completed",
+      });
+      expect(maximumActiveWrites).toBe(2);
+      expect(maximumPendingApprovals).toBe(1);
+      expect(preparedIds).toEqual(toolCallIds(4));
+      expect(await readFile(join(workspaceRoot, "a.txt"), "utf8")).toBe("two");
+      const results = agent.state.messageHistory.filter((message) => message.role === "tool");
+      expect(results.map((result) => result.status)).toEqual([
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+      ]);
+      expect(results[3]?.content).toContain("1| two");
+    } finally {
+      firstWritesStarted.resolve();
+      await agent.close();
+    }
+    const reopenedSession = await openSession({
+      sessionId: session.sessionId,
+      workspaceRoot,
+      sessionDirectory,
+      shell,
+    });
+    try {
+      const restoredAgent = createAgentWithModelStream({
+        session: reopenedSession,
+        modelStream: () => {
+          throw new Error("history must not execute");
+        },
+      });
+      try {
+        expect(
+          restoredAgent.state.messageHistory
+            .filter((message) => message.role === "tool")
+            .map((message) => message.toolCallId),
+        ).toEqual(toolCallIds(4));
+      } finally {
+        await restoredAgent.close();
+      }
+    } finally {
+      await reopenedSession.close();
+    }
+  });
+
   it("runs four read-only calls concurrently and commits reverse completions in source order", async () => {
     const controlledRunner = createControlledReadOnlyRunner(6, 2);
     const modelRequests: ModelRequest[] = [];
@@ -117,7 +314,7 @@ describe("Tool batch scheduling", () => {
       createPlan(toolCall) {
         const sideEffect = toolCall.toolName === "write_file";
         return Object.freeze({
-          scheduling: sideEffect ? "source_order_serial" : "parallel_read_only",
+          scheduling: sideEffect ? "serial" : "parallel",
           abortedPreparationContent: "aborted",
           prepare: () =>
             Promise.resolve(
@@ -219,7 +416,7 @@ describe("Tool batch scheduling", () => {
     const toolRunner: ToolRunner = Object.freeze({
       createPlan() {
         return Object.freeze({
-          scheduling: "parallel_read_only",
+          scheduling: "parallel",
           abortedPreparationContent: "preparation aborted",
           prepare: () => {
             preparationEntered.resolve();
@@ -245,7 +442,7 @@ describe("Tool batch scheduling", () => {
     const toolRunner: ToolRunner = Object.freeze({
       createPlan() {
         return Object.freeze({
-          scheduling: "parallel_read_only",
+          scheduling: "parallel",
           abortedPreparationContent: "preparation aborted",
           prepare: () =>
             Promise.resolve(
@@ -290,7 +487,7 @@ function createControlledReadOnlyRunner(callCount: number, failedIndex?: number)
     createPlan(toolCall) {
       const index = Number.parseInt(toolCall.toolCallId.slice(-12), 16) - 1;
       return Object.freeze({
-        scheduling: "parallel_read_only",
+        scheduling: "parallel",
         abortedPreparationContent: "preparation aborted",
         prepare: () =>
           Promise.resolve(

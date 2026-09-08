@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import type { AssistantToolCallPart } from "../../message.js";
-import type { ArtifactWriter } from "../../session/artifacts.js";
 import type { SessionShell } from "../../session/index.js";
 import {
   hasOnlyKeys,
@@ -23,6 +22,7 @@ import {
   resolveExistingWorkspacePath,
   type ToolWorkspace,
 } from "../workspace-path.js";
+import { createCommandOutputCapture } from "./command-output.js";
 
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
@@ -139,7 +139,6 @@ export async function executePreparedCommand(
   preparedTool: PreparedCommandTool,
   abortSignal: AbortSignal,
   publishUpdate: (update: CommandExecutionUpdate) => void,
-  artifactWriter?: ArtifactWriter,
 ): Promise<CommandExecutionResult> {
   if (abortSignal.aborted) {
     return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
@@ -172,6 +171,7 @@ export async function executePreparedCommand(
 
   const startedAtMilliseconds = Date.now();
   const outputCollector = createCommandOutputCollector();
+  const outputCapture = createCommandOutputCapture();
   const stdoutDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let childProcess: ReturnType<typeof spawn>;
@@ -228,19 +228,21 @@ export async function executePreparedCommand(
       const reason: CommandTerminationReason = spawnFailed
         ? "spawn_failed"
         : (terminationReason ?? (exitCode === 0 ? "completed" : "non_zero_exit"));
-      resolve(
-        createCommandResult(
+      resolve({
+        ...createCommandResult(
           reason,
           exitCode,
           Date.now() - startedAtMilliseconds,
           outputCollector,
           cleanupUncertain,
         ),
-      );
+        ...outputCapture.finish(),
+      });
     };
 
     /** 保存并发布仍落在统一边界内的输出，订阅者异常不能破坏子进程收口。 */
     const publishAcceptedOutput = (stream: "stdout" | "stderr", text: string) => {
+      outputCapture.append(text);
       const acceptedText = outputCollector.append(stream, text);
       if (acceptedText.length === 0 || settled) {
         return;
@@ -273,15 +275,9 @@ export async function executePreparedCommand(
     const handleAbort = () => requestTermination("aborted");
 
     childProcess.stdout?.on("data", (chunk: Buffer) => {
-      if (artifactWriter !== undefined) {
-        void artifactWriter.write(chunk);
-      }
       publishAcceptedOutput("stdout", stdoutDecoder.write(chunk));
     });
     childProcess.stderr?.on("data", (chunk: Buffer) => {
-      if (artifactWriter !== undefined) {
-        void artifactWriter.write(chunk);
-      }
       publishAcceptedOutput("stderr", stderrDecoder.write(chunk));
     });
     childProcess.once("error", () => settle(null, true));

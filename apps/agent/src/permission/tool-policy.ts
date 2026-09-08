@@ -22,7 +22,7 @@ type HardDanger = Readonly<{
 }>;
 
 const CURRENT_USER_COMMAND_BOUNDARY =
-  "命令以 Anthias 当前用户权限运行，无 OS 沙箱；cwd 仅固定在工作区，但命令仍可访问该用户可访问的工作区外文件、网络与系统资源。";
+  "命令以 Anthias 当前用户权限运行，无 OS 沙箱；cwd 仅指定启动目录，命令仍可访问该用户可访问的工作区外文件、网络与系统资源。";
 
 /** 按权限模式、Tool 类型和准备结果形成唯一 Policy Decision。 */
 export function decideToolPolicy(input: ToolPolicyInput): ToolPolicyDecision {
@@ -34,9 +34,13 @@ export function decideToolPolicy(input: ToolPolicyInput): ToolPolicyDecision {
   ) {
     return freezeDecision(
       "allow",
-      "read.workspace_only",
-      "只读取工作区内且不属于活动 Session 的内容。",
-      "路径解析和真实路径校验均限制在当前工作区。",
+      input.permissionMode === "full_access" ? "read.current_user" : "read.workspace_only",
+      input.permissionMode === "full_access"
+        ? "读取当前系统用户可访问的内容。"
+        : "只读取工作区内且不属于活动 Session 的内容。",
+      input.permissionMode === "full_access"
+        ? "允许工作区外路径，应用配置、授权记录与 Session 保留目录仍不可访问。"
+        : "路径解析和真实路径校验均限制在当前工作区。",
     );
   }
   if (input.permissionMode === "plan") {
@@ -62,12 +66,15 @@ export function decideToolPolicy(input: ToolPolicyInput): ToolPolicyDecision {
           "一次批准只允许写入预览中显示的一个精确文件；活动 Session 目录仍不可访问。",
         );
   }
-  return classifyCommandSafety(input.command ?? "");
+  return classifyCommandSafety(input.command ?? "", input.permissionMode);
 }
 
 /** 纯字符串识别高置信危险命令；普通且可审阅的命令交给 HITL。 */
-export function classifyCommandSafety(commandText: string): ToolPolicyDecision {
-  const hardDanger = findHardDanger(commandText.normalize("NFKC"), 0);
+export function classifyCommandSafety(
+  commandText: string,
+  permissionMode: PermissionMode = "agent",
+): ToolPolicyDecision {
+  const hardDanger = findHardDanger(commandText.normalize("NFKC"), permissionMode);
   if (hardDanger !== null) {
     return freezeDecision(
       "deny",
@@ -84,51 +91,56 @@ export function classifyCommandSafety(commandText: string): ToolPolicyDecision {
   );
 }
 
-/** 在有限递归内检查真正的命令位置与字面量 Shell wrapper。 */
-function findHardDanger(commandText: string, wrapperDepth: number): HardDanger | null {
-  const { commands, unquotedText } = scanLiteralCommands(commandText);
-  if (/:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/u.test(unquotedText)) {
-    return danger("danger.fork_bomb", "命令是会耗尽进程资源的 fork bomb。");
-  }
-  for (const redirection of unquotedText.matchAll(/>{1,2}/gu)) {
-    if (/^>{1,2}\s*["']?\/dev\/sd[a-z0-9]*/iu.test(commandText.slice(redirection.index))) {
-      return danger("danger.device_overwrite", "命令会通过重定向覆盖磁盘设备。");
+/** 只展开字面量 Shell wrapper；显式完整访问也不能借多层包装跳过可识别的系统破坏。 */
+function findHardDanger(commandText: string, permissionMode: PermissionMode): HardDanger | null {
+  const pendingCommands = [{ text: commandText, wrapperDepth: 0 }];
+  while (pendingCommands.length > 0) {
+    const pendingCommand = pendingCommands.pop();
+    if (!pendingCommand) break;
+    const { commands, unquotedText } = scanLiteralCommands(pendingCommand.text);
+    if (/:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/u.test(unquotedText)) {
+      return danger("danger.fork_bomb", "命令是会耗尽进程资源的 fork bomb。");
     }
-  }
-
-  let carriesRemoteOutput = false;
-  for (const command of commands) {
-    const literalCommand = normalizeCommandPosition(command.commandText);
-    if (!command.followsPipe) {
-      carriesRemoteOutput = false;
+    for (const redirection of unquotedText.matchAll(/>{1,2}/gu)) {
+      if (
+        /^>{1,2}\s*["']?\/dev\/sd[a-z0-9]*/iu.test(pendingCommand.text.slice(redirection.index))
+      ) {
+        return danger("danger.device_overwrite", "命令会通过重定向覆盖磁盘设备。");
+      }
     }
-    if (
-      carriesRemoteOutput &&
-      /^(?:sh|bash|pwsh|powershell|iex|invoke-expression)(?:\.exe)?\b/iu.test(literalCommand)
-    ) {
-      return danger("danger.remote_script_execution", "命令会把远程脚本内容直接交给解释器执行。");
-    }
-    carriesRemoteOutput ||= /^(?:curl|wget|iwr|invoke-webrequest)(?:\.exe)?\b/iu.test(
-      literalCommand,
-    );
-
-    const directDanger = findDirectHardDanger(literalCommand);
-    if (directDanger !== null) {
-      return directDanger;
-    }
-    const wrappedCommand = extractLiteralWrappedCommand(literalCommand);
-    if (wrappedCommand === null) {
-      continue;
-    }
-    if (wrapperDepth >= 3) {
-      return danger(
-        "danger.opaque_command",
-        "Shell wrapper 嵌套过深，无法向用户提供可信的待执行文本。",
+    let carriesRemoteOutput = false;
+    for (const command of commands) {
+      const literalCommand = normalizeCommandPosition(command.commandText);
+      if (!command.followsPipe) carriesRemoteOutput = false;
+      if (
+        permissionMode !== "full_access" &&
+        carriesRemoteOutput &&
+        /^(?:sh|bash|pwsh|powershell|iex|invoke-expression)(?:\.exe)?\b/iu.test(literalCommand)
+      ) {
+        return danger("danger.remote_script_execution", "命令会把远程脚本内容直接交给解释器执行。");
+      }
+      carriesRemoteOutput ||= /^(?:curl|wget|iwr|invoke-webrequest)(?:\.exe)?\b/iu.test(
+        literalCommand,
       );
-    }
-    const wrappedDanger = findHardDanger(unwrapLiteral(wrappedCommand), wrapperDepth + 1);
-    if (wrappedDanger !== null) {
-      return wrappedDanger;
+      const directDanger = findDirectHardDanger(literalCommand);
+      if (
+        directDanger !== null &&
+        (permissionMode !== "full_access" || directDanger.ruleId !== "danger.opaque_command")
+      )
+        return directDanger;
+      const wrappedCommand = extractLiteralWrappedCommand(literalCommand);
+      if (wrappedCommand === null) continue;
+      if (pendingCommand.wrapperDepth >= 3 && permissionMode !== "full_access") {
+        return danger(
+          "danger.opaque_command",
+          "Shell wrapper 嵌套过深，无法向用户提供可信的待执行文本。",
+        );
+      }
+      // 每层移除一个实际包装入口，文本严格缩短；不用递归承受深层字面包装的调用栈。
+      pendingCommands.push({
+        text: unwrapLiteral(wrappedCommand),
+        wrapperDepth: pendingCommand.wrapperDepth + 1,
+      });
     }
   }
   return null;

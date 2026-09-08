@@ -12,14 +12,14 @@ export const READ_ONLY_TOOL_NAMES = Object.freeze([
 /** 枚举无需人工确认的固定只读 Tool 名称。 */
 export type ReadOnlyToolName = (typeof READ_ONLY_TOOL_NAMES)[number];
 
-/** 保存每次执行前都必须取得人工确认的固定 Tool 名称。 */
+/** 保存执行前由当前权限模式与策略判定的固定 Tool 名称。 */
 export const SIDE_EFFECT_TOOL_NAMES = Object.freeze([
   "edit_file",
   "write_file",
   "execute_command",
 ] as const);
 
-/** 枚举每次执行前都必须取得人工确认的 Tool 名称。 */
+/** 枚举执行前由当前权限模式与策略判定的 Tool 名称。 */
 export type SideEffectToolName = (typeof SIDE_EFFECT_TOOL_NAMES)[number];
 
 /** 枚举 Agent 固定提供给模型的只读与副作用 Tool 名称。 */
@@ -34,28 +34,36 @@ export type ModelToolDefinition = Readonly<{
 
 /** 固定 Tool Schema；实际输入仍由 Agent 自己再次校验。 */
 const ALL_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze([
-  defineTool("read_file", "读取工作区内 UTF-8 文本文件的指定行范围。", {
-    type: "object",
-    additionalProperties: false,
-    required: ["path"],
-    properties: {
-      path: { type: "string", minLength: 1 },
-      startLine: { type: "integer", minimum: 1 },
-      lineCount: { type: "integer", minimum: 1, maximum: 2000 },
+  defineTool(
+    "read_file",
+    "读取 UTF-8 文件的指定行范围，按 nextStartLine 继续；Full Access 可使用工作区外路径，其他模式限工作区。",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        startLine: { type: "integer", minimum: 1 },
+        lineCount: { type: "integer", minimum: 1, maximum: 2000 },
+      },
     },
-  }),
-  defineTool("glob", "按 Glob 模式发现工作区内的文件。", {
-    type: "object",
-    additionalProperties: false,
-    required: ["pattern"],
-    properties: {
-      pattern: { type: "string", minLength: 1 },
-      path: { type: "string", minLength: 1 },
+  ),
+  defineTool(
+    "glob",
+    "按相对 Glob 模式发现文件；path 是搜索基准目录，Full Access 可使用工作区外目录。",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["pattern"],
+      properties: {
+        pattern: { type: "string", minLength: 1 },
+        path: { type: "string", minLength: 1 },
+      },
     },
-  }),
+  ),
   defineTool(
     "grep",
-    '按正则搜索工作区内 UTF-8 文本文件。path 必须是工作区相对目录；搜索单个文件用 filePattern，例如 path="."、filePattern="index.html"。',
+    '按正则搜索 UTF-8 文本文件。path 是搜索基准目录，普通模式限工作区，Full Access 可用外部目录；搜索单个文件用 filePattern，例如 path="."、filePattern="index.html"。',
     {
       type: "object",
       additionalProperties: false,

@@ -19,58 +19,62 @@ export async function* retryModelStream(options: {
   remainingTaskTimeMs?: () => number;
   onAttemptFinished?: (usage: ModelUsage | undefined) => Promise<void>;
 }): AsyncIterable<ModelStreamEvent> {
-  const { modelStream, request, abortSignal, state } = options;
+  const { modelStream, request: modelRequest, abortSignal, state: retryState } = options;
   for (;;) {
     if (abortSignal.aborted) return;
-    let recorded = false;
-    const recordAttempt = async (usage?: ModelUsage) => {
-      if (recorded) return;
-      recorded = true;
+    let attemptUsageRecorded = false;
+    const recordAttemptUsage = async (usage?: ModelUsage) => {
+      if (attemptUsageRecorded) return;
+      attemptUsageRecorded = true;
       await options.onAttemptFinished?.(usage);
     };
     try {
-      for await (const event of modelStream(request, abortSignal)) {
+      for await (const event of modelStream(modelRequest, abortSignal)) {
         if (abortSignal.aborted) return;
         if (event.type === "finish") {
-          await recordAttempt(event.usage);
-          yield Object.freeze({ ...event, retryCount: state.retryCount });
+          await recordAttemptUsage(event.usage);
+          yield Object.freeze({ ...event, retryCount: retryState.retryCount });
           return;
         }
-        state.deliveredContent ||= isDeliveredContent(event);
+        retryState.deliveredContent ||= isDeliveredContent(event);
         yield event;
       }
       return;
     } catch (error) {
-      await recordAttempt();
+      await recordAttemptUsage();
       if (abortSignal.aborted) return;
-      const failure = error instanceof ModelRequestError ? error : new ModelRequestError("unknown");
-      const temporaryFailure = isRetryableModelDiagnostic(failure.diagnostic);
-      if (!temporaryFailure || (request.purpose !== undefined && request.purpose !== "response")) {
-        throw new ModelRequestError(failure.diagnostic.category, {
-          ...failure.diagnostic,
-          retryAfterMs: failure.retryAfterMs,
-          retryCount: state.retryCount,
+      const requestFailure =
+        error instanceof ModelRequestError ? error : new ModelRequestError("unknown");
+      const temporaryFailure = isRetryableModelDiagnostic(requestFailure.diagnostic);
+      if (
+        !temporaryFailure ||
+        (modelRequest.purpose !== undefined && modelRequest.purpose !== "response")
+      ) {
+        throw new ModelRequestError(requestFailure.diagnostic.category, {
+          ...requestFailure.diagnostic,
+          retryAfterMs: requestFailure.retryAfterMs,
+          retryCount: retryState.retryCount,
         });
       }
       let retryStopReason: "content_delivered" | "exhausted" | "wait_too_long" | "deadline" | null =
         null;
-      const delayMs = Math.max(500 * 2 ** state.retryCount, failure.retryAfterMs ?? 0);
-      if (state.deliveredContent) retryStopReason = "content_delivered";
-      else if (state.retryCount >= 2) retryStopReason = "exhausted";
+      const delayMs = Math.max(500 * 2 ** retryState.retryCount, requestFailure.retryAfterMs ?? 0);
+      if (retryState.deliveredContent) retryStopReason = "content_delivered";
+      else if (retryState.retryCount >= 2) retryStopReason = "exhausted";
       else if (delayMs > 30_000) retryStopReason = "wait_too_long";
       else if (delayMs >= (options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY))
         retryStopReason = "deadline";
       if (retryStopReason !== null) {
-        throw new ModelRequestError(failure.diagnostic.category, {
-          ...failure.diagnostic,
-          retryCount: state.retryCount,
+        throw new ModelRequestError(requestFailure.diagnostic.category, {
+          ...requestFailure.diagnostic,
+          retryCount: retryState.retryCount,
           retryStopReason,
         });
       }
-      const retryCount = state.retryCount === 0 ? 1 : 2;
-      const diagnostic = createRunDiagnostic(failure.diagnostic.category, {
-        ...failure.diagnostic,
-        retryCount: state.retryCount,
+      const retryCount = retryState.retryCount === 0 ? 1 : 2;
+      const diagnostic = createRunDiagnostic(requestFailure.diagnostic.category, {
+        ...requestFailure.diagnostic,
+        retryCount: retryState.retryCount,
       });
       yield Object.freeze({
         type: "model_retry",
@@ -82,43 +86,43 @@ export async function* retryModelStream(options: {
       if (!(await waitForRetry(delayMs, abortSignal))) return;
       if (abortSignal.aborted) return;
       if ((options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY) <= 0) {
-        throw new ModelRequestError(failure.diagnostic.category, {
-          ...failure.diagnostic,
-          retryCount: state.retryCount,
+        throw new ModelRequestError(requestFailure.diagnostic.category, {
+          ...requestFailure.diagnostic,
+          retryCount: retryState.retryCount,
           retryStopReason: "deadline",
         });
       }
-      const previousRetryCount = state.retryCount;
-      state.retryCount = retryCount;
+      const previousRetryCount = retryState.retryCount;
+      retryState.retryCount = retryCount;
       yield Object.freeze({
         type: "model_retry",
         phase: "requesting",
         retryCount,
         delayMs: 0,
-        diagnostic: createRunDiagnostic(failure.diagnostic.category, {
-          ...failure.diagnostic,
+        diagnostic: createRunDiagnostic(requestFailure.diagnostic.category, {
+          ...requestFailure.diagnostic,
           retryCount,
         }),
       });
       // 事件订阅者可能同步停止；尚未进入下一次 ModelStream 时不能计为已重试。
       if (abortSignal.aborted) {
-        state.retryCount = previousRetryCount;
+        retryState.retryCount = previousRetryCount;
         throw new ModelRequestError("aborted", {
           retryCount: previousRetryCount,
           abortSource: "unknown",
         });
       }
       if ((options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY) <= 0) {
-        state.retryCount = previousRetryCount;
-        throw new ModelRequestError(failure.diagnostic.category, {
-          ...failure.diagnostic,
+        retryState.retryCount = previousRetryCount;
+        throw new ModelRequestError(requestFailure.diagnostic.category, {
+          ...requestFailure.diagnostic,
           retryCount: previousRetryCount,
           retryStopReason: "deadline",
         });
       }
     } finally {
       // 每个真实请求恰好记录一次已知或未知用量；等待取消不能虚增下一次调用。
-      await recordAttempt();
+      await recordAttemptUsage();
     }
   }
 }

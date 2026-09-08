@@ -41,7 +41,7 @@ describe("web_search", () => {
       "web_search",
     ]);
     const plan = extension.createPlan(searchCall({ query: "Node API", page: 3 }), "plan");
-    expect(plan?.scheduling).toBe("parallel_read_only");
+    expect(plan?.scheduling).toBe("parallel");
     const result = await execute(extension, { query: "Node API", page: 3 });
     expect(result.status).toBe("completed");
     expect(JSON.parse(result.content)).toMatchObject({

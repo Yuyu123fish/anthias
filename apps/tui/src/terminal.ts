@@ -12,10 +12,10 @@ export function createTerminal(
     setRawMode?(enabled: boolean): void;
   };
   const terminalOutput = output as NodeJS.WritableStream & { columns?: number; rows?: number };
-  const buffer = new StdinBuffer();
+  const terminalInputBuffer = new StdinBuffer();
   const wasRaw = terminalInput.isRaw ?? false;
   let resizeListener: (() => void) | undefined;
-  const dataListener = (data: string | Buffer) => buffer.process(data);
+  const dataListener = (data: string | Buffer) => terminalInputBuffer.process(data);
   const write = (data: string) => {
     output.write(data);
   };
@@ -31,8 +31,8 @@ export function createTerminal(
     },
     start(onInput, onResize) {
       resizeListener = onResize;
-      buffer.on("data", onInput);
-      buffer.on("paste", (text) => onInput(`\u001b[200~${text}\u001b[201~`));
+      terminalInputBuffer.on("data", onInput);
+      terminalInputBuffer.on("paste", (text) => onInput(`\u001b[200~${text}\u001b[201~`));
       terminalInput.setRawMode?.(true);
       input.on("data", dataListener);
       output.on("resize", onResize);
@@ -42,7 +42,7 @@ export function createTerminal(
     stop() {
       input.off("data", dataListener);
       if (resizeListener !== undefined) output.off("resize", resizeListener);
-      buffer.destroy();
+      terminalInputBuffer.destroy();
       terminalInput.setRawMode?.(wasRaw);
       input.pause();
       write("\u001b[?2004l");

@@ -162,7 +162,7 @@ export function createContextController(options: {
       run.emit({ type: "context_usage", usage: snapshot() });
     }
 
-    const requestWithContext: ModelStream = async function* (rawRequest, abortSignal) {
+    const contextAwareModelStream: ModelStream = async function* (rawRequest, abortSignal) {
       await run.beforeRequest?.(abortSignal);
       rawRequest = {
         ...rawRequest,
@@ -433,7 +433,7 @@ export function createContextController(options: {
       }
     };
     return Object.freeze({
-      modelStream: requestWithContext,
+      modelStream: contextAwareModelStream,
       recordApprovalUsage: (usage: ModelUsage | undefined, actionFingerprint: string) =>
         recordUsage(
           "approval",
