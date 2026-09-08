@@ -1,5 +1,5 @@
 import { createInterface, type Interface } from "node:readline";
-import type { Agent, AgentEvent, Message } from "@anthias/agent";
+import type { Agent, AgentEvent, Message, WorkspacePermissionSnapshot } from "@anthias/agent";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { executeCommand, parseInput } from "./command.js";
 import {
@@ -10,7 +10,11 @@ import {
 } from "./content-renderer.js";
 import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { collaborationStatus } from "./multi-agent-view.js";
-import { formatPermissions, type PermissionGrantChoice } from "./permission-view.js";
+import {
+  formatPermissions,
+  missingWorkspaceGrantNotice,
+  type PermissionGrantChoice,
+} from "./permission-view.js";
 import { createTerminal } from "./terminal.js";
 import {
   type ConversationView,
@@ -112,18 +116,27 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         notice("已取消，没有新增工作区授权。", "/permissions");
         return true;
       }
+      if (agent.state.pendingToolApproval !== null) {
+        pendingGrant = undefined;
+        view?.reviewPermissions(null);
+        notice(
+          "当前有待执行的工具审批，请用 /approval 处理后重新查看授权范围。grant 不会批准当前动作。",
+          "/permissions",
+        );
+        return true;
+      }
       if (view !== undefined && !view.canGrantPermissions()) {
         notice("请完整浏览授权范围到底部，再输入 grant。也可输入 cancel 取消。", "/permissions");
         return true;
       }
       const currentSnapshot = agent.permissions.snapshot();
-      if (
-        pendingGrant.scope !==
-        JSON.stringify([currentSnapshot.workspaceRoot, currentSnapshot.availableCommands])
-      ) {
+      if (pendingGrant.scope !== permissionScope(currentSnapshot)) {
         pendingGrant = undefined;
         view?.reviewPermissions(null);
-        notice("工作区或授权候选范围已变化，请重新执行 /permissions grant 查看。", "/permissions");
+        notice(
+          "工作区或当前授权状态已变化，请重新执行 /permissions grant 或 /permissions command 查看范围。",
+          "/permissions",
+        );
         return true;
       }
       const choice = pendingGrant.choice;
@@ -146,6 +159,13 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     }
     const approval = agent.state.pendingToolApproval;
     const approvalAnswer = text.trim().toLowerCase();
+    if (approval !== null && approvalAnswer === "grant") {
+      notice(
+        "grant 不会批准当前工具动作；请用 /approval 查看后输入 approve 或 deny。",
+        "/permissions",
+      );
+      return true;
+    }
     if (approval !== null && (approvalAnswer === "approve" || approvalAnswer === "deny")) {
       if (
         approvalAnswer === "approve" &&
@@ -197,10 +217,20 @@ export function runTui(options: RunTuiOptions): Promise<number> {
             }
           },
           permissions(choice) {
+            if (agent.state.pendingToolApproval !== null) {
+              commandRejected = true;
+              pendingGrant = undefined;
+              view?.reviewPermissions(null);
+              notice(
+                "当前有待执行的工具审批，请先用 /approval 处理；新增工作区授权不会批准当前动作。",
+                "/permissions",
+              );
+              return;
+            }
             const snapshot = agent.permissions.snapshot();
             pendingGrant = {
               choice,
-              scope: JSON.stringify([snapshot.workspaceRoot, snapshot.availableCommands]),
+              scope: permissionScope(snapshot),
             };
             const text = formatPermissions(snapshot, choice);
             if (view !== undefined) view.reviewPermissions(text);
@@ -412,6 +442,11 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         `><> Anthias\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${{ agent: "Agent", plan: "Plan", auto_allow: "AutoAllow" }[agent.state.permissionMode]}\n/help 查看命令\n`,
       );
       for (const message of agent.state.messageHistory) plainMessage(message);
+      const permissionNotice = missingWorkspaceGrantNotice(
+        agent.state.permissionMode,
+        agent.permissions.snapshot(),
+      );
+      if (permissionNotice !== null) notice(permissionNotice, "工作区授权");
       if (
         agent.state.lastRunDiagnostic?.category !== "completed" &&
         agent.state.lastRunDiagnostic != null
@@ -431,6 +466,14 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       if (exiting) return;
       try {
         if (event.type === "session_changed") pendingGrant = undefined;
+        if (event.type === "tool_approval_requested" && pendingGrant !== undefined) {
+          pendingGrant = undefined;
+          view?.reviewPermissions(null);
+          notice(
+            "工具执行正在等待确认，已取消尚未确认的工作区授权；请用 /approval 处理后重新查看授权范围。",
+            "/permissions",
+          );
+        }
         if (view === undefined) plainEvent(event);
         else view.event(event);
       } catch {
@@ -456,4 +499,15 @@ function appendBounded(previous: string, addition: string): string {
 }
 function isTty(stream: NodeJS.ReadableStream | NodeJS.WritableStream): boolean {
   return (stream as { isTTY?: boolean }).isTTY === true;
+}
+
+/** 浏览后若授权或撤销状态改变，旧确认不能覆盖新的用户决定。 */
+function permissionScope(snapshot: WorkspacePermissionSnapshot): string {
+  return JSON.stringify([
+    snapshot.workspaceRoot,
+    snapshot.grant,
+    snapshot.revoked,
+    snapshot.availableCommands,
+    snapshot.error,
+  ]);
 }

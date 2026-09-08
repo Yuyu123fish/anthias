@@ -7,6 +7,10 @@ import type {
   ToolResultMessage,
   UserMessage,
 } from "../message.js";
+import {
+  normalizeProviderErrorCode,
+  normalizeProviderErrorParam,
+} from "../model/model-diagnostics.js";
 
 /** 描述 Session 创建时固定、重开时必须一致的 Shell。 */
 export type SessionShell = Readonly<{
@@ -85,6 +89,7 @@ export type ArtifactIncompleteReason =
 export type PersistedUsage = Readonly<{
   inputTokens: number | null;
   outputTokens: number | null;
+  reasoningTokens?: number | null;
   cachedInputTokens: number | null;
   cacheWriteInputTokens?: number | null;
 }>;
@@ -1441,16 +1446,17 @@ function isPersistedUsage(value: unknown): value is PersistedUsage {
     return false;
   }
   const usage = value as Record<string, unknown>;
-  const expectedKeys = Object.hasOwn(usage, "cacheWriteInputTokens")
-    ? ["inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens"]
-    : ["inputTokens", "outputTokens", "cachedInputTokens"];
+  const optionalKeys = ["cacheWriteInputTokens", "reasoningTokens"].filter((key) =>
+    Object.hasOwn(usage, key),
+  );
+  const expectedKeys = ["inputTokens", "outputTokens", "cachedInputTokens", ...optionalKeys];
   return (
     hasExactKeys(usage, expectedKeys) &&
     [
       usage.inputTokens,
       usage.outputTokens,
       usage.cachedInputTokens,
-      ...(Object.hasOwn(usage, "cacheWriteInputTokens") ? [usage.cacheWriteInputTokens] : []),
+      ...optionalKeys.map((key) => usage[key]),
     ].every((tokenCount) => tokenCount === null || isNonNegativeSafeInteger(tokenCount))
   );
 }
@@ -1694,6 +1700,9 @@ export function isRunDiagnostic(value: unknown): value is RunDiagnostic {
       "abortSource",
       "httpStatus",
       "retryStopReason",
+      ...["providerErrorCode", "providerErrorParam", "requestSummary"].filter((key) =>
+        Object.hasOwn(diagnostic, key),
+      ),
     ])
   )
     return false;
@@ -1734,6 +1743,19 @@ export function isRunDiagnostic(value: unknown): value is RunDiagnostic {
         Number.isInteger(diagnostic.httpStatus) &&
         diagnostic.httpStatus >= 100 &&
         diagnostic.httpStatus <= 599)) &&
+    (diagnostic.providerErrorCode === undefined ||
+      diagnostic.providerErrorCode === null ||
+      (normalizeProviderErrorCode(diagnostic.providerErrorCode) !== null &&
+        normalizeProviderErrorCode(diagnostic.providerErrorCode) ===
+          diagnostic.providerErrorCode)) &&
+    (diagnostic.providerErrorParam === undefined ||
+      diagnostic.providerErrorParam === null ||
+      (normalizeProviderErrorParam(diagnostic.providerErrorParam) !== null &&
+        normalizeProviderErrorParam(diagnostic.providerErrorParam) ===
+          diagnostic.providerErrorParam)) &&
+    (diagnostic.requestSummary === undefined ||
+      diagnostic.requestSummary === null ||
+      isRequestSummary(diagnostic.requestSummary)) &&
     (diagnostic.retryStopReason === null ||
       ["exhausted", "content_delivered", "wait_too_long", "deadline"].includes(
         String(diagnostic.retryStopReason),
@@ -1745,5 +1767,30 @@ function snapshotRunDiagnostic(diagnostic: RunDiagnostic): RunDiagnostic {
   return Object.freeze({
     ...diagnostic,
     usage: diagnostic.usage === null ? null : Object.freeze({ ...diagnostic.usage }),
+    ...(diagnostic.requestSummary == null
+      ? {}
+      : { requestSummary: Object.freeze({ ...diagnostic.requestSummary }) }),
   });
+}
+
+function isRequestSummary(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const summary = value as Record<string, unknown>;
+  const countKeys = [
+    "messageCount",
+    "toolDefinitionCount",
+    "toolCallCount",
+    "toolResultCount",
+    "reasoningMessageCount",
+    "unpairedToolCallCount",
+    "unexpectedToolResultCount",
+  ];
+  return (
+    hasExactKeys(summary, ["purpose", "maxOutputTokens", ...countKeys]) &&
+    ["response", "compaction", "approval"].includes(String(summary.purpose)) &&
+    isNonNegativeSafeInteger(summary.maxOutputTokens) &&
+    countKeys.every(
+      (key) => isNonNegativeSafeInteger(summary[key]) && Number(summary[key]) <= 1_000_000,
+    )
+  );
 }

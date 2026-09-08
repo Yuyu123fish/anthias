@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAgentWithModelStream } from "../src/agent.js";
 import type { AssistantToolCallPart } from "../src/message.js";
-import type { ModelStream } from "../src/model/model-stream.js";
+import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import { createSession, openSession, type Session } from "../src/session/index.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -122,6 +122,73 @@ describe("AutoAllow Agent integration", () => {
     await expect(access(join(session.workspaceRoot, "note.txt"))).rejects.toThrow();
   });
 
+  it("preserves the task for later review after manually approving a large file once", async () => {
+    const session = await createFixture();
+    const largeContent = "已批准正文".repeat(2_000);
+    const calls = [
+      toolCall({ path: "large.txt", content: largeContent }),
+      toolCall({ path: "note.txt", content: "approved" }),
+    ];
+    const requests: ModelRequest[] = [];
+    let responseCount = 0;
+    let manualCount = 0;
+    const agent = createAgentWithModelStream({
+      session,
+      permissionMode: "auto_allow",
+      modelStream: async function* (request) {
+        if (request.purpose === "approval") {
+          requests.push(request);
+          yield { type: "text_delta", delta: reviewJson(session) };
+          yield { type: "finish", finishReason: "stop", usage };
+        } else {
+          const call = calls[responseCount++];
+          if (call !== undefined) {
+            yield { ...call, type: "tool_call" };
+            yield { type: "finish", finishReason: "tool_calls", usage };
+          } else {
+            yield { type: "text_delta", delta: "已创建两份任务文件。" };
+            yield { type: "finish", finishReason: "stop", usage };
+          }
+        }
+      },
+    });
+    cleanup.push(() => agent.close());
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        manualCount++;
+        agent.respondToToolApproval(
+          event.request.toolApprovalRequestId,
+          manualCount === 1 ? "approve" : "deny",
+        );
+      }
+    });
+    const task = "请在当前工作区创建 large.txt 和 note.txt，不要写入工作区外。";
+    expect((await agent.prompt(task)).status).toBe("completed");
+    expect(manualCount).toBe(1);
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    const message = request?.messages[0];
+    if (message?.role !== "user") throw new Error("Missing review input");
+    expect(JSON.parse(message.content).authorizationSources).toEqual([
+      expect.objectContaining({ source: "user", content: task }),
+    ]);
+    expect(message.content).not.toContain(largeContent);
+    expect(await readFile(join(session.workspaceRoot, "large.txt"), "utf8")).toBe(largeContent);
+    expect(await readFile(join(session.workspaceRoot, "note.txt"), "utf8")).toBe("approved");
+    expect(
+      session.records.filter(
+        (record) => record.type === "approval_decision" && record.decisionSource === "user",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        decision: "allowed",
+        toolCallId: calls[0]?.toolCallId,
+        actionFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        toolApprovalRequestId: expect.any(String),
+      }),
+    ]);
+  });
+
   it("persists automatic approval and execution start before writing and reopens with default Agent mode", async () => {
     const session = await createFixture();
     const { agent, purposes } = makeAgent(
@@ -197,7 +264,14 @@ describe("AutoAllow Agent integration", () => {
       expect(purposes.filter((purpose) => purpose === "approval")).toHaveLength(1);
       expect(session.records.filter((record) => record.type === "approval_decision")).toMatchObject(
         [
-          { decisionSource: "auto_review", decision: "needs_user" },
+          {
+            decisionSource: "auto_review",
+            decision: "needs_user",
+            reason:
+              kind === "malformed"
+                ? "自动审核结果 JSON 解析失败，请人工确认。"
+                : "当前用户明确授权本次临时文件操作。",
+          },
           { decisionSource: "user", decision: "denied" },
         ],
       );

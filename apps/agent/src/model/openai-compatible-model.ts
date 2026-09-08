@@ -1,9 +1,13 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { APICallError, jsonSchema, type ModelMessage, streamText, type ToolSet, tool } from "ai";
+import { createContextBudget } from "../context/budget.js";
+import type { RunDiagnostic } from "../message.js";
 import type { ModelConfig } from "./model-config.js";
+import { normalizeProviderErrorCode, normalizeProviderErrorParam } from "./model-diagnostics.js";
 import {
   type ModelFinishReason,
   type ModelInputMessage,
+  type ModelRequest,
   ModelRequestError,
   type ModelStream,
   type ModelStreamEvent,
@@ -15,7 +19,17 @@ export function createOpenAICompatibleModelStream({
   baseURL,
   modelId,
   apiKey,
-}: Pick<ModelConfig, "baseURL" | "modelId" | "apiKey">): ModelStream {
+  capabilities,
+  contextBudget,
+  responseReasoningEffort,
+  approvalReasoningEffort,
+}: Pick<
+  ModelConfig,
+  "baseURL" | "modelId" | "apiKey" | "responseReasoningEffort" | "approvalReasoningEffort"
+> &
+  Partial<Pick<ModelConfig, "capabilities" | "contextBudget">>): ModelStream {
+  const outputBudget =
+    contextBudget ?? (capabilities === undefined ? undefined : createContextBudget(capabilities));
   const provider = createOpenAICompatible({
     name: "anthias-openai-compatible",
     baseURL,
@@ -24,6 +38,22 @@ export function createOpenAICompatibleModelStream({
   });
 
   return async function* (modelRequest, abortSignal) {
+    const purpose = modelRequest.purpose ?? "response";
+    const defaultOutputTokens =
+      purpose === "approval"
+        ? 2_000
+        : purpose === "compaction"
+          ? (outputBudget?.summaryOutputTokens ?? 8_000)
+          : (outputBudget?.responseOutputTokens ?? 64_000);
+    const maxOutputTokens =
+      modelRequest.maxOutputTokens ??
+      Math.min(defaultOutputTokens, capabilities?.maxOutputTokens ?? defaultOutputTokens);
+    const reasoningEffort =
+      purpose === "approval"
+        ? approvalReasoningEffort
+        : purpose === "response"
+          ? responseReasoningEffort
+          : undefined;
     try {
       const modelTools: ToolSet = Object.fromEntries(
         modelRequest.tools.map((definition) => [
@@ -41,7 +71,11 @@ export function createOpenAICompatibleModelStream({
         tools: modelTools,
         abortSignal,
         maxRetries: 0,
-        maxOutputTokens: modelRequest.maxOutputTokens ?? 16_000,
+        maxOutputTokens,
+        // 只有用户明确配置时才发送可选字段，避免改变不支持 reasoning_effort 的兼容服务。
+        ...(reasoningEffort === undefined
+          ? {}
+          : { providerOptions: { openaiCompatible: { reasoningEffort } } }),
         // 原始 Provider 错误不得由 AI SDK 写入终端；下方统一转换为 Adapter 内部异常。
         onError: () => undefined,
       });
@@ -49,7 +83,7 @@ export function createOpenAICompatibleModelStream({
       // fullStream 保留 error part，Adapter 才能在不暴露 Provider 细节时可靠地让本轮失败。
       yield* streamModelEvents(streamResult.fullStream);
     } catch (error) {
-      throw normalizeModelError(error);
+      throw normalizeModelError(error, summarizeModelRequest(modelRequest, maxOutputTokens));
     }
   };
 }
@@ -127,7 +161,7 @@ async function* streamModelEvents(
       continue;
     }
     if (streamPart.type === "error") {
-      throw normalizeModelError(streamPart.error);
+      throw streamPart.error;
     }
   }
 }
@@ -190,9 +224,14 @@ function normalizeFinishReason(value: unknown): ModelFinishReason {
 function normalizeModelUsage(value: unknown): ModelUsage {
   const rawUsage = asRecord(asRecord(value)?.raw);
   const promptDetails = asRecord(rawUsage?.prompt_tokens_details);
+  const completionDetails = asRecord(rawUsage?.completion_tokens_details);
+  const outputDetails = asRecord(rawUsage?.output_tokens_details);
   return Object.freeze({
     inputTokens: tokenCount(rawUsage?.prompt_tokens) ?? tokenCount(rawUsage?.input_tokens),
     outputTokens: tokenCount(rawUsage?.completion_tokens) ?? tokenCount(rawUsage?.output_tokens),
+    reasoningTokens:
+      tokenCount(completionDetails?.reasoning_tokens) ??
+      tokenCount(outputDetails?.reasoning_tokens),
     cachedInputTokens:
       tokenCount(promptDetails?.cached_tokens) ??
       tokenCount(rawUsage?.prompt_cache_hit_tokens) ??
@@ -215,8 +254,16 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 /** 只用错误身份和明确的容量语义归类，原始响应与 Provider 文本不越过 Adapter。 */
-function normalizeModelError(error: unknown): ModelRequestError {
-  if (error instanceof ModelRequestError) return error;
+function normalizeModelError(
+  error: unknown,
+  requestSummary: NonNullable<RunDiagnostic["requestSummary"]>,
+): ModelRequestError {
+  if (error instanceof ModelRequestError)
+    return new ModelRequestError(error.diagnostic.category, {
+      ...error.diagnostic,
+      requestSummary,
+      retryAfterMs: error.retryAfterMs,
+    });
   const apiError = APICallError.isInstance(error) ? error : null;
   let errorData = asRecord(apiError?.data) ?? asRecord(error);
   if (apiError?.responseBody !== undefined && apiError.responseBody.length <= 65_536) {
@@ -236,6 +283,12 @@ function normalizeModelError(error: unknown): ModelRequestError {
       ? apiError.statusCode
       : null;
   const retryAfterMs = parseRetryAfter(apiError?.responseHeaders);
+  const diagnosticDetails = {
+    httpStatus,
+    providerErrorCode: normalizeProviderErrorCode(errorCode),
+    providerErrorParam: normalizeProviderErrorParam(details?.param),
+    requestSummary,
+  };
   if (
     typeof errorCode === "string" &&
     [
@@ -246,7 +299,7 @@ function normalizeModelError(error: unknown): ModelRequestError {
       "input_token_limit_exceeded",
     ].includes(errorCode)
   ) {
-    return new ModelRequestError("context_overflow", { httpStatus });
+    return new ModelRequestError("context_overflow", { ...diagnosticDetails });
   }
   if (
     apiError !== null &&
@@ -255,7 +308,7 @@ function normalizeModelError(error: unknown): ModelRequestError {
       apiError.message,
     )
   ) {
-    return new ModelRequestError("context_overflow", { httpStatus });
+    return new ModelRequestError("context_overflow", { ...diagnosticDetails });
   }
   if (
     [
@@ -265,16 +318,17 @@ function normalizeModelError(error: unknown): ModelRequestError {
       "billing_hard_limit_reached",
     ].includes(String(errorCode))
   ) {
-    return new ModelRequestError("configuration", { httpStatus });
+    return new ModelRequestError("configuration", { ...diagnosticDetails });
   }
   if (httpStatus === 401 || httpStatus === 403)
-    return new ModelRequestError("authentication", { httpStatus });
-  if (httpStatus === 404) return new ModelRequestError("configuration", { httpStatus });
-  if (httpStatus === 429) return new ModelRequestError("rate_limit", { httpStatus, retryAfterMs });
+    return new ModelRequestError("authentication", { ...diagnosticDetails });
+  if (httpStatus === 404) return new ModelRequestError("configuration", { ...diagnosticDetails });
+  if (httpStatus === 429)
+    return new ModelRequestError("rate_limit", { ...diagnosticDetails, retryAfterMs });
   if (httpStatus !== null && [408, 425, 500, 502, 503, 504].includes(httpStatus))
-    return new ModelRequestError("service", { httpStatus, retryAfterMs });
+    return new ModelRequestError("service", { ...diagnosticDetails, retryAfterMs });
   if (httpStatus !== null && httpStatus >= 400 && httpStatus < 500)
-    return new ModelRequestError("invalid_request", { httpStatus });
+    return new ModelRequestError("invalid_request", { ...diagnosticDetails });
   const networkCodes = new Set([
     "ECONNRESET",
     "ECONNREFUSED",
@@ -290,12 +344,12 @@ function normalizeModelError(error: unknown): ModelRequestError {
   let cause = asRecord(error);
   for (let depth = 0; cause !== null && depth < 4; depth++) {
     if (typeof cause.code === "string" && networkCodes.has(cause.code))
-      return new ModelRequestError("network", { httpStatus });
+      return new ModelRequestError("network", { ...diagnosticDetails });
     if (cause.name === "AbortError")
-      return new ModelRequestError("aborted", { httpStatus, abortSource: "internal" });
+      return new ModelRequestError("aborted", { ...diagnosticDetails, abortSource: "internal" });
     cause = asRecord(cause.cause);
   }
-  return new ModelRequestError("unknown", { httpStatus });
+  return new ModelRequestError("unknown", { ...diagnosticDetails });
 }
 
 /** Retry-After 仅转为有界数值事实；保留过长等待供上层明确拒绝自动恢复。 */
@@ -314,4 +368,55 @@ function parseRetryAfter(headers: Record<string, string> | undefined): number | 
   return Number.isFinite(timestamp)
     ? Math.min(86_400_000, Math.max(0, timestamp - Date.now()))
     : null;
+}
+
+/** 只保存形状计数；任何用户文本、工具参数、名称和身份都不能进入安全诊断。 */
+function summarizeModelRequest(
+  request: ModelRequest,
+  maxOutputTokens: number,
+): NonNullable<RunDiagnostic["requestSummary"]> {
+  const pendingToolCalls = new Map<string, string[]>();
+  let toolCallCount = 0;
+  let toolResultCount = 0;
+  let reasoningMessageCount = 0;
+  let unpairedToolCallCount = 0;
+  let unexpectedToolResultCount = 0;
+  const closeToolGroup = () => {
+    for (const toolNames of pendingToolCalls.values()) unpairedToolCallCount += toolNames.length;
+    pendingToolCalls.clear();
+  };
+  for (const message of request.messages) {
+    if (message.role === "tool") {
+      toolResultCount += 1;
+      const toolNames = pendingToolCalls.get(message.toolCallId);
+      const matchingIndex = toolNames?.indexOf(message.toolName) ?? -1;
+      if (toolNames === undefined || matchingIndex < 0) unexpectedToolResultCount += 1;
+      else toolNames.splice(matchingIndex, 1);
+      continue;
+    }
+    closeToolGroup();
+    if (message.role !== "assistant") continue;
+    if (message.content.some((part) => part.type === "reasoning")) reasoningMessageCount += 1;
+    for (const part of message.content) {
+      if (part.type !== "tool_call") continue;
+      toolCallCount += 1;
+      const toolNames = pendingToolCalls.get(part.toolCallId) ?? [];
+      toolNames.push(part.toolName);
+      pendingToolCalls.set(part.toolCallId, toolNames);
+    }
+  }
+  closeToolGroup();
+  const boundCount = (count: number) => Math.min(count, 1_000_000);
+  return Object.freeze({
+    purpose: request.purpose ?? "response",
+    maxOutputTokens:
+      Number.isSafeInteger(maxOutputTokens) && maxOutputTokens >= 0 ? maxOutputTokens : 0,
+    messageCount: boundCount(request.messages.length + 1),
+    toolDefinitionCount: boundCount(request.tools.length),
+    toolCallCount: boundCount(toolCallCount),
+    toolResultCount: boundCount(toolResultCount),
+    reasoningMessageCount: boundCount(reasoningMessageCount),
+    unpairedToolCallCount: boundCount(unpairedToolCallCount),
+    unexpectedToolResultCount: boundCount(unexpectedToolResultCount),
+  });
 }

@@ -92,13 +92,15 @@ Model Adapter 的必需配置为：
 三项只供 Agent Module 内部的模型 Adapter 使用，TUI 只接收启动成功后的 Agent 或安全错误文本。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
 
 
-已知 deepseek-v4-flash 使用内置模型能力数据，不需要手工配置安全余量。自定义模型还必须声明 ANTHIAS_MODEL_CONTEXT_WINDOW；ANTHIAS_MODEL_MAX_OUTPUT_TOKENS 可声明输出能力。ANTHIAS_RESPONSE_MAX_TOKENS、ANTHIAS_COMPACTION_MAX_TOKENS、ANTHIAS_CONTEXT_KEEP_TOKENS 分别控制普通输出、摘要输出和保留原文目标，默认 16,000 / 8,000 / 32,000；安全余量固定 20,000。所有数值在 Agent 启动时校验，TUI 不读取这些配置。
+已知 deepseek-v4-flash 使用内置模型能力数据。自定义模型需声明 `ANTHIAS_MODEL_CONTEXT_WINDOW`，可用 `ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 声明输出能力。普通输出默认 64,000；上下文窗口不超过 84,000 时沿用 16,000，再按模型输出能力收窄。摘要和保留原文目标为 8,000 / 32,000，安全余量为 20,000；`ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS` 可覆盖，显式超限仍在启动时拒绝。
 
-上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史。恢复索引与 JSONL 分开，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 的审核是同一模型的独立请求，最多 8,000 输入 / 2,000 输出，不能调用工具或把摘要、工具结果当成授权。
+`ANTHIAS_RESPONSE_REASONING_EFFORT` 与 `ANTHIAS_APPROVAL_REASONING_EFFORT` 分别控制普通生成和审核的可选 `reasoning_effort`，支持 `low` / `medium` / `high`；未配置不传，压缩不采用这两个覆盖值。配置和 Provider 参数装配仍属于 Agent，TUI 不读取。
+
+上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 审核为同一模型的独立请求，最多 8,000 输入 / 2,000 输出。授权来源按顺序保留全部真实用户消息，历史单次批准只留作审计，不携带整份工具输入占据新审核预算；摘要、工具结果和外部内容不成为用户授权。动作或完整用户来源超预算时明确转人工，不静默丢弃原始任务或后续约束。
 
 ## 失败、重试与继续
 
-Agent 保存 `RunDiagnostic` 的固定分类、已知结束原因、HTTP 状态、用量、重试次数与中止来源，不保存原始请求、响应体、带凭据 URL 或任意异常堆栈。Session 恢复保留这些已知字段，旧记录缺失时显示未知。
+Agent 保存 `RunDiagnostic` 的固定分类、已知结束原因、HTTP 状态、用量、重试次数与中止来源；可选保存白名单错误码、标准参数路径和无正文的请求结构计数。`reasoningTokens` 同时保留在请求用量和运行诊断中，属于输出用量分项，不重复汇总。Session Schema 3 无需迁移，旧记录缺失字段保持未知。原始请求、响应体、带凭据 URL、任意错误字符串与堆栈均不进入诊断。
 
 一次普通生成只有在未交付正文、Reasoning、工具参数片段，也未收到完整 ToolCall 时，才对明确的暂时网络、限流或服务失败最多额外重试两次。等待至少为 500 ms、1000 ms，并服从已知 Retry-After；服务要求超过 30 秒或任务剩余时间不足时停止重试。等待和下一次请求都接受同一取消信号，重试不重置共享任务截止。
 
@@ -108,7 +110,9 @@ Agent 保存 `RunDiagnostic` 的固定分类、已知结束原因、HTTP 状态�
 
 授权由 Agent 持有，生产记录保存在 Anthias 根 `data/permissions/`，与 Session、模型可维护记忆和项目规则分离。只有用户通过独立交互才能新增或扩大授权；AGENTS.md、搜索结果、MCP 内容和其他 Agent 消息不成为授权入口。记录绑定规范化工作区，不按父目录或仓库名称扩展。
 
-`/permissions grant [--remember] [--members]` 先展示当前范围，完整浏览后另行输入 `grant` 才调用 Agent 的授予行为，`cancel` 取消。授权包含工作区内普通文件创建与编辑，以及面板列出的完整命令、参数和 cwd。当前命令范围是 pnpm/npm/yarn 的固定构建、测试、检查和 lint 入口；无法按字面解析、额外参数或未列入口转 AutoAllow 审核，不因当前目录匹配而自动放行。
+`/permissions grant [--remember] [--members]` 展示文件及默认 17 项精确命令范围，完整浏览后输入 `grant` 才授予。`/permissions command [--remember] [--members] [--prefix] [--cwd <相对目录>] -- <命令>` 合并登记新命令，继承当前记住/成员选项，并同样先展示后确认。Agent 接受可选 `commands`，每项包含 `command`、`cwd` 和可选 `allowArguments`；省略时沿用原默认列表，磁盘版本 1 的旧记录不扩大。最多 49 项、记录 192,000 字节，校验失败保留原授权。
+
+精确匹配使用字面参数边界；只有显式 `--prefix` 才允许后续参数，cwd 必须为工作区内确切的现存目录，执行前重新核对真实路径。组合命令逐段匹配，CR、LF、CRLF 都作为命令边界；不确定语法、动态展开、重定向及可直接识别的 Git、清理或发布入口交回审核。解释器前缀可运行后续字面脚本，不限制脚本运行时的系统用户能力。授权预览与工具待批准不能并存，撤销或范围变化使旧预览失效。
 
 只有 `auto_allow` 消费授权：先应用硬禁止和当前限制，再核对最终文件路径、命令和有效授权，未命中时独立审核。`agent` 保留逐动作确认，`plan` 保持只读。命中来源随审批事实保存，但历史事实不能恢复旧权限。文件与命令仍以当前系统用户权限运行，cwd 和 worktree 不构成 OS 隔离。
 

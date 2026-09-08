@@ -3,7 +3,7 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PermissionMode } from "./permission/permission-mode.js";
 
-export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 本地配置；请填写自己的 Key，本文件不提交。
+export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env-example 可提交，填入凭据的 .env 不提交。
 # 只读取 Anthias 根目录的 .env，不读取任务工作区中的同名文件。
 # 进程环境覆盖本文件，包括显式空值。值可用单引号或双引号包裹，不展开变量。
 ANTHIAS_MODEL_BASE_URL=
@@ -12,10 +12,17 @@ ANTHIAS_MODEL_API_KEY=
 
 # 自定义模型必须声明上下文窗口；已知模型可使用内置能力数据。
 # ANTHIAS_MODEL_CONTEXT_WINDOW=128000
-# ANTHIAS_MODEL_MAX_OUTPUT_TOKENS=16000
-# ANTHIAS_RESPONSE_MAX_TOKENS=16000
+# ANTHIAS_MODEL_MAX_OUTPUT_TOKENS=64000
+# 普通输出默认 64000；窗口不超过 84000 时沿用 16000，再按模型输出能力收窄。
+# 显式配置保留原值，超过已声明能力或无法容纳安全余量时拒绝启动。
+# ANTHIAS_RESPONSE_MAX_TOKENS=64000
 # ANTHIAS_COMPACTION_MAX_TOKENS=8000
 # ANTHIAS_CONTEXT_KEEP_TOKENS=32000
+
+# 可选 reasoning_effort：low / medium / high，需由当前服务明确支持所选值。
+# 未配置时不发送此参数；普通生成与自动审核独立设置，压缩不继承。
+# ANTHIAS_RESPONSE_REASONING_EFFORT=low
+# ANTHIAS_APPROVAL_REASONING_EFFORT=low
 
 # 可选；缺少此 Key 只影响 web_search。
 SEARCHAPI_API_KEY=

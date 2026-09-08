@@ -315,6 +315,7 @@ describe("Session recovery storage", () => {
         outputTokens: 7,
         cachedInputTokens: null,
         cacheWriteInputTokens: 3,
+        reasoningTokens: 2,
       },
     });
     await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
@@ -358,7 +359,7 @@ describe("Session recovery storage", () => {
     expect(requestUsageRecord).toMatchObject({
       type: "request_usage",
       runId,
-      usage: { cacheWriteInputTokens: 3 },
+      usage: { cacheWriteInputTokens: 3, reasoningTokens: 2 },
     });
     expect(resumeIndex.latestCompaction).toMatchObject({
       entryId: compactionRecord?.entryId,

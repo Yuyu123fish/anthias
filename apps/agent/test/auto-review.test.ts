@@ -118,9 +118,102 @@ describe("automatic tool approval review", () => {
     expect(recordedUsage).toEqual([USAGE]);
   });
 
-  it("includes only bound human approvals with their earlier exact tool input", async () => {
-    const assistantRecord = assistantEntry(1);
-    const manualApproval = approvalEntry(2);
+  it("retains the initial task and every newer limit after an oversized one-time approval", async () => {
+    const previousToolCall: AssistantToolCallPart = {
+      ...TOOL_CALL,
+      toolName: "write_file",
+      input: { path: "previous.txt", content: "已批准文件正文".repeat(2_000) },
+    };
+    const records: SessionRecord[] = [
+      userEntry(1),
+      userEntry(2, "保留 build/cache 子目录，不允许修改工作区外的文件。"),
+      {
+        ...assistantEntry(3),
+        message: { type: "assistant", status: "completed", content: [previousToolCall] },
+      },
+      { ...approvalEntry(4), toolName: previousToolCall.toolName },
+      userEntry(5, "继续。"),
+    ];
+    const requests: ModelRequest[] = [];
+    const result = await reviewToolApproval(
+      reviewOptions(
+        async function* (request) {
+          requests.push(request);
+          yield {
+            type: "text_delta",
+            delta: JSON.stringify({
+              decision: "needs_user",
+              reason: "当前删除命令没有保留用户要求的 cache 子目录。",
+              authorizationEntryIds: [entryId(1), entryId(2)],
+            }),
+          };
+          yield { type: "finish", finishReason: "stop", usage: USAGE };
+        },
+        { records },
+      ),
+    );
+    expect(result).toEqual({
+      decision: "needs_user",
+      reason: "当前删除命令没有保留用户要求的 cache 子目录。",
+      authorizationEntryIds: [entryId(1), entryId(2)],
+    });
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request === undefined) throw new Error("Missing request");
+    const message = request.messages[0];
+    if (message?.role !== "user") throw new Error("Missing review input");
+    expect(JSON.parse(message.content).authorizationSources).toEqual([
+      {
+        entryId: entryId(1),
+        seq: 1,
+        source: "user",
+        content: "请永久删除工作区 build 目录，旧构建产物无需保留。",
+      },
+      {
+        entryId: entryId(2),
+        seq: 2,
+        source: "user",
+        content: "保留 build/cache 子目录，不允许修改工作区外的文件。",
+      },
+      { entryId: entryId(5), seq: 5, source: "user", content: "继续。" },
+    ]);
+    expect(message.content).not.toContain("已批准文件正文");
+    expect(estimateModelRequestTokens(request)).toBeLessThanOrEqual(8_000);
+  });
+
+  it("falls back without dropping older tasks or newer limits when all user originals exceed budget", async () => {
+    const cases = [
+      [userEntry(1, "原始任务".repeat(3_000)), userEntry(2, "继续。")],
+      [userEntry(1), userEntry(2, "更新限制".repeat(3_000))],
+      [userEntry(1, "任务".repeat(2_000)), userEntry(2, "限制".repeat(2_000))],
+    ];
+    for (const records of cases) {
+      let attempts = 0;
+      const result = await reviewToolApproval(
+        reviewOptions(
+          async function* () {
+            attempts++;
+            yield { type: "finish", finishReason: "stop", usage: USAGE };
+          },
+          {
+            records,
+            onUsage: async () => {
+              throw new Error("Unexpected usage");
+            },
+          },
+        ),
+      );
+      expect(result).toEqual({
+        decision: "needs_user",
+        reason:
+          "全部真实用户原文与当前动作超过自动审核输入预算，无法完整核验任务及更新限制，请人工确认。",
+        authorizationEntryIds: [],
+      });
+      expect(attempts).toBe(0);
+    }
+  });
+
+  it("never reuses a historical one-time approval as authorization for a new action", async () => {
     const legacyApproval: ApprovalDecisionRecord = {
       ...entryBase(3),
       type: "approval_decision",
@@ -134,49 +227,34 @@ describe("automatic tool approval review", () => {
       authorizationEntryIds: [],
     };
     const records: SessionRecord[] = [
-      assistantRecord,
-      manualApproval,
+      assistantEntry(1),
+      { ...approvalEntry(2), actionFingerprint: APPROVAL_PLAN.actionFingerprint },
       legacyApproval,
       { ...approvalEntry(4), decisionSource: "auto_review", reason: "AUTO_AUTHORIZATION" },
       { ...approvalEntry(5), decisionSource: "policy", reason: "POLICY_AUTHORIZATION" },
     ];
-    const requests: ModelRequest[] = [];
-    await reviewToolApproval(
+    let attempts = 0;
+    const result = await reviewToolApproval(
       reviewOptions(
-        async function* (request) {
-          requests.push(request);
-          yield {
-            type: "text_delta",
-            delta: JSON.stringify({
-              decision: "needs_user",
-              reason: "先前批准只限原动作。",
-              authorizationEntryIds: [entryId(2)],
-            }),
-          };
+        async function* () {
+          attempts++;
+          yield { type: "text_delta", delta: allowResponse(entryId(2)) };
           yield { type: "finish", finishReason: "stop", usage: USAGE };
         },
-        { records },
+        {
+          records,
+          onUsage: async () => {
+            throw new Error("Unexpected usage");
+          },
+        },
       ),
     );
-    const request = requests[0];
-    if (request === undefined) throw new Error("Missing request");
-    const message = request.messages[0];
-    if (message?.role !== "user") throw new Error("Missing review input");
-    const payload = JSON.parse(message.content);
-    expect(payload.authorizationSources).toEqual([
-      {
-        entryId: entryId(2),
-        seq: 2,
-        source: "human_approval",
-        actionFingerprint: manualApproval.actionFingerprint,
-        toolApprovalRequestId: manualApproval.toolApprovalRequestId,
-        toolCall: TOOL_CALL,
-      },
-    ]);
-    expect(message.content).not.toContain("ASSISTANT_AUTHORIZATION");
-    expect(message.content).not.toContain("LEGACY_APPROVAL");
-    expect(message.content).not.toContain("AUTO_AUTHORIZATION");
-    expect(message.content).not.toContain("POLICY_AUTHORIZATION");
+    expect(result).toEqual({
+      decision: "needs_user",
+      reason: "没有可完整核验的真实用户授权，请人工确认。",
+      authorizationEntryIds: [],
+    });
+    expect(attempts).toBe(0);
   });
 
   it("never uses assistant, tool, or summary claims as authorization", async () => {
@@ -235,19 +313,72 @@ describe("automatic tool approval review", () => {
       noUsage?: boolean;
       toolCall?: boolean;
       throws?: boolean;
+      expectedReason: string;
     }>[] = [
-      { response: "not JSON" },
-      { response: JSON.stringify({ ...valid, extra: true }) },
-      { response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(2)] }) },
-      { response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(1), entryId(1)] }) },
-      { response: JSON.stringify({ ...valid, authorizationEntryIds: [] }) },
-      { response: JSON.stringify({ ...valid, reason: "长".repeat(301) }) },
-      { response: JSON.stringify({ ...valid, decision: "deny" }) },
-      { response: JSON.stringify({ ...valid, decision: "needs_user" }) },
-      { response: JSON.stringify(valid), finishReason: "length" },
-      { response: JSON.stringify(valid), noUsage: true },
-      { response: JSON.stringify(valid), toolCall: true },
-      { response: JSON.stringify(valid), throws: true },
+      { response: "not JSON", expectedReason: "自动审核结果 JSON 解析失败，请人工确认。" },
+      {
+        response: JSON.stringify({ ...valid, extra: true }),
+        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+      },
+      {
+        response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(2)] }),
+        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+      },
+      {
+        response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(1), entryId(1)] }),
+        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+      },
+      {
+        response: JSON.stringify({ ...valid, authorizationEntryIds: [] }),
+        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+      },
+      {
+        response: JSON.stringify({ ...valid, reason: "长".repeat(301) }),
+        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+      },
+      { response: JSON.stringify({ ...valid, decision: "deny" }), expectedReason: valid.reason },
+      {
+        response: JSON.stringify({ ...valid, decision: "needs_user" }),
+        expectedReason: valid.reason,
+      },
+      {
+        response: "incomplete JSON",
+        finishReason: "length",
+        expectedReason: "自动审核模型达到输出上限（output_limit），请人工确认。",
+      },
+      {
+        response: JSON.stringify(valid),
+        finishReason: "error",
+        expectedReason: "自动审核模型调用失败，请人工确认。",
+      },
+      {
+        response: JSON.stringify(valid),
+        finishReason: "other",
+        expectedReason: "自动审核模型未正常结束，请人工确认。",
+      },
+      {
+        response: "长".repeat(2_001),
+        expectedReason: "自动审核结果超过输出预算，请人工确认。",
+      },
+      {
+        response: "x".repeat(8_001),
+        expectedReason: "自动审核结果超过输出预算，请人工确认。",
+      },
+      {
+        response: JSON.stringify(valid),
+        noUsage: true,
+        expectedReason: "自动审核缺少有效用量记录，请人工确认。",
+      },
+      {
+        response: JSON.stringify(valid),
+        toolCall: true,
+        expectedReason: "自动审核返回了不允许的工具调用，请人工确认。",
+      },
+      {
+        response: JSON.stringify(valid),
+        throws: true,
+        expectedReason: "自动审核模型调用失败，请人工确认。",
+      },
     ];
     for (const scenario of cases) {
       let attempts = 0;
@@ -280,6 +411,7 @@ describe("automatic tool approval review", () => {
         ),
       );
       expect(result.decision).toBe("needs_user");
+      expect(result.reason).toBe(scenario.expectedReason);
       expect(JSON.stringify(result)).not.toContain("PRIVATE_PROVIDER_ERROR");
       expect(attempts).toBe(1);
       expect(recordedUsage).toHaveLength(1);
@@ -287,11 +419,10 @@ describe("automatic tool approval review", () => {
     }
   });
 
-  it("does not send incomplete actions or skip oversized recent authorization", async () => {
+  it("does not send actions that are incomplete or exceed configured model capacity", async () => {
     const cases: Partial<ReviewOptions>[] = [
       { toolCall: { ...TOOL_CALL, input: { command: "删".repeat(9_000) } } },
       { approvalPlan: { ...APPROVAL_PLAN, preview: "改".repeat(9_000) } },
-      { records: [userEntry(1), userEntry(2, "新".repeat(9_000))] },
       { budget: createContextBudget({ contextWindow: 22_100, maxOutputTokens: 2_000 }) },
       { budget: createContextBudget({ contextWindow: 128_000, maxOutputTokens: 1_000 }) },
     ];

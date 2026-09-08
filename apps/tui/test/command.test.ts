@@ -135,6 +135,90 @@ describe("slash commands", () => {
     expect(agent.prompt).not.toHaveBeenCalled();
   });
 
+  it("merges a literal command prefix with the existing reviewed scope", async () => {
+    const { agent } = createFakeAgent();
+    const existing = [{ command: "npm run lint", cwd: "." }];
+    vi.mocked(agent.permissions.snapshot).mockReturnValue({
+      workspaceRoot: agent.state.workspaceRoot,
+      grant: { remember: true, includeMembers: true, files: true, commands: existing },
+      revoked: false,
+      availableCommands: [{ command: "pnpm test", cwd: "." }],
+    });
+    const permissions = vi.fn();
+    const command = parseInput(
+      '/permissions command --prefix --cwd "web app" -- python -u "check page.py"',
+    );
+    if (command.type !== "command") throw new Error("Expected a local command");
+    await executeCommand(command, { agent, permissions, notice: vi.fn(), details() {}, exit() {} });
+    expect(permissions).toHaveBeenCalledWith({
+      remember: true,
+      includeMembers: true,
+      commands: [
+        ...existing,
+        { command: 'python -u "check page.py"', cwd: "web app", allowArguments: true },
+      ],
+    });
+    expect(agent.permissions.grant).not.toHaveBeenCalled();
+    expect(agent.prompt).not.toHaveBeenCalled();
+  });
+
+  it("starts command additions from the default scope and rejects malformed options", async () => {
+    const { agent } = createFakeAgent();
+    const permissions = vi.fn();
+    const notice = vi.fn();
+    const options = { agent, permissions, notice, details() {}, exit() {} };
+    for (const line of [
+      "/permissions command --remember --members --cwd 'web app' -- python \"check page.py\"",
+      "/permissions command -- python validate.py",
+    ]) {
+      const command = parseInput(line);
+      if (command.type === "command") await executeCommand(command, options);
+    }
+    expect(permissions).toHaveBeenNthCalledWith(1, {
+      remember: true,
+      includeMembers: true,
+      commands: [
+        { command: "pnpm test", cwd: "." },
+        { command: 'python "check page.py"', cwd: "web app" },
+      ],
+    });
+    expect(permissions).toHaveBeenNthCalledWith(2, {
+      remember: false,
+      includeMembers: false,
+      commands: [
+        { command: "pnpm test", cwd: "." },
+        { command: "python validate.py", cwd: "." },
+      ],
+    });
+    for (const line of [
+      "/permissions command python validate.py",
+      "/permissions command --prefix --prefix -- python",
+      "/permissions command --remember --remember -- python",
+      "/permissions command --cwd -- python",
+      '/permissions command --cwd "web app -- python',
+      "/permissions command --unknown -- python",
+      "/permissions command --",
+    ]) {
+      const command = parseInput(line);
+      if (command.type === "command") await executeCommand(command, options);
+    }
+    expect(permissions).toHaveBeenCalledTimes(2);
+    expect(notice).toHaveBeenCalledTimes(7);
+    expect(agent.permissions.grant).not.toHaveBeenCalled();
+  });
+
+  it("explains that auto review does not grant workspace permissions when switching modes", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    await executeCommand(
+      { type: "command", name: "mode", argumentsText: "auto_allow" },
+      { agent, notice, details() {}, exit() {} },
+    );
+    expect(notice).toHaveBeenCalledWith(expect.stringContaining("自动审核不等于工作区授权"));
+    expect(notice).toHaveBeenCalledWith(expect.stringContaining("/permissions grant --remember"));
+    expect(agent.permissions.grant).not.toHaveBeenCalled();
+  });
+
   it("returns the original skill task only after successful activation", async () => {
     const { agent } = createFakeAgent();
     const options = { agent, notice: vi.fn(), details() {}, exit() {} };

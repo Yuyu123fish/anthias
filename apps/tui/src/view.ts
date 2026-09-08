@@ -36,6 +36,7 @@ import {
   type ExecutionTurn,
 } from "./execution-view.js";
 import { collaborationStatus } from "./multi-agent-view.js";
+import { missingWorkspaceGrantNotice } from "./permission-view.js";
 import { createTheme } from "./theme.js";
 
 export type ConversationView = Readonly<{
@@ -647,6 +648,11 @@ export function createConversationView(options: {
       appendMessage(agent.state.activeAssistantMessage);
     if (agent.state.messageHistory.length === 0)
       appendText("开始工作", "描述你的任务，或输入 / 查看命令。", "muted");
+    const permissionNotice = missingWorkspaceGrantNotice(
+      agent.state.permissionMode,
+      agent.permissions.snapshot(),
+    );
+    if (permissionNotice !== null) appendNotice("工作区授权", permissionNotice);
     conversationScroll.scrollToEnd();
     invalidateConversation();
     updateDetails();

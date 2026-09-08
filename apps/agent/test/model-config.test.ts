@@ -49,7 +49,7 @@ describe("readModelConfig", () => {
         contextBudget: {
           contextWindow: 128_000,
           safetyTokens: 20_000,
-          responseOutputTokens: 16_000,
+          responseOutputTokens: 64_000,
           summaryOutputTokens: 8_000,
           retainedTokens: 32_000,
         },
@@ -66,9 +66,32 @@ describe("readModelConfig", () => {
       ok: true,
       config: {
         capabilities: { contextWindow: 1_048_576, maxOutputTokens: 384_000 },
-        contextBudget: { safetyTokens: 20_000, responseOutputTokens: 16_000 },
+        contextBudget: { safetyTokens: 20_000, responseOutputTokens: 64_000 },
       },
     });
+  });
+
+  it("validates independent optional reasoning efforts without echoing invalid values", () => {
+    const environment = { ...VALID_ENVIRONMENT, ANTHIAS_MODEL_CONTEXT_WINDOW: "128000" };
+    expect(
+      readModelConfig({
+        ...environment,
+        ANTHIAS_RESPONSE_REASONING_EFFORT: " high ",
+        ANTHIAS_APPROVAL_REASONING_EFFORT: "low",
+      }),
+    ).toMatchObject({
+      ok: true,
+      config: { responseReasoningEffort: "high", approvalReasoningEffort: "low" },
+    });
+    const defaultResult = readModelConfig(environment);
+    if (!defaultResult.ok) throw new Error("expected valid configuration");
+    expect(defaultResult.config).not.toHaveProperty("responseReasoningEffort");
+    expect(defaultResult.config).not.toHaveProperty("approvalReasoningEffort");
+    for (const name of ["ANTHIAS_RESPONSE_REASONING_EFFORT", "ANTHIAS_APPROVAL_REASONING_EFFORT"]) {
+      const result = readModelConfig({ ...environment, [name]: "synthetic-secret-effort" });
+      expect(result).toMatchObject({ ok: false, error: expect.stringContaining(name) });
+      expect(JSON.stringify(result)).not.toContain("synthetic-secret-effort");
+    }
   });
 
   it("requires an explicit context window for an unknown production model", () => {

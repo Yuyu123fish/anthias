@@ -13,7 +13,7 @@ describe("context budget", () => {
     expect(createContextBudget({ contextWindow: 128_000 })).toEqual({
       contextWindow: 128_000,
       safetyTokens: 20_000,
-      responseOutputTokens: 16_000,
+      responseOutputTokens: 64_000,
       summaryOutputTokens: 8_000,
       retainedTokens: 32_000,
     });
@@ -30,6 +30,25 @@ describe("context budget", () => {
         { summaryOutputTokens: 4_001 },
       ),
     ).toThrow("超过");
+  });
+
+  it("keeps an explicit response budget while leaving compaction unchanged", () => {
+    expect(
+      createContextBudget({ contextWindow: 128_000 }, { responseOutputTokens: 16_000 }),
+    ).toMatchObject({
+      responseOutputTokens: 16_000,
+      summaryOutputTokens: 8_000,
+    });
+  });
+
+  it("preserves working small-window defaults and rejects an explicit over-allocation", () => {
+    expect(createContextBudget({ contextWindow: 64_000 })).toMatchObject({
+      responseOutputTokens: 16_000,
+      summaryOutputTokens: 8_000,
+    });
+    expect(() =>
+      createContextBudget({ contextWindow: 64_000 }, { responseOutputTokens: 64_000 }),
+    ).toThrow("无法同时容纳");
   });
 
   it("rejects a window with no input space at the exact safety and output boundary", () => {

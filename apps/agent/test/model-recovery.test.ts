@@ -483,11 +483,25 @@ describe("safe final model facts", () => {
     const leaseResult = await session.acquireRun(randomUUID());
     if (leaseResult.status !== "acquired") throw new Error("expected lease");
     const diagnostic = createRunDiagnostic("output_limit", {
+      providerErrorCode: "missing_reasoning_content",
+      providerErrorParam: "messages[].reasoning_content",
+      requestSummary: {
+        purpose: "response",
+        maxOutputTokens: 64_000,
+        messageCount: 2,
+        toolDefinitionCount: 0,
+        toolCallCount: 0,
+        toolResultCount: 0,
+        reasoningMessageCount: 0,
+        unpairedToolCallCount: 0,
+        unexpectedToolResultCount: 0,
+      },
       retryCount: 1,
       providerFinishReason: "length",
       usage: {
         inputTokens: 12,
-        outputTokens: null,
+        outputTokens: 20,
+        reasoningTokens: 15,
         cachedInputTokens: null,
         cacheWriteInputTokens: null,
       },
@@ -519,6 +533,27 @@ describe("safe final model facts", () => {
     });
     expect(history.messages[3]).not.toHaveProperty("diagnostic");
     expect(isRunDiagnostic({ ...diagnostic, rawBody: "secret" })).toBe(false);
+    expect(isRunDiagnostic({ ...diagnostic, providerErrorCode: "synthetic_secret" })).toBe(false);
+    expect(
+      isRunDiagnostic({ ...diagnostic, providerErrorParam: "messages[].synthetic_secret" }),
+    ).toBe(false);
+    expect(
+      isRunDiagnostic({
+        ...diagnostic,
+        requestSummary: { ...diagnostic.requestSummary, content: "synthetic_secret" },
+      }),
+    ).toBe(false);
+    const legacyDiagnostic = createRunDiagnostic("completed", {
+      usage: {
+        inputTokens: 12,
+        outputTokens: 2,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: null,
+      },
+    });
+    expect(isRunDiagnostic(legacyDiagnostic)).toBe(true);
+    expect(legacyDiagnostic.usage).not.toHaveProperty("reasoningTokens");
+    expect(legacyDiagnostic).not.toHaveProperty("requestSummary");
     expect(isRunDiagnostic({ ...diagnostic, usage: { inputTokens: 12 } })).toBe(false);
   });
 });

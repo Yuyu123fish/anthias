@@ -1,6 +1,8 @@
 import { type ContextBudget, createContextBudget } from "../context/budget.js";
 import { type ModelCapabilities, resolveModelCapabilities } from "./model-capabilities.js";
 
+export type ModelReasoningEffort = "low" | "medium" | "high";
+
 /** 保存生产 Model Adapter 配置与已经验证的上下文能力和策略。 */
 export type ModelConfig = Readonly<{
   baseURL: string;
@@ -8,6 +10,8 @@ export type ModelConfig = Readonly<{
   apiKey: string;
   capabilities: ModelCapabilities;
   contextBudget: ContextBudget;
+  responseReasoningEffort?: ModelReasoningEffort;
+  approvalReasoningEffort?: ModelReasoningEffort;
 }>;
 
 /** 表示模型配置读取成功或返回安全校验错误。 */
@@ -29,7 +33,15 @@ const BUDGET_VARIABLES = [
   "ANTHIAS_CONTEXT_KEEP_TOKENS",
 ] as const;
 
-type ModelVariable = (typeof MODEL_VARIABLES)[number] | (typeof BUDGET_VARIABLES)[number];
+const REASONING_VARIABLES = [
+  "ANTHIAS_RESPONSE_REASONING_EFFORT",
+  "ANTHIAS_APPROVAL_REASONING_EFFORT",
+] as const;
+
+type ModelVariable =
+  | (typeof MODEL_VARIABLES)[number]
+  | (typeof BUDGET_VARIABLES)[number]
+  | (typeof REASONING_VARIABLES)[number];
 type ModelEnvironment = Readonly<Partial<Record<ModelVariable, string | undefined>>>;
 
 /** 本地解析凭据、能力与预算；失败只包含配置变量名或固定校验原因。 */
@@ -50,6 +62,14 @@ export function readModelConfig(environment: ModelEnvironment = process.env): Mo
   }
   const modelId = environment.ANTHIAS_MODEL_ID?.trim() ?? "";
   try {
+    const responseReasoningEffort = readReasoningEffort(
+      environment,
+      "ANTHIAS_RESPONSE_REASONING_EFFORT",
+    );
+    const approvalReasoningEffort = readReasoningEffort(
+      environment,
+      "ANTHIAS_APPROVAL_REASONING_EFFORT",
+    );
     const contextWindow = readTokenSetting(environment, "ANTHIAS_MODEL_CONTEXT_WINDOW");
     const maxOutputTokens = readTokenSetting(environment, "ANTHIAS_MODEL_MAX_OUTPUT_TOKENS");
     const responseOutputTokens = readTokenSetting(environment, "ANTHIAS_RESPONSE_MAX_TOKENS");
@@ -72,6 +92,8 @@ export function readModelConfig(environment: ModelEnvironment = process.env): Mo
         apiKey: environment.ANTHIAS_MODEL_API_KEY?.trim() ?? "",
         capabilities,
         contextBudget,
+        ...(responseReasoningEffort === undefined ? {} : { responseReasoningEffort }),
+        ...(approvalReasoningEffort === undefined ? {} : { approvalReasoningEffort }),
       }),
     });
   } catch (error) {
@@ -80,6 +102,19 @@ export function readModelConfig(environment: ModelEnvironment = process.env): Mo
       error: error instanceof Error ? error.message : "模型上下文配置无效。",
     });
   }
+}
+
+function readReasoningEffort(
+  environment: ModelEnvironment,
+  name: (typeof REASONING_VARIABLES)[number],
+): ModelReasoningEffort | undefined {
+  const rawValue = environment[name];
+  if (rawValue === undefined) return undefined;
+  const value = rawValue.trim();
+  if (value !== "low" && value !== "medium" && value !== "high") {
+    throw new Error(`模型配置格式错误：${name} 只能为 low、medium 或 high。`);
+  }
+  return value;
 }
 
 function readTokenSetting(

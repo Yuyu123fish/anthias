@@ -1,4 +1,4 @@
-import { link, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -301,4 +301,154 @@ describe("Workspace authorization", () => {
     expect(await readFile(join(workspaceRoot, ".env"), "utf8")).toContain(syntheticKey);
     expect(manualRequests).toBe(0);
   });
+});
+
+it("remembers explicit prefixes and scopes each literal command to its exact directory", async () => {
+  const location = await fixture();
+  await mkdir(join(location.workspaceRoot, "app files"));
+  const permissions = createWorkspacePermissions(location);
+  const commands = [
+    { command: "python -c", cwd: "app files", allowArguments: true },
+    { command: "node --check demo.js", cwd: "app files" },
+    { command: "Get-ChildItem", cwd: "app files", allowArguments: true },
+    { command: "Select-Object Name", cwd: "app files" },
+  ];
+  expect((await permissions.grant({ remember: true, includeMembers: false, commands })).ok).toBe(
+    true,
+  );
+  const reopened = createWorkspacePermissions(location);
+  expect(reopened.snapshot().grant?.commands).toEqual(commands);
+  const matches = (command: string, cwd = "app files") =>
+    reopened.matches(
+      call("execute_command", { command, cwd }),
+      approval("execute_command", join(location.workspaceRoot, cwd), "command.current_user_review"),
+      location.workspaceRoot,
+      false,
+    );
+  expect(matches('python -c "print(1); print(2)"')).toBe(true);
+  expect(matches('python -c "print(1)" && node --check demo.js')).toBe(true);
+  expect(matches("Get-ChildItem . | Select-Object Name")).toBe(true);
+  for (const command of [
+    "python3 -c code",
+    "python -m pip",
+    "node --check demo.js --extra",
+    "python -c code\rGet-Date",
+    "python -c code\r\nGet-Date",
+    "python -c code\u2028Get-Date",
+    "python -c code; git push",
+    "python -c code > output.txt",
+    "python -c $script",
+    "python -c code & calc",
+    "python -c code | powershell",
+    "python -c code || calc",
+    "python -c @args",
+    'python -c "unclosed',
+  ])
+    expect(matches(command), command).toBe(false);
+  expect(matches("python -c code", ".")).toBe(false);
+  await reopened.revoke();
+  expect(matches("python -c code")).toBe(false);
+});
+
+it("rejects external directory aliases and never expands legacy command grants", async () => {
+  const location = await fixture();
+  const external = await fixture();
+  await symlink(external.workspaceRoot, join(location.workspaceRoot, "external"), "junction");
+  const permissions = createWorkspacePermissions(location);
+  expect((await permissions.grant({ remember: true, includeMembers: false })).ok).toBe(true);
+  const before = permissions.snapshot().grant;
+  const oversized = await permissions.grant({
+    remember: true,
+    includeMembers: false,
+    commands: Array.from({ length: 49 }, (_, index) => ({
+      command: `python ${"文".repeat(1_900)}${index}`,
+      cwd: ".",
+    })),
+  });
+  expect(oversized.ok).toBe(false);
+  expect(permissions.snapshot().grant).toEqual(before);
+  const outside = await permissions.grant({
+    remember: true,
+    includeMembers: false,
+    commands: [{ command: "python", cwd: "external", allowArguments: true }],
+  });
+  expect(outside.ok).toBe(false);
+  expect(permissions.snapshot().grant).toEqual(before);
+  expect(
+    permissions.matches(
+      call("execute_command", { command: "pnpm test --help" }),
+      approval("execute_command", location.workspaceRoot, "command.current_user_review"),
+      location.workspaceRoot,
+      false,
+    ),
+  ).toBe(false);
+  for (const command of ["git push", "Remove-Item .", "npm publish", "python -c x; node x"])
+    expect(
+      (
+        await permissions.grant({
+          remember: false,
+          includeMembers: false,
+          commands: [{ command, cwd: "." }],
+        })
+      ).ok,
+    ).toBe(false);
+});
+
+it("rechecks a registered directory when it becomes an external junction", async () => {
+  const location = await fixture();
+  const external = await fixture();
+  const directory = join(location.workspaceRoot, "checks");
+  await mkdir(directory);
+  const permissions = createWorkspacePermissions(location);
+  await permissions.grant({
+    remember: false,
+    includeMembers: false,
+    commands: [{ command: "python", cwd: "checks", allowArguments: true }],
+  });
+  await rm(directory, { recursive: true });
+  await symlink(external.workspaceRoot, directory, "junction");
+  expect(
+    permissions.matches(
+      call("execute_command", { command: "python check.py", cwd: "checks" }),
+      approval("execute_command", external.workspaceRoot, "command.current_user_review"),
+      location.workspaceRoot,
+      false,
+    ),
+  ).toBe(false);
+});
+
+it("executes different literal arguments of an explicitly granted command without another approval", async () => {
+  let count = 0;
+  const { agent, session } = await createAgentFixture(async function* (request) {
+    if (request.purpose === "approval") throw new Error("unexpected model approval");
+    if (++count <= 2) {
+      yield {
+        type: "tool_call",
+        toolCallId: "command-" + count,
+        toolName: "execute_command",
+        input: { command: "Write-Output result" + count, cwd: "." },
+        invalid: false,
+      };
+      yield { type: "finish", finishReason: "tool_calls" };
+    } else {
+      yield { type: "text_delta", delta: "Finished." };
+      yield { type: "finish", finishReason: "stop" };
+    }
+  });
+  await agent.permissions.grant({
+    remember: false,
+    includeMembers: false,
+    commands: [{ command: "Write-Output", cwd: ".", allowArguments: true }],
+  });
+  let manualApprovals = 0;
+  agent.subscribe((event) => {
+    if (event.type === "tool_approval_requested") manualApprovals++;
+  });
+  expect((await agent.prompt("检查两次输出")).status).toBe("completed");
+  expect(manualApprovals).toBe(0);
+  expect(
+    session.records
+      .filter((record) => record.type === "approval_decision")
+      .map((record) => record.decisionSource),
+  ).toEqual(["workspace", "workspace"]);
 });

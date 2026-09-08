@@ -572,9 +572,11 @@ async function attachArtifactResult(
 ): Promise<ToolExecutionOutcome & Readonly<{ cleanupUncertain: boolean }>> {
   const cleanupUncertain = executionResult.cleanupUncertain === true;
   if (artifactWriter === undefined) {
+    // store 关闭、ToolCall ID 无效，或 createWriter 抛错
     return Object.freeze({ ...executionResult, cleanupUncertain });
   }
   const pendingOrWrittenByteLength = artifactWriter.byteLength + artifactWriter.pendingByteLength;
+  // 有待写入字节、结果被截断、有未完成标记都应保留原文
   const retainArtifact =
     pendingOrWrittenByteLength > 0 || executionResult.truncated || artifactWriter.hasIncomplete;
   let artifactReference: Awaited<ReturnType<ArtifactWriter["finish"]>>;

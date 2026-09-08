@@ -1,6 +1,12 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import type { AssistantMessage, Message, PromptResult, RunDiagnostic } from "@anthias/agent";
+import type {
+  AgentState,
+  AssistantMessage,
+  Message,
+  PromptResult,
+  RunDiagnostic,
+} from "@anthias/agent";
 import { Markdown } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TerminalCapabilities } from "../src/content-renderer.js";
@@ -23,8 +29,10 @@ function createHarness(
     hyperlinks: false,
     unicode: true,
   },
+  initialState: Partial<AgentState> = {},
 ) {
   const fake = createFakeAgent();
+  fake.setState(initialState);
   const input = new PassThrough();
   input.resume();
   const output = new PassThrough();
@@ -741,6 +749,78 @@ describe("daily usage interactions", () => {
     await screenContains(harness.terminal, "详情 2/2");
   });
 
+  it.each([true, false])(
+    "shows missing workspace authorization at startup with interactive=%s",
+    async (interactive) => {
+      const harness = createHarness(interactive, 110, 30, undefined, {
+        permissionMode: "auto_allow",
+      });
+      if (interactive) await screenContains(harness.terminal, "自动审核不等于工作区授权");
+      else await vi.waitFor(() => expect(harness.plain()).toContain("自动审核不等于工作区授权"));
+      expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+      expect(harness.agent.prompt).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reviews the merged command prefix and only grants after reaching its boundary", async () => {
+    const harness = createHarness(true, 110, 30);
+    await screenContains(harness.terminal, "Workspace:");
+    harness.terminal.send('/permissions command --remember --prefix --cwd "web app" -- python -u');
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "python -u");
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+    harness.terminal.send("grant");
+    harness.terminal.send("\r");
+    await screenContains(harness.terminal, "请完整浏览授权范围");
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+    harness.terminal.send("\u001b[1;5F");
+    await screenContains(harness.terminal, "不限于测试");
+    harness.terminal.send("grant");
+    harness.terminal.send("\r");
+    await vi.waitFor(() =>
+      expect(harness.agent.permissions.grant).toHaveBeenCalledWith({
+        remember: true,
+        includeMembers: false,
+        commands: [
+          { command: "pnpm test", cwd: "." },
+          { command: "python -u", cwd: "web app", allowArguments: true },
+        ],
+      }),
+    );
+    expect(harness.agent.respondToToolApproval).not.toHaveBeenCalled();
+  });
+
+  it("rejects a reviewed grant after authorization is revoked", async () => {
+    const harness = createHarness(false);
+    harness.input.write("/permissions command --prefix -- python\n");
+    await vi.waitFor(() => expect(harness.plain()).toContain("完整浏览后输入 grant"));
+    vi.mocked(harness.agent.permissions.snapshot).mockReturnValue({
+      workspaceRoot: harness.agent.state.workspaceRoot,
+      grant: null,
+      revoked: true,
+      availableCommands: [{ command: "pnpm test", cwd: "." }],
+    });
+    harness.input.write("grant\n");
+    await vi.waitFor(() => expect(harness.plain()).toContain("当前授权状态已变化"));
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+  });
+
+  it("keeps workspace grants separate from pending tool approval", async () => {
+    const harness = createHarness(false);
+    harness.input.write("/permissions command --prefix -- python\n");
+    await vi.waitFor(() => expect(harness.plain()).toContain("完整浏览后输入 grant"));
+    const request = approvalRequest();
+    harness.setState({ pendingToolApproval: request, running: true });
+    harness.emit({ type: "tool_approval_requested", request });
+    expect(harness.plain()).toContain("已取消尚未确认的工作区授权");
+    harness.input.write("grant\n");
+    harness.input.write("/permissions command --prefix -- python\n");
+    await vi.waitFor(() => expect(harness.plain()).toContain("新增工作区授权不会批准当前动作"));
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+    expect(harness.agent.respondToToolApproval).not.toHaveBeenCalled();
+    expect(harness.agent.prompt).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit reviewed grant and keeps revocation available during a run", async () => {
     const harness = createHarness(true, 110, 30);
     await screenContains(harness.terminal, "Workspace:");
@@ -863,24 +943,23 @@ describe("permission review feedback", () => {
   it("reports a failed remembered save with the actual session scope", async () => {
     const harness = createHarness(true, 110, 38);
     await screenContains(harness.terminal, "Workspace:");
-    vi.mocked(harness.agent.permissions.grant).mockResolvedValueOnce({
-      ok: false,
-      error: "本次会话授权已生效，但跨启动设置未保存。",
+    vi.mocked(harness.agent.permissions.grant).mockImplementationOnce(async () => {
+      vi.mocked(harness.agent.permissions.snapshot).mockReturnValue({
+        workspaceRoot: harness.agent.state.workspaceRoot,
+        revoked: false,
+        grant: {
+          remember: false,
+          includeMembers: false,
+          files: true,
+          commands: [{ command: "pnpm test", cwd: "." }],
+        },
+        availableCommands: [{ command: "pnpm test", cwd: "." }],
+      });
+      return { ok: false, error: "本次会话授权已生效，但跨启动设置未保存。" };
     });
     harness.terminal.send("/permissions grant --remember");
     harness.terminal.send("\r");
     await screenContains(harness.terminal, "完整浏览后输入 grant");
-    vi.mocked(harness.agent.permissions.snapshot).mockReturnValue({
-      workspaceRoot: harness.agent.state.workspaceRoot,
-      revoked: false,
-      grant: {
-        remember: false,
-        includeMembers: false,
-        files: true,
-        commands: [{ command: "pnpm test", cwd: "." }],
-      },
-      availableCommands: [{ command: "pnpm test", cwd: "." }],
-    });
     harness.terminal.send("\u001b[1;5F");
     harness.terminal.send("grant");
     harness.terminal.send("\r");

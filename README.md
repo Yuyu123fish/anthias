@@ -26,7 +26,7 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 
 把上面的仓库路径替换为你的实际路径。省略 `--workspace` 时使用调用命令的当前目录，也可以传入 `--workspace 'D:\你的项目'`。根 `.env` 与任务工作区无关，进程环境覆盖文件；模式优先级为 `--mode` → 进程环境 → 根 `.env` → `agent`。`--mode plan` 以只读模式启动；`--mode auto_allow` 采用已明确授予的工作区权限，未命中的动作再独立审核。Session 默认集中保存在 Anthias 仓库的 `data/conversation/`。
 
-需要记住日常工作区授权时，使用 `/permissions grant --remember`，浏览范围后另行输入 `grant`；`--members` 可明确包含登记成员 worktree，`/permissions revoke` 可撤销。可选的 `SEARCHAPI_API_KEY` 启用网页搜索。Quick Start 包含详细范围、PowerShell `anthias` 短命令、Session 恢复和故障处理。
+需要记住日常工作区授权时，使用 `/permissions grant --remember`，浏览范围后另行输入 `grant`；`--members` 可明确包含登记成员 worktree，`/permissions revoke` 可撤销。其他常用命令可通过 `/permissions command` 明确登记，带 `--prefix` 时允许后续字面参数，具体示例见 [Quick Start](quick-start.md#工作区授权)。可选的 `SEARCHAPI_API_KEY` 启用网页搜索。Quick Start 包含详细范围、PowerShell `anthias` 短命令、Session 恢复和故障处理。
 
 ## 当前状态
 

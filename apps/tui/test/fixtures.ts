@@ -85,7 +85,11 @@ export function createFakeAgent() {
         value: {
           workspaceRoot: state.workspaceRoot,
           revoked: false,
-          grant: { ...choice, files: true, commands: [{ command: "pnpm test", cwd: "." }] },
+          grant: {
+            ...choice,
+            files: true,
+            commands: choice.commands ?? [{ command: "pnpm test", cwd: "." }],
+          },
           availableCommands: [{ command: "pnpm test", cwd: "." }],
         },
       })),

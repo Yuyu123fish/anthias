@@ -34,7 +34,9 @@ Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录
 
 DeepSeek V4 Flash 的日常参考配置为 Base URL `https://api.deepseek.com`、模型 ID `deepseek-v4-flash`，窗口能力内置。其他模型若没有内置能力数据，还需在 `.env` 中取消 `ANTHIAS_MODEL_CONTEXT_WINDOW` 的注释，并填写服务明确声明的窗口。
 
-安全余量固定为 20,000 token。普通回答、摘要输出和保留原文的目标默认分别为 16,000、8,000 和 32,000 token；需要调整时填写 `ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS`。`ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 用于声明模型输出能力，配置超限会在进入交互前说明。
+安全余量固定为 20,000 token。普通输出默认 64,000；上下文窗口不超过 84,000 时沿用 16,000，再按已声明的模型输出能力收窄。摘要输出和保留原文目标仍为 8,000、32,000。`ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS` 可显式覆盖；`ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 声明模型输出能力，显式配置超限在启动时拒绝。
+
+支持 `reasoning_effort` 的服务还可分别配置 `ANTHIAS_RESPONSE_REASONING_EFFORT` 与 `ANTHIAS_APPROVAL_REASONING_EFFORT`，可选 `low`、`medium`、`high`。前者用于普通生成，后者用于授权审核；未配置时不发送该参数。当前日常模型可使用 `low` 减少思考等待；更换服务时按其支持情况调整。
 
 `.env` 支持 `NAME=value`、单行引号值和注释，不展开变量或执行命令。配置错误只显示变量名、文件位置或行号。无法创建文件但进程环境已经提供完整配置时，程序会提示并继续启动。
 
@@ -144,7 +146,18 @@ Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬�
 
 这一步只打开授权范围。核对完整 Workspace、文件范围、命令及工作目录，浏览面板到底部后另行输入 `grant` 才授予；输入 `cancel` 取消。省略 `--remember` 只授予本次会话；选择记住后，同一规范工作区重新启动可复用。`/permissions` 随时显示当前范围、来源及保存错误。
 
-该范围包含工作区内的普通文件创建与编辑，以及面板列明的构建、测试、检查和 lint 命令，例如 `pnpm build`、`pnpm test`、`npm run check`。命令入口、完整参数和工作目录均需匹配；额外参数、其他入口、重定向或动态拼装仍需审核。它不包含外部路径写入、破坏性清理、Git 提交或远端发布。Agent 模式仍逐动作确认，Plan 仍只读；只在 AutoAllow 模式消费这份授权。
+该范围包含工作区内的普通文件创建与编辑，以及 17 个默认构建、测试、检查和 lint 命令，例如 `pnpm build`、`pnpm test`、`npm run check`。默认命令按完整参数与确切 cwd 匹配。只选择 AutoAllow 不会创建这份授权；无有效授权时 TUI 会给出提示。
+
+常用的其他命令可单独登记，例如：
+
+```text
+/permissions command --remember -- node --check demo.js
+/permissions command --remember --prefix --cwd scripts -- python check.py
+```
+
+第一条精确授权工作区根目录的检查命令；第二条允许 `scripts` 目录下 `python check.py` 及其后续字面参数，目录必须已存在。命令保留 `--` 后的引号，带空格的目录可写 `--cwd "app files"`。登记会合并当前命令，并继承当前记住/成员选项；没有当前授权时从默认 17 项开始。仍需浏览完整范围后输入 `grant` 确认，最多保存 49 个入口，完整记录不得超过 192,000 字节。
+
+`--prefix` 按参数边界匹配；授予 `python -c`、`powershell -Command` 等前缀即允许其后续字面脚本，需按实际需要选择范围。组合命令的每段均须已登记；动态展开、重定向、未登记命令以及可直接识别的 Git、清理、发布入口继续审核。旧授权不会自动扩大，Agent 模式仍逐动作确认，Plan 仍只读。命令以当前系统用户运行，cwd 不限制脚本的运行时副作用。
 
 确实希望成员继承时，使用 `/permissions grant --remember --members`，阅读后同样输入 `grant`。仅本次会话的 `--members` 覆盖当前任务创建并登记的成员 worktree；同时选择 `--remember` 时，还包括今后从同一根工作区发起任务所创建并登记的成员 worktree。不选择 `--members` 就不继承，也不会扩展到相邻目录或任意工作树。
 
@@ -152,7 +165,7 @@ Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬�
 
 ### 失败、重试与继续
 
-`/diagnostics` 显示最近 Run 的安全分类、已知 HTTP 状态、Provider 结束原因、中止来源、用量和自动重试次数。旧 Session 没有记录的字段保持未知，不补猜历史停止原因。
+`/diagnostics` 显示最近 Run 的安全分类、HTTP 状态、Provider 结束原因、受控错误码和参数字段、用量、请求结构计数及自动重试次数。Provider 返回思考用量时会显示；它属于输出用量，不能再次加总。旧 Session 缺失字段保持未知，不补猜历史原因，也不保存请求正文或原始异常。
 
 一次普通模型生成只会针对明确的暂时网络、限流或服务错误最多额外重试两次，等待时间和次数在 TUI 可见。已经显示正文、Reasoning、工具参数片段，或收到完整 ToolCall 后不会自动重试；认证、配置、未知错误和输出截止也不重试。压缩、审批与 Tool 执行不套用这套重试。服务要求等待超过 30 秒、剩余任务时间不足或用户停止时，后续请求终止；重试不重置共享任务时限。
 

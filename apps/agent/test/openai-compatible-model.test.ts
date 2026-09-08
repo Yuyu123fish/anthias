@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
+import { readModelConfig } from "../src/model/model-config.js";
 import { ModelRequestError } from "../src/model/model-stream.js";
 import { createOpenAICompatibleModelStream } from "../src/model/openai-compatible-model.js";
 import {
@@ -144,6 +145,178 @@ describe("createOpenAICompatibleModelStream", () => {
       ]),
     });
   });
+
+  it("sends independent configured reasoning efforts and bounded budgets by request purpose", async () => {
+    const requestBodies: Record<string, unknown>[] = [];
+    const server = await startServer(async (request, response) => {
+      requestBodies.push(JSON.parse(await readBody(request)) as Record<string, unknown>);
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      writeChunk(response, "done");
+      response.write(
+        `data: ${JSON.stringify({ id: "purpose", created: 0, model: "test-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+      );
+      response.end("data: [DONE]\n\n");
+    });
+    const address = server.address() as AddressInfo;
+    const configResult = readModelConfig({
+      ANTHIAS_MODEL_BASE_URL: `http://127.0.0.1:${address.port}/v1`,
+      ANTHIAS_MODEL_ID: "test-model",
+      ANTHIAS_MODEL_API_KEY: "test-key",
+      ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
+      ANTHIAS_RESPONSE_REASONING_EFFORT: "high",
+      ANTHIAS_APPROVAL_REASONING_EFFORT: "low",
+    });
+    if (!configResult.ok) throw new Error("expected valid configuration");
+    const configuredStream = createOpenAICompatibleModelStream(configResult.config);
+    const request = {
+      systemPrompt: "rules",
+      messages: [{ role: "user" as const, content: "inspect" }],
+      tools: [],
+    };
+    for (const purpose of ["response", "approval", "compaction"] as const) {
+      await collect(configuredStream({ ...request, purpose }, new AbortController().signal));
+    }
+    const unconfiguredStream = createOpenAICompatibleModelStream({
+      baseURL: configResult.config.baseURL,
+      modelId: "test-model",
+      apiKey: "test-key",
+      capabilities: { contextWindow: 128_000, maxOutputTokens: 4_000 },
+    });
+    for (const purpose of ["response", "approval"] as const) {
+      await collect(unconfiguredStream({ ...request, purpose }, new AbortController().signal));
+    }
+    expect(
+      requestBodies.map((body) => ({
+        max_tokens: body.max_tokens,
+        reasoning_effort: body.reasoning_effort,
+      })),
+    ).toEqual([
+      { max_tokens: 64_000, reasoning_effort: "high" },
+      { max_tokens: 2_000, reasoning_effort: "low" },
+      { max_tokens: 8_000, reasoning_effort: undefined },
+      { max_tokens: 4_000, reasoning_effort: undefined },
+      { max_tokens: 2_000, reasoning_effort: undefined },
+    ]);
+    expect(requestBodies.slice(2).every((body) => !Object.hasOwn(body, "reasoning_effort"))).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    {
+      code: "tool_result_mismatch",
+      param: "messages[4].tool_call_id",
+      expectedCode: "tool_result_mismatch",
+      expectedParam: "messages[].tool_call_id",
+    },
+    {
+      code: "missing_reasoning_content",
+      param: "messages.2.reasoning_content",
+      expectedCode: "missing_reasoning_content",
+      expectedParam: "messages[].reasoning_content",
+    },
+    {
+      code: "synthetic_secret_looks_like_code",
+      param: "messages[2].synthetic_secret",
+      expectedCode: null,
+      expectedParam: null,
+    },
+    {
+      code: "unknown_provider_error",
+      param: "messages[2].tool_calls[0].function.arguments.synthetic_secret",
+      expectedCode: null,
+      expectedParam: null,
+    },
+  ])(
+    "retains only approved HTTP error facts: $code",
+    async ({ code, param, expectedCode, expectedParam }) => {
+      const server = await startServer((_request, response) => {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({ error: { code, param, message: "synthetic_secret_provider_body" } }),
+        );
+      });
+      const address = server.address() as AddressInfo;
+      const modelStream = createOpenAICompatibleModelStream({
+        baseURL: `http://127.0.0.1:${address.port}/v1`,
+        modelId: "test-model",
+        apiKey: "test-key",
+      });
+      const outcome = await collect(
+        modelStream(
+          {
+            systemPrompt: "synthetic_secret_system",
+            tools: FIXED_TOOL_DEFINITIONS,
+            messages: [
+              { role: "user", content: "synthetic_secret_user" },
+              {
+                role: "assistant",
+                content: [
+                  { type: "reasoning", text: "synthetic_secret_reasoning" },
+                  {
+                    type: "tool_call",
+                    toolCallId: "synthetic_secret_paired",
+                    toolName: "read_file",
+                    input: { path: "synthetic_secret_path" },
+                    invalid: false,
+                  },
+                ],
+              },
+              {
+                role: "tool",
+                toolCallId: "synthetic_secret_paired",
+                toolName: "read_file",
+                status: "completed",
+                content: "synthetic_secret_result",
+                truncated: false,
+              },
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "tool_call",
+                    toolCallId: "synthetic_secret_unpaired",
+                    toolName: "read_file",
+                    input: {},
+                    invalid: false,
+                  },
+                ],
+              },
+              {
+                role: "tool",
+                toolCallId: "synthetic_secret_unpaired",
+                toolName: "read_file",
+                status: "completed",
+                content: "synthetic_secret_late_result",
+                truncated: false,
+              },
+            ],
+          },
+          new AbortController().signal,
+        ),
+      ).catch((error: unknown) => error);
+      expect(outcome).toMatchObject({
+        diagnostic: {
+          category: "invalid_request",
+          httpStatus: 400,
+          providerErrorCode: expectedCode,
+          providerErrorParam: expectedParam,
+          requestSummary: {
+            purpose: "response",
+            maxOutputTokens: 64_000,
+            messageCount: 6,
+            toolDefinitionCount: FIXED_TOOL_DEFINITIONS.length,
+            toolCallCount: 2,
+            toolResultCount: 2,
+            reasoningMessageCount: 1,
+            unpairedToolCallCount: 0,
+            unexpectedToolResultCount: 0,
+          },
+        },
+      });
+      expect(JSON.stringify(outcome)).not.toContain("synthetic_secret");
+    },
+  );
 
   it("does not retry a failed provider request", async () => {
     let requestCount = 0;
@@ -394,6 +567,7 @@ describe("createOpenAICompatibleModelStream", () => {
         connection: "keep-alive",
       });
       if (requestBodies.length === 1) {
+        writeReasoningChunk(response, "same-run-reasoning-marker");
         writeToolCalls(response, [
           {
             toolCallId: "00000000-0000-4000-8000-000000000101",
@@ -444,6 +618,7 @@ describe("createOpenAICompatibleModelStream", () => {
       await expect(agent.prompt("把 target.txt 更新为 new 并验证")).resolves.toEqual({
         status: "completed",
       });
+      await expect(agent.prompt("说明已经完成的验证")).resolves.toEqual({ status: "completed" });
     } finally {
       await agent.close();
       await closeServer(server);
@@ -451,7 +626,9 @@ describe("createOpenAICompatibleModelStream", () => {
     }
 
     expect(server.listening).toBe(false);
-    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies).toHaveLength(3);
+    expect(JSON.stringify(requestBodies[2])).not.toContain("same-run-reasoning-marker");
+    expect(JSON.stringify(agent.state)).not.toContain("same-run-reasoning-marker");
     expect(requestBodies[1]).toMatchObject({
       messages: [
         { role: "system" },
@@ -461,6 +638,7 @@ describe("createOpenAICompatibleModelStream", () => {
         { role: "user", content: "把 target.txt 更新为 new 并验证" },
         {
           role: "assistant",
+          reasoning_content: "same-run-reasoning-marker",
           tool_calls: [
             { id: "00000000-0000-4000-8000-000000000101" },
             { id: "00000000-0000-4000-8000-000000000102" },
@@ -507,6 +685,32 @@ describe("createOpenAICompatibleModelStream", () => {
   });
 
   it.each([
+    {
+      name: "reasoning as part of total output",
+      providerUsage: {
+        prompt_tokens: 12,
+        completion_tokens: 20,
+        completion_tokens_details: { reasoning_tokens: 15 },
+      },
+      expectedUsage: {
+        inputTokens: 12,
+        outputTokens: 20,
+        reasoningTokens: 15,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: null,
+      },
+    },
+    {
+      name: "known zero reasoning",
+      providerUsage: { completion_tokens: 2, completion_tokens_details: { reasoning_tokens: 0 } },
+      expectedUsage: {
+        inputTokens: null,
+        outputTokens: 2,
+        reasoningTokens: 0,
+        cachedInputTokens: null,
+        cacheWriteInputTokens: null,
+      },
+    },
     {
       name: "standard cached input as part of total input",
       providerUsage: {
@@ -595,10 +799,10 @@ describe("createOpenAICompatibleModelStream", () => {
     expect(modelEvents.at(-1)).toEqual({
       type: "finish",
       finishReason: "stop",
-      usage: expectedUsage,
+      usage: { reasoningTokens: null, ...expectedUsage },
     });
     expect(requestBody).toMatchObject({
-      max_tokens: 16_000,
+      max_tokens: 64_000,
       stream_options: { include_usage: true },
     });
   });
@@ -754,6 +958,7 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
 }
 
 const UNKNOWN_USAGE = Object.freeze({
+  reasoningTokens: null,
   inputTokens: null,
   outputTokens: null,
   cachedInputTokens: null,

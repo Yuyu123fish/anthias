@@ -54,6 +54,7 @@ export function boundToolOutput(
     byteCount += lineBytes;
   }
   if (truncated) {
+    // 只修改预览，丢掉超限行
     const marker = "...[结果已截断，未穷尽]";
     while (
       acceptedLines.length > 0 &&

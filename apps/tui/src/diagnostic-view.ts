@@ -20,7 +20,15 @@ export function formatRunDiagnostic(diagnostic: RunDiagnostic | null | undefined
       : "输入 /continue 继续上一任务，或输入新的要求；已完成事实会保留。",
     `分类：${diagnostic.category} · HTTP：${diagnostic.httpStatus ?? "未知"} · 自动重试：${diagnostic.retryCount ?? "未知"}`,
     `Provider 结束原因：${diagnostic.providerFinishReason ?? "未知"} · 中止来源：${diagnostic.abortSource === null ? "未知" : abortSources[diagnostic.abortSource]}`,
-    `本次请求用量：输入 ${tokens(diagnostic.usage?.inputTokens)} · 输出 ${tokens(diagnostic.usage?.outputTokens)} tokens`,
+    `Provider 错误码：${diagnostic.providerErrorCode ?? "未知"} · 参数：${diagnostic.providerErrorParam ?? "未知"}`,
+    `本次请求用量：输入 ${tokens(diagnostic.usage?.inputTokens)} · 输出 ${tokens(diagnostic.usage?.outputTokens)} · 思考 ${tokens(diagnostic.usage?.reasoningTokens)} tokens`,
+    diagnostic.requestSummary == null
+      ? "请求结构：未知，当前记录未提供。"
+      : [
+          `请求规模：${diagnostic.requestSummary.purpose} · 输出上限 ${tokens(diagnostic.requestSummary.maxOutputTokens)} · 消息 ${diagnostic.requestSummary.messageCount}（含 system） · Tool 定义 ${diagnostic.requestSummary.toolDefinitionCount}`,
+          `工具衔接：调用 ${diagnostic.requestSummary.toolCallCount} · 结果 ${diagnostic.requestSummary.toolResultCount} · 未配对调用 ${diagnostic.requestSummary.unpairedToolCallCount} · 无对应调用的结果 ${diagnostic.requestSummary.unexpectedToolResultCount}`,
+          `携带 Reasoning 的消息：${diagnostic.requestSummary.reasoningMessageCount}`,
+        ].join("\n"),
   ]
     .filter(Boolean)
     .join("\n");

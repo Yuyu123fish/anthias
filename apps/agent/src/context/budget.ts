@@ -23,9 +23,11 @@ export function createContextBudget(
   if (capabilities.maxOutputTokens !== undefined) {
     requirePositiveTokenCount(capabilities.maxOutputTokens, "模型输出能力");
   }
+  // 小窗口沿用原默认预算，避免提高默认值使已有自定义模型无法启动。
+  const defaultResponseOutputTokens = capabilities.contextWindow <= 84_000 ? 16_000 : 64_000;
   const responseOutputTokens = resolveOutputBudget(
     overrides.responseOutputTokens,
-    16_000,
+    defaultResponseOutputTokens,
     capabilities.maxOutputTokens,
   );
   const summaryOutputTokens = resolveOutputBudget(

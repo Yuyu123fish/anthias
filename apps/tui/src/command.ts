@@ -1,10 +1,14 @@
-import type { Agent, ContextUsage, PermissionMode } from "@anthias/agent";
+import type { Agent, ContextUsage, PermissionMode, WorkspaceCommand } from "@anthias/agent";
 import { CombinedAutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./content-renderer.js";
 import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { runMemoryCommand } from "./memory-view.js";
 import { runCollaborationCommand } from "./multi-agent-view.js";
-import { formatPermissions, type PermissionGrantChoice } from "./permission-view.js";
+import {
+  formatPermissions,
+  missingWorkspaceGrantNotice,
+  type PermissionGrantChoice,
+} from "./permission-view.js";
 
 const COMMANDS = [
   { name: "agents", argumentHint: "", description: "成员、Team 与任务状态" },
@@ -34,7 +38,7 @@ const COMMANDS = [
   { name: "context", argumentHint: "", description: "上下文窗口和调用用量" },
   {
     name: "permissions",
-    argumentHint: "[grant [--remember] [--members]|revoke]",
+    argumentHint: "[grant [--remember] [--members]|command ...|revoke]",
     description: "查看、授予或撤销工作区授权",
   },
   { name: "approval", argumentHint: "", description: "查看当前执行确认" },
@@ -91,6 +95,8 @@ export function commandHelp(): string {
     "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
     "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。/approval 返回当前审批。",
     "工作区授权：/permissions grant [--remember] [--members]，浏览后输入 grant 或 cancel。",
+    "/permissions command [--remember] [--members] [--prefix] [--cwd <相对目录>] -- <完整命令或前缀>",
+    "--cwd 支持带引号的目录；-- 后保留命令引号。--prefix 允许入口后续任意字面参数或脚本，浏览合并范围后再确认。",
     "拒绝的输入可用 /draft 恢复；/continue 明确继续上一任务。",
     "// 开头会将一个 / 作为普通文本发送。",
   ].join("\n");
@@ -111,6 +117,8 @@ export function createCommandAutocomplete(agent: Agent): CombinedAutocompletePro
                   "grant --remember",
                   "grant --members",
                   "grant --remember --members",
+                  "command -- ",
+                  "command --prefix -- ",
                   "revoke",
                 ]
               : command.name === "mode"
@@ -265,6 +273,28 @@ export async function executeCommand(
             : result.error,
         );
         if (!result.ok) notice(formatPermissions(agent.permissions.snapshot()));
+      } else if (args[0] === "command") {
+        const addition = parsePermissionCommand(command.argumentsText.trimStart().slice(7));
+        if (addition === null) {
+          invalid();
+          break;
+        }
+        const snapshot = agent.permissions.snapshot();
+        const commands = [...(snapshot.grant?.commands ?? snapshot.availableCommands)];
+        if (
+          !commands.some(
+            (existing) =>
+              existing.command === addition.command.command &&
+              existing.cwd === addition.command.cwd &&
+              Boolean(existing.allowArguments) === Boolean(addition.command.allowArguments),
+          )
+        )
+          commands.push(addition.command);
+        options.permissions?.({
+          remember: addition.remember || snapshot.grant?.remember || false,
+          includeMembers: addition.includeMembers || snapshot.grant?.includeMembers || false,
+          commands,
+        });
       } else if (
         args[0] === "grant" &&
         args.slice(1).every((argument) => argument === "--remember" || argument === "--members") &&
@@ -342,13 +372,26 @@ export async function executeCommand(
         invalid();
         break;
       }
-      if (mode === undefined) notice(`当前权限模式：${agent.state.permissionMode}`);
+      if (mode === undefined)
+        notice(
+          [
+            `当前权限模式：${agent.state.permissionMode}`,
+            missingWorkspaceGrantNotice(agent.state.permissionMode, agent.permissions.snapshot()),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
       else {
         const result = agent.setPermissionMode(mode);
         if (result.status === "rejected") options.rejected?.();
         notice(
           result.status === "accepted"
-            ? `权限模式：${result.permissionMode}`
+            ? [
+                `权限模式：${result.permissionMode}`,
+                missingWorkspaceGrantNotice(result.permissionMode, agent.permissions.snapshot()),
+              ]
+                .filter(Boolean)
+                .join("\n")
             : `暂时不能切换模式：${result.reason}`,
         );
       }
@@ -488,4 +531,56 @@ export function formatContextUsage(usage: ContextUsage): string {
 
 function isPermissionMode(value: string): value is PermissionMode {
   return value === "agent" || value === "plan" || value === "auto_allow";
+}
+
+/** 只解析授权入口的选项；分隔符之后的 Shell 文本交给 Agent 校验，保留原始引号。 */
+function parsePermissionCommand(text: string): Readonly<{
+  remember: boolean;
+  includeMembers: boolean;
+  command: WorkspaceCommand;
+}> | null {
+  let cursor = 0;
+  let cwd = ".";
+  const flags = new Set<string>();
+  const readArgument = (): string | null => {
+    while (cursor < text.length && /\s/u.test(text[cursor] ?? "")) cursor++;
+    if (cursor === text.length) return null;
+    const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : null;
+    const start = cursor;
+    if (quote !== null) {
+      while (cursor < text.length && text[cursor] !== quote) cursor++;
+      if (cursor === text.length) return null;
+      const value = text.slice(start, cursor++);
+      return cursor < text.length && !/\s/u.test(text[cursor] ?? "") ? null : value;
+    }
+    while (cursor < text.length && !/\s/u.test(text[cursor] ?? "")) cursor++;
+    const value = text.slice(start, cursor);
+    return /["']/u.test(value) ? null : value;
+  };
+  while (cursor < text.length) {
+    const argument = readArgument();
+    if (argument === "--") {
+      const command = text.slice(cursor).trim();
+      return command
+        ? {
+            remember: flags.has("--remember"),
+            includeMembers: flags.has("--members"),
+            command: { command, cwd, ...(flags.has("--prefix") ? { allowArguments: true } : {}) },
+          }
+        : null;
+    }
+    if (
+      argument === null ||
+      !["--remember", "--members", "--prefix", "--cwd"].includes(argument) ||
+      flags.has(argument)
+    )
+      return null;
+    flags.add(argument);
+    if (argument === "--cwd") {
+      const directory = readArgument();
+      if (!directory) return null;
+      cwd = directory;
+    }
+  }
+  return null;
 }

@@ -7,8 +7,9 @@ import type { AssistantToolCallPart } from "../message.js";
 import { isRecord } from "../tool/input-validation.js";
 import type { ToolApprovalPlan } from "../tool/tool-runner.js";
 import { arePathsEqual, isPathSameOrInside } from "../tool/workspace-path.js";
+import { isCommandGrant, matchesCommandGrants, normalizeCommandGrants } from "./command-grants.js";
 
-export type WorkspaceCommand = Readonly<{ command: string; cwd: string }>;
+export type WorkspaceCommand = Readonly<{ command: string; cwd: string; allowArguments?: boolean }>;
 export type WorkspaceGrant = Readonly<{
   remember: boolean;
   includeMembers: boolean;
@@ -25,7 +26,11 @@ export type WorkspacePermissionSnapshot = Readonly<{
 export type WorkspacePermissionControls = Readonly<{
   snapshot(): WorkspacePermissionSnapshot;
   grant(
-    options: Readonly<{ remember: boolean; includeMembers: boolean }>,
+    options: Readonly<{
+      remember: boolean;
+      includeMembers: boolean;
+      commands?: readonly WorkspaceCommand[];
+    }>,
   ): Promise<ActionResult<WorkspacePermissionSnapshot>>;
   revoke(): Promise<ActionResult<WorkspacePermissionSnapshot>>;
 }>;
@@ -90,7 +95,7 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
   function refresh() {
     if (pendingWrites > 0) return;
     try {
-      if (statSync(filePath).size > 32_000) throw new Error("invalid permission record");
+      if (statSync(filePath).size > 192_000) throw new Error("invalid permission record");
       const loaded: unknown = JSON.parse(readFileSync(filePath, "utf8"));
       if (!validStoredPermission(loaded, workspaceRoot))
         throw new Error("invalid permission record");
@@ -119,7 +124,12 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
       grant:
         state.grant === null
           ? null
-          : Object.freeze({ ...state.grant, commands: AVAILABLE_COMMANDS }),
+          : Object.freeze({
+              ...state.grant,
+              commands: Object.freeze(
+                state.grant.commands.map((command) => Object.freeze({ ...command })),
+              ),
+            }),
       availableCommands: AVAILABLE_COMMANDS,
       revoked: state.revoked,
       ...(error === undefined ? {} : { error }),
@@ -149,13 +159,23 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
     });
   }
   async function grant(
-    input: Readonly<{ remember: boolean; includeMembers: boolean }>,
+    input: Readonly<{
+      remember: boolean;
+      includeMembers: boolean;
+      commands?: readonly WorkspaceCommand[];
+    }>,
   ): Promise<ActionResult<WorkspacePermissionSnapshot>> {
     if (typeof input.remember !== "boolean" || typeof input.includeMembers !== "boolean")
       return { ok: false, error: "授权选项必须明确选择是否记住和是否包含成员。" };
     if (pendingWrites > 0) return { ok: false, error: "授权变更正在保存，请稍后重试。" };
+    let commands: readonly WorkspaceCommand[];
+    try {
+      commands = normalizeCommandGrants(input.commands ?? AVAILABLE_COMMANDS, workspaceRoot);
+    } catch (failure) {
+      return { ok: false, error: failure instanceof Error ? failure.message : "命令授权无效。" };
+    }
     error = undefined;
-    state = {
+    const candidate: StoredPermission = {
       version: 1,
       workspaceRoot,
       revision: randomUUID(),
@@ -164,9 +184,13 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
         remember: input.remember,
         includeMembers: input.includeMembers,
         files: true,
-        commands: AVAILABLE_COMMANDS,
+        commands,
       },
     };
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > 192_000)
+      return { ok: false, error: "命令授权记录过大，请缩短命令或减少入口。" };
+    error = undefined;
+    state = candidate;
     localOverride = !input.remember;
     const grantedRevision = state.revision;
     changed();
@@ -224,11 +248,16 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
     )
       return false;
     if (
-      !arePathsEqual(resolve(actualWorkspace, approval.target), actualWorkspace) ||
+      !isPathSameOrInside(actualWorkspace, resolve(actualWorkspace, approval.target)) ||
       typeof call.input.command !== "string"
     )
       return false;
-    return matchesCheckCommands(call.input.command);
+    return matchesCommandGrants(
+      call.input.command,
+      resolve(actualWorkspace, approval.target),
+      actualWorkspace,
+      currentGrant.commands,
+    );
   }
   refresh();
   return {
@@ -256,19 +285,6 @@ export function createWorkspacePermissions(options: { workspaceRoot: string; dir
 
 export type WorkspacePermissions = ReturnType<typeof createWorkspacePermissions>;
 
-/** 只接受列明的字面命令；管道、展开、重定向和 Shell 包装全部交回审核。 */
-function matchesCheckCommands(command: string): boolean {
-  if (command.length > 2_000 || /[|<>$`'"(){}[\]\\]/u.test(command)) return false;
-  const commands = command.split(/&&|;|\r?\n/u);
-  return (
-    commands.length > 0 &&
-    commands.every((part) => {
-      const normalized = part.trim().replaceAll(/[ \t]+/gu, " ");
-      return CHECK_COMMANDS.includes(normalized);
-    })
-  );
-}
-
 function validStoredPermission(value: unknown, workspaceRoot: string): value is StoredPermission {
   if (
     !isRecord(value) ||
@@ -290,13 +306,5 @@ function validStoredPermission(value: unknown, workspaceRoot: string): value is 
     !Array.isArray(value.grant.commands)
   )
     return false;
-  return (
-    value.grant.commands.length === AVAILABLE_COMMANDS.length &&
-    value.grant.commands.every(
-      (command, index) =>
-        isRecord(command) &&
-        command.command === AVAILABLE_COMMANDS[index]?.command &&
-        command.cwd === ".",
-    )
-  );
+  return value.grant.commands.length <= 49 && value.grant.commands.every(isCommandGrant);
 }

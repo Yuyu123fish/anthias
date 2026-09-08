@@ -11,7 +11,7 @@ import type {
   ModelUsage,
 } from "../model/model-stream.js";
 import { APPROVAL_REVIEW_SYSTEM_PROMPT } from "../prompts/approval-review-prompt.js";
-import type { ApprovalDecisionRecord, SessionRecord } from "../session/schema.js";
+import type { SessionRecord } from "../session/schema.js";
 import { hasOnlyKeys, isRecord } from "../tool/input-validation.js";
 import type { ToolApprovalPlan } from "../tool/tool-runner.js";
 
@@ -32,21 +32,12 @@ type ReviewToolApprovalOptions = Readonly<{
   onUsage: (usage: ModelUsage | undefined) => Promise<void>;
 }>;
 
-type AuthorizationSource =
-  | Readonly<{
-      entryId: string;
-      seq: number;
-      source: "user";
-      content: string;
-    }>
-  | Readonly<{
-      entryId: string;
-      seq: number;
-      source: "human_approval";
-      actionFingerprint: string;
-      toolApprovalRequestId: string;
-      toolCall: AssistantToolCallPart;
-    }>;
+type AuthorizationSource = Readonly<{
+  entryId: string;
+  seq: number;
+  source: "user";
+  content: string;
+}>;
 
 const APPROVAL_INPUT_TOKEN_LIMIT = 8_000;
 const APPROVAL_OUTPUT_TOKEN_LIMIT = 2_000;
@@ -69,33 +60,38 @@ export async function reviewToolApproval(
     APPROVAL_INPUT_TOKEN_LIMIT,
     options.budget.contextWindow - 20_000 - APPROVAL_OUTPUT_TOKEN_LIMIT,
   );
-  const authorizationSources: AuthorizationSource[] = [];
-  let modelRequest = createReviewRequest(options, authorizationSources);
   if (
     options.toolCall.invalid ||
     options.toolCall.toolName !== options.approvalPlan.toolName ||
-    !/^[a-f0-9]{64}$/u.test(options.approvalPlan.actionFingerprint) ||
-    estimateModelRequestTokens(modelRequest) > inputTokenLimit
+    !/^[a-f0-9]{64}$/u.test(options.approvalPlan.actionFingerprint)
   ) {
-    return needsUser("完整动作无法纳入自动审核，请人工确认。");
+    return needsUser("待审动作信息无效，无法自动审核，请人工确认。");
+  }
+  if (estimateModelRequestTokens(createReviewRequest(options, [])) > inputTokenLimit) {
+    return needsUser("完整动作超过自动审核输入预算，请人工确认。");
   }
 
-  // 从最新来源向前选择完整后缀，遇到放不下的近期原文就停止，避免绕过更新后的限制。
-  for (let index = options.records.length - 1; index >= 0; index--) {
-    const source = readAuthorizationSource(options.records, index);
-    if (source === null) {
-      continue;
+  // 历史人工批准只审计已绑定动作；其文件正文不能挤掉当前任务或更新限制。
+  const authorizationSources: AuthorizationSource[] = [];
+  for (const record of options.records) {
+    if (record.type === "message" && record.message.type === "user") {
+      authorizationSources.push({
+        entryId: record.entryId,
+        seq: record.seq,
+        source: "user",
+        content: record.message.content.map((part) => part.text).join(""),
+      });
     }
-    const candidateSources = [source, ...authorizationSources];
-    const candidateRequest = createReviewRequest(options, candidateSources);
-    if (estimateModelRequestTokens(candidateRequest) > inputTokenLimit) {
-      break;
-    }
-    authorizationSources.unshift(source);
-    modelRequest = candidateRequest;
   }
   if (authorizationSources.length === 0) {
     return needsUser("没有可完整核验的真实用户授权，请人工确认。");
+  }
+  const modelRequest = createReviewRequest(options, authorizationSources);
+  // 不截断或挑选部分用户原文，否则可能丢失仍有效的任务或后续限制。
+  if (estimateModelRequestTokens(modelRequest) > inputTokenLimit) {
+    return needsUser(
+      "全部真实用户原文与当前动作超过自动审核输入预算，无法完整核验任务及更新限制，请人工确认。",
+    );
   }
   if (options.abortSignal.aborted) {
     return abortedReview();
@@ -105,6 +101,8 @@ export async function reviewToolApproval(
   let finishReason: ModelFinishReason | null = null;
   let usage: ModelUsage | undefined;
   let invalidResponse = false;
+  let responseTooLarge = false;
+  let modelFailed = false;
   try {
     for await (const event of options.modelStream(modelRequest, options.abortSignal)) {
       if (options.abortSignal.aborted) {
@@ -112,11 +110,15 @@ export async function reviewToolApproval(
       }
       if (event.type === "text_delta") {
         if (responseText.length + event.delta.length > APPROVAL_OUTPUT_CHARACTER_LIMIT) {
-          invalidResponse = true;
-        } else {
+          responseTooLarge = true;
+        } else if (!responseTooLarge) {
           responseText += event.delta;
         }
-      } else if (event.type === "tool_call") {
+      } else if (
+        event.type === "tool_call" ||
+        event.type === "tool_input_start" ||
+        event.type === "tool_input_delta"
+      ) {
         invalidResponse = true;
       } else if (event.type === "finish") {
         finishReason = event.finishReason;
@@ -126,7 +128,7 @@ export async function reviewToolApproval(
       // 审核 Reasoning 既不积累，也不发布到主对话或事件。
     }
   } catch {
-    invalidResponse = true;
+    modelFailed = true;
   }
 
   // 每个实际 attempt 恰好记一次；回调失败不能伪装为可继续执行的人工降级。
@@ -134,13 +136,23 @@ export async function reviewToolApproval(
   if (options.abortSignal.aborted) {
     return abortedReview();
   }
-  if (
-    invalidResponse ||
-    finishReason !== "stop" ||
-    usage === undefined ||
-    estimateTextTokens(responseText) > APPROVAL_OUTPUT_TOKEN_LIMIT
-  ) {
-    return needsUser("自动审核未能完成有效判断，请人工确认。");
+  if (modelFailed || finishReason === "error") {
+    return needsUser("自动审核模型调用失败，请人工确认。");
+  }
+  if (finishReason === "length") {
+    return needsUser("自动审核模型达到输出上限（output_limit），请人工确认。");
+  }
+  if (responseTooLarge || estimateTextTokens(responseText) > APPROVAL_OUTPUT_TOKEN_LIMIT) {
+    return needsUser("自动审核结果超过输出预算，请人工确认。");
+  }
+  if (invalidResponse) {
+    return needsUser("自动审核返回了不允许的工具调用，请人工确认。");
+  }
+  if (finishReason !== "stop") {
+    return needsUser("自动审核模型未正常结束，请人工确认。");
+  }
+  if (usage === undefined) {
+    return needsUser("自动审核缺少有效用量记录，请人工确认。");
   }
   return parseReviewResult(
     responseText,
@@ -180,71 +192,6 @@ function createReviewRequest(
   });
 }
 
-function readAuthorizationSource(
-  records: readonly SessionRecord[],
-  recordIndex: number,
-): AuthorizationSource | null {
-  const record = records[recordIndex];
-  if (record?.type === "message" && record.message.type === "user") {
-    return {
-      entryId: record.entryId,
-      seq: record.seq,
-      source: "user",
-      content: record.message.content.map((part) => part.text).join(""),
-    };
-  }
-  if (
-    record?.type !== "approval_decision" ||
-    record.decisionSource !== "user" ||
-    record.decision !== "allowed" ||
-    record.actionFingerprint === undefined ||
-    record.toolApprovalRequestId === undefined ||
-    record.runId === undefined
-  ) {
-    return null;
-  }
-  const originalToolCall = findApprovedToolCall(records, recordIndex, record);
-  if (originalToolCall === null) {
-    return null;
-  }
-  return {
-    entryId: record.entryId,
-    seq: record.seq,
-    source: "human_approval",
-    actionFingerprint: record.actionFingerprint,
-    toolApprovalRequestId: record.toolApprovalRequestId,
-    toolCall: originalToolCall,
-  };
-}
-
-function findApprovedToolCall(
-  records: readonly SessionRecord[],
-  approvalRecordIndex: number,
-  approvalRecord: ApprovalDecisionRecord,
-): AssistantToolCallPart | null {
-  for (let index = approvalRecordIndex - 1; index >= 0; index--) {
-    const record = records[index];
-    if (
-      record?.type !== "message" ||
-      record.runId !== approvalRecord.runId ||
-      record.message.type !== "assistant"
-    ) {
-      continue;
-    }
-    for (const part of record.message.content) {
-      if (
-        part.type === "tool_call" &&
-        !part.invalid &&
-        part.toolCallId === approvalRecord.toolCallId &&
-        part.toolName === approvalRecord.toolName
-      ) {
-        return part;
-      }
-    }
-  }
-  return null;
-}
-
 function parseReviewResult(
   responseText: string,
   suppliedEntryIds: ReadonlySet<string>,
@@ -253,7 +200,7 @@ function parseReviewResult(
   try {
     response = JSON.parse(responseText);
   } catch {
-    return needsUser("自动审核结果格式无效，请人工确认。");
+    return needsUser("自动审核结果 JSON 解析失败，请人工确认。");
   }
   if (
     !isRecord(response) ||

@@ -32,10 +32,11 @@ export type ModelInputMessage = (
 ) &
   Readonly<{ entryId?: string }>;
 
-/** 保存 Provider 明确提供的调用用量；缺失字段保持未知，缓存是输入子集。 */
+/** 保存 Provider 明确提供的调用用量；未知不补零，缓存与 Reasoning 分别是输入与输出的子集。 */
 export type ModelUsage = Readonly<{
   inputTokens: number | null;
   outputTokens: number | null;
+  reasoningTokens?: number | null;
   cachedInputTokens: number | null;
   cacheWriteInputTokens: number | null;
 }>;

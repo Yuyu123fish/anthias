@@ -79,12 +79,69 @@ export type RunDiagnostic = Readonly<{
   usage: Readonly<{
     inputTokens: number | null;
     outputTokens: number | null;
+    reasoningTokens?: number | null;
     cachedInputTokens: number | null;
     cacheWriteInputTokens: number | null;
   }> | null;
   retryCount: number | null;
   abortSource: "user" | "task_deadline" | "shutdown" | "parent" | "internal" | "unknown" | null;
   httpStatus: number | null;
+  providerErrorCode?:
+    | "context_length_exceeded"
+    | "context_window_exceeded"
+    | "max_context_length_exceeded"
+    | "prompt_too_long"
+    | "input_token_limit_exceeded"
+    | "invalid_request_error"
+    | "invalid_parameter"
+    | "invalid_value"
+    | "unsupported_parameter"
+    | "unsupported_value"
+    | "missing_required_parameter"
+    | "tool_result_mismatch"
+    | "missing_reasoning_content"
+    | "insufficient_quota"
+    | "model_not_found"
+    | "invalid_model"
+    | "billing_hard_limit_reached"
+    | "invalid_api_key"
+    | "rate_limit_exceeded"
+    | "server_error"
+    | null;
+  providerErrorParam?:
+    | "model"
+    | "max_tokens"
+    | "max_completion_tokens"
+    | "reasoning_effort"
+    | "stream"
+    | "stream_options"
+    | "tools"
+    | "tool_choice"
+    | "messages"
+    | "messages[].role"
+    | "messages[].content"
+    | "messages[].reasoning_content"
+    | "messages[].tool_call_id"
+    | "messages[].tool_calls"
+    | "messages[].tool_calls[].id"
+    | "messages[].tool_calls[].type"
+    | "messages[].tool_calls[].function.name"
+    | "messages[].tool_calls[].function.arguments"
+    | "tools[].type"
+    | "tools[].function.name"
+    | "tools[].function.parameters"
+    | null;
+  requestSummary?: Readonly<{
+    purpose: "response" | "compaction" | "approval";
+    maxOutputTokens: number;
+    messageCount: number;
+    toolDefinitionCount: number;
+    toolCallCount: number;
+    toolResultCount: number;
+    reasoningMessageCount: number;
+    unpairedToolCallCount: number;
+    unexpectedToolResultCount: number;
+  }> | null;
   retryStopReason: "exhausted" | "content_delivered" | "wait_too_long" | "deadline" | null;
 }>;
 

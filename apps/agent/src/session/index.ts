@@ -1178,18 +1178,21 @@ function snapshotUsage(
   usage: Readonly<{
     inputTokens: number | null;
     outputTokens: number | null;
+    reasoningTokens?: number | null;
     cachedInputTokens: number | null;
     cacheWriteInputTokens?: number | null;
   }>,
 ): Readonly<{
   inputTokens: number | null;
   outputTokens: number | null;
+  reasoningTokens?: number | null;
   cachedInputTokens: number | null;
   cacheWriteInputTokens?: number | null;
 }> {
   return Object.freeze({
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
+    ...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
     cachedInputTokens: usage.cachedInputTokens,
     ...(usage.cacheWriteInputTokens === undefined
       ? {}

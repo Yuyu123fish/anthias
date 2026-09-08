@@ -76,9 +76,10 @@ export function assembleContext(
   const sourceRecords = records.filter(
     (record): record is ContextSourceRecord => record.type === "context_source",
   );
-  let initialSources: ContextSourceRecord[];
-  let updates: ContextSourceRecord[];
+  let initialSources: ContextSourceRecord[]; // 固定前缀，会放到发给模型的消息最前面
+  let updates: ContextSourceRecord[]; // 压缩之后（或对话进行中）才出现的来源，插进历史中间
   if (sourceCheckpoint) {
+    // 已经压缩
     initialSources = sourceCheckpoint.sourceVersions.flatMap((source) => {
       const record = byId.get(source.entryId);
       return record?.type === "context_source" && record.content !== null ? [record] : [];

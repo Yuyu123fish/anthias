@@ -30,6 +30,18 @@ export function createRunDiagnostic(
     retryCount: details.retryCount ?? null,
     abortSource: details.abortSource ?? null,
     httpStatus: details.httpStatus ?? null,
+    ...(details.providerErrorCode === undefined
+      ? {}
+      : { providerErrorCode: normalizeProviderErrorCode(details.providerErrorCode) }),
+    ...(details.providerErrorParam === undefined
+      ? {}
+      : { providerErrorParam: normalizeProviderErrorParam(details.providerErrorParam) }),
+    ...(details.requestSummary === undefined
+      ? {}
+      : {
+          requestSummary:
+            details.requestSummary === null ? null : Object.freeze({ ...details.requestSummary }),
+        }),
     retryStopReason: details.retryStopReason ?? null,
   };
   const retrySummary =
@@ -60,4 +72,66 @@ export function createRunDiagnostic(
 /** 仅明确的暂时网络、限流与服务失败允许普通生成恢复。 */
 export function isRetryableModelDiagnostic(diagnostic: RunDiagnostic): boolean {
   return ["network", "rate_limit", "service"].includes(diagnostic.category);
+}
+
+const PROVIDER_ERROR_CODES: readonly NonNullable<RunDiagnostic["providerErrorCode"]>[] = [
+  "context_length_exceeded",
+  "context_window_exceeded",
+  "max_context_length_exceeded",
+  "prompt_too_long",
+  "input_token_limit_exceeded",
+  "invalid_request_error",
+  "invalid_parameter",
+  "invalid_value",
+  "unsupported_parameter",
+  "unsupported_value",
+  "missing_required_parameter",
+  "tool_result_mismatch",
+  "missing_reasoning_content",
+  "insufficient_quota",
+  "model_not_found",
+  "invalid_model",
+  "billing_hard_limit_reached",
+  "invalid_api_key",
+  "rate_limit_exceeded",
+  "server_error",
+];
+const PROVIDER_ERROR_PARAMS: readonly NonNullable<RunDiagnostic["providerErrorParam"]>[] = [
+  "model",
+  "max_tokens",
+  "max_completion_tokens",
+  "reasoning_effort",
+  "stream",
+  "stream_options",
+  "tools",
+  "tool_choice",
+  "messages",
+  "messages[].role",
+  "messages[].content",
+  "messages[].reasoning_content",
+  "messages[].tool_call_id",
+  "messages[].tool_calls",
+  "messages[].tool_calls[].id",
+  "messages[].tool_calls[].type",
+  "messages[].tool_calls[].function.name",
+  "messages[].tool_calls[].function.arguments",
+  "tools[].type",
+  "tools[].function.name",
+  "tools[].function.parameters",
+];
+
+/** 即使错误 code 看似标识符，也只能保留固定已知值，不能让服务端回显密钥。 */
+export function normalizeProviderErrorCode(
+  value: unknown,
+): NonNullable<RunDiagnostic["providerErrorCode"]> | null {
+  return PROVIDER_ERROR_CODES.find((code) => code === value) ?? null;
+}
+
+/** 索引归并为标准字段路径；任意属性、参数值和未经识别的路径一律不保留。 */
+export function normalizeProviderErrorParam(
+  value: unknown,
+): NonNullable<RunDiagnostic["providerErrorParam"]> | null {
+  if (typeof value !== "string" || value.length > 160) return null;
+  const normalized = value.replace(/\[\d{1,6}\]/gu, "[]").replace(/\.\d{1,6}(?=\.|$)/gu, "[]");
+  return PROVIDER_ERROR_PARAMS.find((param) => param === normalized) ?? null;
 }
