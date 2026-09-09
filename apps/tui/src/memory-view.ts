@@ -1,4 +1,5 @@
 import type { Agent, MemoryAction, MemoryEntry, MemorySnapshot } from "@anthias/agent";
+import { MEMORY_HELP } from "./command-definitions.js";
 import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 
@@ -45,18 +46,6 @@ function formatEntry(entry: MemoryEntry): string {
     ].join("\n"),
   );
 }
-export const MEMORY_HELP = [
-  "/memory [list] [user|experience] [active|candidate|review|expired|forgotten|all]",
-  "/memory all [类别] [状态] · 查看全部项目",
-  "/memory show <id>",
-  "/memory save user|experience global|project <正文>",
-  "/memory correct <id> <版本> <正文>",
-  "/memory confirm <id> <版本>",
-  "/memory forget <id> <版本> [no-send]",
-  "/memory on|off",
-  "遗忘停止采用记忆；no-send 同时要求后续模型投影排除相关原文。原始会话清理由独立功能负责。",
-].join("\n");
-
 /** 命令只组装已知动作，内容和版本仍由 Agent 校验。 */
 export async function runMemoryCommand(
   argumentsText: string,

@@ -1,6 +1,7 @@
 import type { Agent, ContextUsage, PermissionMode, WorkspaceCommand } from "@anthias/agent";
 import type { AutocompleteProvider, SlashCommand } from "@earendil-works/pi-tui";
 import { createInputAutocomplete } from "./autocomplete.js";
+import { COMMAND_DEFINITIONS, commandArgumentHint, commandHelp } from "./command-definitions.js";
 import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 import { formatRunDiagnostic } from "./diagnostic-view.js";
@@ -12,57 +13,7 @@ import {
   permissionModeNotice,
 } from "./permission-view.js";
 
-const COMMANDS = [
-  { name: "agents", argumentHint: "", description: "成员、Team 与任务状态" },
-  {
-    name: "agent",
-    argumentHint: "[spawn|result|wait|stop|release|resume ...]",
-    description: "委派与成员历史",
-  },
-  {
-    name: "team",
-    argumentHint: "[create|add|assign|message|tasks|close ...]",
-    description: "持续团队协作",
-  },
-  {
-    name: "git",
-    argumentHint: "[status|create|commit|integrate ...]",
-    description: "本地 Git 与 worktree",
-  },
-  { name: "help", argumentHint: "", description: "命令与快捷键" },
-  { name: "new", argumentHint: "", description: "新建当前工作区的会话" },
-  { name: "resume", argumentHint: "[id]", description: "列出或恢复会话" },
-  {
-    name: "memory",
-    argumentHint: "[list|all|show|save|correct|confirm|forget|on|off|help ...]",
-    description: "查看和维护分层记忆",
-  },
-  { name: "context", argumentHint: "", description: "上下文窗口和调用用量" },
-  {
-    name: "permissions",
-    argumentHint: "[grant [--remember] [--members]|command ...|revoke]",
-    description: "查看、授予或撤销工作区授权",
-  },
-  { name: "approval", argumentHint: "", description: "查看当前执行确认" },
-  { name: "diagnostics", argumentHint: "", description: "查看最近 Run 的安全诊断" },
-  { name: "continue", argumentHint: "[补充要求]", description: "明确继续上一任务，开始新 Run" },
-  { name: "draft", argumentHint: "", description: "恢复未接受的上一份输入" },
-  { name: "compact", argumentHint: "", description: "手动压缩上下文" },
-  {
-    name: "mode",
-    argumentHint: "[agent|plan|auto_allow|full_access]",
-    description: "查看或切换权限模式",
-  },
-  { name: "skills", argumentHint: "[reload|clear]", description: "外部 Skill 目录与激活状态" },
-  { name: "skill:name", argumentHint: "[任务]", description: "激活指定 Skill，可附带用户任务" },
-  {
-    name: "mcp",
-    argumentHint: "[connect|disconnect|inspect|read|prompt ...]",
-    description: "MCP 连接与外部能力",
-  },
-  { name: "details", argumentHint: "[prev|next]", description: "查看命令、Reasoning 和 Tool 详情" },
-  { name: "exit", argumentHint: "", description: "停止 Agent 并退出" },
-] as const;
+export { commandHelp } from "./command-definitions.js";
 
 export type ParsedInput =
   | Readonly<{ type: "prompt"; text: string }>
@@ -75,144 +26,65 @@ export function parseInput(text: string): ParsedInput {
   return { type: "command", name: match?.[1] ?? "", argumentsText: match?.[2] ?? "" };
 }
 
-export function commandHelp(): string {
-  return [
-    ...COMMANDS.map(
-      (command) =>
-        `/${command.name}${command.argumentHint ? ` ${command.argumentHint}` : ""}  ${command.description}`,
-    ),
-    "",
-    "/agent spawn [--write] <任务> | result <id> [offset] | wait <id> | stop <id> | release <id> | resume <id> [任务]",
-    "/agent artifact <id> <artifactId> [cursor]",
-    "/team create <名称> | add [--write] <任务> | assign <id> <任务> | message <id> <消息> | tasks | close",
-    "/git status|diff|log [worktreeId] | show [ref] | branches | worktrees",
-    "/git create [ref] | inspect <id> | remove <id> [discard]",
-    '/git commit {"paths":["文件路径"],"message":"提交说明","worktreeId":"可选"}',
-    "/git integrate <worktreeId> <commit> | continue | abort",
-    "可写成员从已提交版本创建；主目录未提交修改不会带入。",
-    "",
-    "/mcp connect <id> | disconnect <id> | inspect <id>",
-    "/mcp read <id> <uri>",
-    '/mcp prompt <id> <name> [{"参数名":"值"}]',
-    "",
-    "Enter 提交 · Alt+Enter / Shift+Enter 换行 · Tab 补全",
-    "鼠标滚轮 / 拖动右侧滑块滚动 · 点击执行过程或步骤标题展开、收起",
-    "PageUp / PageDown 滚动 · Ctrl+Home / Ctrl+End 顶部/末尾",
-    "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
-    "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。/approval 返回当前审批。",
-    "工作区授权：/permissions grant [--remember] [--members]，浏览后输入 grant 或 cancel。",
-    "FullAccess 跳过人工与自动审核，可访问工作区外文件；当前没有 OS 沙箱。",
-    "工作区授权及其撤销只影响 auto_allow；退出 FullAccess 请在空闲时使用 /mode 切换模式。",
-    "/permissions command [--remember] [--members] [--prefix] [--cwd <相对目录>] -- <完整命令或前缀>",
-    "--cwd 支持带引号的目录；-- 后保留命令引号。--prefix 允许入口后续任意字面参数或脚本，浏览合并范围后再确认。",
-    "拒绝的输入可用 /draft 恢复；/continue 明确继续上一任务。",
-    "// 开头会将一个 / 作为普通文本发送。",
-  ].join("\n");
-}
-
-/** 菜单、参数提示与 /help 使用同一命令目录。 */
+/** 声明提供命令与参数候选；动态身份仍从当前 Agent 控制面读取。 */
 export function createCommandAutocomplete(agent: Agent): AutocompleteProvider {
-  const commands: SlashCommand[] = COMMANDS.filter((command) => command.name !== "skill:name").map(
-    (command) => ({
-      ...command,
-      async getArgumentCompletions(prefix) {
-        const choices =
-          command.name === "memory"
-            ? ["list", "all", "show", "save", "correct", "confirm", "forget", "on", "off", "help"]
-            : command.name === "permissions"
-              ? [
-                  "grant",
-                  "grant --remember",
-                  "grant --members",
-                  "grant --remember --members",
-                  "command -- ",
-                  "command --prefix -- ",
-                  "revoke",
-                ]
-              : command.name === "mode"
-                ? ["agent", "plan", "auto_allow", "full_access"]
-                : command.name === "skills"
-                  ? ["reload", "clear"]
-                  : command.name === "details"
-                    ? ["prev", "next"]
-                    : command.name === "mcp"
-                      ? ["connect", "disconnect", "inspect", "read", "prompt"]
-                      : command.name === "agent"
-                        ? ["spawn", "result", "artifact", "wait", "stop", "release", "resume"]
-                        : command.name === "team"
-                          ? ["create", "add", "assign", "message", "tasks", "close"]
-                          : command.name === "git"
-                            ? [
-                                "status",
-                                "diff",
-                                "log",
-                                "show",
-                                "branches",
-                                "worktrees",
-                                "create",
-                                "inspect",
-                                "remove",
-                                "commit",
-                                "integrate",
-                                "continue",
-                                "abort",
-                              ]
-                            : [];
-        if ((command.name === "agent" || command.name === "team") && prefix.includes(" ")) {
-          const operation = prefix.split(/\s+/u)[0] ?? "";
-          if (
-            [
-              "result",
-              "artifact",
-              "wait",
-              "stop",
-              "release",
-              "resume",
-              "assign",
-              "message",
-            ].includes(operation)
-          ) {
-            const memberPrefix = prefix.slice(operation.length).trimStart();
-            return agent.collaboration
-              .snapshot()
-              .members.filter((member) => member.sessionId.startsWith(memberPrefix))
-              .map((member) => ({
-                value: operation + " " + member.sessionId,
-                label: member.sessionId,
-                description: sanitizeTerminalText(member.name + " · " + member.status),
-              }));
-          }
-        }
-        if (command.name === "resume") {
-          const result = await agent.sessions.list();
-          return result.ok
-            ? result.value
-                .filter((session) => session.id.startsWith(prefix))
-                .map((session) => ({
-                  value: session.id,
-                  label: sanitizeTerminalText(session.id),
-                  description: sanitizeTerminalText(session.title ?? session.createdAt),
-                }))
-            : null;
-        }
-        if (command.name === "mcp" && prefix.includes(" ")) {
-          const operation = prefix.split(/\s+/u)[0] ?? "";
-          const serverPrefix = prefix.slice(operation.length).trimStart();
-          return agent.mcp
-            .list()
-            .filter((server) => server.id.startsWith(serverPrefix))
-            .map((server) => ({
-              value: `${operation} ${server.id}`,
-              label: sanitizeTerminalText(server.id),
-              description: sanitizeTerminalText(`${server.status} · ${server.source}`),
-            }));
-        }
-        return choices
-          .filter((choice) => choice.startsWith(prefix))
-          .map((value) => ({ value, label: value }));
-      },
-    }),
-  );
+  const commands: SlashCommand[] = COMMAND_DEFINITIONS.filter(
+    (command) => command.name !== "skill:name",
+  ).map((command) => ({
+    name: command.name,
+    description: command.description,
+    argumentHint: commandArgumentHint(command),
+    async getArgumentCompletions(prefix) {
+      const operation = prefix.split(/\s+/u)[0] ?? "";
+      const subcommand = command.subcommands?.find((candidate) => candidate.name === operation);
+      if (prefix.includes(" ") && subcommand?.argumentCompletion === "member") {
+        const memberPrefix = prefix.slice(operation.length).trimStart();
+        return agent.collaboration
+          .snapshot()
+          .members.filter((member) => member.sessionId.startsWith(memberPrefix))
+          .map((member) => ({
+            value: operation + " " + member.sessionId,
+            label: member.sessionId,
+            description: sanitizeTerminalText(member.name + " · " + member.status),
+          }));
+      }
+      if (command.name === "resume") {
+        const result = await agent.sessions.list();
+        return result.ok
+          ? result.value
+              .filter((session) => session.id.startsWith(prefix))
+              .map((session) => ({
+                value: session.id,
+                label: sanitizeTerminalText(session.id),
+                description: sanitizeTerminalText(session.title ?? session.createdAt),
+              }))
+          : null;
+      }
+      if (prefix.includes(" ") && subcommand?.argumentCompletion === "mcp-server") {
+        const serverPrefix = prefix.slice(operation.length).trimStart();
+        return agent.mcp
+          .list()
+          .filter((server) => server.id.startsWith(serverPrefix))
+          .map((server) => ({
+            value: `${operation} ${server.id}`,
+            label: sanitizeTerminalText(server.id),
+            description: sanitizeTerminalText(`${server.status} · ${server.source}`),
+          }));
+      }
+      return (command.subcommands ?? []).flatMap((choice) =>
+        (choice.completionSuffixes ?? [""])
+          .map((suffix) => choice.name + suffix)
+          .filter((value) => value.startsWith(prefix))
+          .map((value) => ({
+            value,
+            label: value,
+            description: [choice.argumentHint, choice.description].filter(Boolean).join(" · "),
+          })),
+      );
+    },
+  }));
+  const skillArgumentHint =
+    COMMAND_DEFINITIONS.find((command) => command.name === "skill:name")?.argumentHint ?? "";
   const skills = agent.skills.list();
   for (const skill of skills) {
     const identity =
@@ -222,7 +94,7 @@ export function createCommandAutocomplete(agent: Agent): AutocompleteProvider {
     commands.push({
       name: `skill:${identity}`,
       description: sanitizeTerminalText(skill.description),
-      argumentHint: "[任务]",
+      argumentHint: skillArgumentHint,
     });
   }
   return createInputAutocomplete(commands, agent.state.workspaceRoot);

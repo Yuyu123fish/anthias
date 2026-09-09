@@ -1,14 +1,14 @@
 # Feature 011 Report
 
-状态：实施中
+状态：已实现
 
 ## 开发者速览
 
-> **一句话**：Plan 01、02 已完成实现和本地验证，核心独立审查通过。<br>
+> **一句话**：三个 Plan 的实现、本地验证与独立审查已完成，等待开发者验收。<br>
 > **核心做法**：会话归属、完整 Tool 批次、写入队列和请求投影各有明确持有者。<br>
-> **边界**：核心保持既有权限与持久化语义，TUI 尚未实施。<br>
-> **风险 / 未验证**：真实 Provider、人工终端体验与最终全量验证尚未完成。<br>
-> **当前 / 请审阅**：Plan 01 已提交 aea8813；Plan 02 审查通过，提交后继续 Plan 03。
+> **边界**：旧历史原位兼容，公开 Agent 边界及执行权限合同保持。<br>
+> **风险 / 未验证**：真实 Provider 与人工终端体验未验证，1 项原有 Windows 条件测试跳过。<br>
+> **当前 / 请审阅**：三个 Plan 均已实现且通过审查，按授权逐项提交；等待开发者验收。
 
 ## Plan 01 的结果
 
@@ -63,10 +63,9 @@
 | pnpm exec vitest run apps/agent/test/session-cleanup.test.ts apps/agent/test/session-locations.test.ts | 定向核对修复后 2 文件、35 用例通过，补充 4 个未知内容保留与无关组清理用例 |
 | 文档与独立定向核对 | 独立有界源码核对完成；确认的两处问题已修复并有回归证据，6 份 Feature 文档、10 个本地链接及状态检查通过，git diff --check 通过 |
 
-共 108 个不同用例获得通过证据，不把多轮重叠用例相加。补充变更后只复跑受影响的定位、组清理与公开协作套件；其他可信结果复用。Feature 最终 pnpm verify 与完整 Spec 独立审查保留在 Plan 03，不以本增量替代。
+共 108 个不同用例获得通过证据，不把多轮重叠用例相加。补充变更后只复跑受影响的定位、组清理与公开协作套件；其他可信结果复用。Feature 最终 pnpm verify 与完整 Spec 独立审查见 Plan 03，不以本增量替代。
 
-本增量完成一次独立有界源码核对，统筹复核关键清理判断。核对发现未知目录内容删除与已知坏成员影响无关组两处缺口，修复后只复验定位/清理套件。关于旧 Windows pending 分隔符的疑点，经 HEAD 基线确认 groups 与 cleanup 持久化始终写入正斜杠，未确认实际兼容回退；没有借此扩大状态迁移范围。完整 Feature 的最终独立审查仍在 Plan 03。
-
+本增量完成一次独立有界源码核对，统筹复核关键清理判断。核对发现未知目录内容删除与已知坏成员影响无关组两处缺口，修复后只复验定位/清理套件。关于旧 Windows pending 分隔符的疑点，经 HEAD 基线确认 groups 与 cleanup 持久化始终写入正斜杠，未确认实际兼容回退；没有借此扩大状态迁移范围。完整 Feature 的最终独立审查见 Plan 03。
 
 ## Plan 02 的结果
 
@@ -100,12 +99,60 @@ Context 的 assembly.ts 已删除，历史装配实质归入 projection.ts；mcp
 
 合计 163 项不同测试通过。Context 回归同时覆盖完整双 ToolResult、穿插的 agent_input、来源更新/撤销、持久切点与恢复；MCP 回归验证连续请求的可见性隔离、预算省略与执行时 generation 复核。测试均在 Windows、Node v24.13.1、pnpm 10.33.0 下使用本地确定性流或本地 MCP/Git 夹具。没有真实 Provider 或远端 Git 调用。
 
+A10 的独立写并发、冲突屏障、四并发、逆序完成后源序提交及取消排队专项主要在 tool-scheduling.test.ts，本轮最终全量测试已覆盖；不将全部专项归到上述 163 项分区结果。
+
 Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建期间关闭；既有 refreshAfterUsageOnlyAppend 等待期间仍可能交付 lease，close 随后等待持有者释放。该判断与 aea8813 相同，本次未扩张为新的取消语义，也不宣称测试覆盖获取锁全过程。
 
-## 未完成范围与验收
+## Plan 03 的结果
 
-- Plan 02：实现、定向验证与独立衔接审查已完成。
-- Plan 03：根会话概览、成员过程收拢、TUI 呈现状态、共享文案与命令声明尚未实施；当前 TUI 行为不作为归组呈现已完成的证据。
-- Spec A01–A03、A05–A12 已有分区证据；A04、A13 及完整 A14–A15 留到 Plan 03。
-- 未做真实 Provider、OS 沙箱、真实用户数据迁移/删除或人工终端验收。已完成 Research 归档不表示沙箱能力已实现。
-- 分支仍为 main，Plan 01 已提交 aea8813，未推送、未创建 PR。开发者于 2026-09-09 明确授权连续完成 Feature，每个 Plan 审查通过后提交；本 Feature 不再逐阶段等待用户确认。
+接续 c94f08f。全屏头部明确当前根 Session；恢复的成员按各自 ID 建立独立卡片，展示名称/ID、种类、任务、状态及已有结果，过程默认收起。成员模型重试和终态进入自己的呈现区域，不拆开根 Assistant 的流式正文。成员详情与根输入的控制权继续分离，展开过程或读取历史不会调用 prompt、open 或 resume。
+
+/agents 显示所属根，/agent result 与 /agent artifact 在发起读取前捕获同一根与成员摘要；成功结果和读取失败均带归属标题。成员已结束、已释放或缺少摘要时仍按实际事实显示，不合成成功或调用模型生成名称。TUI 只使用既有 Agent 控制面，不扫描日志文件。
+
+纯文本入口显示根身份和成员概览。成员准备、执行、输出与授权过程默认收进有来源的有界详情，/details 开启后才实时输出；审批请求仍直接呈现。成员通知插入正在生成的根回复时，后续正文标记“主 Agent（继续）”。两种入口共享状态、授权来源、重试、压缩和终止的文本含义。
+
+| 真实调用者 | 原来的维护方式 | 当前归属 |
+| --- | --- | --- |
+| AgentEvent → 全屏 view | View 同时赋值 Assistant 前缀、ExecutionTurn、Tool map、正文组件和详情列表 | presentation.event/restore/notice 持有全部关联更新、成员卡片和 Markdown 资源；view 只读取呈现结果，持有 Editor、布局、滚动、详情选择及审批完整阅读门禁 |
+| TUI 全屏与纯文本 | 多处分别翻译 Tool 状态、授权来源、压缩与终态 | event-text 提供无状态文本函数，两入口继续各自持有布局和流式显示，不复制 AgentEvent 总线或业务状态 |
+| 帮助、自动补全、记忆帮助 | COMMANDS、嵌套 choices、手写子命令与 MEMORY_HELP 分开维护 | command-definitions 为顶层/子命令名称、参数提示、候选来源与帮助唯一声明；command 保留显式解析、校验与 Agent 调用，memory-view 只消费帮助 |
+| 成员详情命令 | 结果内容或错误与根/成员摘要分开拼装 | multi-agent-view 捕获请求归属并统一渲染标题，失败保留对应 ID；实际授权和产物引用校验仍由 Agent 持有 |
+
+没有新增 package 或 Agent 公开字段。presentation 直接接管原有实质呈现逻辑，旧 View 没有保留第二份可独立修改的 Assistant/Tool/成员状态；command.ts 保留实际解析和执行，并非只转发的旧壳。命令分区逐字核对 parseInput、executeCommand 及权限参数解析主体与 c94f08f 相同。
+
+### Plan 03 验证与最终门禁
+
+- 命令与补全：2 文件、28 项通过，包含子命令发现/提示/帮助一致性、记忆参数与动态身份候选边界。
+- 呈现与成员浏览：2 文件、40 项通过；包含跨重绘点击、成员恢复后同 Tool ID 的 Run 归属、旧终态隔离、纯文本成员审批与终态后的根续接、只读查看保持根输入。
+- `pnpm verify` 完整执行一次：check、build 通过；48 个测试文件中 576 项通过、1 项失败、1 项跳过。唯一失败是 CLI 测试仍以旧 `Session:` 行首提取 ID，而本 Feature 已明确显示“根会话 Session:”。
+- 只修改 main.test.ts 的创建/恢复标签断言，再执行 `pnpm exec vitest run apps/tui/test/main.test.ts -t "creates a Session without arguments and reopens the same UUID"`，受影响用例通过；同文件另 9 项只是筛选未运行，其首轮可信结果继续复用。
+- 最终 `pnpm check` 再次通过。全部生产代码与全量运行时一致，最后只变更该标签断言；因此最终获得 **577 个不同测试通过、1 个原有平台条件跳过** 的证据。没有把首次 pnpm verify 的退出码写成成功，也没有重跑所有已通过测试。
+- 原有跳过项为 permission-policy.test.ts 中“编辑前将文件符号链接解析到真实父目录”的非 Windows 用例，当前 Windows 条件明确跳过。
+
+最终独立审查对照全部 Spec 与各 Plan 的可信验证，确认无未解决问题。审查发现的两处 P2 已修复并覆盖：成员审批打断后补根来源标签；成员卡片的点击回调身份在重绘间保持稳定。审查者复核了对应实现与断言，没有重复测试或重审全部已完成代码。
+
+## 验收项与证据位置
+
+以下文件均为仓库现有定向验证或本 Feature 的必要补充；最后以统一门禁结果确认完整代码版本。
+
+| 验收项 | 主要代码入口与测试证据 |
+| --- | --- |
+| A01–A03 | session/locations、artifacts、multi-agent 的结果/产物检查；session-locations、multi-agent、tool-artifacts 测试覆盖一根三成员、跨日、独立引用与拒绝越界 |
+| A04、A13 | presentation、multi-agent-view、terminal-conversation、command-definitions；tui、multi-agent-view、command、autocomplete 测试覆盖根成员归属、按需详情、输入目标与命令发现 |
+| A05–A08 | locations/history/groups/cleanup、Session 打开及成员恢复；session-locations、session-cleanup、session-recovery、multi-agent、tool-artifacts 覆盖旧格式、混合布局、冲突、取消和中断收口 |
+| A09 | agent/runtime 的装配与控制分类；agent-controls、multi-agent、agent-capability-boundaries 覆盖忙闲、切换、审批路由及关闭 |
+| A10 | tool-batch 与 tool-scheduling；tool-scheduling 专项结合完整工具循环、审批与取消测试，最终全量覆盖 |
+| A11 | session/writer 与 context/projection/selection；session、session-recovery、context-selection、context-integration、context-compaction、memory-context 验证身份、来源与持久边界 |
+| A12 | mcp/tool-snapshot、external-capabilities、git/integration；mcp-tool-snapshot、mcp 及三个 Git 文件验证快照、连接复核与集成恢复 |
+| A14–A15 | 本 Report 的前后调用链/真实消费者对照、未扩张公开入口的差异核对、中文注释清理；各 Plan 审查及最终 Spec 遗漏审查，不以目录移动或行数作为完成依据 |
+
+## 验收边界与交付
+
+三个 Plan 均已实现并完成各自审查，本 Feature 标为“已实现”，等待开发者验收。Plan 01 提交为 aea8813，Plan 02 提交为 c94f08f；Plan 03 随本次交付提交。按开发者授权逐 Plan 提交，不推送、不创建 PR。
+
+- 已验证：存储层级、旧布局兼容、产物归属、组清理，核心执行/持久化/快照/恢复，以及 TUI 与命令接线。全部 A01–A15 有上述实现或验证证据。
+- 人工终端主观体验及真实 Provider 未验证；本地模拟终端和确定性流不能替代这些证据。
+- 未改写、迁移或删除实际 data/conversation 历史；未实施 OS 沙箱，没有保留演示后台进程。Research 归档不代表沙箱能力实现。
+- 稳定使用说明与技术基线按 Plan 03 在开发者验收后同步；当前已实现行为、预期目录及证据以本 Feature 的 Spec、Plan、Tasks 和 Report 为准。
+
+最终文档核对：6 份 Feature 文档均为已实现，11 个本地链接有效；Agent/TUI package 入口与 AgentControls 相对 865baac 均无差异，git diff --check 通过。

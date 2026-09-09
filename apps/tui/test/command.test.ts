@@ -311,6 +311,89 @@ describe("slash commands", () => {
     expect(commandHelp()).toContain("/compact");
     expect(commandHelp()).toContain("Alt+Enter");
   });
+  it("shows declared subcommand arguments in help and completion suggestions", async () => {
+    const { agent } = createFakeAgent();
+    const provider = createCommandAutocomplete(agent);
+    const help = commandHelp();
+    for (const [prefix, value, usage] of [
+      ["/agent ar", "artifact", "<id> <artifactId> [cursor]"],
+      ["/git rem", "remove", "<id> [discard]"],
+      ["/memory f", "forget", "<id> <版本> [no-send]"],
+      ["/mcp p", "prompt", '<id> <name> [{"参数名":"值"}]'],
+    ]) {
+      if (prefix === undefined || value === undefined || usage === undefined) {
+        throw new Error("Expected a complete command discovery case");
+      }
+      const suggestions = await provider.getSuggestions([prefix], 0, prefix.length, {
+        signal: new AbortController().signal,
+      });
+      expect(suggestions?.items.find((item) => item.value === value)?.description).toContain(usage);
+      expect(help).toContain(prefix.split(" ")[0] + " " + value + " " + usage);
+    }
+    expect(help.split("\n").find((line) => line.startsWith("/agent ["))).toContain("artifact");
+    expect(help).toContain("/agent wait <id> [id2] [id3]");
+    expect(agent.prompt).not.toHaveBeenCalled();
+  });
+
+  it("uses the same memory usage for explicit help and invalid arguments", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    const options = { agent, notice, details() {}, exit() {} };
+    await expect(
+      executeCommand({ type: "command", name: "memory", argumentsText: "help" }, options),
+    ).resolves.toEqual({ kind: "handled" });
+    const help = notice.mock.calls[0]?.[0];
+    expect(help).toContain(
+      "/memory [list] [user|experience] [active|candidate|review|expired|forgotten|all]",
+    );
+    expect(help).toContain("/memory forget <id> <版本> [no-send]");
+    expect(help).toContain("原始会话清理由独立功能负责");
+    expect(commandHelp()).toContain(help);
+    await expect(
+      executeCommand(
+        { type: "command", name: "memory", argumentsText: "confirm missing-version" },
+        options,
+      ),
+    ).resolves.toEqual({ kind: "rejected" });
+    expect(notice).toHaveBeenLastCalledWith(help);
+    expect(agent.memory.query).not.toHaveBeenCalled();
+    expect(agent.memory.execute).not.toHaveBeenCalled();
+    expect(agent.prompt).not.toHaveBeenCalled();
+  });
+
+  it("queries dynamic identities only for the declared command family", async () => {
+    const { agent } = createFakeAgent();
+    const provider = createCommandAutocomplete(agent);
+    for (const prefix of ["/agent assign ", "/team result ", "/mcp unknown "]) {
+      const suggestions = await provider.getSuggestions([prefix], 0, prefix.length, {
+        signal: new AbortController().signal,
+      });
+      expect(suggestions?.items ?? []).toEqual([]);
+    }
+    expect(agent.collaboration.snapshot).not.toHaveBeenCalled();
+    expect(agent.mcp.list).not.toHaveBeenCalled();
+
+    const memberPrefix = "/agent result ";
+    await provider.getSuggestions([memberPrefix], 0, memberPrefix.length, {
+      signal: new AbortController().signal,
+    });
+    expect(agent.collaboration.snapshot).toHaveBeenCalledOnce();
+    const serverPrefix = "/mcp read l";
+    const serverSuggestions = await provider.getSuggestions(
+      [serverPrefix],
+      0,
+      serverPrefix.length,
+      {
+        signal: new AbortController().signal,
+      },
+    );
+    expect(serverSuggestions?.items.map((item) => item.value)).toContain("read local");
+    expect(agent.mcp.list).toHaveBeenCalledOnce();
+    expect(agent.sessions.open).not.toHaveBeenCalled();
+    expect(agent.collaboration.execute).not.toHaveBeenCalled();
+    expect(agent.mcp.readResource).not.toHaveBeenCalled();
+  });
+
   it("routes collaboration and Git commands through Agent controls", async () => {
     const { agent } = createFakeAgent();
     const notice = vi.fn();

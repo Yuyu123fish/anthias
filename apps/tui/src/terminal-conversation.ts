@@ -1,5 +1,11 @@
 import { createInterface, type Interface } from "node:readline";
-import type { Agent, AgentEvent, Message, WorkspacePermissionSnapshot } from "@anthias/agent";
+import type {
+  Agent,
+  AgentEvent,
+  CollaborationSnapshot,
+  Message,
+  WorkspacePermissionSnapshot,
+} from "@anthias/agent";
 import type { Terminal } from "@earendil-works/pi-tui";
 import { executeCommand, parseInput } from "./command.js";
 import {
@@ -8,8 +14,15 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
-import { formatModelRecovery, formatRunDiagnostic } from "./diagnostic-view.js";
-import { collaborationStatus } from "./multi-agent-view.js";
+import { formatRunDiagnostic } from "./diagnostic-view.js";
+import {
+  authorizationSourceName,
+  eventNotice,
+  eventSourceLabel,
+  toolPreparationText,
+  toolResultStatus,
+} from "./event-text.js";
+import { formatCollaboration } from "./multi-agent-view.js";
 import {
   formatPermissions,
   type PermissionGrantChoice,
@@ -53,8 +66,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   let exiting = false;
   let exitCode = 0;
   let plainAssistantStreaming = false;
+  let plainAssistantNeedsLabel = false;
   let plainDetailsVisible = false;
   let latestPlainDetails = "";
+  let renderedPlainCollaboration = "";
   let submissionPending = false;
   let pendingWorkspaceGrantReview: { choice: PermissionGrantChoice; scope: string } | undefined;
   const renderedPlainToolResultIds = new Set<string>();
@@ -70,7 +85,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   function notice(text: string, title = "Anthias"): void {
     if (exiting) return;
     if (view !== undefined) view.notice(text, title);
-    else write(`\n${title}\n${text}\n`);
+    else {
+      if (plainAssistantStreaming) plainAssistantNeedsLabel = true;
+      write(`\n${title}\n${text}\n`);
+    }
   }
   function interrupt(): void {
     if (agent.state.running || agent.state.operation !== null) {
@@ -315,13 +333,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     if (renderedPlainToolResultIds.has(identity)) return;
     renderedPlainToolResultIds.add(identity);
     const member = memberSessionId ? ` · 成员 ${memberName ?? memberSessionId}` : "";
-    const status = {
-      completed: "已完成",
-      failed: "失败",
-      denied: "已拒绝",
-      aborted: "已停止",
-      unknown: "结果未知",
-    }[message.status];
+    const status = toolResultStatus(message.status);
     write(
       `\n${message.toolName} [${message.toolCallId.slice(-8)}]${member} · ${status}\n${message.content.slice(0, 600)}${message.content.length > 600 ? "\n… /details 查看完整预览" : ""}\n`,
     );
@@ -330,18 +342,50 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       `\n${message.toolName}${member}\n${message.content}`,
     );
   }
+  function plainCollaboration(snapshot: CollaborationSnapshot | undefined): void {
+    if (!snapshot) return;
+    const text = formatCollaboration({
+      ...snapshot,
+      rootSessionId: snapshot.rootSessionId ?? agent.state.sessionId,
+    });
+    if (text === renderedPlainCollaboration) return;
+    renderedPlainCollaboration = text;
+    if (plainAssistantStreaming) plainAssistantNeedsLabel = true;
+    write(`\n${text}\n`);
+  }
   function plainEvent(event: AgentEvent): void {
+    // 纯文本没有可折叠组件；成员过程留在有来源的详情与成员历史中，默认只打印概览和终态。
+    const text = memberToolText(event);
+    if (text !== null) {
+      const source = eventSourceLabel(event);
+      latestPlainDetails = appendBounded(latestPlainDetails, `\n${source}\n${text}\n`);
+      if (plainDetailsVisible) {
+        if (plainAssistantStreaming) plainAssistantNeedsLabel = true;
+        write(`\n${source}\n${text}\n`);
+      }
+      return;
+    }
+    const notification = eventNotice(event);
+    if (notification) {
+      if (plainAssistantStreaming) plainAssistantNeedsLabel = true;
+      write(`\n${notification.title}\n${notification.text}\n`);
+      return;
+    }
     switch (event.type) {
       case "collaboration_changed":
-        write("\n" + collaborationStatus(event.snapshot).replace(/^ · /u, "") + "\n");
+        plainCollaboration(event.snapshot);
         break;
       case "session_changed":
         pendingWorkspaceGrantReview = undefined;
         renderedPlainToolResultIds.clear();
+        renderedPlainCollaboration = "";
+        plainAssistantStreaming = false;
+        plainAssistantNeedsLabel = false;
         write(
-          `\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n`,
+          `\n根会话 Session: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n`,
         );
         for (const message of agent.state.messageHistory) plainMessage(message);
+        plainCollaboration(agent.state.collaboration);
         latestPlainDetails = "";
         if (
           agent.state.lastRunDiagnostic?.category !== "completed" &&
@@ -353,9 +397,14 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         if (event.message.role === "assistant") {
           write("\n><> Anthias\n");
           plainAssistantStreaming = true;
+          plainAssistantNeedsLabel = false;
         } else if (event.message.role === "user") plainMessage(event.message);
         break;
       case "message_update":
+        if (plainAssistantNeedsLabel) {
+          write("\n><> Anthias · 主 Agent（继续）\n");
+          plainAssistantNeedsLabel = false;
+        }
         write(event.delta);
         break;
       case "message_end":
@@ -368,7 +417,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         }
         break;
       case "reasoning_start":
-        latestPlainDetails = appendBounded(latestPlainDetails, "\nReasoning\n");
+        latestPlainDetails = appendBounded(latestPlainDetails, "\n主 Agent · Reasoning\n");
         break;
       case "reasoning_update":
         latestPlainDetails = appendBounded(latestPlainDetails, event.delta);
@@ -379,20 +428,12 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         break;
       case "tool_preparation":
         write(
-          `\n${event.toolName} [${event.toolCallId.slice(-8)}]${event.memberSessionId ? ` · 成员 ${event.memberName ?? event.memberSessionId}` : ""} · ${event.phase === "input" ? "参数生成中" : "完整请求已收到，等待执行"}\n`,
+          `\n${event.toolName} [${event.toolCallId.slice(-8)}]${event.memberSessionId ? ` · 成员 ${event.memberName ?? event.memberSessionId}` : ""} · ${toolPreparationText(event.phase).status}\n`,
         );
         break;
       case "tool_execution_end":
         plainToolResult(event.result, event.memberSessionId, event.memberName);
         break;
-      case "model_retry": {
-        const recovery = formatModelRecovery(event);
-        const member = event.memberSessionId
-          ? "成员 " + (event.memberName ?? event.memberSessionId) + " · "
-          : "";
-        write("\n" + member + recovery.status + "\n" + recovery.detail + "\n");
-        break;
-      }
       case "tool_execution_start":
         write(
           `\n${event.activity.toolName} [${event.activity.toolCallId.slice(-8)}] · 运行中\n${event.activity.summary}\n`,
@@ -401,36 +442,19 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       case "tool_execution_update":
         latestPlainDetails = appendBounded(
           latestPlainDetails,
-          `\n[${event.stream}] ${event.delta}`,
+          `\n主 Agent · ${event.toolName} [${event.stream}] ${event.delta}`,
         );
-        if (plainDetailsVisible) write(event.delta);
+        if (plainDetailsVisible)
+          write(`${eventSourceLabel(event)} · [${event.stream}] ${event.delta}`);
         break;
       case "tool_approval_requested":
+        if (plainAssistantStreaming) plainAssistantNeedsLabel = true;
         write(`\n${formatApproval(event.request)}\n`);
         break;
       case "tool_authorization":
-        write(`\n授权 · ${event.source} · ${event.decision}\n${event.reason}\n`);
-        break;
-      case "compaction_start":
-        write("\n正在压缩上下文。\n");
-        break;
-      case "compaction_end":
-        write(`\n压缩完成 ${event.inputTokensBefore} -> ${event.inputTokensAfter} tokens\n`);
-        break;
-      case "compaction_failed":
-        write(`\n${event.error}\n`);
-        break;
-      case "run_end":
-        if (event.memberSessionId !== undefined) {
-          write(
-            `\n成员 ${event.memberName ?? event.memberSessionId} · ${event.result.status === "completed" ? "已完成" : event.result.status === "aborted" ? "已停止" : "运行失败"}\n${event.diagnostic?.summary ?? (event.result.status === "failed" ? event.result.error : "")}\n`,
-          );
-          break;
-        }
-        if (event.result.status !== "completed")
-          write(
-            `\n${event.result.status === "failed" ? event.result.error + "\n" : "已停止。\n"}${formatRunDiagnostic(event.diagnostic)}\n`,
-          );
+        write(
+          `\n授权 · ${authorizationSourceName(event.source)} · ${event.decision}\n${event.reason}\n`,
+        );
         break;
     }
   }
@@ -456,9 +480,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       });
     } else {
       write(
-        `><> Anthias\nSession: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n/help 查看命令\n`,
+        `><> Anthias\n根会话 Session: ${agent.state.sessionId}\nWorkspace: ${agent.state.workspaceRoot}\nMode: ${permissionModeLabel(agent.state.permissionMode)}\n/help 查看命令\n`,
       );
       for (const message of agent.state.messageHistory) plainMessage(message);
+      plainCollaboration(agent.state.collaboration);
       const permissionNotice = permissionModeNotice(
         agent.state.permissionMode,
         agent.permissions.snapshot(),
@@ -506,6 +531,26 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     void exit(1);
   }
   return tuiExitPromiseResolvers.promise;
+}
+
+function memberToolText(event: AgentEvent): string | null {
+  if (!event.memberSessionId) return null;
+  switch (event.type) {
+    case "tool_execution_end":
+      return `${event.toolName} · ${toolResultStatus(event.result.status)}\n${event.result.content}`;
+    case "tool_execution_update":
+      return `${event.toolName} [${event.stream}] ${event.delta}`;
+    case "tool_execution_start":
+      return `${event.activity.toolName} · 运行中\n${event.activity.summary}`;
+    case "tool_authorization":
+      return `${event.toolName} · ${authorizationSourceName(event.source)} · ${event.decision}\n${event.reason}`;
+    case "tool_preparation":
+      return `${event.toolName} · ${toolPreparationText(event.phase).status}`;
+    case "tool_auto_review_start":
+      return `${event.toolName} · 自动审核中`;
+    default:
+      return null;
+  }
 }
 
 function appendBounded(previous: string, addition: string): string {

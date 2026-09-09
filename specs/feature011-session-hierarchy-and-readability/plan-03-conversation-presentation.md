@@ -1,6 +1,6 @@
 # Plan 03：根会话浏览与 TUI 阅读路径
 
-状态：已计划
+状态：已实现
 
 ## 开发者速览
 
@@ -8,11 +8,15 @@
 > **核心做法**：集中呈现状态、共享文案与命令声明，通过现有控制面读取成员。<br>
 > **边界**：查看成员保持根输入，不增加运行生命周期或分享权限。<br>
 > **风险 / 未验证**：流式更新、取消后的详情一致性和实际终端体验。<br>
-> **当前 / 请审阅**：按开发者授权在 Plan 02 审查并提交后实施。
+> **当前 / 请审阅**：实现、68 项 TUI 定向验证及最终审查完成，按授权提交。
 
 ## 基线与范围
 
 接续 Plan 02 审查后的工作区，完成 Spec A04、A13 及最终 A14–A15。核对全屏和纯文本的真实事件消费者及 Agent 只读状态。若缺少展示字段，仅补现有事实的只读摘要，在开始实施前列明具体字段与消费者，不暴露模型、Provider 或内部循环步骤。
+
+本 Plan 直接消费现有 AgentState.sessionId、CollaborationSnapshot.rootSessionId 和 MemberSummary 的名称、ID、kind、task、status、result/error；不新增公开字段。成员结果/产物标题使用请求开始时同一根的摘要，读取仍走 collaboration.execute(result)。presentation 接管正文及关联详情更新；view 保留布局和审批阅读门禁。
+
+定向分工：呈现执行者负责 `pnpm exec vitest run apps/tui/test/tui.test.ts apps/tui/test/multi-agent-view.test.ts`（后者补结果标题/归属测试）；命令执行者负责 `pnpm exec vitest run apps/tui/test/command.test.ts apps/tui/test/autocomplete.test.ts`。统筹完成 event-text 与纯文本接线后通知前者验证，不重复同一组测试。最终统一运行 pnpm verify。
 
 ## 实施步骤
 
@@ -31,3 +35,5 @@
 ## 停止与报告
 
 需要扩大结果分享权限、改变根输入生命周期或新增事件体系时返回讨论。Report 汇总行为、调用链、所有权、失败边界与验证；只标已实现，等待开发者验收。验收后同步稳定使用说明与技术基线；本 Feature 逐 Plan 审查后提交已授权，推送和 PR 仍分别授权。
+
+最终验证结果与唯一旧 CLI 标签断言的定向修正见 [Report](report.md#plan-03-验证与最终门禁)。完整 pnpm verify 运行一次，其他通过结果复用；共 577 个不同测试最终通过，1 项原有 Windows 条件跳过。

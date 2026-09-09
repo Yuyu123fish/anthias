@@ -188,7 +188,7 @@ describe("Anthias CLI", () => {
     expect(firstProcessResult.status).toBe(0);
     expect(firstProcessResult.stderr).toBe("");
     const sessionIdMatch = firstProcessResult.stdout.match(
-      /^Session: ([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/m,
+      /^根会话 Session: ([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/m,
     );
     expect(sessionIdMatch).not.toBeNull();
     const sessionId = sessionIdMatch?.[1];
@@ -222,7 +222,7 @@ describe("Anthias CLI", () => {
 
     expect(reopenedProcessResult.status).toBe(0);
     expect(reopenedProcessResult.stderr).toBe("");
-    expect(reopenedProcessResult.stdout).toContain(`Session: ${sessionId}\n`);
+    expect(reopenedProcessResult.stdout).toContain(`根会话 Session: ${sessionId}\n`);
     expect(reopenedProcessResult.stdout).toContain(`Workspace: ${normalizedWorkspaceRoot}\n`);
     expect(reopenedProcessResult.stdout).toContain("Mode: Agent\n");
     expect(await findSessionFiles(sessionDirectory)).toEqual(sessionFiles);

@@ -18,8 +18,15 @@ const statusNames: Record<MemberSummary["status"], string> = {
   interrupted: "已中断",
   closed: "已释放",
 };
-export function formatCollaboration(snapshot: CollaborationSnapshot): string {
+export function memberStatusName(status: MemberSummary["status"]): string {
+  return statusNames[status];
+}
+export function formatCollaboration(
+  snapshot: CollaborationSnapshot,
+  fallbackRootSessionId?: string,
+): string {
   const lines = [
+    "主 Agent · 根 Session：" + (snapshot.rootSessionId ?? fallbackRootSessionId ?? "归属信息缺失"),
     ...(snapshot.notice ? [snapshot.notice] : []),
     snapshot.team
       ? "Team · " +
@@ -29,10 +36,15 @@ export function formatCollaboration(snapshot: CollaborationSnapshot): string {
       : "当前没有 Team。",
     ...snapshot.members.map((member) =>
       [
-        member.name + " · " + member.kind + " · " + statusNames[member.status],
+        (member.name.trim() || member.sessionId) +
+          " · " +
+          member.kind +
+          " · " +
+          memberStatusName(member.status),
         "  " + member.sessionId,
         "  Workspace: " + member.workspaceRoot,
-        "  任务: " + member.task,
+        "  任务: " + (member.task.trim() || "任务信息缺失"),
+        member.result?.trim() ? "  结果: " + member.result : "  尚无结果摘要。",
         member.error ? "  原因: " + member.error : "",
       ]
         .filter(Boolean)
@@ -78,15 +90,45 @@ export async function runCollaborationCommand(
     return rest;
   }
   async function dispatch(action: CollaborationAction): Promise<CommandResult> {
-    const result = await agent.collaboration.execute(action);
-    notice(result.ok ? renderResult(result.value) : result.error);
-    return { kind: result.ok ? "handled" : "rejected" };
+    const snapshot = agent.collaboration.snapshot();
+    const owner =
+      action.action === "result"
+        ? {
+            rootSessionId: snapshot.rootSessionId ?? agent.state.sessionId,
+            memberId: action.memberId,
+            member: snapshot.members.find((member) => member.sessionId === action.memberId),
+            ...(action.artifactId ? { artifactId: action.artifactId } : {}),
+          }
+        : undefined;
+    try {
+      const result = await agent.collaboration.execute(action);
+      notice(
+        result.ok
+          ? renderResult(result.value, owner)
+          : sanitizeTerminalText(
+              [owner ? resultOwnerTitle(owner) : "", result.error].filter(Boolean).join("\n\n"),
+            ),
+      );
+      return { kind: result.ok ? "handled" : "rejected" };
+    } catch (error) {
+      notice(
+        sanitizeTerminalText(
+          [
+            owner ? resultOwnerTitle(owner) : "",
+            error instanceof Error ? error.message : "成员操作失败。",
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
+        ),
+      );
+      return { kind: "rejected" };
+    }
   }
   if (name === "agents" || (name === "team" && (!operation || operation === "tasks"))) {
     if (name === "agents" && tokens.length) {
       notice("用法：/agents");
       return { kind: "rejected" };
-    } else notice(formatCollaboration(agent.collaboration.snapshot()));
+    } else notice(formatCollaboration(agent.collaboration.snapshot(), agent.state.sessionId));
     return { kind: "handled" };
   }
   try {
@@ -199,7 +241,32 @@ export async function runCollaborationCommand(
   }
 }
 
-function renderResult(text: string): string {
+type ResultOwner = {
+  rootSessionId: string;
+  memberId: string;
+  member: MemberSummary | undefined;
+  artifactId?: string;
+};
+
+function resultOwnerTitle(owner: ResultOwner): string {
+  const member = owner.member;
+  return [
+    "根 Session：" + owner.rootSessionId,
+    "成员 " + (member?.name.trim() || owner.memberId) + " [" + owner.memberId + "]",
+    "种类：" + (member?.kind ?? "身份信息缺失"),
+    "状态：" + (member ? memberStatusName(member.status) : "状态信息缺失"),
+    "任务：" + (member?.task.trim() || "任务信息缺失"),
+    ...(owner.artifactId ? ["产物：" + owner.artifactId] : []),
+  ].join("\n");
+}
+
+function renderResult(text: string, owner?: ResultOwner): string {
+  return sanitizeTerminalText(
+    [owner ? resultOwnerTitle(owner) : "", renderPayload(text)].filter(Boolean).join("\n\n"),
+  );
+}
+
+function renderPayload(text: string): string {
   try {
     const value: unknown = JSON.parse(text);
     if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -207,7 +274,9 @@ function renderResult(text: string): string {
       if (typeof result.history === "string")
         return [
           "成员 " + String(result.memberSessionId) + " · " + String(result.status),
-          typeof result.result === "string" ? result.result : "",
+          typeof result.result === "string" && result.result.trim()
+            ? result.result
+            : "尚无结果摘要。",
           "历史\n" + result.history,
           result.nextOffset === null
             ? ""

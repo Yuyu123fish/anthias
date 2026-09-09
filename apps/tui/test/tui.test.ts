@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import type {
   AgentState,
   AssistantMessage,
+  CollaborationSnapshot,
   Message,
   PromptResult,
   RunDiagnostic,
@@ -1014,8 +1015,8 @@ describe("permission review feedback", () => {
   });
 });
 
-it("ends only unfinished member tools when a member fails while the root keeps streaming", async () => {
-  const harness = createHarness(true, 130, 40);
+it("keeps member runs separate and preserves root streaming across failure and resume", async () => {
+  const harness = createHarness(true, 170, 56);
   await screenContains(harness.terminal, "Workspace:");
   harness.setState({ running: true, activeRun: { runId: "root-run", phase: "requesting_model" } });
   harness.emit({ type: "message_start", message: { role: "user", content: "Root task" } });
@@ -1027,32 +1028,182 @@ it("ends only unfinished member tools when a member fails while the root keeps s
     toolName: "read_file",
     phase: "input",
   });
+  const memberSource = { memberSessionId: "member-1", memberName: "Checker" };
   harness.emit({
     type: "tool_preparation",
     runId: "member-run",
     toolCallId: "member-tool",
     toolName: "grep",
     phase: "input",
-    memberSessionId: "member-1",
-    memberName: "Checker",
+    ...memberSource,
   });
-  await screenContains(harness.terminal, "成员 Checker");
+  await screenContains(harness.terminal, "成员 Checker [member-1]");
+  expect(harness.terminal.text()).not.toContain("grep [ber-tool]");
   harness.emit({
     type: "run_end",
     runId: "member-run",
-    memberSessionId: "member-1",
-    memberName: "Checker",
+    ...memberSource,
     result: { status: "failed", error: "Member model failed before completing parameters" },
   });
-  await screenContains(harness.terminal, "grep [ber-tool] · 成员 Checker · 未执行");
+  await screenContains(harness.terminal, "Member model failed");
+  expect(harness.terminal.text()).not.toContain("grep [ber-tool]");
+  const memberHeading = harness.terminal.locate("成员 Checker [member-1]");
+  harness.terminal.mouse(0, memberHeading.x, memberHeading.y);
+  harness.emit({
+    type: "run_end",
+    runId: "member-run",
+    ...memberSource,
+    result: { status: "failed", error: "Updated failure while clicking" },
+  });
+  await screenContains(harness.terminal, "Updated failure while clicking");
+  harness.terminal.mouse(0, memberHeading.x, memberHeading.y, true);
+  await screenContains(harness.terminal, "grep [ber-tool] · 未执行");
   expect(harness.terminal.text()).toContain("read_file [oot-tool] · 参数生成中");
-  expect(harness.terminal.text()).toContain("执行过程 · 2 步 · 运行中");
+  expect(harness.terminal.text()).toContain("执行过程 · 1 步 · 运行中");
   harness.emit({
     type: "message_update",
     message: assistant("ROOT_STREAM_CONTINUES"),
     delta: "_CONTINUES",
   });
   await screenContains(harness.terminal, "ROOT_STREAM_CONTINUES");
+  harness.emit({
+    type: "tool_preparation",
+    runId: "resumed-member-run",
+    toolCallId: "member-tool",
+    toolName: "grep",
+    phase: "input",
+    ...memberSource,
+  });
+  // 同一成员恢复后的请求复用 Tool ID 时，旧结束事件仍只能完成旧 Run 的呈现。
+  harness.emit({
+    type: "run_end",
+    runId: "member-run",
+    ...memberSource,
+    result: { status: "failed", error: "Late old run end" },
+  });
+  await screenContains(harness.terminal, "Run resumed-member-run");
+  expect(harness.terminal.text()).toContain("grep [ber-tool] · 未执行");
+  expect(harness.terminal.text()).toContain("grep [ber-tool] · 参数生成中");
+  expect(harness.terminal.text().match(/执行过程 · 1 步 · 运行中/gu)).toHaveLength(2);
+  expect(harness.terminal.text()).not.toContain("Late old run end");
+  harness.terminal.send("\u0014");
+  await screenContains(harness.terminal, "详情 3/3");
+  expect(harness.terminal.text()).toContain("根 Session");
+  expect(harness.terminal.text()).toContain("Run resumed-member-run");
   expect(harness.agent.state.lastRunDiagnostic).toBeUndefined();
   expect(harness.agent.abort).not.toHaveBeenCalled();
+});
+
+it("restores root and member summaries without opening member sessions", async () => {
+  const rootSessionId = "00000000-0000-4000-8000-000000000001";
+  const snapshot: CollaborationSnapshot = {
+    rootSessionId,
+    team: null,
+    tasks: [],
+    members: [
+      {
+        sessionId: "closed-member",
+        name: "Reviewer",
+        kind: "teammate",
+        status: "closed",
+        workspaceRoot: process.cwd(),
+        writable: false,
+        task: "Review existing changes",
+        result: "Saved review result",
+      },
+      {
+        sessionId: "missing-member",
+        name: "",
+        kind: "subagent",
+        status: "failed",
+        workspaceRoot: process.cwd(),
+        writable: false,
+        task: "Check source files",
+        error: "Member log is missing",
+      },
+    ],
+  };
+  const harness = createHarness(true, 140, 44, undefined, {
+    collaboration: snapshot,
+    messageHistory: [assistant("Saved root answer", "completed")],
+  });
+  await screenContains(harness.terminal, "主 Agent · 根 Session " + rootSessionId);
+  expect(harness.terminal.text()).toContain("Saved root answer");
+  expect(harness.terminal.text()).toContain("成员 Reviewer [closed-member] · teammate · 已释放");
+  expect(harness.terminal.text()).toContain("Review existing changes");
+  expect(harness.terminal.text()).toContain("Saved review result");
+  expect(harness.terminal.text()).toContain(
+    "成员 missing-member [missing-member] · subagent · 失败",
+  );
+  expect(harness.terminal.text()).toContain("尚无结果摘要。");
+  expect(harness.terminal.text()).toContain("Member log is missing");
+  clickText(harness.terminal, "成员 Reviewer");
+  await screenContains(harness.terminal, "/agent result closed-member");
+  expect(harness.agent.collaboration.execute).not.toHaveBeenCalled();
+  expect(harness.agent.sessions.open).not.toHaveBeenCalled();
+  expect(harness.agent.sessions.create).not.toHaveBeenCalled();
+  expect(harness.agent.prompt).not.toHaveBeenCalled();
+  harness.terminal.send("Continue in the root");
+  harness.terminal.send("\r");
+  await vi.waitFor(() => expect(harness.agent.prompt).toHaveBeenCalledWith("Continue in the root"));
+  expect(harness.agent.state.sessionId).toBe(rootSessionId);
+});
+
+it("keeps plain member process in sourced details and relabels interrupted root output", async () => {
+  const harness = createHarness(false);
+  await vi.waitFor(() => expect(harness.plain()).toContain("根会话 Session:"));
+  harness.emit({ type: "message_start", message: assistant("") });
+  harness.emit({ type: "message_update", message: assistant("ROOT_START"), delta: "ROOT_START" });
+  const memberSource = { memberSessionId: "member-1", memberName: "Checker" };
+  harness.emit({
+    type: "tool_preparation",
+    runId: "member-run",
+    toolCallId: "member-tool",
+    toolName: "execute_command",
+    phase: "input",
+    ...memberSource,
+  });
+  harness.emit({
+    type: "tool_execution_update",
+    toolCallId: "member-tool",
+    toolName: "execute_command",
+    stream: "stdout",
+    delta: "MEMBER_PRIVATE_PROCESS",
+    ...memberSource,
+  });
+  expect(harness.plain()).not.toContain("MEMBER_PRIVATE_PROCESS");
+  expect(harness.plain()).not.toContain("参数生成中");
+  const request = { ...approvalRequest(), toolCallId: "member-tool", ...memberSource };
+  harness.setState({ pendingToolApproval: request });
+  harness.emit({ type: "tool_approval_requested", request });
+  await vi.waitFor(() => expect(harness.plain()).toContain("成员: Checker"));
+  harness.emit({
+    type: "message_update",
+    message: assistant("ROOT_START_AFTER_APPROVAL"),
+    delta: "_AFTER_APPROVAL",
+  });
+  expect(harness.plain()).toContain("主 Agent（继续）\n_AFTER_APPROVAL");
+  harness.setState({ pendingToolApproval: null });
+  harness.emit({ type: "tool_approval_resolved", request, decision: "deny" });
+  harness.emit({
+    type: "run_end",
+    runId: "member-run",
+    ...memberSource,
+    result: { status: "completed" },
+  });
+  harness.emit({
+    type: "message_update",
+    message: assistant("ROOT_START_AFTER_APPROVAL_AFTER_MEMBER"),
+    delta: "_AFTER_MEMBER",
+  });
+  expect(harness.plain()).toContain("主 Agent（继续）\n_AFTER_MEMBER");
+  expect(harness.plain()).toContain("输入仍发送给主 Agent");
+  harness.input.write("/details\n");
+  await vi.waitFor(() => expect(harness.plain()).toContain("MEMBER_PRIVATE_PROCESS"));
+  expect(harness.plain()).toContain("成员 Checker [member-1]");
+  expect(harness.agent.prompt).not.toHaveBeenCalled();
+  harness.input.write("Follow the root task\n");
+  await vi.waitFor(() => expect(harness.agent.prompt).toHaveBeenCalledWith("Follow the root task"));
+  expect(harness.agent.sessions.open).not.toHaveBeenCalled();
+  expect(harness.agent.collaboration.execute).not.toHaveBeenCalled();
 });
