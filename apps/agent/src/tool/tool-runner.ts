@@ -1,32 +1,14 @@
-import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
 import type { PermissionMode } from "../permission/permission-mode.js";
-import { decideToolPolicy, type ToolPolicyDecision } from "../permission/tool-policy.js";
 import type { SessionArtifactStore } from "../session/artifacts.js";
 import type { SessionShell } from "../session/index.js";
-import { prepareEditFileTool, validateEditFileToolCallInput } from "./basetool/edit-file.js";
 import {
-  executePreparedCommand,
-  type PreparedCommandTool,
-  prepareCommandTool,
-  validateCommandToolCallInput,
-} from "./basetool/execute-command.js";
-import {
-  executePreparedFileTool,
-  type PreparedFileResult,
-  type PreparedFileTool,
-} from "./basetool/file-change.js";
-import { executeGlobTool, validateGlobToolCallInput } from "./basetool/glob.js";
-import { executeGrepTool, validateGrepToolCallInput } from "./basetool/grep.js";
-import {
-  executeReadArtifactTool,
-  validateReadArtifactToolCallInput,
-} from "./basetool/read-artifact.js";
-import { executeReadFileTool, validateReadFileToolCallInput } from "./basetool/read-file.js";
-import { prepareWriteFileTool, validateWriteFileToolCallInput } from "./basetool/write-file.js";
-import type { ReadOnlyToolName } from "./definitions.js";
-import { isRecord } from "./input-validation.js";
+  BASE_TOOLS,
+  isReadOnlyToolName,
+  isSideEffectToolName,
+  type ModelToolDefinition,
+} from "./definitions.js";
+import { createRejectedToolCallPlan } from "./tool-plan.js";
 import type { ToolExecutionResult } from "./tool-result.js";
 import type { ToolWorkspace } from "./workspace-path.js";
 
@@ -108,432 +90,84 @@ export type ToolCallPlan = Readonly<{
   waitForPreparationOnAbort?: boolean;
 }>;
 
-/** 创建已经绑定运行环境、可以被 Agent Loop 直接调用的 ToolRunner。 */
-export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
-  const runnerOptions = Object.freeze({
-    workspace: options.workspace,
-    shell: options.shell,
-    ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
-  });
+/** 定义和计划绑定同一个工具，模型可见性不能替代计划内的权限检查。 */
+export type AgentTool = Readonly<{
+  definition: ModelToolDefinition;
+  createPlan(toolCall: AssistantToolCallPart, permissionMode: PermissionMode): ToolCallPlan;
+}>;
+
+/** 基础工具只在绑定时接收工作区资源，定义与计划始终来自工具自身。 */
+export type BaseTool = Readonly<{
+  definition: ModelToolDefinition;
+  createPlan(
+    toolCall: AssistantToolCallPart,
+    permissionMode: PermissionMode,
+    options: CreateToolRunnerOptions,
+  ): ToolCallPlan;
+}>;
+
+/** 每次请求选取同一组工具；Full Access 的路径能力仍由调用时的权限决定。 */
+export function createBaseTools(
+  options: CreateToolRunnerOptions,
+  mode: PermissionMode,
+): readonly AgentTool[] {
+  return Object.freeze(
+    BASE_TOOLS.filter((tool) => mode !== "plan" || isReadOnlyToolName(tool.definition.name)).map(
+      (tool) =>
+        Object.freeze({
+          definition: tool.definition,
+          createPlan: (toolCall: AssistantToolCallPart, permissionMode: PermissionMode) =>
+            tool.createPlan(toolCall, permissionMode, {
+              ...options,
+              workspace: {
+                ...options.workspace,
+                allowExternalPaths: permissionMode === "full_access",
+              },
+            }),
+        }),
+    ),
+  );
+}
+
+/** Runner 只按同源工具集合查找，不持有另一套业务分派。 */
+export function createToolRunnerFromTools(tools: readonly AgentTool[]): ToolRunner {
+  const toolsByName = new Map<string, AgentTool>();
+  for (const tool of tools) {
+    if (toolsByName.has(tool.definition.name))
+      throw new Error("工具名称重复：" + tool.definition.name);
+    toolsByName.set(tool.definition.name, tool);
+  }
   return Object.freeze({
-    createPlan: (toolCall, permissionMode) =>
-      createToolCallPlan(toolCall, permissionMode, {
-        ...runnerOptions,
-        workspace: {
-          ...runnerOptions.workspace,
-          allowExternalPaths: permissionMode === "full_access",
-        },
-      }),
+    createPlan(toolCall, permissionMode) {
+      return (
+        toolsByName.get(toolCall.toolName)?.createPlan(toolCall, permissionMode) ??
+        createRejectedToolCallPlan(
+          toolCall.invalid
+            ? `${toolCall.toolName} 输入无法解析或不符合 Schema。`
+            : `未知或尚不可执行的 Tool：${toolCall.toolName}`,
+        )
+      );
+    },
   });
 }
 
-/** 将任意 ToolCall 解析为统一的预检、Policy 与执行计划。 */
-function createToolCallPlan(
+/** 确定性测试可直接构造基础 Runner；执行仍经过工具自身的模式校验。 */
+export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
+  return createToolRunnerFromTools(createBaseTools(options, "agent"));
+}
+
+/** 隐藏的副作用工具仍先校验参数再拒绝；复用同一计划入口，不能另开执行路径。 */
+export function rejectUnavailableBaseTool(
   toolCall: AssistantToolCallPart,
   permissionMode: PermissionMode,
   options: CreateToolRunnerOptions,
-): ToolCallPlan {
-  if (toolCall.toolName === "read_file") {
-    const validationError = validateReadFileToolCallInput(toolCall, options.workspace);
-    return validationError === null
-      ? createReadOnlyToolCallPlan(
-          toolCall,
-          "read_file",
-          permissionMode,
-          options.workspace,
-          executeReadFileTool,
-        )
-      : createRejectedToolCallPlan(validationError);
-  }
-  if (toolCall.toolName === "glob") {
-    const validationError = validateGlobToolCallInput(toolCall, options.workspace);
-    return validationError === null
-      ? createReadOnlyToolCallPlan(
-          toolCall,
-          "glob",
-          permissionMode,
-          options.workspace,
-          executeGlobTool,
-        )
-      : createRejectedToolCallPlan(validationError);
-  }
-  if (toolCall.toolName === "grep") {
-    const validationError = validateGrepToolCallInput(toolCall, options.workspace);
-    return validationError === null
-      ? createReadOnlyToolCallPlan(
-          toolCall,
-          "grep",
-          permissionMode,
-          options.workspace,
-          executeGrepTool,
-        )
-      : createRejectedToolCallPlan(validationError);
-  }
-  if (toolCall.toolName === "read_artifact") {
-    const validationError = validateReadArtifactToolCallInput(toolCall);
-    if (validationError !== null) {
-      return createRejectedToolCallPlan(validationError);
-    }
-    return createReadArtifactToolCallPlan(toolCall, permissionMode, options.artifactStore);
-  }
-  if (toolCall.toolName === "execute_command") {
-    const validationError = validateCommandToolCallInput(toolCall);
-    if (validationError !== null) {
-      return createRejectedToolCallPlan(validationError);
-    }
-    if (permissionMode === "plan") {
-      return createPolicyDeniedPlan(
-        decideToolPolicy({ permissionMode, toolName: "execute_command" }),
-      );
-    }
-    return createCommandToolCallPlan(toolCall, permissionMode, options);
-  }
-  if (toolCall.toolName === "edit_file") {
-    const validationError = validateEditFileToolCallInput(toolCall);
-    if (validationError !== null) {
-      return createRejectedToolCallPlan(validationError);
-    }
-    if (permissionMode === "plan") {
-      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "edit_file" }));
-    }
-    return createFileToolCallPlan(toolCall, permissionMode, options.workspace, prepareEditFileTool);
-  }
-  if (toolCall.toolName === "write_file") {
-    const validationError = validateWriteFileToolCallInput(toolCall);
-    if (validationError !== null) {
-      return createRejectedToolCallPlan(validationError);
-    }
-    if (permissionMode === "plan") {
-      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "write_file" }));
-    }
-    return createFileToolCallPlan(
+): ToolCallPlan | null {
+  if (permissionMode !== "plan" || !isSideEffectToolName(toolCall.toolName)) return null;
+  return (
+    BASE_TOOLS.find((tool) => tool.definition.name === toolCall.toolName)?.createPlan(
       toolCall,
       permissionMode,
-      options.workspace,
-      prepareWriteFileTool,
-    );
-  }
-  return createRejectedToolCallPlan(
-    toolCall.invalid
-      ? `${toolCall.toolName} 输入无法解析或不符合 Schema。`
-      : `未知或尚不可执行的 Tool：${toolCall.toolName}`,
+      options,
+    ) ?? null
   );
-}
-
-/** 创建无需人工确认的只读 Tool 计划。 */
-function createReadOnlyToolCallPlan(
-  toolCall: AssistantToolCallPart,
-  toolName: ReadOnlyToolName,
-  permissionMode: PermissionMode,
-  workspace: ToolWorkspace,
-  executeTool: (
-    toolCall: AssistantToolCallPart,
-    workspace: ToolWorkspace,
-    abortSignal: AbortSignal,
-  ) => Promise<ToolExecutionResult>,
-): ToolCallPlan {
-  const policyDecision = decideToolPolicy({ permissionMode, toolName });
-  if (policyDecision.kind !== "allow") {
-    return createPolicyDeniedPlan(policyDecision);
-  }
-  return Object.freeze({
-    scheduling: fileAccess(toolCall, workspace, "read"),
-    abortedPreparationContent: "Tool 执行已停止。",
-    prepare: () =>
-      Promise.resolve(
-        Object.freeze({
-          ok: true,
-          preparedExecution: Object.freeze({
-            approval: null,
-            activitySummary: createReadOnlyToolActivitySummary(toolCall, toolName),
-            executionUnavailableContent: "Run 已停止，Tool 未执行。",
-            async execute(abortSignal: AbortSignal) {
-              try {
-                return {
-                  ...(await executeTool(toolCall, workspace, abortSignal)),
-                  cleanupUncertain: false,
-                };
-              } catch {
-                return failedExecution(false);
-              }
-            },
-          }),
-        }),
-      ),
-  });
-}
-
-/** 创建需要预检和人工确认的文件 Tool 计划。 */
-function createFileToolCallPlan(
-  toolCall: AssistantToolCallPart,
-  permissionMode: PermissionMode,
-  workspace: ToolWorkspace,
-  prepareTool: (
-    toolCall: AssistantToolCallPart,
-    workspace: ToolWorkspace,
-  ) => Promise<PreparedFileResult>,
-): ToolCallPlan {
-  return Object.freeze({
-    scheduling: fileAccess(toolCall, workspace, "write"),
-    abortedPreparationContent: "Run 已停止，文件未写入。",
-    async prepare() {
-      const preparedResult = await prepareTool(toolCall, workspace);
-      if (!preparedResult.ok) {
-        return Object.freeze({ ok: false, result: preparedResult.result });
-      }
-      const preparedTool = preparedResult.preparedTool;
-      const policyDecision = decideToolPolicy({
-        permissionMode,
-        toolName: preparedTool.toolName,
-        externalFile: preparedTool.scope === "external",
-      });
-      if (policyDecision.kind === "deny") {
-        return Object.freeze({ ok: false, result: policyResult(policyDecision) });
-      }
-      return Object.freeze({
-        ok: true,
-        preparedExecution: Object.freeze({
-          approval: createApprovalPlan(preparedTool, policyDecision),
-          activitySummary: createToolActivitySummary(`target: ${preparedTool.target}`),
-          executionUnavailableContent: "Run 已停止，文件未写入。",
-          async execute(abortSignal: AbortSignal) {
-            try {
-              return Object.freeze({
-                ...(await executePreparedFileTool(preparedTool, abortSignal)),
-                cleanupUncertain: false,
-              });
-            } catch {
-              return failedExecution(false);
-            }
-          },
-        }),
-      });
-    },
-  });
-}
-
-/** 创建需要预检、分类和人工确认的命令 Tool 计划。 */
-function createCommandToolCallPlan(
-  toolCall: AssistantToolCallPart,
-  permissionMode: PermissionMode,
-  options: CreateToolRunnerOptions,
-): ToolCallPlan {
-  return Object.freeze({
-    scheduling: "serial",
-    abortedPreparationContent: "Run 已停止，命令未启动。",
-    async prepare() {
-      const preparedResult = await prepareCommandTool(toolCall, options.workspace, options.shell);
-      if (!preparedResult.ok) {
-        return Object.freeze({ ok: false, result: preparedResult.result });
-      }
-      const preparedTool = preparedResult.preparedTool;
-      const policyDecision = decideToolPolicy({
-        permissionMode,
-        toolName: "execute_command",
-        command: preparedTool.command,
-      });
-      if (policyDecision.kind === "deny") {
-        return Object.freeze({ ok: false, result: policyResult(policyDecision) });
-      }
-      return Object.freeze({
-        ok: true,
-        preparedExecution: Object.freeze({
-          approval: createApprovalPlan(preparedTool, policyDecision),
-          activitySummary: createToolActivitySummary(
-            `cwd: ${preparedTool.target}; command: ${preparedTool.command}`,
-          ),
-          executionUnavailableContent: "Run 已停止，命令未启动。",
-          async execute(
-            abortSignal: AbortSignal,
-            publishUpdate: (update: ToolExecutionUpdate) => void,
-          ) {
-            try {
-              return await executePreparedCommand(preparedTool, abortSignal, publishUpdate);
-            } catch {
-              return failedExecution(true);
-            }
-          },
-        }),
-      });
-    },
-  });
-}
-
-/** 从已通过 Schema 校验的只读 ToolCall 形成不含原始 JSON 的动作摘要。 */
-function createReadOnlyToolActivitySummary(
-  toolCall: AssistantToolCallPart,
-  toolName: ReadOnlyToolName,
-): string {
-  if (!isRecord(toolCall.input)) {
-    throw new Error("已校验 ToolCall 缺少对象输入。");
-  }
-  const input = toolCall.input;
-  if (toolName === "read_file") {
-    const range =
-      typeof input.startLine === "number" || typeof input.lineCount === "number"
-        ? `; lines: ${typeof input.startLine === "number" ? input.startLine : 1}-${
-            (typeof input.startLine === "number" ? input.startLine : 1) +
-            (typeof input.lineCount === "number" ? input.lineCount : 200) -
-            1
-          }`
-        : "";
-    return createToolActivitySummary(`path: ${String(input.path)}${range}`);
-  }
-  if (toolName === "glob") {
-    return createToolActivitySummary(
-      `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}`,
-    );
-  }
-  if (toolName === "read_artifact") {
-    if (!isRecord(toolCall.input)) {
-      throw new Error("已校验 ToolCall 缺少对象输入。");
-    }
-    return createToolActivitySummary(`artifactId: ${String(toolCall.input.artifactId)}`);
-  }
-  return createToolActivitySummary(
-    `pattern: ${String(input.pattern)}; base: ${typeof input.path === "string" ? input.path : "."}; files: ${
-      typeof input.filePattern === "string" ? input.filePattern : "**/*"
-    }`,
-  );
-}
-
-function createReadArtifactToolCallPlan(
-  toolCall: AssistantToolCallPart,
-  permissionMode: PermissionMode,
-  artifactStore: SessionArtifactStore | undefined,
-): ToolCallPlan {
-  const policyDecision = decideToolPolicy({ permissionMode, toolName: "read_artifact" });
-  if (policyDecision.kind !== "allow") {
-    return createPolicyDeniedPlan(policyDecision);
-  }
-  return Object.freeze({
-    scheduling: "parallel",
-    abortedPreparationContent: "Tool 执行已停止。",
-    prepare: () =>
-      Promise.resolve(
-        Object.freeze({
-          ok: true,
-          preparedExecution: Object.freeze({
-            approval: null,
-            activitySummary: createReadOnlyToolActivitySummary(toolCall, "read_artifact"),
-            executionUnavailableContent: "Run 已停止，Tool 未执行。",
-            async execute(
-              abortSignal: AbortSignal,
-              _publishUpdate: (update: ToolExecutionUpdate) => void,
-              resultTokenBudget?: number,
-            ) {
-              return Object.freeze({
-                ...(await executeReadArtifactTool(
-                  toolCall,
-                  artifactStore,
-                  abortSignal,
-                  resultTokenBudget,
-                )),
-                cleanupUncertain: false,
-              });
-            },
-          }),
-        }),
-      ),
-  });
-}
-
-/** 删除终端控制字符、折叠换行，并以 Unicode code point 限制展示长度。 */
-function createToolActivitySummary(summary: string): string {
-  const singleLineSummary = [...summary]
-    .map((character) => {
-      const codePoint = character.codePointAt(0) ?? 0;
-      return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ? " " : character;
-    })
-    .join("")
-    .replace(/\s+/gu, " ")
-    .trim();
-  const visibleCharacters = [...singleLineSummary];
-  return visibleCharacters.length <= 160
-    ? singleLineSummary
-    : `${visibleCharacters.slice(0, 159).join("")}…`;
-}
-
-/** 创建 Permission 或 hard danger 的不可批准结果。 */
-function createPolicyDeniedPlan(policyDecision: ToolPolicyDecision): ToolCallPlan {
-  return Object.freeze({
-    scheduling: "serial",
-    abortedPreparationContent: "Tool 未执行。",
-    prepare: () =>
-      Promise.resolve(Object.freeze({ ok: false, result: policyResult(policyDecision) })),
-  });
-}
-
-/** 创建无效输入或未知 Tool 的直接失败计划。 */
-function createRejectedToolCallPlan(content: string): ToolCallPlan {
-  return Object.freeze({
-    scheduling: "serial",
-    abortedPreparationContent: "Tool 未执行。",
-    prepare: () =>
-      Promise.resolve(
-        Object.freeze({
-          ok: false,
-          result: Object.freeze({ status: "failed", content, truncated: false }),
-        }),
-      ),
-  });
-}
-
-function createApprovalPlan(
-  preparedTool: PreparedFileTool | PreparedCommandTool,
-  policyDecision: ToolPolicyDecision,
-): ToolApprovalPlan {
-  // 指纹覆盖完整准备快照，不能只绑定展示预览；文件身份在部分平台上可能是 bigint。
-  const actionFingerprint = createHash("sha256")
-    .update(
-      JSON.stringify(preparedTool, (_key, value: unknown) =>
-        typeof value === "bigint" ? value.toString() : value,
-      ),
-    )
-    .digest("hex");
-  return Object.freeze({
-    toolName: preparedTool.toolName,
-    target: preparedTool.target,
-    preview: preparedTool.preview,
-    actionFingerprint,
-    ruleId: policyDecision.ruleId,
-    riskSummary: policyDecision.riskSummary,
-    executionBoundary: policyDecision.executionBoundary,
-    deniedContent: `用户拒绝执行 ${preparedTool.toolName}。`,
-  });
-}
-
-function policyResult(policyDecision: ToolPolicyDecision): ImmediateToolResult {
-  return Object.freeze({
-    status: policyDecision.kind === "deny" ? "denied" : "failed",
-    content: `${policyDecision.riskSummary}（规则：${policyDecision.ruleId}）`,
-    truncated: false,
-  });
-}
-
-/** 将副作用 Tool 的意外异常转换为不含本地细节的失败结果。 */
-function failedExecution(
-  cleanupUncertain: boolean,
-): ToolExecutionResult & Readonly<{ cleanupUncertain: boolean }> {
-  return Object.freeze({
-    status: "failed",
-    content: "Tool 执行失败。",
-    truncated: false,
-    cleanupUncertain,
-  });
-}
-
-function fileAccess(
-  toolCall: AssistantToolCallPart,
-  workspace: ToolWorkspace,
-  access: "read" | "write",
-): ToolCallScheduling {
-  const input = toolCall.input;
-  if (!isRecord(input)) return "serial";
-  const path = typeof input.path === "string" ? input.path : ".";
-  return {
-    path: resolve(workspace.workspaceRoot, path),
-    access,
-    recursive: toolCall.toolName === "glob" || toolCall.toolName === "grep",
-  };
 }

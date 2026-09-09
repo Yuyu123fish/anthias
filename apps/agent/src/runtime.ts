@@ -1,6 +1,5 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createGitWorkspace } from "./git/index.js";
 import { createMemory } from "./memory/index.js";
 import { createMultiAgent, type MultiAgent } from "./multi-agent/index.js";
 import { createWorkspacePermissions } from "./permission/workspace-permissions.js";
@@ -9,9 +8,12 @@ import {
   type AgentEvent,
   type CreateAgentWithModelStreamOptions,
   createSessionAgent,
+  type PermissionMode,
   type SessionAgent,
+  type SessionAgentOptions,
 } from "./session-agent.js";
-import { createGitTools } from "./tool/git-tools.js";
+import { createGitWorkspace } from "./tool/basetool/git/index.js";
+import { createGitTools } from "./tool/basetool/git/tool.js";
 import type { AgentToolExtension } from "./tool/managed-tool.js";
 import { createMultiAgentTools } from "./tool/multi-agent-tools.js";
 
@@ -23,15 +25,20 @@ export function createAgentRuntime(
     memberEvent(event: AgentEvent, member: { sessionId: string; name: string }): void;
   },
 ) {
-  const { worktreeDirectory, ...sessionOptions } = options;
+  const {
+    worktreeDirectory,
+    memoryDirectory: configuredMemoryDirectory,
+    permissionDirectory,
+    ...sessionOptions
+  } = options;
   const rootSession = options.session;
   const mode = options.permissionMode;
   const memoryDirectory =
-    options.memoryDirectory ?? resolve(rootSession.sessionDirectory, "memory");
+    configuredMemoryDirectory ?? resolve(rootSession.sessionDirectory, "memory");
   const { emit } = events;
   const permissions = createWorkspacePermissions({
     workspaceRoot: rootSession.workspaceRoot,
-    directory: options.permissionDirectory ?? resolve(rootSession.sessionDirectory, "permissions"),
+    directory: permissionDirectory ?? resolve(rootSession.sessionDirectory, "permissions"),
   });
   const memory = createMemory({
     directory: memoryDirectory,
@@ -71,15 +78,33 @@ export function createAgentRuntime(
       }),
     ];
     return {
-      definitions: (permissionMode) =>
-        extensions.flatMap((extension) => extension.definitions(permissionMode)),
-      createPlan: (call, permissionMode) => {
+      tools: (permissionMode) => extensions.flatMap((extension) => extension.tools(permissionMode)),
+      rejectUnavailableTool(call, permissionMode) {
         for (const extension of extensions) {
-          const plan = extension.createPlan(call, permissionMode);
-          if (plan) return plan;
+          const rejection = extension.rejectUnavailableTool?.(call, permissionMode);
+          if (rejection) return rejection;
         }
         return null;
       },
+    };
+  }
+  function commonAgentOptions(
+    session: Session,
+    permissionMode: PermissionMode | undefined,
+    coordinator: MultiAgent,
+  ): SessionAgentOptions {
+    return {
+      session,
+      permissionMode,
+      modelStream: coordinator.modelStream,
+      ...(sessionOptions.modelContext ? { modelContext: sessionOptions.modelContext } : {}),
+      ...(sessionOptions.skills ? { skills: sessionOptions.skills } : {}),
+      ...(sessionOptions.mcp ? { mcp: sessionOptions.mcp } : {}),
+      ...(sessionOptions.protectedPaths ? { protectedPaths: sessionOptions.protectedPaths } : {}),
+      managedTools: toolsFor(session, coordinator),
+      beforeRequest: (lease, signal) => coordinator.drain(session.sessionId, lease, signal),
+      workspacePermissions: permissions,
+      remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
     };
   }
   const coordinator = createMultiAgent({
@@ -97,12 +122,7 @@ export function createAgentRuntime(
         workspaceRoot: session.workspaceRoot,
       });
       return createSessionAgent({
-        session,
-        permissionMode,
-        modelStream: coordinator.modelStream,
-        ...(sessionOptions.modelContext ? { modelContext: sessionOptions.modelContext } : {}),
-        ...(sessionOptions.skills ? { skills: sessionOptions.skills } : {}),
-        ...(sessionOptions.mcp ? { mcp: sessionOptions.mcp } : {}),
+        ...commonAgentOptions(session, permissionMode, coordinator),
         memory: memberMemory,
         maintainMemory: async (action, writer, signal) => {
           if (action.action !== "save" || action.id)
@@ -115,26 +135,15 @@ export function createAgentRuntime(
           emit({ type: "memory_changed" });
           return snapshot;
         },
-        managedTools: toolsFor(session, coordinator),
-        beforeRequest: (lease, signal) => coordinator.drain(session.sessionId, lease, signal),
         authorizationRecords: () => rootSession.records,
-        workspacePermissions: permissions,
         permissionMember: true,
-        ...(sessionOptions.protectedPaths ? { protectedPaths: sessionOptions.protectedPaths } : {}),
-        remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
       });
     },
   });
   const primary = createSessionAgent({
     ...sessionOptions,
-    session: rootSession,
-    permissionMode: mode,
-    modelStream: coordinator.modelStream,
+    ...commonAgentOptions(rootSession, mode, coordinator),
     memory,
-    workspacePermissions: permissions,
-    remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
-    managedTools: toolsFor(rootSession, coordinator),
-    beforeRequest: (lease, signal) => coordinator.drain(rootSession.sessionId, lease, signal),
   });
   bindings = { agent: primary, coordinator };
   return {

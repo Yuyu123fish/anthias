@@ -41,10 +41,17 @@ import type { SessionCleanupResult } from "./session/cleanup.js";
 import type { AgentInputDetails, Session, SessionRunLease } from "./session/index.js";
 import { isSideEffectToolName, type SessionRecord } from "./session/schema.js";
 import type { SkillLibrary } from "./skill/index.js";
-import { getToolDefinitions } from "./tool/definitions.js";
 import type { AgentToolExtension } from "./tool/managed-tool.js";
 import { createMemoryTools, type MaintainMemory } from "./tool/memory-tools.js";
-import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
+import {
+  type AgentTool,
+  type CreateToolRunnerOptions,
+  createBaseTools,
+  createToolRunnerFromTools,
+  rejectUnavailableBaseTool,
+  type ToolApprovalPlan,
+  type ToolRunner,
+} from "./tool/tool-runner.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
 export type RunPhase =
@@ -207,14 +214,19 @@ export type SessionAgent = Readonly<{
   external: ReturnType<typeof createExternalCapabilities>;
   subscribe(listener: AgentListener): () => void;
 }>;
-export type CreateAgentWithModelStreamOptions = Readonly<{
+export type CreateAgentWithModelStreamOptions = SessionAgentOptions &
+  Readonly<{
+    memoryDirectory?: string;
+    worktreeDirectory?: string;
+    permissionDirectory?: string;
+  }>;
+
+/** 已装配能力属于单 Agent；存储目录和共享资源的创建留在 Runtime。 */
+export type SessionAgentOptions = Readonly<{
   modelStream: ModelStream;
-  memoryDirectory?: string;
   memory?: Memory;
   maintainMemory?: MaintainMemory;
-  worktreeDirectory?: string;
   managedTools?: AgentToolExtension;
-  permissionDirectory?: string;
   protectedPaths?: readonly string[];
   workspacePermissions?: WorkspacePermissions;
   permissionMember?: boolean;
@@ -248,6 +260,7 @@ type ActiveRunOwnership = {
   toolAuthorizationRevisions: Map<string, string>;
   deniedToolActionFingerprints: Set<string>;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
+  requestToolRunners: WeakMap<ModelRequest, ToolRunner>;
 };
 
 /** 持有当前确认 Promise 的唯一解决入口和对应请求。 */
@@ -256,6 +269,24 @@ type PendingToolApproval = Readonly<{
   request: ToolApprovalRequest;
   resolve(decision: "approve" | "deny" | "aborted"): void;
 }>;
+
+/** 单 Agent 的可变事实；对外 AgentState 只从这里及资源快照投影。 */
+type SessionAgentExecutionState = {
+  messageHistory: Message[];
+  messageEntryIds: WeakMap<Message, string>;
+  permissionMode: PermissionMode;
+  activeAssistantMessage: AssistantMessage | null;
+  lastError: string | null;
+  lastRunDiagnostic: RunDiagnostic | null;
+  activeRun: ActiveRunOwnership | null;
+  sessionUnavailableResult: FinishedPromptResult | null;
+  sessionLeaseAcquisitionPending: boolean;
+  sessionChanged: boolean;
+  pendingToolApproval: PendingToolApproval | null;
+  ownedPromptResultPromise: Promise<PromptResult> | null;
+  closeRequested: boolean;
+  closeCompletionPromise: Promise<void> | null;
+};
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
 const SAFE_SESSION_ERROR = "Session 写入失败，请检查本地存储后重试。";
@@ -299,20 +330,37 @@ export function createSessionAgent({
   remainingTaskTimeMs,
   memory,
   maintainMemory,
-}: CreateAgentWithModelStreamOptions): SessionAgent {
-  const messageHistory: Message[] = [...session.messageHistory];
-  const messageEntryIds = new WeakMap<Message, string>();
+}: SessionAgentOptions): SessionAgent {
+  const lastRunRecord = session.records.findLast((record) => record.type === "run_finished");
+  const state: SessionAgentExecutionState = {
+    messageHistory: [...session.messageHistory],
+    messageEntryIds: new WeakMap(),
+    permissionMode: initialPermissionMode,
+    activeAssistantMessage: null,
+    lastError: null,
+    lastRunDiagnostic:
+      lastRunRecord?.type === "run_finished" ? (lastRunRecord.diagnostic ?? null) : null,
+    activeRun: null,
+    pendingToolApproval: null,
+    sessionUnavailableResult: null,
+    sessionLeaseAcquisitionPending: false,
+    sessionChanged: false,
+    ownedPromptResultPromise: null,
+    closeRequested: false,
+    closeCompletionPromise: null,
+  };
+
   const initialMessageRecords = session.records.filter((record) => record.type === "message");
-  messageHistory.forEach((message, index) => {
+  state.messageHistory.forEach((message, index) => {
     const record = initialMessageRecords[index];
-    if (record) messageEntryIds.set(message, record.entryId);
+    if (record) state.messageEntryIds.set(message, record.entryId);
   });
   const contextBudget = modelContext?.budget ?? createContextBudget({ contextWindow: 128_000 });
   const artifactStore = createSessionArtifactStore({
     sessionId: session.sessionId,
     storageDirectory: session.storageDirectory,
   });
-  for (const message of messageHistory) {
+  for (const message of state.messageHistory) {
     if (message.role === "tool" && message.artifact !== undefined)
       artifactStore.registerReference(message.artifact);
   }
@@ -320,19 +368,19 @@ export function createSessionAgent({
     session,
     ...(memory ? { memory } : {}),
     environment: () =>
-      createCodingEnvironmentPrompt(session.workspaceRoot, session.shell, permissionMode),
+      createCodingEnvironmentPrompt(session.workspaceRoot, session.shell, state.permissionMode),
     skillDirectory: () => external.directory(),
     appendSource: async (details) => {
       try {
-        await (activeRun
-          ? activeRun.sessionLease.appendContextSource(details)
+        await (state.activeRun
+          ? state.activeRun.sessionLease.appendContextSource(details)
           : session.appendContextSource(details));
       } catch {
-        if (activeRun) {
-          activeRun.sessionWriteFailed = true;
-          activeRun.abortController.abort();
+        if (state.activeRun) {
+          state.activeRun.sessionWriteFailed = true;
+          state.activeRun.abortController.abort();
         }
-        sessionUnavailableResult = SESSION_FAILED_RESULT;
+        state.sessionUnavailableResult = SESSION_FAILED_RESULT;
         throw new Error(SAFE_SESSION_ERROR);
       }
     },
@@ -345,20 +393,18 @@ export function createSessionAgent({
     modelId: modelContext?.modelId ?? "deterministic-local",
     budget: contextBudget,
   });
-  const localToolRunner =
-    providedToolRunner ??
-    createToolRunner({
-      workspace: Object.freeze({
-        workspaceRoot: session.workspaceRoot,
-        sessionDirectory: session.sessionDirectory,
-        protectedPaths: [
-          ...protectedPaths,
-          ...(workspacePermissions ? [workspacePermissions.directory] : []),
-        ],
-      }),
-      shell: session.shell,
-      artifactStore,
-    });
+  const baseToolOptions: CreateToolRunnerOptions = {
+    workspace: Object.freeze({
+      workspaceRoot: session.workspaceRoot,
+      sessionDirectory: session.sessionDirectory,
+      protectedPaths: [
+        ...protectedPaths,
+        ...(workspacePermissions ? [workspacePermissions.directory] : []),
+      ],
+    }),
+    shell: session.shell,
+    artifactStore,
+  };
   const memoryTools = memory
     ? createMemoryTools({
         memory,
@@ -367,65 +413,93 @@ export function createSessionAgent({
         ...(maintainMemory ? { maintain: maintainMemory } : {}),
         changed: () => publishEvent({ type: "memory_changed" }),
         onAdoptionFailure: () => {
-          if (activeRun) activeRun.memoryCommittedBeforeFailure = true;
+          if (state.activeRun) state.activeRun.memoryCommittedBeforeFailure = true;
         },
       })
     : undefined;
-  function createRequestToolRunner(
-    snapshot?: ReturnType<typeof external.prepareRequest>["mcpSnapshot"],
-  ): ToolRunner {
+  // 自持 Session、上下文投影及产物；权限仓库与 MCP 连接由外层共享，关闭只释放本 Agent 的订阅。
+  const runtime = Object.freeze({
+    state,
+    session,
+    modelStream,
+    context: Object.freeze({ budget: contextBudget, sources, controller: contextController }),
+    tools: Object.freeze({
+      baseOptions: baseToolOptions,
+      providedRunner: providedToolRunner,
+      managed: managedTools,
+      memory: memoryTools,
+      external,
+    }),
+    permissions: Object.freeze({ workspace: workspacePermissions, member: permissionMember }),
+    artifactStore,
+    eventListeners: new Set<AgentListener>(),
+    beforeRequest,
+    authorizationRecords,
+    remainingTaskTimeMs,
+  });
+
+  /** 模型定义和执行计划由同一请求工具集合投影，MCP 连接代次绑定在各自计划中。 */
+  function prepareRequest(request: ModelRequest, permissionMode: PermissionMode) {
+    const baseTools = createBaseTools(runtime.tools.baseOptions, permissionMode).map(
+      (tool): AgentTool => ({
+        definition: tool.definition,
+        createPlan: (call, mode) =>
+          runtime.tools.providedRunner?.createPlan(call, mode) ?? tool.createPlan(call, mode),
+      }),
+    );
+    const localTools = [
+      ...baseTools,
+      ...(runtime.tools.managed?.tools(permissionMode) ?? []),
+      ...(runtime.tools.memory?.tools(permissionMode) ?? []),
+    ];
+    const prepared = runtime.tools.external.prepareRequest(
+      {
+        ...request,
+        tools: localTools.map((tool) => tool.definition),
+      },
+      permissionMode,
+    );
+    const toolRunner = createToolRunnerFromTools([...localTools, ...prepared.tools]);
     return {
-      createPlan: (call, mode) =>
-        memoryTools?.createPlan(call, mode) ??
-        managedTools?.createPlan(call, mode) ??
-        external.createPlan(call, mode, snapshot) ??
-        localToolRunner.createPlan(call, mode),
+      request: prepared.request,
+      toolRunner: {
+        createPlan: (call, mode) =>
+          rejectUnavailableBaseTool(call, mode, runtime.tools.baseOptions) ??
+          runtime.tools.managed?.rejectUnavailableTool?.(call, mode) ??
+          runtime.tools.memory?.rejectUnavailableTool?.(call, mode) ??
+          runtime.tools.external.rejectUnavailableTool(call, mode, prepared.mcpSnapshot) ??
+          toolRunner.createPlan(call, mode),
+      } satisfies ToolRunner,
     };
   }
-  const toolRunner = createRequestToolRunner();
-  const eventListeners = new Set<AgentListener>();
-  let permissionMode = initialPermissionMode;
-  let activeAssistantMessage: AssistantMessage | null = null;
-  let lastError: string | null = null;
-  const lastRunRecord = session.records.findLast((record) => record.type === "run_finished");
-  let lastRunDiagnostic: RunDiagnostic | null =
-    lastRunRecord?.type === "run_finished" ? (lastRunRecord.diagnostic ?? null) : null;
-  let activeRun: ActiveRunOwnership | null = null;
-  let sessionUnavailableResult: FinishedPromptResult | null = null;
-  let sessionLeaseAcquisitionPending = false;
-  let sessionChanged = false;
-  let pendingToolApproval: PendingToolApproval | null = null;
-  let ownedPromptResultPromise: Promise<PromptResult> | null = null;
-  let closeRequested = false;
-  let closeCompletionPromise: Promise<void> | null = null;
 
   /** 生成只读状态投影；完成消息与活动 partial 的生命周期由各自形成边界持有。 */
   function createStateSnapshot(): AgentState {
     return Object.freeze({
       operation: null,
-      sessionId: session.sessionId,
-      workspaceRoot: session.workspaceRoot,
-      permissionMode,
-      contextUsage: contextController.snapshot(),
-      messageHistory: Object.freeze([...messageHistory]),
-      activeAssistantMessage,
-      activeRun: activeRun
+      sessionId: runtime.session.sessionId,
+      workspaceRoot: runtime.session.workspaceRoot,
+      permissionMode: state.permissionMode,
+      contextUsage: runtime.context.controller.snapshot(),
+      messageHistory: Object.freeze([...state.messageHistory]),
+      activeAssistantMessage: state.activeAssistantMessage,
+      activeRun: state.activeRun
         ? Object.freeze({
-            runId: activeRun.runId,
-            phase: activeRun.phase,
+            runId: state.activeRun.runId,
+            phase: state.activeRun.phase,
           })
         : null,
-      pendingToolApproval: pendingToolApproval?.request ?? null,
-      running: activeRun !== null,
-      lastError,
-      lastRunDiagnostic,
+      pendingToolApproval: state.pendingToolApproval?.request ?? null,
+      running: state.activeRun !== null,
+      lastError: state.lastError,
+      lastRunDiagnostic: state.lastRunDiagnostic,
     });
   }
 
   /** 按注册顺序同步发布事件，并隔离订阅者异常。 */
   function publishEvent(event: AgentEvent): void {
     const eventSnapshot = Object.freeze(event);
-    for (const listener of [...eventListeners]) {
+    for (const listener of [...runtime.eventListeners]) {
       try {
         void listener(eventSnapshot);
       } catch {
@@ -456,35 +530,35 @@ export function createSessionAgent({
     publishEvent({ type: "reasoning_end", runId: currentRun.runId });
   }
   function subscribeToEvents(listener: AgentListener): () => void {
-    eventListeners.add(listener);
+    runtime.eventListeners.add(listener);
     let subscribed = true;
     return () => {
       if (!subscribed) {
         return;
       }
       subscribed = false;
-      eventListeners.delete(listener);
+      runtime.eventListeners.delete(listener);
     };
   }
 
   /** 只在 Agent 空闲时改变后续 Run 的权限快照。 */
   function setPermissionMode(nextPermissionMode: PermissionMode): PermissionModeChangeResult {
-    if (closeRequested) {
+    if (state.closeRequested) {
       return Object.freeze({ status: "rejected", reason: "closed" });
     }
-    if (activeRun !== null || sessionLeaseAcquisitionPending) {
+    if (state.activeRun !== null || state.sessionLeaseAcquisitionPending) {
       return Object.freeze({ status: "rejected", reason: "busy" });
     }
-    if (permissionMode !== nextPermissionMode) {
-      permissionMode = nextPermissionMode;
-      publishEvent({ type: "permission_mode_changed", permissionMode });
+    if (state.permissionMode !== nextPermissionMode) {
+      state.permissionMode = nextPermissionMode;
+      publishEvent({ type: "permission_mode_changed", permissionMode: state.permissionMode });
     }
-    return Object.freeze({ status: "accepted", permissionMode });
+    return Object.freeze({ status: "accepted", permissionMode: state.permissionMode });
   }
 
   /** 请求中止当前 Run，实际终结继续由 Agent Loop 和统一收口路径完成。 */
   function abortActiveRun(source: NonNullable<RunDiagnostic["abortSource"]> = "user"): void {
-    const currentRun = activeRun;
+    const currentRun = state.activeRun;
     if (currentRun === null || currentRun.abortController.signal.aborted) {
       return;
     }
@@ -498,7 +572,7 @@ export function createSessionAgent({
     toolApprovalRequestId: string,
     decision: "approve" | "deny",
   ): ToolApprovalResponse {
-    const pendingApproval = pendingToolApproval;
+    const pendingApproval = state.pendingToolApproval;
     if (pendingApproval === null) {
       return Object.freeze({ status: "rejected", reason: "not_pending" });
     }
@@ -506,13 +580,13 @@ export function createSessionAgent({
       return Object.freeze({ status: "rejected", reason: "request_mismatch" });
     }
     if (
-      activeRun?.runId !== pendingApproval.runId ||
-      activeRun.phase !== "awaiting_tool_approval"
+      state.activeRun?.runId !== pendingApproval.runId ||
+      state.activeRun.phase !== "awaiting_tool_approval"
     ) {
       return Object.freeze({ status: "rejected", reason: "request_mismatch" });
     }
 
-    pendingToolApproval = null;
+    state.pendingToolApproval = null;
     publishEvent({
       type: "tool_approval_resolved",
       request: pendingApproval.request,
@@ -524,11 +598,11 @@ export function createSessionAgent({
 
   /** 解决当前 Run 唯一待决确认，晚到或其他 Run 的请求保持不变。 */
   function resolvePendingToolApproval(currentRun: ActiveRunOwnership, decision: "aborted"): void {
-    const pendingApproval = pendingToolApproval;
+    const pendingApproval = state.pendingToolApproval;
     if (pendingApproval === null || pendingApproval.runId !== currentRun.runId) {
       return;
     }
-    pendingToolApproval = null;
+    state.pendingToolApproval = null;
     publishEvent({
       type: "tool_approval_resolved",
       request: pendingApproval.request,
@@ -547,7 +621,7 @@ export function createSessionAgent({
       toolApprovalRequestId: randomUUID(),
       toolCallId: toolCall.toolCallId,
       toolName: approvalPlan.toolName,
-      workspaceRoot: session.workspaceRoot,
+      workspaceRoot: runtime.session.workspaceRoot,
       target: approvalPlan.target,
       preview: approvalPlan.preview,
       permissionMode: currentRun.permissionMode,
@@ -555,7 +629,7 @@ export function createSessionAgent({
       executionBoundary: approvalPlan.executionBoundary,
     });
     return new Promise((resolve) => {
-      pendingToolApproval = Object.freeze({
+      state.pendingToolApproval = Object.freeze({
         runId: currentRun.runId,
         request,
         resolve: (decision) =>
@@ -601,15 +675,15 @@ export function createSessionAgent({
         decision: details.decision,
         reason,
         authorizationEntryIds: details.authorizationEntryIds,
-        ...(authorizationRecords && details.authorizationEntryIds.length
-          ? { authorizationSessionId: session.rootSessionId }
+        ...(runtime.authorizationRecords && details.authorizationEntryIds.length
+          ? { authorizationSessionId: runtime.session.rootSessionId }
           : {}),
         actionFingerprint: details.actionFingerprint,
         toolApprovalRequestId: details.toolApprovalRequestId,
       });
     } catch {
       currentRun.sessionWriteFailed = true;
-      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      state.sessionUnavailableResult = SESSION_FAILED_RESULT;
       throw new Error(SAFE_SESSION_ERROR);
     }
     if (details.source === "user" && details.decision === "denied")
@@ -650,14 +724,19 @@ export function createSessionAgent({
       });
       return { toolApprovalRequestId, decision: "approve" };
     }
-    const permissionRevision = workspacePermissions?.revision();
+    const permissionRevision = runtime.permissions.workspace?.revision();
     if (permissionRevision)
       currentRun.toolAuthorizationRevisions.set(toolCall.toolCallId, permissionRevision);
     const denied = currentRun.deniedToolActionFingerprints.has(fingerprint);
     if (
       currentRun.permissionMode === "auto_allow" &&
       !denied &&
-      workspacePermissions?.matches(toolCall, approvalPlan, session.workspaceRoot, permissionMember)
+      runtime.permissions.workspace?.matches(
+        toolCall,
+        approvalPlan,
+        runtime.session.workspaceRoot,
+        runtime.permissions.member,
+      )
     ) {
       const toolApprovalRequestId = randomUUID();
       await saveToolAuthorization(currentRun, toolCall, {
@@ -670,7 +749,7 @@ export function createSessionAgent({
       });
       return { toolApprovalRequestId, decision: "approve" };
     }
-    const workspaceRevoked = workspacePermissions?.isRevoked() === true;
+    const workspaceRevoked = runtime.permissions.workspace?.isRevoked() === true;
     // 明确拒绝与授权撤销持续生效；其他新 ToolCall 仍按真实用户原文重新审核。
     if (currentRun.permissionMode === "auto_allow" && (denied || workspaceRevoked)) {
       const toolApprovalRequestId = randomUUID();
@@ -694,13 +773,15 @@ export function createSessionAgent({
         toolName: toolCall.toolName,
       });
       const reviewResult = await reviewToolApproval({
-        modelStream,
-        budget: contextBudget,
-        records: authorizationRecords?.() ?? session.records,
-        executionRecords: session.records,
+        modelStream: runtime.modelStream,
+        budget: runtime.context.budget,
+        records: runtime.authorizationRecords?.() ?? runtime.session.records,
+        executionRecords: runtime.session.records,
         runId: currentRun.runId,
-        ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
-        workspaceRoot: session.workspaceRoot,
+        ...(runtime.remainingTaskTimeMs
+          ? { remainingTaskTimeMs: runtime.remainingTaskTimeMs }
+          : {}),
+        workspaceRoot: runtime.session.workspaceRoot,
         toolCall,
         approvalPlan,
         abortSignal: currentRun.abortController.signal,
@@ -736,7 +817,7 @@ export function createSessionAgent({
     }
     if (
       currentRun.abortController.signal.aborted ||
-      (permissionRevision && workspacePermissions?.revision() !== permissionRevision)
+      (permissionRevision && runtime.permissions.workspace?.revision() !== permissionRevision)
     )
       return { toolApprovalRequestId: randomUUID(), decision: "aborted" };
     updateRunPhase(currentRun, "awaiting_tool_approval");
@@ -760,21 +841,25 @@ export function createSessionAgent({
     internalInput?: AgentInputDetails,
     controlCall?: AssistantToolCallPart,
   ): Promise<PromptResult> {
-    if (closeRequested) {
+    if (state.closeRequested) {
       return Promise.resolve(CLOSED_PROMPT_RESULT);
     }
-    if (ownedPromptResultPromise !== null || activeRun !== null || sessionLeaseAcquisitionPending) {
+    if (
+      state.ownedPromptResultPromise !== null ||
+      state.activeRun !== null ||
+      state.sessionLeaseAcquisitionPending
+    ) {
       return Promise.resolve(BUSY_PROMPT_RESULT);
     }
     const promptCompletion = Promise.withResolvers<PromptResult>();
-    ownedPromptResultPromise = promptCompletion.promise;
+    state.ownedPromptResultPromise = promptCompletion.promise;
     void submitPrompt(promptText, internalInput, controlCall).then(
       (result) => {
-        ownedPromptResultPromise = null;
+        state.ownedPromptResultPromise = null;
         promptCompletion.resolve(result);
       },
       (error: unknown) => {
-        ownedPromptResultPromise = null;
+        state.ownedPromptResultPromise = null;
         promptCompletion.reject(error);
       },
     );
@@ -783,32 +868,32 @@ export function createSessionAgent({
 
   /** 终态事件交付后才释放 Session 使用标记，保证清理任务不会命中仍在退出的 Agent。 */
   function close(): Promise<void> {
-    if (closeCompletionPromise !== null) {
-      return closeCompletionPromise;
+    if (state.closeCompletionPromise !== null) {
+      return state.closeCompletionPromise;
     }
-    closeRequested = true;
+    state.closeRequested = true;
     abortActiveRun("shutdown");
-    closeCompletionPromise = (async () => {
+    state.closeCompletionPromise = (async () => {
       try {
-        await ownedPromptResultPromise;
+        await state.ownedPromptResultPromise;
       } finally {
         try {
           try {
-            await artifactStore.close();
+            await runtime.artifactStore.close();
           } finally {
-            await session.close();
+            await runtime.session.close();
           }
         } finally {
           try {
             await stopCleanup?.();
           } finally {
             unsubscribePermissions?.();
-            eventListeners.clear();
+            runtime.eventListeners.clear();
           }
         }
       }
     })();
-    return closeCompletionPromise;
+    return state.closeCompletionPromise;
   }
   async function submitPrompt(
     promptText: string,
@@ -818,38 +903,38 @@ export function createSessionAgent({
     if (promptText.trim().length === 0) {
       return EMPTY_PROMPT_RESULT;
     }
-    if (activeRun !== null || sessionLeaseAcquisitionPending) {
+    if (state.activeRun !== null || state.sessionLeaseAcquisitionPending) {
       return BUSY_PROMPT_RESULT;
     }
-    if (sessionChanged) {
+    if (state.sessionChanged) {
       return SESSION_CHANGED_PROMPT_RESULT;
     }
-    if (sessionUnavailableResult !== null) {
-      return sessionUnavailableResult;
+    if (state.sessionUnavailableResult !== null) {
+      return state.sessionUnavailableResult;
     }
 
-    lastError = null;
+    state.lastError = null;
     const runId = randomUUID();
-    sessionLeaseAcquisitionPending = true;
+    state.sessionLeaseAcquisitionPending = true;
     let sessionRunAcquisition: Awaited<ReturnType<Session["acquireRun"]>>;
     try {
-      sessionRunAcquisition = await session.acquireRun(runId);
+      sessionRunAcquisition = await runtime.session.acquireRun(runId);
     } catch {
-      sessionUnavailableResult = SESSION_FAILED_RESULT;
-      lastError = SAFE_SESSION_ERROR;
+      state.sessionUnavailableResult = SESSION_FAILED_RESULT;
+      state.lastError = SAFE_SESSION_ERROR;
       return SESSION_FAILED_RESULT;
     } finally {
-      sessionLeaseAcquisitionPending = false;
+      state.sessionLeaseAcquisitionPending = false;
     }
     if (sessionRunAcquisition.status === "rejected") {
       if (sessionRunAcquisition.reason === "session_changed") {
-        sessionChanged = true;
+        state.sessionChanged = true;
         return SESSION_CHANGED_PROMPT_RESULT;
       }
       return SESSION_BUSY_PROMPT_RESULT;
     }
 
-    if (closeRequested) {
+    if (state.closeRequested) {
       await sessionRunAcquisition.lease.release();
       return ABORTED_PROMPT_RESULT;
     }
@@ -859,15 +944,16 @@ export function createSessionAgent({
       phase: "requesting_model",
       sessionLease: sessionRunAcquisition.lease,
       abortController: new AbortController(),
-      permissionMode,
+      permissionMode: state.permissionMode,
       visibleReasoningActive: false,
       sessionWriteFailed: false,
       toolAuthorizations: new Map(),
       toolAuthorizationRevisions: new Map(),
       deniedToolActionFingerprints: new Set(),
       terminalResultPromise: null,
+      requestToolRunners: new WeakMap(),
     };
-    activeRun = currentRun;
+    state.activeRun = currentRun;
 
     const userMessage: UserMessage = internalInput
       ? agentInputMessage(internalInput)
@@ -876,41 +962,43 @@ export function createSessionAgent({
       // UserMessage 刷新成功后 Run 才算被接受，后续事件与 Tool 才能开始。
       if (internalInput) await currentRun.sessionLease.appendAgentInput(internalInput);
       else await currentRun.sessionLease.appendMessage(userMessage);
-      const userRecord = session.records.findLast(
+      const userRecord = runtime.session.records.findLast(
         (record) => record.type === (internalInput ? "agent_input" : "message"),
       );
-      if (userRecord) messageEntryIds.set(userMessage, userRecord.entryId);
+      if (userRecord) state.messageEntryIds.set(userMessage, userRecord.entryId);
     } catch {
       return failBeforeRunStart(currentRun);
     }
 
-    messageHistory.push(userMessage);
+    state.messageHistory.push(userMessage);
     publishEvent({ type: "run_start", runId });
     publishEvent({ type: "message_start", message: userMessage });
     publishEvent({ type: "message_end", message: userMessage });
 
     try {
-      if (closeRequested || currentRun.abortController.signal.aborted) {
+      if (state.closeRequested || currentRun.abortController.signal.aborted) {
         return finishRun(currentRun, ABORTED_PROMPT_RESULT);
       }
       let contextFailure: string | null = null;
-      const requestToolRunners = new WeakMap<ModelRequest, ToolRunner>();
-      const contextModelStream = contextController.wrapRun({
-        ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
+
+      const contextModelStream = runtime.context.controller.wrapRun({
+        ...(runtime.remainingTaskTimeMs
+          ? { remainingTaskTimeMs: runtime.remainingTaskTimeMs }
+          : {}),
         lease: currentRun.sessionLease,
         beforeRequest: async (signal) => {
           try {
-            await beforeRequest?.(currentRun.sessionLease, signal);
-            await sources.prepare(signal);
+            await runtime.beforeRequest?.(currentRun.sessionLease, signal);
+            await runtime.context.sources.prepare(signal);
           } catch (error) {
             contextFailure = error instanceof Error ? error.message : "上下文来源准备失败。";
             throw error;
           }
         },
         extendRequest: (request, requestIdentity) => {
-          const prepared = external.prepareRequest(request, currentRun.permissionMode);
+          const prepared = prepareRequest(request, currentRun.permissionMode);
           // 模型回复只能执行该请求看见的工具；并行成员和后续请求不会替换这里的快照。
-          requestToolRunners.set(requestIdentity, createRequestToolRunner(prepared.mcpSnapshot));
+          currentRun.requestToolRunners.set(requestIdentity, prepared.toolRunner);
           return prepared.request;
         },
         emit: (event) => {
@@ -928,25 +1016,31 @@ export function createSessionAgent({
         },
         onStorageFailure: () => {
           currentRun.sessionWriteFailed = true;
-          sessionUnavailableResult = SESSION_FAILED_RESULT;
+          state.sessionUnavailableResult = SESSION_FAILED_RESULT;
         },
       });
+      const controlModelStream = controlCall ? controlToolStream(controlCall) : null;
+      const requestModelStream: ModelStream = controlModelStream
+        ? (request, signal) => {
+            const prepared = prepareRequest(request, currentRun.permissionMode);
+            currentRun.requestToolRunners.set(request, prepared.toolRunner);
+            return controlModelStream(prepared.request, signal);
+          }
+        : contextModelStream.modelStream;
       const loopResult = await runAgentLoop({
-        messages: messageHistory,
-        messageEntryId: (message) => messageEntryIds.get(message),
-        modelStream: controlCall ? controlToolStream(controlCall) : contextModelStream.modelStream,
+        messages: state.messageHistory,
+        messageEntryId: (message) => state.messageEntryIds.get(message),
+        modelStream: requestModelStream,
         systemPrompt: createCodingSystemPrompt(),
-        toolDefinitions: [
-          ...getToolDefinitions(currentRun.permissionMode),
-          ...(managedTools?.definitions(currentRun.permissionMode) ?? []),
-          ...(memoryTools?.definitions(currentRun.permissionMode) ?? []),
-        ],
+        toolDefinitions: [],
         permissionMode: currentRun.permissionMode,
-        toolRunner,
-        toolRunnerForRequest: (request) => requestToolRunners.get(request),
-        artifactStore,
+        toolRunner: createToolRunnerFromTools([]),
+        toolRunnerForRequest: (request) => currentRun.requestToolRunners.get(request),
+        artifactStore: runtime.artifactStore,
         abortController: currentRun.abortController,
-        ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
+        ...(runtime.remainingTaskTimeMs
+          ? { remainingTaskTimeMs: runtime.remainingTaskTimeMs }
+          : {}),
         emit: (event) => processAgentLoopEvent(currentRun, event),
         updatePhase: (phase) => updateRunPhase(currentRun, phase),
         requestToolApproval: (toolCall, approvalPlan) =>
@@ -979,10 +1073,10 @@ export function createSessionAgent({
     } catch {
       failedResult = SESSION_RELEASE_FAILED_RESULT;
     }
-    lastError = failedResult.status === "failed" ? failedResult.error : SAFE_SESSION_ERROR;
-    sessionUnavailableResult = failedResult;
-    if (activeRun === currentRun) {
-      activeRun = null;
+    state.lastError = failedResult.status === "failed" ? failedResult.error : SAFE_SESSION_ERROR;
+    state.sessionUnavailableResult = failedResult;
+    if (state.activeRun === currentRun) {
+      state.activeRun = null;
     }
     return failedResult;
   }
@@ -1023,11 +1117,11 @@ export function createSessionAgent({
         closeVisibleReasoning(currentRun);
         return;
       case "assistant_message_start":
-        activeAssistantMessage = event.message;
+        state.activeAssistantMessage = event.message;
         publishEvent({ type: "message_start", message: event.message });
         return;
       case "assistant_message_update":
-        activeAssistantMessage = event.message;
+        state.activeAssistantMessage = event.message;
         if (event.delta !== null) {
           publishEvent({
             type: "message_update",
@@ -1039,7 +1133,7 @@ export function createSessionAgent({
       case "assistant_message_end":
         if (event.message.diagnostic) currentRun.diagnostic = event.message.diagnostic;
         await appendCompletedMessage(currentRun, event.message, true);
-        activeAssistantMessage = null;
+        state.activeAssistantMessage = null;
         return;
       case "tool_result":
         await appendCompletedMessage(currentRun, event.message, false);
@@ -1060,11 +1154,14 @@ export function createSessionAgent({
         const authorizationRevision = currentRun.toolAuthorizationRevisions.get(
           event.toolCall.toolCallId,
         );
-        if (authorizationRevision && workspacePermissions?.revision() !== authorizationRevision) {
+        if (
+          authorizationRevision &&
+          runtime.permissions.workspace?.revision() !== authorizationRevision
+        ) {
           throw new Error("工作区授权已变化，此动作尚未执行，请重新确认。");
         }
         try {
-          await sources.checkExecution(currentRun.abortController.signal);
+          await runtime.context.sources.checkExecution(currentRun.abortController.signal);
         } catch {
           currentRun.abortController.abort();
           throw new Error("当前记忆已撤销，工具执行已停止。");
@@ -1088,7 +1185,10 @@ export function createSessionAgent({
             });
           }
           await appendToolExecutionStarted(currentRun, event.toolCall, approvalId);
-          if (authorizationRevision && workspacePermissions?.revision() !== authorizationRevision) {
+          if (
+            authorizationRevision &&
+            runtime.permissions.workspace?.revision() !== authorizationRevision
+          ) {
             currentRun.abortController.abort();
             throw new Error("工作区授权已撤销，执行已停止。");
           }
@@ -1129,8 +1229,8 @@ export function createSessionAgent({
       });
     } catch {
       currentRun.sessionWriteFailed = true;
-      sessionUnavailableResult = SESSION_FAILED_RESULT;
-      lastError = SAFE_SESSION_ERROR;
+      state.sessionUnavailableResult = SESSION_FAILED_RESULT;
+      state.lastError = SAFE_SESSION_ERROR;
       throw new Error(SAFE_SESSION_ERROR);
     }
   }
@@ -1143,17 +1243,17 @@ export function createSessionAgent({
   ): Promise<void> {
     try {
       await currentRun.sessionLease.appendMessage(message);
-      const messageRecord = session.records.findLast((record) => record.type === "message");
-      if (messageRecord) messageEntryIds.set(message, messageRecord.entryId);
+      const messageRecord = runtime.session.records.findLast((record) => record.type === "message");
+      if (messageRecord) state.messageEntryIds.set(message, messageRecord.entryId);
     } catch {
       currentRun.sessionWriteFailed = true;
-      sessionUnavailableResult = SESSION_FAILED_RESULT;
-      lastError = SAFE_SESSION_ERROR;
+      state.sessionUnavailableResult = SESSION_FAILED_RESULT;
+      state.lastError = SAFE_SESSION_ERROR;
       throw new Error(SAFE_SESSION_ERROR);
     }
     if (message.role === "tool" && message.artifact !== undefined)
-      artifactStore.registerReference(message.artifact);
-    messageHistory.push(message);
+      runtime.artifactStore.registerReference(message.artifact);
+    state.messageHistory.push(message);
     if (!messageStartAlreadyPublished) {
       publishEvent({ type: "message_start", message });
     }
@@ -1184,7 +1284,7 @@ export function createSessionAgent({
               currentRun.abortSource ??
               (currentRun.diagnostic?.abortSource && currentRun.diagnostic.abortSource !== "unknown"
                 ? currentRun.diagnostic.abortSource
-                : remainingTaskTimeMs?.() === 0
+                : runtime.remainingTaskTimeMs?.() === 0
                   ? "task_deadline"
                   : "unknown"),
           })
@@ -1192,12 +1292,12 @@ export function createSessionAgent({
           ? createRunDiagnostic("unknown", currentRun.diagnostic)
           : (currentRun.diagnostic ??
             createRunDiagnostic(finalResult.status === "completed" ? "completed" : "unknown"));
-    lastRunDiagnostic = diagnostic;
+    state.lastRunDiagnostic = diagnostic;
     resolvePendingToolApproval(currentRun, "aborted");
     closeVisibleReasoning(currentRun);
-    activeAssistantMessage = null;
+    state.activeAssistantMessage = null;
     if (finalResult.status === "failed") {
-      lastError = finalResult.error;
+      state.lastError = finalResult.error;
     }
 
     try {
@@ -1208,9 +1308,9 @@ export function createSessionAgent({
     } catch {
       finalResult = SESSION_FAILED_RESULT;
       diagnostic = createRunDiagnostic("storage", diagnostic);
-      lastRunDiagnostic = diagnostic;
-      lastError = finalResult.error;
-      sessionUnavailableResult = SESSION_FAILED_RESULT;
+      state.lastRunDiagnostic = diagnostic;
+      state.lastError = finalResult.error;
+      state.sessionUnavailableResult = SESSION_FAILED_RESULT;
     }
 
     if (currentRun.memoryCommittedBeforeFailure && finalResult.status === "failed") {
@@ -1218,8 +1318,8 @@ export function createSessionAgent({
         status: "failed",
         error: "记忆已保存，但本会话未能采用该版本；恢复会话后继续。 " + finalResult.error,
       };
-      lastError = finalResult.error;
-      if (currentRun.sessionWriteFailed) sessionUnavailableResult = finalResult;
+      state.lastError = finalResult.error;
+      if (currentRun.sessionWriteFailed) state.sessionUnavailableResult = finalResult;
     }
 
     // activeRun 保留到 run_end 同步交付后，阻止终态订阅者重入 prompt。
@@ -1232,19 +1332,19 @@ export function createSessionAgent({
     try {
       await currentRun.sessionLease.release();
     } catch {
-      sessionUnavailableResult = SESSION_RELEASE_FAILED_RESULT;
-      lastError = SAFE_SESSION_RELEASE_ERROR;
+      state.sessionUnavailableResult = SESSION_RELEASE_FAILED_RESULT;
+      state.lastError = SAFE_SESSION_RELEASE_ERROR;
     } finally {
-      if (activeRun === currentRun) {
-        activeRun = null;
+      if (state.activeRun === currentRun) {
+        state.activeRun = null;
       }
     }
     return finalResult;
   }
 
-  const unsubscribePermissions = workspacePermissions?.subscribe(() => {
-    if (activeRun && workspacePermissions.isRevoked())
-      resolvePendingToolApproval(activeRun, "aborted");
+  const unsubscribePermissions = runtime.permissions.workspace?.subscribe(() => {
+    if (state.activeRun && runtime.permissions.workspace?.isRevoked())
+      resolvePendingToolApproval(state.activeRun, "aborted");
     publishEvent({ type: "permissions_changed" });
   });
   const stopCleanup = startCleanup?.((result) => publishEvent({ type: "session_cleanup", result }));
@@ -1255,7 +1355,7 @@ export function createSessionAgent({
     },
     prompt,
     promptInternal(input) {
-      if (input.rootSessionId !== session.rootSessionId)
+      if (input.rootSessionId !== runtime.session.rootSessionId)
         return Promise.resolve({ status: "failed", error: "内部输入的根 Session 不匹配。" });
       return prompt(input.content, input);
     },
@@ -1269,28 +1369,28 @@ export function createSessionAgent({
       };
       return prompt("用户直接执行 " + toolName + "：\n" + JSON.stringify(input), undefined, call);
     },
-    external,
+    external: runtime.tools.external,
     async compact(signal: AbortSignal) {
-      await sources.prepare(signal);
-      await contextController.compact(
-        external.prepareRequest(
+      await runtime.context.sources.prepare(signal);
+      await runtime.context.controller.compact(
+        prepareRequest(
           {
             systemPrompt: createCodingSystemPrompt(),
-            messages: messageHistory.map((message) => {
-              const entryId = messageEntryIds.get(message);
+            messages: state.messageHistory.map((message) => {
+              const entryId = state.messageEntryIds.get(message);
               return entryId ? { ...message, entryId } : message;
             }),
-            tools: getToolDefinitions(permissionMode),
+            tools: [],
           },
-          permissionMode,
+          state.permissionMode,
         ).request,
         signal,
         (event) => {
           if (event.type === "context_usage") publishEvent(event);
         },
         () => {
-          sessionUnavailableResult = SESSION_FAILED_RESULT;
-          lastError = SAFE_SESSION_ERROR;
+          state.sessionUnavailableResult = SESSION_FAILED_RESULT;
+          state.lastError = SAFE_SESSION_ERROR;
         },
       );
     },

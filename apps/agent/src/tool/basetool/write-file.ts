@@ -1,11 +1,46 @@
 import type { AssistantToolCallPart } from "../../message.js";
+import { decideToolPolicy } from "../../permission/tool-policy.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "../input-validation.js";
+import {
+  createFileToolCallPlan,
+  createPolicyDeniedPlan,
+  createRejectedToolCallPlan,
+} from "../tool-plan.js";
+import type { BaseTool } from "../tool-runner.js";
 import type { ToolWorkspace } from "../workspace-path.js";
 import {
   failedFilePreparation,
   type PreparedFileResult,
   prepareFileChange,
 } from "./file-change.js";
+
+export const writeFileTool: BaseTool = Object.freeze({
+  definition: Object.freeze({
+    name: "write_file",
+    description: "创建 UTF-8 文本文件或完整覆盖已有文件。",
+    inputSchema: Object.freeze({
+      type: "object",
+      additionalProperties: false,
+      required: ["path", "content"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        content: { type: "string" },
+      },
+    }),
+  }),
+  createPlan(toolCall, permissionMode, options) {
+    const validationError = validateWriteFileToolCallInput(toolCall);
+    if (validationError !== null) return createRejectedToolCallPlan(validationError);
+    if (permissionMode === "plan")
+      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "write_file" }));
+    return createFileToolCallPlan(
+      toolCall,
+      permissionMode,
+      options.workspace,
+      prepareWriteFileTool,
+    );
+  },
+});
 
 /** 表示 write_file 已完成运行时校验后的固定输入。 */
 type WriteFileToolInput = Readonly<{

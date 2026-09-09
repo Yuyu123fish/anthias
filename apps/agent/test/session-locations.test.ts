@@ -5,15 +5,14 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createSessionArtifactStore } from "../src/session/artifacts.js";
 import { locateSessionGroup } from "../src/session/groups.js";
-import { readSessionHistory } from "../src/session/history.js";
 import { openSession } from "../src/session/index.js";
-import { listSessions } from "../src/session/list.js";
 import {
   createSessionStorageDirectory,
   enumerateSessionStorage,
   getSessionStorageRelativeDirectory,
   locateSessionStorage,
 } from "../src/session/locations.js";
+import { listSessions, readSessionHistory } from "../src/session/query.js";
 import type { SessionHeader } from "../src/session/schema.js";
 
 const roots: string[] = [];

@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import type { JsonValue } from "../src/message.js";
 import {
   createGitWorkspace,
   type GitWorkspace,
   type GitWorkspaceOptions,
-} from "../src/git/index.js";
-import type { JsonValue } from "../src/message.js";
+} from "../src/tool/basetool/git/index.js";
 
 const execFileAsync = promisify(execFile);
 const fixtureRoots = new Set<string>();

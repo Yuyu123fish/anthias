@@ -5,6 +5,7 @@ import {
   isOptionalNonEmptyString,
   isRecord,
 } from "../input-validation.js";
+import { createReadOnlyToolCallPlan, createRejectedToolCallPlan } from "../tool-plan.js";
 import {
   boundToolOutput,
   failedToolResult,
@@ -12,9 +13,43 @@ import {
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
+import type { BaseTool } from "../tool-runner.js";
 import { type ToolWorkspace, validateWorkspaceRelativePath } from "../workspace-path.js";
 import { readStrictUtf8File, splitTextLines } from "./text-file.js";
 import { discoverWorkspaceFiles } from "./workspace-file-discovery.js";
+
+export const grepTool: BaseTool = Object.freeze({
+  definition: Object.freeze({
+    name: "grep",
+    description:
+      '按正则搜索 UTF-8 文本文件。path 是搜索基准目录，普通模式限工作区，Full Access 可用外部目录；搜索单个文件用 filePattern，例如 path="."、filePattern="index.html"。',
+    inputSchema: Object.freeze({
+      type: "object",
+      additionalProperties: false,
+      required: ["pattern"],
+      properties: {
+        pattern: { type: "string" },
+        path: { type: "string", minLength: 1 },
+        filePattern: { type: "string", minLength: 1 },
+        contextLines: { type: "integer", minimum: 0, maximum: 10 },
+      },
+    }),
+  }),
+  createPlan(toolCall, permissionMode, options) {
+    const parsed = parseGrepToolInput(toolCall, options.workspace);
+    if (!parsed.ok) return createRejectedToolCallPlan(parsed.error);
+    const input = parsed.input;
+    return createReadOnlyToolCallPlan(
+      toolCall,
+      "grep",
+      permissionMode,
+      options.workspace,
+      `pattern: ${input.pattern}; base: ${input.path}; files: ${input.filePattern}`,
+      true,
+      executeGrepTool,
+    );
+  },
+});
 
 /** 表示 grep 已完成运行时校验后的固定输入。 */
 type GrepToolInput = Readonly<{
@@ -24,15 +59,6 @@ type GrepToolInput = Readonly<{
   filePattern: string;
   contextLines: number;
 }>;
-
-/** 只检查 grep 的运行时输入形状，不访问文件系统。 */
-export function validateGrepToolCallInput(
-  toolCall: AssistantToolCallPart,
-  workspace?: ToolWorkspace,
-): string | null {
-  const inputResult = parseGrepToolInput(toolCall, workspace);
-  return inputResult.ok ? null : inputResult.error;
-}
 
 /** 执行 grep，并用相对路径、行号和可选上下文呈现匹配。 */
 export async function executeGrepTool(

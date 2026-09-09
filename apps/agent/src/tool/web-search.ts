@@ -3,7 +3,7 @@ import type { ModelToolDefinition } from "./definitions.js";
 import { hasOnlyKeys, isRecord } from "./input-validation.js";
 import type { AgentToolExtension } from "./managed-tool.js";
 import { failedToolResult, type ToolExecutionResult } from "./tool-result.js";
-import type { ToolCallPlan } from "./tool-runner.js";
+import type { AgentTool, ToolCallPlan } from "./tool-runner.js";
 
 const SEARCH_ENDPOINT = "https://www.searchapi.io/api/v1/search";
 const MAX_QUERY_LENGTH = 2000;
@@ -49,10 +49,9 @@ export function createWebSearchTools({
       },
     }),
   });
-  return {
-    definitions: () => [definition],
-    createPlan(call): ToolCallPlan | null {
-      if (call.toolName !== "web_search") return null;
+  const tool: AgentTool = {
+    definition,
+    createPlan(call): ToolCallPlan {
       return {
         scheduling: "parallel",
         abortedPreparationContent: "网页搜索已取消，未发起请求。",
@@ -86,6 +85,7 @@ export function createWebSearchTools({
       };
     },
   };
+  return { tools: () => [tool] };
 }
 
 function validateInput(call: AssistantToolCallPart): SearchInput | string {

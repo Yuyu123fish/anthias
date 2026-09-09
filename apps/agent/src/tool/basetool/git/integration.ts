@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { JsonValue } from "../message.js";
+import type { JsonValue } from "../../../message.js";
 import { GitCommandAbortedError, runGit } from "./command.js";
 import type { GitIntegrationResult, ResolveGitIntegrationInput } from "./index.js";
 

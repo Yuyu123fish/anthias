@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import type { AssistantToolCallPart } from "../message.js";
 import type { PermissionMode } from "../permission/permission-mode.js";
-import type { ModelToolDefinition } from "./definitions.js";
-import type { ToolCallPlan } from "./tool-runner.js";
+import type { AgentTool, ToolCallPlan } from "./tool-runner.js";
 
 export type AgentToolExtension = Readonly<{
-  definitions(mode: PermissionMode): readonly ModelToolDefinition[];
-  createPlan(call: AssistantToolCallPart, mode: PermissionMode): ToolCallPlan | null;
+  tools(mode: PermissionMode): readonly AgentTool[];
+  /** 只解释已知但未开放工具的拒绝原因，不能返回可执行行为。 */
+  rejectUnavailableTool?(call: AssistantToolCallPart, mode: PermissionMode): ToolCallPlan | null;
 }>;
 
 export type ManagedOperation = Readonly<{

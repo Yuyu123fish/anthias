@@ -1,9 +1,9 @@
 import type { JSONSchema7 } from "ai";
-import type { JsonValue } from "../message.js";
-import type { GitWorkspace } from "../multi-agent/members.js";
-import { hasOnlyKeys, isRecord } from "./input-validation.js";
-import type { AgentToolExtension } from "./managed-tool.js";
-import { managedToolPlan } from "./managed-tool.js";
+import type { JsonValue } from "../../../message.js";
+import { hasOnlyKeys, isRecord } from "../../input-validation.js";
+import type { AgentToolExtension } from "../../managed-tool.js";
+import { managedToolPlan } from "../../managed-tool.js";
+import type { GitWorkspace } from "./index.js";
 
 export type GitAction = Readonly<{
   action:
@@ -80,75 +80,78 @@ export function createGitTools(options: {
       : {}),
   };
   return {
-    definitions: (mode) => [
+    tools: (mode) => [
       {
-        name: "git",
-        description:
-          "查询本地仓库或执行受管 Git 操作。创建 worktree 仅带入明确提交。提交与集成需单独授权；成员仅能查询自己的工作区。",
-        inputSchema: {
-          type: "object",
-          additionalProperties: false,
-          required: ["action"],
-          properties:
-            mode === "plan" && options.primary
-              ? { ...properties, action: { type: "string", enum: [...queries] } }
-              : properties,
+        definition: {
+          name: "git",
+          description:
+            "查询本地仓库或执行受管 Git 操作。创建 worktree 仅带入明确提交。提交与集成需单独授权；成员仅能查询自己的工作区。",
+          inputSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["action"],
+            properties:
+              mode === "plan" && options.primary
+                ? { ...properties, action: { type: "string", enum: [...queries] } }
+                : properties,
+          },
+        },
+        createPlan(call, mode) {
+          return managedToolPlan(call, mode, async (signal) => {
+            const parsed = parseGitAction(call.input);
+            if (
+              !options.primary &&
+              (!["status", "diff", "log", "show"].includes(parsed.action) ||
+                parsed.worktreeId !== undefined)
+            )
+              throw new Error("成员只能查询自己的工作区，不能创建 worktree、提交或集成。");
+            const action: GitAction =
+              !options.primary && options.memberWorktreeId
+                ? { ...parsed, worktreeId: options.memberWorktreeId }
+                : parsed;
+            const mutation = !isGitQuery(action);
+            if (mutation && action.worktreeId) options.assertIdle(action.worktreeId);
+            const approvalInput = {
+              ...(action.worktreeId ? { worktreeId: action.worktreeId } : {}),
+              ...(action.action === "commit" && action.paths ? { paths: action.paths } : {}),
+              ...(action.action === "integrate"
+                ? { ref: required(action.commit, "commit"), includeRoot: true }
+                : action.ref
+                  ? { ref: action.ref }
+                  : {}),
+            };
+            const fingerprint =
+              mutation && mode !== "plan"
+                ? await options.git.captureApprovalState(approvalInput, signal)
+                : "";
+            const state =
+              mutation && mode !== "plan"
+                ? await describeGitState(options.git, action, signal)
+                : "";
+            return {
+              target:
+                "Git " +
+                action.action +
+                (action.worktreeId ? " · " + action.worktreeId : " · 主工作区"),
+              preview:
+                JSON.stringify(action, null, 2) +
+                (action.action === "create" ? "\n仅包含已提交版本；未提交修改不会带入。" : "") +
+                (mutation ? "\n" + state + "\n状态指纹: " + fingerprint : ""),
+              approval: mutation,
+              async execute(signal) {
+                if (mutation && action.worktreeId) options.assertIdle(action.worktreeId);
+                if (
+                  mutation &&
+                  fingerprint !== (await options.git.captureApprovalState(approvalInput, signal))
+                )
+                  throw new Error("审批期间 Git 状态已经变化，请重新检查并发起操作。");
+                return executeGitAction(options.git, action, signal);
+              },
+            };
+          });
         },
       },
     ],
-    createPlan(call, mode) {
-      if (call.toolName !== "git") return null;
-      return managedToolPlan(call, mode, async (signal) => {
-        const parsed = parseGitAction(call.input);
-        if (
-          !options.primary &&
-          (!["status", "diff", "log", "show"].includes(parsed.action) ||
-            parsed.worktreeId !== undefined)
-        )
-          throw new Error("成员只能查询自己的工作区，不能创建 worktree、提交或集成。");
-        const action: GitAction =
-          !options.primary && options.memberWorktreeId
-            ? { ...parsed, worktreeId: options.memberWorktreeId }
-            : parsed;
-        const mutation = !isGitQuery(action);
-        if (mutation && action.worktreeId) options.assertIdle(action.worktreeId);
-        const approvalInput = {
-          ...(action.worktreeId ? { worktreeId: action.worktreeId } : {}),
-          ...(action.action === "commit" && action.paths ? { paths: action.paths } : {}),
-          ...(action.action === "integrate"
-            ? { ref: required(action.commit, "commit"), includeRoot: true }
-            : action.ref
-              ? { ref: action.ref }
-              : {}),
-        };
-        const fingerprint =
-          mutation && mode !== "plan"
-            ? await options.git.captureApprovalState(approvalInput, signal)
-            : "";
-        const state =
-          mutation && mode !== "plan" ? await describeGitState(options.git, action, signal) : "";
-        return {
-          target:
-            "Git " +
-            action.action +
-            (action.worktreeId ? " · " + action.worktreeId : " · 主工作区"),
-          preview:
-            JSON.stringify(action, null, 2) +
-            (action.action === "create" ? "\n仅包含已提交版本；未提交修改不会带入。" : "") +
-            (mutation ? "\n" + state + "\n状态指纹: " + fingerprint : ""),
-          approval: mutation,
-          async execute(signal) {
-            if (mutation && action.worktreeId) options.assertIdle(action.worktreeId);
-            if (
-              mutation &&
-              fingerprint !== (await options.git.captureApprovalState(approvalInput, signal))
-            )
-              throw new Error("审批期间 Git 状态已经变化，请重新检查并发起操作。");
-            return executeGitAction(options.git, action, signal);
-          },
-        };
-      });
-    },
   };
 }
 

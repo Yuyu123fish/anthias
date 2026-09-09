@@ -12,6 +12,7 @@ import { resolveMemoryProject } from "../memory/selection.js";
 import type { Session } from "../session/index.js";
 import { isRecord } from "./input-validation.js";
 import { type AgentToolExtension, managedToolPlan } from "./managed-tool.js";
+import type { AgentTool } from "./tool-runner.js";
 
 export type MaintainMemory = (
   action: MemoryAction,
@@ -74,10 +75,9 @@ export function createMemoryTools(options: {
   changed: () => void;
   onAdoptionFailure?: () => void;
 }): AgentToolExtension {
-  return {
-    definitions: () => [definition],
+  const tool: AgentTool = {
+    definition,
     createPlan(call, mode) {
-      if (call.toolName !== "memory") return null;
       return managedToolPlan(call, mode, async () => {
         if (
           !isRecord(call.input) ||
@@ -394,4 +394,5 @@ export function createMemoryTools(options: {
       });
     },
   };
+  return { tools: () => [tool] };
 }

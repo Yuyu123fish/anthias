@@ -13,8 +13,8 @@ import {
   type ModelStreamEvent,
   streamAssistantMessage,
 } from "../src/model/model-stream.js";
-import { readSessionHistory } from "../src/session/history.js";
 import { createSession, openSession } from "../src/session/index.js";
+import { readSessionHistory } from "../src/session/query.js";
 import { isRunDiagnostic } from "../src/session/schema.js";
 
 const request: ModelRequest = {

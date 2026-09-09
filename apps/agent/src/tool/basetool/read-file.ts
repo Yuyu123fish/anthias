@@ -6,12 +6,14 @@ import {
   isOptionalIntegerInRange,
   isRecord,
 } from "../input-validation.js";
+import { createReadOnlyToolCallPlan, createRejectedToolCallPlan } from "../tool-plan.js";
 import {
   failedToolResult,
   renderToolFilePage,
   type ToolExecutionResult,
   toSafeToolFileError,
 } from "../tool-result.js";
+import type { BaseTool } from "../tool-runner.js";
 import {
   resolveExistingWorkspacePath,
   type ToolWorkspace,
@@ -19,21 +21,44 @@ import {
 } from "../workspace-path.js";
 import { readStrictUtf8File, splitTextLines } from "./text-file.js";
 
+export const readFileTool: BaseTool = Object.freeze({
+  definition: Object.freeze({
+    name: "read_file",
+    description:
+      "读取 UTF-8 文件的指定行范围，按 nextStartLine 继续；Full Access 可使用工作区外路径，其他模式限工作区。",
+    inputSchema: Object.freeze({
+      type: "object",
+      additionalProperties: false,
+      required: ["path"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        startLine: { type: "integer", minimum: 1 },
+        lineCount: { type: "integer", minimum: 1, maximum: 2000 },
+      },
+    }),
+  }),
+  createPlan(toolCall, permissionMode, options) {
+    const parsed = parseReadFileToolInput(toolCall, options.workspace);
+    if (!parsed.ok) return createRejectedToolCallPlan(parsed.error);
+    const input = parsed.input;
+    return createReadOnlyToolCallPlan(
+      toolCall,
+      "read_file",
+      permissionMode,
+      options.workspace,
+      `path: ${input.path}${typeof toolCall.input === "object" && toolCall.input !== null && ("startLine" in toolCall.input || "lineCount" in toolCall.input) ? `; lines: ${input.startLine}-${input.startLine + input.lineCount - 1}` : ""}`,
+      false,
+      executeReadFileTool,
+    );
+  },
+});
+
 /** 表示 read_file 已完成运行时校验后的固定输入。 */
 type ReadFileToolInput = Readonly<{
   path: string;
   startLine: number;
   lineCount: number;
 }>;
-
-/** 只检查 read_file 的运行时输入形状，不访问文件系统。 */
-export function validateReadFileToolCallInput(
-  toolCall: AssistantToolCallPart,
-  workspace?: ToolWorkspace,
-): string | null {
-  const inputResult = parseReadFileToolInput(toolCall, workspace);
-  return inputResult.ok ? null : inputResult.error;
-}
 
 /** 执行 read_file 并返回有范围、继续位置和截断事实的文本。 */
 export async function executeReadFileTool(

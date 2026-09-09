@@ -84,16 +84,13 @@ export function createMultiAgentTools(options: {
   coordinator: MultiAgent;
 }): AgentToolExtension {
   const primary = options.callerSessionId === options.rootSessionId;
+  const memberRestriction = "成员不能创建 Agent、管理团队、等待其他成员或分派任务。";
+  const visibleToCaller = (definition: ModelToolDefinition) =>
+    primary || ["agent_list", "agent_result", "team"].includes(definition.name);
   return {
-    definitions: (mode) =>
+    tools: (mode) =>
       definitions
-        .filter(
-          (definition) =>
-            primary ||
-            definition.name === "agent_list" ||
-            definition.name === "agent_result" ||
-            definition.name === "team",
-        )
+        .filter(visibleToCaller)
         .map((definition) => {
           if (primary || definition.name !== "team") return definition;
           return define(
@@ -123,27 +120,43 @@ export function createMultiAgentTools(options: {
                 },
               }
             : definition,
-        ),
-    createPlan(call, mode) {
-      if (!definitions.some((definition) => definition.name === call.toolName)) return null;
+        )
+        .map((definition) => ({
+          definition,
+          createPlan(call, mode) {
+            return managedToolPlan(call, mode, async () => {
+              const action = parseCollaborationCall(call);
+              if (!primary && !["list", "result", "task_update", "message"].includes(action.action))
+                throw new Error(memberRestriction);
+              const writable =
+                action.action === "spawn" || action.action === "team_add"
+                  ? action.writable === true
+                  : action.action === "resume" || action.action === "task_assign"
+                    ? options.coordinator.member(action.memberId).writable
+                    : false;
+              return {
+                target: call.toolName + " · " + options.callerSessionId,
+                preview:
+                  JSON.stringify(action, null, 2) +
+                  (writable ? "\n可写成员使用独立 worktree；主目录未提交修改不会带入。" : ""),
+                approval: writable,
+                execute: (signal) =>
+                  options.coordinator.execute(options.callerSessionId, action, signal),
+              };
+            });
+          },
+        })),
+    rejectUnavailableTool(call, mode) {
+      if (
+        !definitions.some(
+          (definition) => definition.name === call.toolName && !visibleToCaller(definition),
+        )
+      )
+        return null;
       return managedToolPlan(call, mode, async () => {
-        const action = parseCollaborationCall(call);
-        if (!primary && !["list", "result", "task_update", "message"].includes(action.action))
-          throw new Error("成员不能创建 Agent、管理团队、等待其他成员或分派任务。");
-        const writable =
-          action.action === "spawn" || action.action === "team_add"
-            ? action.writable === true
-            : action.action === "resume" || action.action === "task_assign"
-              ? options.coordinator.member(action.memberId).writable
-              : false;
-        return {
-          target: call.toolName + " · " + options.callerSessionId,
-          preview:
-            JSON.stringify(action, null, 2) +
-            (writable ? "\n可写成员使用独立 worktree；主目录未提交修改不会带入。" : ""),
-          approval: writable,
-          execute: (signal) => options.coordinator.execute(options.callerSessionId, action, signal),
-        };
+        // 保留参数解析先于成员权限拒绝的顺序，但隐藏工具永远没有执行步骤。
+        parseCollaborationCall(call);
+        throw new Error(memberRestriction);
       });
     },
   };

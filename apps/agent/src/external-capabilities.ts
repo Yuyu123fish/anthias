@@ -14,7 +14,7 @@ import type { PermissionMode } from "./permission/permission-mode.js";
 import type { SkillContent, SkillLibrary } from "./skill/index.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 import { isRecord } from "./tool/input-validation.js";
-import type { ToolCallPlan } from "./tool/tool-runner.js";
+import type { AgentTool, ToolCallPlan } from "./tool/tool-runner.js";
 
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 const skillKey = (id: string) => `skill:${id}`;
@@ -198,11 +198,21 @@ export function createExternalCapabilities(options: {
     lastPreparedMcpDiagnostics = mcpSnapshot.omittedToolCount
       ? [`${mcpSnapshot.omittedToolCount} 个工具定义超出当前请求预算，未提供给模型。`]
       : [];
+    const tools: readonly AgentTool[] = Object.freeze(
+      [...extraTools, ...mcpSnapshot.definitions].map((definition) =>
+        Object.freeze({
+          definition,
+          createPlan: (call: AssistantToolCallPart, mode: PermissionMode) =>
+            createExternalToolPlan(call, mode, mcpSnapshot),
+        }),
+      ),
+    );
     return Object.freeze({
       request: {
         ...request,
-        tools: [...request.tools, ...extraTools, ...mcpSnapshot.definitions],
+        tools: [...request.tools, ...tools.map((tool) => tool.definition)],
       },
+      tools,
       mcpSnapshot,
     });
   }
@@ -234,15 +244,15 @@ export function createExternalCapabilities(options: {
     };
   }
 
-  function createPlan(
+  function createExternalToolPlan(
     call: AssistantToolCallPart,
     permissionMode: PermissionMode,
-    mcpSnapshot?: McpToolSnapshot,
-  ): ToolCallPlan | null {
+    mcpSnapshot: McpToolSnapshot,
+  ): ToolCallPlan {
     const managed = ["load_skill", "read_skill", "read_mcp_resource"].includes(call.toolName);
     const snapshotTool = resolveMcpTool(mcpSnapshot, call.toolName);
     const mcpTool = snapshotTool?.tool;
-    if (!managed && !mcpTool) return null;
+    if (!managed && !mcpTool) return rejected("未知或尚不可执行的外部 Tool。");
     if (call.invalid || !isRecord(call.input)) return rejected("外部 Tool 输入必须是有效对象。");
     const input = call.input;
     if (managed) {
@@ -385,11 +395,25 @@ export function createExternalCapabilities(options: {
     };
   }
 
+  /** 只补充未提供给模型的 MCP 拒绝原因，绝不把当前连接集合变成执行后门。 */
+  function rejectUnavailableTool(
+    call: AssistantToolCallPart,
+    permissionMode: PermissionMode,
+    mcpSnapshot?: McpToolSnapshot,
+  ): ToolCallPlan | null {
+    const snapshotTool = resolveMcpTool(mcpSnapshot, call.toolName);
+    if (!snapshotTool) return null;
+    if (call.invalid || !isRecord(call.input)) return rejected("外部 Tool 输入必须是有效对象。");
+    if (permissionMode === "plan")
+      return rejected("Plan 模式不允许执行未知副作用的 MCP Tool。", true);
+    return snapshotTool.visible ? null : rejected("MCP Tool 定义未进入当前请求预算。");
+  }
+
   return {
     prepareRequest,
     directory: () => JSON.stringify(directoryItems()),
     mcpDiagnostics: () => lastPreparedMcpDiagnostics,
-    createPlan,
+    rejectUnavailableTool,
     activate,
     listSkills,
     diagnoseSkills,

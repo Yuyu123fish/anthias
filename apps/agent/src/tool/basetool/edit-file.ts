@@ -1,11 +1,54 @@
 import type { AssistantToolCallPart } from "../../message.js";
+import { decideToolPolicy } from "../../permission/tool-policy.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "../input-validation.js";
+import {
+  createFileToolCallPlan,
+  createPolicyDeniedPlan,
+  createRejectedToolCallPlan,
+} from "../tool-plan.js";
+import type { BaseTool } from "../tool-runner.js";
 import type { ToolWorkspace } from "../workspace-path.js";
 import {
   failedFilePreparation,
   type PreparedFileResult,
   prepareFileChange,
 } from "./file-change.js";
+
+export const editFileTool: BaseTool = Object.freeze({
+  definition: Object.freeze({
+    name: "edit_file",
+    description:
+      "对已有 UTF-8 文本文件执行一组精确替换。replacements 是对象数组，每项必须包含 oldText 与 newText；不能直接传字符串或单个对象。",
+    inputSchema: Object.freeze({
+      type: "object",
+      additionalProperties: false,
+      required: ["path", "replacements"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        replacements: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["oldText", "newText"],
+            properties: {
+              oldText: { type: "string", minLength: 1 },
+              newText: { type: "string" },
+            },
+          },
+        },
+      },
+    }),
+  }),
+  createPlan(toolCall, permissionMode, options) {
+    const validationError = validateEditFileToolCallInput(toolCall);
+    if (validationError !== null) return createRejectedToolCallPlan(validationError);
+    if (permissionMode === "plan")
+      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "edit_file" }));
+    return createFileToolCallPlan(toolCall, permissionMode, options.workspace, prepareEditFileTool);
+  },
+});
 
 /** 表示 edit_file 已完成运行时校验后的固定输入。 */
 type EditFileToolInput = Readonly<{

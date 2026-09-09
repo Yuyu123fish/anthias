@@ -17,6 +17,7 @@ import {
   type SessionLockSystem,
   type SessionUsageMarkerOwnership,
 } from "./lock.js";
+import { fromDurableMessage, toDurableMessage } from "./message-codec.js";
 import { upgradeSessionToSchema3 } from "./migration.js";
 import { readOrRebuildResumeIndex } from "./resume-index.js";
 import {
@@ -30,7 +31,6 @@ import {
   type ContextSourceRecord,
   type CoordinationDetails,
   type CoordinationRecord,
-  fromDurableMessage,
   getSessionOwnership,
   isJsonValue,
   isSideEffectToolName,
@@ -46,7 +46,6 @@ import {
   type SessionRecord,
   snapshotJsonValue,
   type ToolExecutionStartedDetails,
-  toDurableMessage,
   validateSessionRecords,
 } from "./schema.js";
 

@@ -5,6 +5,7 @@ import { createExternalCapabilities } from "../src/external-capabilities.js";
 import type { McpConnections, McpToolInfo } from "../src/mcp/index.js";
 import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelRequest } from "../src/model/model-stream.js";
+import { createToolRunnerFromTools } from "../src/tool/tool-runner.js";
 
 function fixture(toolCount = 1) {
   let generation = 1;
@@ -93,8 +94,8 @@ describe("MCP request snapshot", () => {
     const first = external.prepareRequest(request, "agent");
     const other = external.prepareRequest(request, "plan");
     expect(other.request.tools.some((tool) => tool.name === "mcp_000")).toBe(false);
-    expect(external.createPlan(toolCall("mcp_000"), "agent")).toBeNull();
-    const planned = external.createPlan(toolCall("mcp_000"), "agent", first.mcpSnapshot);
+    expect(external.rejectUnavailableTool(toolCall("mcp_000"), "agent")).toBeNull();
+    const planned = createToolRunnerFromTools(first.tools).createPlan(toolCall("mcp_000"), "agent");
     const preparation = await planned?.prepare();
     if (!preparation?.ok) throw new Error("expected first snapshot to remain available");
     expect(preparation.preparedExecution.approval?.executionBoundary).toContain("版本 1");
@@ -111,10 +112,14 @@ describe("MCP request snapshot", () => {
       await preparation.preparedExecution.execute(new AbortController().signal, () => undefined),
     ).toMatchObject({ status: "failed", content: expect.stringContaining("失效") });
     expect(
-      await external.createPlan(toolCall("mcp_000"), "agent", first.mcpSnapshot)?.prepare(),
+      await createToolRunnerFromTools(first.tools)
+        .createPlan(toolCall("mcp_000"), "agent")
+        ?.prepare(),
     ).toMatchObject({ ok: false, result: { content: expect.stringContaining("失效") } });
     expect(
-      await external.createPlan(toolCall("mcp_000"), "plan", reconnected.mcpSnapshot)?.prepare(),
+      await createToolRunnerFromTools(reconnected.tools)
+        .createPlan(toolCall("mcp_000"), "plan")
+        ?.prepare(),
     ).toMatchObject({ ok: false, result: { status: "denied" } });
     expect(calls()).toBe(1);
   });
@@ -130,10 +135,14 @@ describe("MCP request snapshot", () => {
     const later = external.prepareRequest(request, "agent");
     expect(later.request.tools.some((tool) => tool.name === "mcp_064")).toBe(true);
     expect(
-      await external.createPlan(toolCall("mcp_064"), "agent", crowded.mcpSnapshot)?.prepare(),
+      await external
+        .rejectUnavailableTool(toolCall("mcp_064"), "agent", crowded.mcpSnapshot)
+        ?.prepare(),
     ).toMatchObject({ ok: false, result: { content: expect.stringContaining("预算") } });
     expect(
-      await external.createPlan(toolCall("mcp_064"), "agent", later.mcpSnapshot)?.prepare(),
+      await createToolRunnerFromTools(later.tools)
+        .createPlan(toolCall("mcp_064"), "agent")
+        ?.prepare(),
     ).toMatchObject({ ok: true });
   });
 });

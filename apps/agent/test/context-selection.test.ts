@@ -10,14 +10,13 @@ import {
 } from "../src/context/projection.js";
 import { selectCompaction } from "../src/context/selection.js";
 import type { ModelInputMessage } from "../src/model/model-stream.js";
+import { fromDurableMessage, toDurableMessage } from "../src/session/message-codec.js";
 import {
   type AgentInputRecord,
   type CompactionRecord,
   type ContextSourceRecord,
-  fromDurableMessage,
   isValidCompactionRecord,
   type MessageRecord,
-  toDurableMessage,
 } from "../src/session/schema.js";
 
 function contextEntry(

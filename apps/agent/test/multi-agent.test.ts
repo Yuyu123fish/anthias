@@ -9,9 +9,9 @@ import { type Agent, createAgentWithModelStream } from "../src/agent.js";
 import { memoryHash } from "../src/memory/schema.js";
 import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import type { MemberSummary } from "../src/multi-agent/index.js";
-import { readSessionHistory } from "../src/session/history.js";
 import { createSession, openSession } from "../src/session/index.js";
 import { locateSessionStorage } from "../src/session/locations.js";
+import { readSessionHistory } from "../src/session/query.js";
 
 const execute = promisify(execFile);
 const roots: string[] = [];

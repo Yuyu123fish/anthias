@@ -1,7 +1,10 @@
 import type { MemoryControls } from "./memory/index.js";
 import type { CollaborationControls } from "./multi-agent/index.js";
 import type { WorkspacePermissionControls } from "./permission/workspace-permissions.js";
-import type { GitControls } from "./tool/git-tools.js";
+import type { SessionSummary } from "./session/query.js";
+import type { GitControls } from "./tool/basetool/git/tool.js";
+
+export type { SessionSummary } from "./session/query.js";
 export type ActionResult<T> =
   | Readonly<{ ok: true; value: T }>
   | Readonly<{ ok: false; error: string }>;
@@ -11,7 +14,7 @@ export type AgentOperation =
   | "updating_capabilities"
   | "updating_memory"
   | null;
-export type SessionSummary = Readonly<{ id: string; createdAt: string; title?: string }>;
+
 export type SkillSummary = Readonly<{
   id: string;
   name: string;

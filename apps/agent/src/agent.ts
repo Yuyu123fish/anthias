@@ -4,7 +4,7 @@ import { type CollaborationAction, isDirectCollaborationControl } from "./multi-
 import { createAgentRuntime } from "./runtime.js";
 import type { Session } from "./session/index.js";
 import { createSession, openSession } from "./session/index.js";
-import { listSessions } from "./session/list.js";
+import { listSessions } from "./session/query.js";
 import type {
   AgentEvent,
   AgentListener,
@@ -13,7 +13,7 @@ import type {
   SessionAgent,
   ToolApprovalRequest,
 } from "./session-agent.js";
-import { executeGitAction, type GitAction, isGitQuery } from "./tool/git-tools.js";
+import { executeGitAction, type GitAction, isGitQuery } from "./tool/basetool/git/tool.js";
 import { collaborationToolCall } from "./tool/multi-agent-tools.js";
 
 export type {

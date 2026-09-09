@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readlink, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { JsonValue } from "../message.js";
+import type { JsonValue } from "../../../message.js";
 import { GitCommandAbortedError, GitCommandError, runGit } from "./command.js";
 import {
   createGitIntegration,

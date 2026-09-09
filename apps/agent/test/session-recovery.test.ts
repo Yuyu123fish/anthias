@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "../src/message.js";
-import { readSessionHistory } from "../src/session/history.js";
 import { createSession, openSession, type SessionShell } from "../src/session/index.js";
 import { readSessionJournal } from "../src/session/journal.js";
 import { getSessionStorageRelativeDirectory } from "../src/session/locations.js";
 import { acquireSessionUsageMarker, inspectSessionUsageMarkers } from "../src/session/lock.js";
+import { readSessionHistory } from "../src/session/query.js";
 
 const usageMarkerSyncFault = vi.hoisted(() => ({ enabled: false }));
 

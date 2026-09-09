@@ -51,8 +51,8 @@ import {
 } from "./schema.js";
 import { createSessionWriter } from "./writer.js";
 
-export { readSessionHistory, type SessionHistory } from "./history.js";
 export type { SessionLockSystem } from "./lock.js";
+export { readSessionHistory, type SessionHistory } from "./query.js";
 export type {
   AgentInputDetails,
   ApprovalDecisionDetails,

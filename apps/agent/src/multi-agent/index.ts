@@ -4,11 +4,11 @@ import { createSessionArtifactStore } from "../session/artifacts.js";
 import type { Session, SessionRunLease } from "../session/index.js";
 import { locateSessionStorage } from "../session/locations.js";
 import type { AgentEvent, PermissionMode } from "../session-agent.js";
+import type { GitWorkspace } from "../tool/basetool/git/index.js";
 import { isRecord } from "../tool/input-validation.js";
 import { createAgentTeam, type TeamSummary, type TeamTask } from "./agent-team.js";
 import {
   createMembers,
-  type GitWorkspace,
   type MemberFactory,
   type MemberSummary,
   type SpawnMemberInput,

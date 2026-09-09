@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import type { AssistantToolCallPart } from "../../message.js";
+import type { PermissionMode } from "../../permission/permission-mode.js";
+import { decideToolPolicy } from "../../permission/tool-policy.js";
 import type { SessionShell } from "../../session/index.js";
 import {
   hasOnlyKeys,
@@ -11,18 +13,57 @@ import {
   isRecord,
 } from "../input-validation.js";
 import {
+  createApprovalPlan,
+  createPolicyDeniedPlan,
+  createRejectedToolCallPlan,
+  createToolActivitySummary,
+  failedExecution,
+  policyResult,
+} from "../tool-plan.js";
+import {
   boundToolOutput,
-  TOOL_RESULT_BYTE_LIMIT,
-  TOOL_RESULT_LINE_LIMIT,
   type ToolExecutionResult,
   type ToolFailedResult,
 } from "../tool-result.js";
+import type { BaseTool, CreateToolRunnerOptions, ToolCallPlan } from "../tool-runner.js";
 import {
   arePathsEqual,
   resolveExistingWorkspacePath,
   type ToolWorkspace,
 } from "../workspace-path.js";
-import { createCommandOutputCapture } from "./command-output.js";
+import {
+  createCommandOutputCapture,
+  createCommandOutputCollector,
+  createCommandResult,
+  splitCommandOutputLines,
+} from "./command-output.js";
+
+export const executeCommandTool: BaseTool = Object.freeze({
+  definition: Object.freeze({
+    name: "execute_command",
+    description:
+      "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。",
+    inputSchema: Object.freeze({
+      type: "object",
+      additionalProperties: false,
+      required: ["command"],
+      properties: {
+        command: { type: "string", minLength: 1 },
+        cwd: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: 1800000 },
+      },
+    }),
+  }),
+  createPlan(toolCall, permissionMode, options) {
+    const validationError = validateCommandToolCallInput(toolCall);
+    if (validationError !== null) return createRejectedToolCallPlan(validationError);
+    if (permissionMode === "plan")
+      return createPolicyDeniedPlan(
+        decideToolPolicy({ permissionMode, toolName: "execute_command" }),
+      );
+    return createCommandToolCallPlan(toolCall, permissionMode, options);
+  },
+});
 
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
@@ -53,21 +94,8 @@ export type CommandExecutionResult = ToolExecutionResult &
     cleanupUncertain: boolean;
   }>;
 
-/** 保存命令输出中一个按 Node 观察顺序接受的有界片段。 */
-type CommandOutputEntry = Readonly<{
-  stream: "stdout" | "stderr";
-  text: string;
-}>;
-
-/** 聚合命令输出并在达到展示边界后继续排空但停止保存。 */
-type CommandOutputCollector = Readonly<{
-  append(stream: "stdout" | "stderr", text: string): string;
-  entries(): readonly CommandOutputEntry[];
-  readonly truncated: boolean;
-}>;
-
 /** 枚举一次命令可以进入的明确终止原因。 */
-type CommandTerminationReason =
+export type CommandTerminationReason =
   | "completed"
   | "non_zero_exit"
   | "spawn_failed"
@@ -111,7 +139,7 @@ export async function prepareCommandTool(
       `cwd: ${target}`,
       `timeoutMs: ${inputResult.input.timeoutMilliseconds}`,
       "command:",
-      ...splitLines(inputResult.input.command),
+      ...splitCommandOutputLines(inputResult.input.command),
     ]);
     if (previewResult.truncated) {
       return failedPreparation("execute_command 确认内容超过 64 KiB 或 2,000 行，请缩短命令。");
@@ -332,86 +360,6 @@ function parseCommandInput(toolCall: AssistantToolCallPart):
   });
 }
 
-/** 创建一个只保存有界 UTF-8 文本和行数的命令输出收集器。 */
-function createCommandOutputCollector(): CommandOutputCollector {
-  const entries: CommandOutputEntry[] = [];
-  let byteCount = 0;
-  let lineCount = 0;
-  let outputStarted = false;
-  let truncated = false;
-
-  return Object.freeze({
-    append(stream, text) {
-      if (truncated || text.length === 0) {
-        return "";
-      }
-      let acceptedText = "";
-      for (const character of text) {
-        const characterBytes = Buffer.byteLength(character, "utf8");
-        const nextLineCount = lineCount + (!outputStarted || character === "\n" ? 1 : 0);
-        if (
-          byteCount + characterBytes > TOOL_RESULT_BYTE_LIMIT - 1024 ||
-          nextLineCount > TOOL_RESULT_LINE_LIMIT - 16
-        ) {
-          truncated = true;
-          break;
-        }
-        acceptedText += character;
-        byteCount += characterBytes;
-        lineCount = nextLineCount;
-        outputStarted = true;
-      }
-      if (acceptedText.length > 0) {
-        const previousEntry = entries.at(-1);
-        // 相邻同源块合并后只占一个渲染标签，预留的行数才能覆盖最终 ToolResult 元数据。
-        if (previousEntry?.stream === stream) {
-          entries[entries.length - 1] = Object.freeze({
-            stream,
-            text: previousEntry.text + acceptedText,
-          });
-        } else {
-          entries.push(Object.freeze({ stream, text: acceptedText }));
-        }
-      }
-      return acceptedText;
-    },
-    entries: () => Object.freeze([...entries]),
-    get truncated() {
-      return truncated;
-    },
-  });
-}
-
-/** 将命令终止事实与按观察顺序保存的输出收敛为一个有界 ToolResult。 */
-function createCommandResult(
-  reason: CommandTerminationReason,
-  exitCode: number | null,
-  durationMilliseconds: number,
-  outputCollector: CommandOutputCollector,
-  cleanupUncertain: boolean,
-): CommandExecutionResult {
-  const resultLines = [
-    `termination: ${reason}`,
-    `exitCode: ${exitCode ?? "none"}`,
-    `durationMs: ${Math.max(0, Math.round(durationMilliseconds))}`,
-    `cleanupUncertain: ${cleanupUncertain}`,
-    "output:",
-  ];
-  for (const entry of outputCollector.entries()) {
-    resultLines.push(`[${entry.stream}]`, ...splitLines(entry.text));
-  }
-  if (outputCollector.truncated) {
-    resultLines.push("...[命令输出已截断，管道已继续排空]");
-  }
-  const rendered = boundToolOutput(resultLines);
-  return Object.freeze({
-    status: reason === "completed" ? "completed" : "failed",
-    content: rendered.content,
-    truncated: outputCollector.truncated || rendered.truncated,
-    cleanupUncertain,
-  });
-}
-
 /** 终止本次命令拥有的进程树，并在无法确认时返回 true。 */
 async function terminateProcessTree(childProcess: ReturnType<typeof spawn>): Promise<boolean> {
   const processId = childProcess.pid;
@@ -526,15 +474,6 @@ function renderShell(shell: SessionShell): string {
   return [shell.executable, ...shell.arguments].map((part) => JSON.stringify(part)).join(" ");
 }
 
-/** 把多行确认或结果文本拆成稳定行，不虚构额外尾行。 */
-function splitLines(text: string): string[] {
-  const lines = text.split(/\r?\n/u);
-  if (lines.at(-1) === "") {
-    lines.pop();
-  }
-  return lines.length === 0 ? [""] : lines;
-}
-
 /** 创建一个无需确认即可返回模型的命令预检失败。 */
 function failedPreparation(error: string): PreparedCommandResult {
   return Object.freeze({
@@ -550,4 +489,51 @@ function toSafeCommandError(error: unknown): string {
     return `execute_command 预检失败：${errorCode}`;
   }
   return error instanceof Error ? error.message : "execute_command 预检失败。";
+}
+
+/** 创建需要预检、分类和人工确认的命令 Tool 计划。 */
+function createCommandToolCallPlan(
+  toolCall: AssistantToolCallPart,
+  permissionMode: PermissionMode,
+  options: CreateToolRunnerOptions,
+): ToolCallPlan {
+  return Object.freeze({
+    scheduling: "serial",
+    abortedPreparationContent: "Run 已停止，命令未启动。",
+    async prepare() {
+      const preparedResult = await prepareCommandTool(toolCall, options.workspace, options.shell);
+      if (!preparedResult.ok) {
+        return Object.freeze({ ok: false, result: preparedResult.result });
+      }
+      const preparedTool = preparedResult.preparedTool;
+      const policyDecision = decideToolPolicy({
+        permissionMode,
+        toolName: "execute_command",
+        command: preparedTool.command,
+      });
+      if (policyDecision.kind === "deny") {
+        return Object.freeze({ ok: false, result: policyResult(policyDecision) });
+      }
+      return Object.freeze({
+        ok: true,
+        preparedExecution: Object.freeze({
+          approval: createApprovalPlan(preparedTool, policyDecision),
+          activitySummary: createToolActivitySummary(
+            `cwd: ${preparedTool.target}; command: ${preparedTool.command}`,
+          ),
+          executionUnavailableContent: "Run 已停止，命令未启动。",
+          async execute(
+            abortSignal: AbortSignal,
+            publishUpdate: (update: CommandExecutionUpdate) => void,
+          ) {
+            try {
+              return await executePreparedCommand(preparedTool, abortSignal, publishUpdate);
+            } catch {
+              return failedExecution(true);
+            }
+          },
+        }),
+      });
+    },
+  });
 }

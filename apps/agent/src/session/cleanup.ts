@@ -1,20 +1,19 @@
-import { randomUUID } from "node:crypto";
-import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import {
+  ensureSafeDirectory,
+  isSafeOwnedPath,
+  isSafeSessionContents,
+  openSessionCleanupState,
+  type SessionCleanupState,
+} from "./cleanup-state.js";
 import {
   type LocatedGroupSession,
   type LocatedSessionGroup,
   locateSessionGroup,
 } from "./groups.js";
 import { readSessionJournal } from "./journal.js";
-import {
-  enumerateSessionStorage,
-  getContainingSessionStorageDirectory,
-  isSessionStorageRelativeDirectory,
-  locateSessionStorage,
-  MAXIMUM_MANAGED_SESSION_DIRECTORIES,
-  removeSessionLocation,
-} from "./locations.js";
+import { enumerateSessionStorage, locateSessionStorage } from "./locations.js";
 import {
   acquireSessionLock,
   DEFAULT_SESSION_LOCK_SYSTEM,
@@ -28,7 +27,6 @@ import { hasPendingSessionMigration } from "./migration.js";
 import {
   type CoordinationRecord,
   deriveLastActivityAt,
-  isUuid,
   type Schema2SessionHeader,
   type SessionHeader,
   type SessionRecord,
@@ -37,27 +35,6 @@ import {
 
 const RETENTION_MILLISECONDS = 14 * 24 * 60 * 60 * 1_000;
 const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
-const MAX_CLEANUP_STATE_BYTES = 1024 * 1024;
-
-type SinglePendingDeletion = Readonly<{
-  kind?: "single";
-  source: string;
-  trash: string;
-  sessionId: string;
-}>;
-
-type GroupPendingDeletion = Readonly<{
-  kind: "group";
-  rootSessionId: string;
-  cursorAfter: string;
-  trash: string;
-  sessions: readonly Readonly<{ source: string; sessionId: string }>[];
-}>;
-
-type CleanupState = {
-  cursor: string | null;
-  pending: SinglePendingDeletion | GroupPendingDeletion | null;
-};
 
 type VerifiedManagedSession = Readonly<{
   located: LocatedGroupSession;
@@ -122,15 +99,13 @@ export async function cleanupExpiredSessions({
     return result("busy");
   }
 
-  const statePath = join(root, ".maintenance", "cleanup-state.json");
   try {
-    const state = await readCleanupState(root, statePath);
-    if (state.pending !== null) {
-      const pending = state.pending;
-      if (stopped() || !(await finishPendingDeletion(root, state, statePath, stopped))) {
-        return result("bounded");
-      }
-      deleted += await countMissingPendingSources(root, pending);
+    const state = await openSessionCleanupState(root);
+    if (state.hasPendingDeletion) {
+      if (stopped()) return result("bounded");
+      const recovery = await state.resumePendingDeletion(stopped);
+      if (!recovery.completed) return result("bounded");
+      deleted += recovery.deleted;
     }
 
     if (stopped()) return result("bounded");
@@ -156,12 +131,11 @@ export async function cleanupExpiredSessions({
       )
         continue;
       if (processedSessionIds.has(sessionId)) {
-        state.cursor = relativeDirectory;
-        await writeCleanupState(statePath, state);
+        await state.advanceCursor(relativeDirectory);
         continue;
       }
       if (stopped() || inspected >= maximumCandidates) {
-        await writeCleanupState(statePath, state);
+        await state.advanceCursor(state.cursor);
         return result("bounded");
       }
       inspected += 1;
@@ -170,13 +144,13 @@ export async function cleanupExpiredSessions({
         for (const session of group.sessions) processedSessionIds.add(session.sessionId);
         if (!group.complete) throw new Error("group ownership incomplete");
         if (group.sessions[0]?.header.schemaVersion === 2) {
-          deleted += await cleanSchema2Session(root, group.sessions[0], state, statePath, {
+          deleted += await cleanSchema2Session(root, group.sessions[0], state, {
             now,
             stopped,
             lockSystem,
           });
         } else {
-          deleted += await cleanSchema3Group(root, group, relativeDirectory, state, statePath, {
+          deleted += await cleanSchema3Group(root, group, relativeDirectory, state, {
             now,
             stopped,
             lockSystem,
@@ -185,10 +159,9 @@ export async function cleanupExpiredSessions({
       } catch (error) {
         skipReasons.add(safeCleanupSkipReason(error));
         skipped += 1;
-        if (state.pending !== null) return result("bounded");
+        if (state.hasPendingDeletion) return result("bounded");
       }
-      state.cursor = relativeDirectory;
-      await writeCleanupState(statePath, state);
+      await state.advanceCursor(relativeDirectory);
     }
     if (storageScan.diagnostics.length > 0) {
       skipped += storageScan.diagnostics.length;
@@ -198,7 +171,7 @@ export async function cleanupExpiredSessions({
     const legacyNames = storageScan.entries
       .filter(({ location }) => location.source === "legacy")
       .map(({ location }) => `${location.sessionId}.jsonl`);
-    const legacyResult = await cleanLegacySessions(root, state, statePath, legacyNames, {
+    const legacyResult = await cleanLegacySessions(root, state, legacyNames, {
       now,
       stopped,
       remainingCandidates: maximumCandidates - inspected,
@@ -213,8 +186,7 @@ export async function cleanupExpiredSessions({
     if (legacyResult.status === "bounded") {
       return result("bounded");
     }
-    state.cursor = null;
-    await writeCleanupState(statePath, state);
+    await state.advanceCursor(null);
     return result("completed");
   } catch {
     return result("unavailable");
@@ -226,8 +198,7 @@ export async function cleanupExpiredSessions({
 async function cleanSchema2Session(
   root: string,
   located: LocatedGroupSession | undefined,
-  state: CleanupState,
-  statePath: string,
+  state: SessionCleanupState,
   options: Readonly<{
     now: number;
     stopped: () => boolean;
@@ -258,16 +229,13 @@ async function cleanSchema2Session(
       throw new Error("Session tree cannot be safely deleted");
     }
 
-    await ensureSafeDirectory(root, ".maintenance/trash");
-    const trash = `.maintenance/trash/${located.sessionId}-${randomUUID()}`;
-    state.pending = {
-      source: located.relativeStorageDirectory,
-      trash,
-      sessionId: located.sessionId,
-    };
-    await writeCleanupState(statePath, state);
-    await rename(located.storageDirectory, join(root, trash));
-    if (!(await finishPendingDeletion(root, state, statePath, options.stopped))) {
+    if (
+      !(await state.deleteSession(
+        located.relativeStorageDirectory,
+        located.sessionId,
+        options.stopped,
+      ))
+    ) {
       throw new Error("pending deletion incomplete");
     }
     return 1;
@@ -282,8 +250,7 @@ async function cleanSchema3Group(
   root: string,
   group: LocatedSessionGroup,
   cursorAfter: string,
-  state: CleanupState,
-  statePath: string,
+  state: SessionCleanupState,
   options: Readonly<{
     now: number;
     stopped: () => boolean;
@@ -362,29 +329,17 @@ async function cleanSchema3Group(
       }
     }
 
-    await ensureSafeDirectory(root, ".maintenance/trash");
-    const trash = `.maintenance/trash/${group.rootSessionId}-${randomUUID()}`;
-    await mkdir(join(root, trash));
-    state.pending = Object.freeze({
-      kind: "group",
-      rootSessionId: group.rootSessionId,
-      cursorAfter,
-      trash,
-      sessions: Object.freeze(
-        verifiedSessions.map((session) =>
-          Object.freeze({
-            source: session.located.relativeStorageDirectory,
-            sessionId: session.header.sessionId,
-          }),
-        ),
-      ),
-    });
-    // 清单保留全部身份供锁和缓存失效；物理移动去掉嵌套子路径，避免根已移动后再移动成员。
-    await writeCleanupState(statePath, state);
-    for (const session of pendingMoveRoots(state.pending)) {
-      await rename(join(root, session.source), join(root, trash, session.sessionId));
-    }
-    if (!(await finishPendingDeletion(root, state, statePath, options.stopped))) {
+    if (
+      !(await state.deleteGroup(
+        group.rootSessionId,
+        cursorAfter,
+        verifiedSessions.map((session) => ({
+          source: session.located.relativeStorageDirectory,
+          sessionId: session.header.sessionId,
+        })),
+        options.stopped,
+      ))
+    ) {
       throw new Error("pending deletion incomplete");
     }
     return verifiedSessions.length;
@@ -569,434 +524,9 @@ function isCompletedGitOperation(payload: Record<string, unknown>): boolean {
   return false;
 }
 
-async function finishPendingDeletion(
-  root: string,
-  state: CleanupState,
-  statePath: string,
-  stopped: () => boolean,
-): Promise<boolean> {
-  const pending = state.pending;
-  if (pending === null) {
-    return true;
-  }
-  return pending.kind === "group"
-    ? finishPendingGroupDeletion(root, state, statePath, pending, stopped)
-    : finishPendingSingleDeletion(root, state, statePath, pending, stopped);
-}
-
-/** 清单保留全体身份；这里只选择互不包含的物理源，旧平铺记录保持逐目录处理。 */
-function pendingMoveRoots(pending: GroupPendingDeletion) {
-  return pending.sessions.filter(
-    (session) =>
-      !pending.sessions.some(
-        (parent) => parent !== session && session.source.startsWith(parent.source + "/"),
-      ),
-  );
-}
-
-async function finishPendingGroupDeletion(
-  root: string,
-  state: CleanupState,
-  statePath: string,
-  pending: GroupPendingDeletion,
-  stopped: () => boolean,
-): Promise<boolean> {
-  const trashPath = join(root, pending.trash);
-  if (!(await pathExists(trashPath))) {
-    const sourcePresence = await Promise.all(
-      pending.sessions.map((session) => pathExists(join(root, session.source))),
-    );
-    if (sourcePresence.every(Boolean)) {
-      state.pending = null;
-      await writeCleanupState(statePath, state);
-      return true;
-    }
-    if (sourcePresence.some(Boolean)) {
-      return false;
-    }
-    for (const session of pending.sessions) {
-      await removeSessionLocation(root, session.sessionId);
-    }
-    state.cursor = pending.cursorAfter;
-    state.pending = null;
-    await writeCleanupState(statePath, state);
-    return true;
-  }
-  if (stopped() || !(await isSafeOwnedPath(root, trashPath, "directory"))) {
-    return false;
-  }
-
-  const moves = pendingMoveRoots(pending);
-  const expectedTrashEntries = new Set(moves.map((session) => session.sessionId));
-  const sourcePresence = await Promise.all(
-    moves.map((session) => pathExists(join(root, session.source))),
-  );
-  if (sourcePresence.some(Boolean)) {
-    const trashEntries = await readdir(trashPath);
-    if (trashEntries.some((entry) => !expectedTrashEntries.has(entry))) {
-      return false;
-    }
-    // 跨进程重启后不继承旧删除授权；先恢复已移动成员，再由正常组检查重新决定。
-    for (const [index, session] of moves.entries()) {
-      const sourcePath = join(root, session.source);
-      const destinationPath = join(trashPath, session.sessionId);
-      const sourceExists = sourcePresence[index] === true;
-      const destinationExists = await pathExists(destinationPath);
-      if (sourceExists) {
-        if (destinationExists) {
-          return false;
-        }
-        continue;
-      }
-      if (!destinationExists || stopped() || !(await isSafeTree(root, destinationPath, stopped))) {
-        return false;
-      }
-      if (!(await isSafeOwnedPath(root, resolve(sourcePath, ".."), "directory"))) return false;
-      await rename(destinationPath, sourcePath);
-    }
-    if ((await readdir(trashPath)).length !== 0) {
-      return false;
-    }
-    await rm(trashPath, { recursive: true });
-    state.pending = null;
-    await writeCleanupState(statePath, state);
-    return true;
-  }
-
-  const trashEntries = await readdir(trashPath);
-  if (
-    trashEntries.some((entry) => !expectedTrashEntries.has(entry)) ||
-    stopped() ||
-    !(await isSafeTree(root, trashPath, stopped)) ||
-    !(
-      await Promise.all(
-        trashEntries.map((entry) => isSafeSessionContents(root, join(trashPath, entry), stopped)),
-      )
-    ).every(Boolean)
-  ) {
-    return false;
-  }
-  // 所有源均已移走后，trash 少项可能是上次递归删除中断；仅允许既定移动根的剩余内容。
-  await rm(trashPath, { recursive: true, force: true });
-  for (const session of pending.sessions) {
-    await removeSessionLocation(root, session.sessionId);
-  }
-  state.cursor = pending.cursorAfter;
-  state.pending = null;
-  await writeCleanupState(statePath, state);
-  return true;
-}
-
-async function finishPendingSingleDeletion(
-  root: string,
-  state: CleanupState,
-  statePath: string,
-  pending: SinglePendingDeletion,
-  stopped: () => boolean,
-): Promise<boolean> {
-  const trashPath = join(root, pending.trash);
-  try {
-    await lstat(trashPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      return false;
-    }
-    if (!(await pathExists(join(root, pending.source)))) {
-      await removeSessionLocation(root, pending.sessionId);
-      state.cursor = pending.source.endsWith(".jsonl") ? `~${pending.source}` : pending.source;
-    }
-    // 意图已刷新但 rename 尚未发生时，保留旧 cursor，让原目录下次重新核验。
-    state.pending = null;
-    await writeCleanupState(statePath, state);
-    return true;
-  }
-  if (stopped() || !(await isSafeTree(root, trashPath, stopped))) {
-    return false;
-  }
-  if (await pathExists(join(root, pending.source))) {
-    if ((await readdir(trashPath)).length !== 0) {
-      return false;
-    }
-    await rm(trashPath, { recursive: true });
-    state.pending = null;
-    await writeCleanupState(statePath, state);
-    return true;
-  }
-  await rm(trashPath, { recursive: true, force: true });
-  await removeSessionLocation(root, pending.sessionId);
-  state.cursor = pending.source.endsWith(".jsonl") ? `~${pending.source}` : pending.source;
-  state.pending = null;
-  await writeCleanupState(statePath, state);
-  return true;
-}
-
-async function countMissingPendingSources(
-  root: string,
-  pending: SinglePendingDeletion | GroupPendingDeletion,
-): Promise<number> {
-  const sources =
-    pending.kind === "group" ? pending.sessions.map((session) => session.source) : [pending.source];
-  const presence = await Promise.all(sources.map((source) => pathExists(join(root, source))));
-  return presence.filter((exists) => !exists).length;
-}
-
-async function readCleanupState(root: string, statePath: string): Promise<CleanupState> {
-  try {
-    if (!(await isSafeOwnedPath(root, statePath, "file"))) {
-      return { cursor: null, pending: null };
-    }
-    if ((await lstat(statePath)).size > MAX_CLEANUP_STATE_BYTES) {
-      throw new Error("maintenance state exceeds read budget");
-    }
-    const value: unknown = JSON.parse(await readFile(statePath, "utf8"));
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      throw new Error("invalid maintenance state");
-    }
-    const candidate = value as Record<string, unknown>;
-    if (candidate.cursor !== null && !isCleanupCursor(candidate.cursor)) {
-      throw new Error("invalid cleanup cursor");
-    }
-    if (candidate.pending !== null) {
-      if (
-        typeof candidate.pending !== "object" ||
-        candidate.pending === null ||
-        Array.isArray(candidate.pending)
-      ) {
-        throw new Error("invalid pending deletion");
-      }
-      const pending = candidate.pending as Record<string, unknown>;
-      if (pending.kind === "group") {
-        validateGroupPendingDeletion(pending);
-      } else {
-        validateSinglePendingDeletion(pending);
-      }
-    }
-    return candidate as CleanupState;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { cursor: null, pending: null };
-    }
-    throw error;
-  }
-}
-
-function validateSinglePendingDeletion(pending: Record<string, unknown>): void {
-  if (
-    !(pending.kind === undefined || pending.kind === "single") ||
-    !isUuid(pending.sessionId) ||
-    !isCleanupSource(pending.source) ||
-    typeof pending.trash !== "string" ||
-    !pending.trash.startsWith(`.maintenance/trash/${pending.sessionId}-`) ||
-    !isUuid(pending.trash.slice(`.maintenance/trash/${pending.sessionId}-`.length)) ||
-    !(
-      pending.source.endsWith(`-${pending.sessionId}`) ||
-      pending.source === `${pending.sessionId}.jsonl`
-    )
-  ) {
-    throw new Error("invalid pending deletion identity");
-  }
-}
-
-function validateGroupPendingDeletion(pending: Record<string, unknown>): void {
-  if (
-    !isUuid(pending.rootSessionId) ||
-    !isSessionRelativeDirectory(pending.cursorAfter) ||
-    typeof pending.trash !== "string" ||
-    !pending.trash.startsWith(`.maintenance/trash/${pending.rootSessionId}-`) ||
-    !isUuid(pending.trash.slice(`.maintenance/trash/${pending.rootSessionId}-`.length)) ||
-    !Array.isArray(pending.sessions) ||
-    pending.sessions.length === 0 ||
-    pending.sessions.length > MAXIMUM_MANAGED_SESSION_DIRECTORIES
-  ) {
-    throw new Error("invalid group deletion identity");
-  }
-  const sessionIds = new Set<string>();
-  for (const item of pending.sessions) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      throw new Error("invalid group deletion member");
-    }
-    const session = item as Record<string, unknown>;
-    if (
-      !isUuid(session.sessionId) ||
-      !isSessionRelativeDirectory(session.source) ||
-      !isSessionStorageRelativeDirectory(session.source, session.sessionId) ||
-      sessionIds.has(session.sessionId)
-    ) {
-      throw new Error("invalid group deletion member");
-    }
-    sessionIds.add(session.sessionId);
-  }
-  const sessions = pending.sessions as Array<{ source: string; sessionId: string }>;
-  const rootSession = sessions.find((session) => session.sessionId === pending.rootSessionId);
-  if (
-    rootSession === undefined ||
-    getContainingSessionStorageDirectory(rootSession.source) !== null ||
-    sessions.some((session) => {
-      const containingDirectory = getContainingSessionStorageDirectory(session.source);
-      return containingDirectory !== null && containingDirectory !== rootSession.source;
-    })
-  ) {
-    throw new Error("invalid group deletion root");
-  }
-}
-
-function isSessionRelativeDirectory(value: unknown): value is string {
-  return (
-    typeof value === "string" && !value.includes("\\") && isSessionStorageRelativeDirectory(value)
-  );
-}
-
-async function writeCleanupState(path: string, state: CleanupState): Promise<void> {
-  const serializedState = `${JSON.stringify(state)}\n`;
-  if (Buffer.byteLength(serializedState, "utf8") > MAX_CLEANUP_STATE_BYTES) {
-    throw new Error("maintenance state exceeds write budget");
-  }
-  const temporaryPath = `${path}.${randomUUID()}.tmp`;
-  const handle = await open(temporaryPath, "wx");
-  try {
-    await handle.writeFile(serializedState, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporaryPath, path);
-}
-
-async function ensureSafeDirectory(root: string, relativeDirectory: string): Promise<void> {
-  let current = root;
-  for (const segment of relativeDirectory.split("/")) {
-    if (segment === "" || segment === "." || segment === ".." || segment.includes("\\")) {
-      throw new Error("invalid maintenance directory");
-    }
-    current = join(current, segment);
-    try {
-      await mkdir(current);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-    }
-    if (!(await isSafeOwnedPath(root, current, "directory"))) {
-      throw new Error("unsafe maintenance directory");
-    }
-  }
-}
-
-async function isSafeOwnedPath(
-  root: string,
-  path: string,
-  kind: "directory" | "file",
-): Promise<boolean> {
-  const relativePath = relative(root, resolve(path));
-  if (
-    relativePath === "" ||
-    relativePath === ".." ||
-    relativePath.startsWith(`..${sep}`) ||
-    isAbsolute(relativePath)
-  ) {
-    return false;
-  }
-  let current = root;
-  try {
-    const segments = relativePath.split(sep);
-    for (let index = 0; index < segments.length; index += 1) {
-      current = join(current, segments[index] ?? "");
-      const stats = await lstat(current);
-      if (stats.isSymbolicLink() || (await realpath(current)) !== resolve(current)) {
-        return false;
-      }
-      if (index < segments.length - 1 || kind === "directory") {
-        if (!stats.isDirectory()) {
-          return false;
-        }
-      } else if (!stats.isFile()) {
-        return false;
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** 目录位于历史根内并不等于内容归 Agent 所有；未知项目文件必须留给用户处理。 */
-async function isSafeSessionContents(
-  root: string,
-  directory: string,
-  stopped: () => boolean,
-  allowMembers = true,
-): Promise<boolean> {
-  if (stopped() || !(await isSafeOwnedPath(root, directory, "directory"))) return false;
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (stopped() || entry.isSymbolicLink()) return false;
-    const child = join(directory, entry.name);
-    if (entry.isFile()) {
-      if (
-        entry.name !== "session.jsonl" &&
-        entry.name !== "session.index.json" &&
-        !(
-          entry.name.startsWith(".session.index.json.") &&
-          entry.name.endsWith(".tmp") &&
-          isUuid(entry.name.slice(".session.index.json.".length, -4))
-        )
-      )
-        return false;
-      if (!(await isSafeOwnedPath(root, child, "file"))) return false;
-      continue;
-    }
-    if (!entry.isDirectory() || !(await isSafeOwnedPath(root, child, "directory"))) return false;
-    if (entry.name === "members" && allowMembers) {
-      for (const member of await readdir(child, { withFileTypes: true })) {
-        if (
-          !isUuid(member.name) ||
-          !member.isDirectory() ||
-          !(await isSafeSessionContents(root, join(child, member.name), stopped, false))
-        )
-          return false;
-      }
-    } else if (entry.name === "artifacts" || entry.name === "migration-backup") {
-      for (const file of await readdir(child, { withFileTypes: true })) {
-        if (
-          stopped() ||
-          !file.isFile() ||
-          (entry.name === "migration-backup" && file.name !== "legacy-session.jsonl") ||
-          !(await isSafeOwnedPath(root, join(child, file.name), "file"))
-        )
-          return false;
-      }
-    } else return false;
-  }
-  return true;
-}
-
-async function isSafeTree(
-  root: string,
-  directory: string,
-  stopped: () => boolean,
-): Promise<boolean> {
-  if (stopped() || !(await isSafeOwnedPath(root, directory, "directory"))) {
-    return false;
-  }
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (stopped() || entry.isSymbolicLink()) {
-      return false;
-    }
-    const child = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      if (!(await isSafeTree(root, child, stopped))) {
-        return false;
-      }
-    } else if (!entry.isFile() || !(await isSafeOwnedPath(root, child, "file"))) {
-      return false;
-    }
-  }
-  return true;
-}
-
 async function cleanLegacySessions(
   root: string,
-  state: CleanupState,
-  statePath: string,
+  state: SessionCleanupState,
   legacyNames: readonly string[],
   options: Readonly<{
     now: number;
@@ -1057,20 +587,14 @@ async function cleanLegacySessions(
       ) {
         throw new Error("legacy Session cannot be deleted");
       }
-      await ensureSafeDirectory(root, ".maintenance/trash");
-      const trash = `.maintenance/trash/${sessionId}-${randomUUID()}`;
-      state.pending = { source: name, trash, sessionId };
-      await writeCleanupState(statePath, state);
-      await mkdir(join(root, trash));
-      await rename(path, join(root, trash, "session.jsonl"));
-      if (!(await finishPendingDeletion(root, state, statePath, options.stopped))) {
+      if (!(await state.deleteSession(name, sessionId, options.stopped))) {
         return { inspected, deleted, skipped, skipReasons: [...skipReasons], status: "bounded" };
       }
       deleted += 1;
     } catch (error) {
       skipReasons.add(safeCleanupSkipReason(error));
       skipped += 1;
-      if (state.pending !== null) {
+      if (state.hasPendingDeletion) {
         return { inspected, deleted, skipped, skipReasons: [...skipReasons], status: "bounded" };
       }
     } finally {
@@ -1081,36 +605,9 @@ async function cleanLegacySessions(
         await releaseSessionLock(sessionLock);
       }
     }
-    state.cursor = cursor;
-    await writeCleanupState(statePath, state);
+    await state.advanceCursor(cursor);
   }
   return { inspected, deleted, skipped, skipReasons: [...skipReasons], status: "completed" };
-}
-
-function isCleanupSource(value: unknown): value is string {
-  return (
-    isSessionRelativeDirectory(value) ||
-    (typeof value === "string" && value.endsWith(".jsonl") && isUuid(value.slice(0, -6)))
-  );
-}
-
-function isCleanupCursor(value: unknown): value is string {
-  return (
-    isSessionRelativeDirectory(value) ||
-    (typeof value === "string" && value.startsWith("~") && isCleanupSource(value.slice(1)))
-  );
-}
-
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await lstat(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
 }
 
 /** 只发布本模块固定的失败分类，磁盘异常中的路径与任意正文不能进入事件。 */

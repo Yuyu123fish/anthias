@@ -1,4 +1,5 @@
 import type { ModelInputMessage } from "../model/model-stream.js";
+import { fromDurableMessage } from "../session/message-codec.js";
 import type {
   AgentInputDetails,
   AgentInputRecord,
@@ -8,7 +9,7 @@ import type {
   MessageRecord,
   SessionRecord,
 } from "../session/schema.js";
-import { fromDurableMessage, isValidCompactionRecord } from "../session/schema.js";
+import { isValidCompactionRecord } from "../session/schema.js";
 
 export type ContextMessageEntry = Readonly<{
   entryId: string;

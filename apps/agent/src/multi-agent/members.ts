@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { createGitWorkspace } from "../git/index.js";
-import { readSessionHistory } from "../session/history.js";
 import {
   type AgentInputDetails,
   createSession,
   openSession,
   type Session,
 } from "../session/index.js";
+import { readSessionHistory } from "../session/query.js";
 import type { AgentEvent, PermissionMode, PromptResult, SessionAgent } from "../session-agent.js";
+import type { GitWorkspace } from "../tool/basetool/git/index.js";
 import { isRecord } from "../tool/input-validation.js";
 
 export type MemberSummary = Readonly<{
@@ -50,7 +50,6 @@ type MemberOwnership = {
 };
 
 export type MemberFactory = (session: Session, permissionMode: PermissionMode) => SessionAgent;
-export type GitWorkspace = ReturnType<typeof createGitWorkspace>;
 
 /** 根会话持有全部成员资源；恢复只恢复摘要，显式继续才创建执行者。 */
 export function createMembers(options: {

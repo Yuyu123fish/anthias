@@ -52,4 +52,4 @@ export {
   type CreateAgentFromEnvironmentOptions,
   createAgentFromEnvironment,
 } from "./startup.js";
-export type { GitAction } from "./tool/git-tools.js";
+export type { GitAction } from "./tool/basetool/git/tool.js";

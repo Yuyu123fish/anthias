@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolArtifactIncompleteReason } from "../../message.js";
 import { ARTIFACT_BYTE_LIMIT } from "../../session/artifacts.js";
-import { TOOL_RESULT_BYTE_LIMIT, type ToolExecutionResult } from "../tool-result.js";
+import {
+  boundToolOutput,
+  TOOL_RESULT_BYTE_LIMIT,
+  TOOL_RESULT_LINE_LIMIT,
+  type ToolExecutionResult,
+} from "../tool-result.js";
+import type { CommandExecutionResult, CommandTerminationReason } from "./execute-command.js";
 
 /** 命令独占的输出收集：短输出留内存，超过阈值才创建临时文件，句柄在交付前关闭。 */
 export function createCommandOutputCapture() {
@@ -76,4 +82,106 @@ export function createCommandOutputCapture() {
       };
     },
   };
+}
+
+/** 保存命令输出中一个按 Node 观察顺序接受的有界片段。 */
+type CommandOutputEntry = Readonly<{
+  stream: "stdout" | "stderr";
+  text: string;
+}>;
+
+/** 聚合命令输出并在达到展示边界后继续排空但停止保存。 */
+type CommandOutputCollector = Readonly<{
+  append(stream: "stdout" | "stderr", text: string): string;
+  entries(): readonly CommandOutputEntry[];
+  readonly truncated: boolean;
+}>;
+
+/** 创建一个只保存有界 UTF-8 文本和行数的命令输出收集器。 */
+export function createCommandOutputCollector(): CommandOutputCollector {
+  const entries: CommandOutputEntry[] = [];
+  let byteCount = 0;
+  let lineCount = 0;
+  let outputStarted = false;
+  let truncated = false;
+
+  return Object.freeze({
+    append(stream, text) {
+      if (truncated || text.length === 0) {
+        return "";
+      }
+      let acceptedText = "";
+      for (const character of text) {
+        const characterBytes = Buffer.byteLength(character, "utf8");
+        const nextLineCount = lineCount + (!outputStarted || character === "\n" ? 1 : 0);
+        if (
+          byteCount + characterBytes > TOOL_RESULT_BYTE_LIMIT - 1024 ||
+          nextLineCount > TOOL_RESULT_LINE_LIMIT - 16
+        ) {
+          truncated = true;
+          break;
+        }
+        acceptedText += character;
+        byteCount += characterBytes;
+        lineCount = nextLineCount;
+        outputStarted = true;
+      }
+      if (acceptedText.length > 0) {
+        const previousEntry = entries.at(-1);
+        // 相邻同源块合并后只占一个渲染标签，预留的行数才能覆盖最终 ToolResult 元数据。
+        if (previousEntry?.stream === stream) {
+          entries[entries.length - 1] = Object.freeze({
+            stream,
+            text: previousEntry.text + acceptedText,
+          });
+        } else {
+          entries.push(Object.freeze({ stream, text: acceptedText }));
+        }
+      }
+      return acceptedText;
+    },
+    entries: () => Object.freeze([...entries]),
+    get truncated() {
+      return truncated;
+    },
+  });
+}
+
+/** 将命令终止事实与按观察顺序保存的输出收敛为一个有界 ToolResult。 */
+export function createCommandResult(
+  reason: CommandTerminationReason,
+  exitCode: number | null,
+  durationMilliseconds: number,
+  outputCollector: CommandOutputCollector,
+  cleanupUncertain: boolean,
+): CommandExecutionResult {
+  const resultLines = [
+    `termination: ${reason}`,
+    `exitCode: ${exitCode ?? "none"}`,
+    `durationMs: ${Math.max(0, Math.round(durationMilliseconds))}`,
+    `cleanupUncertain: ${cleanupUncertain}`,
+    "output:",
+  ];
+  for (const entry of outputCollector.entries()) {
+    resultLines.push(`[${entry.stream}]`, ...splitCommandOutputLines(entry.text));
+  }
+  if (outputCollector.truncated) {
+    resultLines.push("...[命令输出已截断，管道已继续排空]");
+  }
+  const rendered = boundToolOutput(resultLines);
+  return Object.freeze({
+    status: reason === "completed" ? "completed" : "failed",
+    content: rendered.content,
+    truncated: outputCollector.truncated || rendered.truncated,
+    cleanupUncertain,
+  });
+}
+
+/** 把多行确认或结果文本拆成稳定行，不虚构额外尾行。 */
+export function splitCommandOutputLines(text: string): string[] {
+  const lines = text.split(/\r?\n/u);
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  return lines.length === 0 ? [""] : lines;
 }
