@@ -53,7 +53,7 @@ export async function migrateLegacySession(
   sessionDirectory: string,
   legacyLocation: SessionStorageLocation,
 ): Promise<MigratedSession> {
-  if (legacyLocation.source !== "schema1") {
+  if (legacyLocation.source !== "legacy") {
     throw new Error("只能迁移 Schema 1 Session。");
   }
   await rejectLegacyWriter(legacyLocation.sessionFilePath);
@@ -96,7 +96,7 @@ export async function migrateLegacySession(
     storageDirectory: finalDirectory,
     sessionFilePath: join(finalDirectory, "session.jsonl"),
     relativeStorageDirectory: finalRelativeDirectory,
-    source: "schema2",
+    source: "directory",
     legacyFilePath: legacyLocation.sessionFilePath,
   });
   await writeSessionLocation(sessionDirectory, location).catch(() => undefined);
@@ -113,7 +113,7 @@ export async function completePublishedMigration(
   sessionDirectory: string,
   location: SessionStorageLocation,
 ): Promise<void> {
-  if (location.source !== "schema2") {
+  if (location.source !== "directory") {
     return;
   }
   const state = await readMigrationState(location.storageDirectory);

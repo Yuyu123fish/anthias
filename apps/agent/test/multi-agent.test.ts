@@ -11,6 +11,7 @@ import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import type { MemberSummary } from "../src/multi-agent/index.js";
 import { readSessionHistory } from "../src/session/history.js";
 import { createSession, openSession } from "../src/session/index.js";
+import { locateSessionStorage } from "../src/session/locations.js";
 
 const execute = promisify(execFile);
 const roots: string[] = [];
@@ -82,6 +83,86 @@ function userText(request: ModelRequest) {
 }
 
 describe("MultiAgent through the Agent interface", () => {
+  it("reads referenced member artifacts through the root interface without sharing files across members", async () => {
+    const { agent, session, sessionDirectory, directory } = await setup(async function* (request) {
+      if (
+        userText(request).includes("short result") ||
+        request.messages.some((message) => message.role === "tool")
+      ) {
+        yield { type: "text_delta", delta: "member finished" };
+        yield { type: "finish", finishReason: "stop" };
+      } else {
+        yield {
+          type: "tool_call",
+          toolCallId: randomUUID(),
+          toolName: "read_file",
+          input: { path: "large.txt", lineCount: 200 },
+          invalid: false,
+        };
+        yield { type: "finish", finishReason: "tool_calls" };
+      }
+    });
+    await writeFile(
+      join(directory, "large.txt"),
+      ("member-output-" + "中".repeat(400) + "\n").repeat(100),
+    );
+    const first = await spawn(agent, "read the large file");
+    await wait(agent, first.sessionId);
+    const second = await spawn(agent, "short result");
+    await wait(agent, second.sessionId);
+    value(await agent.collaboration.execute({ action: "team_create", name: "Archive check" }));
+    const third = JSON.parse(
+      value(await agent.collaboration.execute({ action: "team_add", task: "short result" })),
+    ) as MemberSummary;
+    await wait(agent, third.sessionId);
+    const saved = JSON.parse(
+      value(await agent.collaboration.execute({ action: "result", memberId: first.sessionId })),
+    ) as {
+      artifacts: Array<{ sessionId: string; artifactId: string }>;
+    };
+    const artifact = saved.artifacts[0];
+    if (artifact === undefined) throw new Error("expected durable member artifact");
+    expect(artifact.sessionId).toBe(first.sessionId);
+    const page = JSON.parse(
+      value(
+        await agent.collaboration.execute({
+          action: "result",
+          memberId: first.sessionId,
+          artifactId: artifact.artifactId,
+        }),
+      ),
+    ) as { status: string; content: string };
+    expect(page.status).toBe("completed");
+    expect(page.content).toContain("member-output-");
+    for (const memberId of [second.sessionId, third.sessionId]) {
+      const denied = await agent.collaboration.execute({
+        action: "result",
+        memberId,
+        artifactId: artifact.artifactId,
+      });
+      expect(denied.ok).toBe(false);
+      if (!denied.ok) expect(denied.error).toContain("未被该成员历史引用");
+    }
+    expect(
+      (
+        await agent.collaboration.execute({
+          action: "result",
+          memberId: first.sessionId,
+          artifactId: randomUUID(),
+        })
+      ).ok,
+    ).toBe(false);
+    for (const member of [first, second, third]) {
+      expect(
+        (await locateSessionStorage(sessionDirectory, member.sessionId)).storageDirectory,
+      ).toBe(join(session.storageDirectory, "members", member.sessionId));
+    }
+    await expect(
+      readFile(join(session.storageDirectory, "artifacts", artifact.artifactId + ".txt")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(agent.state.sessionId).toBe(session.sessionId);
+  }, 120_000);
+
   it("keeps a read-only member in Plan under a Full Access root", async () => {
     const requests: ModelRequest[] = [];
     const { agent } = await setup(async function* (request) {

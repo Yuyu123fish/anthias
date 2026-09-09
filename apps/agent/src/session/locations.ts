@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Dirent } from "node:fs";
-import { mkdir, open, readdir, readFile, realpath, rename } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readFile, realpath, rename } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { hasRecoverableIncompleteSessionTail } from "./journal.js";
 import {
@@ -23,7 +22,7 @@ export type SessionStorageLocation = Readonly<{
   storageDirectory: string;
   sessionFilePath: string;
   relativeStorageDirectory: string | null;
-  source: "schema2" | "schema1";
+  source: "directory" | "legacy";
   legacyFilePath?: string;
 }>;
 
@@ -46,73 +45,96 @@ export function getSessionStorageRelativeDirectory(header: ParsedSessionHeader):
   return join(dateDirectory, timestampDirectory);
 }
 
-/** 创建一个尚未发布内容的 Schema 2 独占目录。 */
+/** 成员在根位置确认后创建；跨日执行不改变归属目录或 Header 的真实时间。 */
 export async function createSessionStorageDirectory(
   sessionDirectory: string,
   header: SessionHeader,
 ): Promise<SessionStorageLocation> {
   const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const relativeStorageDirectory = getSessionStorageRelativeDirectory(header);
-  const dateDirectory = await ensureDateDirectory(
-    normalizedSessionDirectory,
-    dirname(relativeStorageDirectory),
-  );
-  const storageDirectoryName = basename(relativeStorageDirectory);
-  const storageDirectory = join(dateDirectory, storageDirectoryName);
+  const existing = await enumerateSessionStorage(normalizedSessionDirectory);
+  if (
+    !existing.complete ||
+    existing.entries.some(({ location }) => location.sessionId === header.sessionId) ||
+    existing.diagnostics.some((diagnostic) => diagnostic.sessionId === header.sessionId)
+  ) {
+    throw new Error("Session ID 已存在或位置扫描不完整。");
+  }
+  let parentDirectory: string;
+  let directoryName: string;
+  if (header.sessionKind === "primary") {
+    const relativeDirectory = getSessionStorageRelativeDirectory(header);
+    parentDirectory = await ensureDateDirectory(
+      normalizedSessionDirectory,
+      dirname(relativeDirectory),
+    );
+    directoryName = basename(relativeDirectory);
+  } else {
+    const rootLocation = await locateSessionStorage(
+      normalizedSessionDirectory,
+      header.rootSessionId,
+      { updateCache: false },
+    );
+    if (rootLocation.source !== "directory")
+      throw new Error("成员创建需要已经显式打开的根 Session。");
+    const rootHeader = await readManagedDirectoryHeader(
+      rootLocation.storageDirectory,
+      rootLocation.sessionFilePath,
+    );
+    if (
+      rootHeader.schemaVersion !== 3 ||
+      rootHeader.sessionKind !== "primary" ||
+      rootHeader.sessionId !== header.rootSessionId ||
+      rootHeader.rootSessionId !== header.rootSessionId
+    ) {
+      throw new Error("成员 Header 的根归属无效。");
+    }
+    parentDirectory = join(rootLocation.storageDirectory, "members");
+    await mkdir(parentDirectory, { recursive: true });
+    await resolveExistingDirectChild(rootLocation.storageDirectory, "members");
+    directoryName = header.sessionId;
+  }
+  const storageDirectory = join(parentDirectory, directoryName);
   await mkdir(storageDirectory);
   const canonicalStorageDirectory = await realpath(storageDirectory);
-  assertDirectChild(dateDirectory, canonicalStorageDirectory, storageDirectoryName);
+  assertDirectChild(parentDirectory, canonicalStorageDirectory, directoryName);
   return Object.freeze({
     sessionId: header.sessionId,
     storageDirectory: canonicalStorageDirectory,
     sessionFilePath: join(canonicalStorageDirectory, "session.jsonl"),
-    relativeStorageDirectory,
-    source: "schema2",
+    relativeStorageDirectory: relative(normalizedSessionDirectory, canonicalStorageDirectory),
+    source: "directory",
   });
 }
-/** 按稳定 ID 定位 Session；缓存不是权威，失效时完整扫描兼容布局。 */
+/** 按稳定 ID 完整核验兼容布局；定位缓存可重建，不能代替来源冲突检查。 */
 export async function locateSessionStorage(
   sessionDirectory: string,
   sessionId: string,
   options: Readonly<{ updateCache?: boolean }> = {},
 ): Promise<SessionStorageLocation> {
-  if (!isUuid(sessionId)) {
-    throw new Error("Session ID 无效。");
+  if (!isUuid(sessionId)) throw new Error("Session ID 无效。");
+  const root = await realpath(sessionDirectory);
+  // 缓存无法排除另一位置的同 ID 日志，只有完整枚举才能确定写入权威。
+  const scan = await enumerateSessionStorage(root);
+  if (!scan.complete) throw new Error("Session 位置扫描不完整，无法确认唯一来源。");
+  if (scan.diagnostics.some((diagnostic) => diagnostic.sessionId === sessionId)) {
+    throw new Error("Session ID 存在损坏或归属不明的位置。");
   }
-  const normalizedSessionDirectory = await realpath(sessionDirectory);
-  const cachedLocation = await readCachedSessionLocation(
-    normalizedSessionDirectory,
-    sessionId,
-  ).catch(() => null);
-  const candidates: SessionStorageLocation[] = [];
-  if (cachedLocation !== null) {
-    const location = await inspectSchema2Location(
-      normalizedSessionDirectory,
-      sessionId,
-      cachedLocation.relativeStorageDirectory,
-    ).catch(() => null);
-    if (location !== null) {
-      candidates.push(location);
-    }
+  const location = await resolveLocationCandidates(
+    scan.entries
+      .filter((entry) => entry.location.sessionId === sessionId)
+      .map((entry) => entry.location),
+  );
+  if (location.source === "directory" && options.updateCache !== false) {
+    await writeSessionLocation(root, location).catch(() => undefined);
   }
-  for (const location of await scanSessionLocations(normalizedSessionDirectory, sessionId)) {
-    if (!candidates.some((candidate) => candidate.sessionFilePath === location.sessionFilePath)) {
-      candidates.push(location);
-    }
-  }
-  const resolvedLocation = await resolveLocationCandidates(candidates);
-  if (resolvedLocation.source === "schema2" && options.updateCache !== false) {
-    await writeSessionLocation(normalizedSessionDirectory, resolvedLocation).catch(() => undefined);
-  }
-  return resolvedLocation;
+  return location;
 }
-
 /** 更新可重建 ID 定位缓存；缓存写入失败不能回滚已经发布的 JSONL。 */
 export async function writeSessionLocation(
   sessionDirectory: string,
   location: SessionStorageLocation,
 ): Promise<void> {
-  if (location.source !== "schema2" || location.relativeStorageDirectory === null) {
+  if (location.source !== "directory" || location.relativeStorageDirectory === null) {
     return;
   }
   const normalizedSessionDirectory = await realpath(sessionDirectory);
@@ -158,22 +180,51 @@ export async function removeSessionLocation(
   });
 }
 
-/** 检查目录是否恰好属于 Schema 2 的受管布局，供清理在删除前做最后确认。 */
+/** 只校验受管相对路径语法；实际访问仍需校验 Header 与每一层真实路径。 */
+export function isSessionStorageRelativeDirectory(
+  value: unknown,
+  sessionId?: string,
+): value is string {
+  if (typeof value !== "string") return false;
+  const segments = value.split(/[\\/]/u);
+  if (
+    !DATE_DIRECTORY_PATTERN.test(segments[0] ?? "") ||
+    !SESSION_DIRECTORY_PATTERN.test(segments[1] ?? "")
+  )
+    return false;
+  const pathId =
+    segments.length === 2
+      ? SESSION_DIRECTORY_PATTERN.exec(segments[1] ?? "")?.[2]
+      : segments.length === 4 && segments[2] === "members"
+        ? segments[3]
+        : undefined;
+  return (
+    isUuid(pathId) && (sessionId === undefined || pathId.toLowerCase() === sessionId.toLowerCase())
+  );
+}
+
+/** 返回物理包含成员目录的 Session 路径；平铺布局没有物理父 Session，归属仍以 Header 为准。 */
+export function getContainingSessionStorageDirectory(
+  relativeStorageDirectory: string,
+): string | null {
+  if (!isSessionStorageRelativeDirectory(relativeStorageDirectory))
+    throw new Error("Session location 路径无效。");
+  const segments = relativeStorageDirectory.split(/[\\/]/u);
+  return segments.length === 4 ? segments.slice(0, 2).join("/") : null;
+}
+
 export function isSessionStorageDirectory(
   sessionDirectory: string,
   storageDirectory: string,
   sessionId: string,
 ): boolean {
-  if (!isUuid(sessionId)) {
-    return false;
-  }
-  const relativeStorageDirectory = relative(resolve(sessionDirectory), resolve(storageDirectory));
-  const segments = relativeStorageDirectory.split(/[\\/]/u);
-  if (segments.length !== 2 || !DATE_DIRECTORY_PATTERN.test(segments[0] ?? "")) {
-    return false;
-  }
-  const match = SESSION_DIRECTORY_PATTERN.exec(segments[1] ?? "");
-  return match?.[2]?.toLocaleLowerCase("en-US") === sessionId.toLocaleLowerCase("en-US");
+  return (
+    isUuid(sessionId) &&
+    isSessionStorageRelativeDirectory(
+      relative(resolve(sessionDirectory), resolve(storageDirectory)),
+      sessionId,
+    )
+  );
 }
 
 /** 创建迁移暂存目录，名称不能被扫描器当作一个正常 Session。 */
@@ -194,16 +245,6 @@ export async function createMigrationStagingDirectory(
   assertDirectChild(dateDirectory, canonicalStagingDirectory, stagingDirectoryName);
   return canonicalStagingDirectory;
 }
-/** 只读取并严格校验定位缓存；任何异常都由调用方降级为扫描。 */
-async function readCachedSessionLocation(
-  sessionDirectory: string,
-  sessionId: string,
-): Promise<Readonly<{ relativeStorageDirectory: string }> | null> {
-  const index = await readSessionLocationIndex(sessionDirectory);
-  const location = index.locations[sessionId];
-  return location ?? null;
-}
-
 async function readSessionLocationIndex(sessionDirectory: string): Promise<SessionLocationIndex> {
   const indexText = await readFile(join(sessionDirectory, LOCATION_INDEX_FILE_NAME), "utf8");
   const index = parseJsonObject(indexText);
@@ -226,7 +267,7 @@ async function readSessionLocationIndex(sessionDirectory: string): Promise<Sessi
     if (
       !hasExactKeys(location, ["relativeStorageDirectory"]) ||
       typeof location.relativeStorageDirectory !== "string" ||
-      !isRelativeStorageDirectoryForSession(location.relativeStorageDirectory, sessionId)
+      !isSessionStorageRelativeDirectory(location.relativeStorageDirectory, sessionId)
     ) {
       throw new Error("Session location index 条目无效。");
     }
@@ -273,124 +314,284 @@ async function serializeLocationIndexUpdate(
   }
 }
 
-async function inspectSchema2Location(
+async function inspectDirectoryLocation(
   sessionDirectory: string,
   sessionId: string,
   relativeStorageDirectory: string,
-): Promise<SessionStorageLocation> {
-  if (!isRelativeStorageDirectoryForSession(relativeStorageDirectory, sessionId)) {
-    throw new Error("Session location 缓存路径无效。");
+): Promise<SessionStorageEntry> {
+  if (!isSessionStorageRelativeDirectory(relativeStorageDirectory, sessionId)) {
+    throw new Error("Session location 路径无效。");
   }
   const segments = relativeStorageDirectory.split(/[\\/]/u);
-  const dateDirectoryName = segments[0];
-  const storageDirectoryName = segments[1];
-  if (dateDirectoryName === undefined || storageDirectoryName === undefined) {
-    throw new Error("Session location 缓存路径无效。");
-  }
-  const dateDirectory = await resolveExistingDateDirectory(sessionDirectory, dateDirectoryName);
-  if (dateDirectory === null) {
-    throw new Error("Session 日期目录不存在。");
-  }
-  const storageDirectory = await resolveExistingDirectChild(dateDirectory, storageDirectoryName);
-  if (storageDirectory === null) {
-    throw new Error("Session 存储目录不存在。");
+  let storageDirectory = sessionDirectory;
+  for (const segment of segments) {
+    const child = await resolveExistingDirectChild(storageDirectory, segment);
+    if (child === null) throw new Error("Session 存储目录不存在。");
+    storageDirectory = child;
   }
   const sessionFilePath = join(storageDirectory, "session.jsonl");
   const header = await readManagedDirectoryHeader(storageDirectory, sessionFilePath);
-  if (
-    (header.schemaVersion !== 2 && header.schemaVersion !== 3) ||
-    header.sessionId !== sessionId
-  ) {
+  if (header.schemaVersion === 1 || header.sessionId !== sessionId) {
     throw new Error("Session location 与 Header 不匹配。");
   }
+  if (segments.length === 2) {
+    if (getSessionStorageRelativeDirectory(header) !== join(...segments)) {
+      throw new Error("Session creation path mismatch");
+    }
+  } else {
+    const rootRelativeDirectory = join(...segments.slice(0, 2));
+    const rootId = SESSION_DIRECTORY_PATTERN.exec(segments[1] ?? "")?.[2];
+    if (rootId === undefined) throw new Error("Session 根目录身份无效。");
+    const root = await inspectDirectoryLocation(sessionDirectory, rootId, rootRelativeDirectory);
+    if (
+      root.header.schemaVersion !== 3 ||
+      root.header.sessionKind !== "primary" ||
+      root.header.rootSessionId !== rootId ||
+      header.schemaVersion !== 3 ||
+      header.sessionKind === "primary" ||
+      header.rootSessionId !== rootId
+    ) {
+      throw new Error("Session 成员归属与根 Header 不匹配。");
+    }
+  }
   return Object.freeze({
-    sessionId,
-    storageDirectory,
-    sessionFilePath,
-    relativeStorageDirectory,
-    source: "schema2",
+    header,
+    location: Object.freeze({
+      sessionId,
+      storageDirectory,
+      sessionFilePath,
+      relativeStorageDirectory,
+      source: "directory",
+    }),
   });
 }
+
 async function readManagedDirectoryHeader(
   storageDirectory: string,
   sessionFilePath: string,
 ): Promise<ParsedSessionHeader> {
   try {
-    return parseSessionHeader((await readFile(sessionFilePath, "utf8")).split("\n", 1)[0]);
+    return await readHeaderFile(storageDirectory, sessionFilePath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-    await readFile(join(storageDirectory, "schema-upgrade-state.json"));
-    return parseSessionHeader(
-      (await readFile(join(storageDirectory, "schema2-session.jsonl"), "utf8")).split("\n", 1)[0],
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await readHeaderFileExists(
+      storageDirectory,
+      join(storageDirectory, "schema-upgrade-state.json"),
     );
+    return readHeaderFile(storageDirectory, join(storageDirectory, "schema2-session.jsonl"));
   }
 }
 
-async function scanSessionLocations(
-  sessionDirectory: string,
-  sessionId: string,
-): Promise<SessionStorageLocation[]> {
-  const entries = await readdir(sessionDirectory, { withFileTypes: true });
-  const locations: SessionStorageLocation[] = [];
-  for (const dateEntry of entries) {
-    if (!dateEntry.isDirectory() || !DATE_DIRECTORY_PATTERN.test(dateEntry.name)) {
-      continue;
-    }
-    const dateDirectory = await resolveExistingDateDirectory(
-      sessionDirectory,
-      dateEntry.name,
-    ).catch(() => null);
-    if (dateDirectory === null) {
-      continue;
-    }
-    const dateEntries = await readdir(dateDirectory, { withFileTypes: true }).catch(
-      () => [] as Dirent[],
-    );
-    for (const sessionEntry of dateEntries) {
-      if (!sessionEntry.isDirectory() || !isSessionDirectoryForId(sessionEntry.name, sessionId)) {
-        continue;
-      }
-      const relativeStorageDirectory = join(dateEntry.name, sessionEntry.name);
-      const location = await inspectSchema2Location(
-        sessionDirectory,
-        sessionId,
-        relativeStorageDirectory,
-      ).catch(() => null);
-      if (location !== null) {
-        locations.push(location);
-      }
-    }
-  }
-  const legacyFilePath = join(sessionDirectory, `${sessionId}.jsonl`);
-  const legacyLocation = await inspectLegacyLocation(
-    sessionDirectory,
-    sessionId,
-    legacyFilePath,
-  ).catch(() => null);
-  if (legacyLocation !== null) {
-    locations.push(legacyLocation);
-  }
-  return locations;
+async function readHeaderFileExists(parentDirectory: string, filePath: string): Promise<void> {
+  const stats = await lstat(filePath);
+  if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("Session 日志不是受管普通文件。");
+  assertDirectChild(parentDirectory, await realpath(filePath), basename(filePath));
 }
+
+async function readHeaderFile(
+  parentDirectory: string,
+  filePath: string,
+): Promise<ParsedSessionHeader> {
+  await readHeaderFileExists(parentDirectory, filePath);
+  const handle = await open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(16 * 1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const newline = text.indexOf("\n");
+    if (newline < 0 && bytesRead === buffer.length)
+      throw new Error("Session Header 超过读取预算。");
+    return parseSessionHeader(newline < 0 ? text : text.slice(0, newline));
+  } finally {
+    await handle.close();
+  }
+}
+
+export const MAXIMUM_MANAGED_SESSION_DIRECTORIES = 4096;
+export type SessionStorageEntry = Readonly<{
+  location: SessionStorageLocation;
+  header: ParsedSessionHeader;
+}>;
+export type SessionStorageScan = Readonly<{
+  entries: readonly SessionStorageEntry[];
+  complete: boolean;
+  diagnostics: readonly Readonly<{
+    relativePath: string;
+    sessionId?: string;
+    rootSessionId?: string;
+    message: string;
+  }>[];
+}>;
+
+/** 只枚举固定布局，不打开 Session；损坏候选保留诊断供列表容错与组清理保守判断。 */
+export async function enumerateSessionStorage(
+  sessionDirectory: string,
+  options: Readonly<{ maximumCandidates?: number }> = {},
+): Promise<SessionStorageScan> {
+  const root = await realpath(sessionDirectory);
+  const maximumCandidates = Math.max(
+    1,
+    Math.min(
+      MAXIMUM_MANAGED_SESSION_DIRECTORIES,
+      options.maximumCandidates ?? MAXIMUM_MANAGED_SESSION_DIRECTORIES,
+    ),
+  );
+  const entries: SessionStorageEntry[] = [];
+  const diagnostics: Array<{
+    relativePath: string;
+    sessionId?: string;
+    rootSessionId?: string;
+    message: string;
+  }> = [];
+  let complete = true;
+  let visitedEntries = 0;
+  let candidates = 0;
+  const readNames = async (directory: string): Promise<string[]> => {
+    const names: string[] = [];
+    try {
+      const handle = await opendir(directory);
+      for await (const entry of handle) {
+        visitedEntries += 1;
+        if (visitedEntries > MAXIMUM_MANAGED_SESSION_DIRECTORIES * 4) {
+          complete = false;
+          break;
+        }
+        names.push(entry.name);
+      }
+    } catch {
+      complete = false;
+      diagnostics.push({ relativePath: relative(root, directory), message: "目录无法完整枚举" });
+    }
+    return names.sort();
+  };
+  const inspect = async (
+    relativePath: string,
+    sessionId: string,
+    legacy = false,
+    rootSessionId?: string,
+  ): Promise<void> => {
+    candidates += 1;
+    if (candidates > maximumCandidates) {
+      complete = false;
+      return;
+    }
+    try {
+      entries.push(
+        legacy
+          ? await inspectLegacyLocation(root, sessionId, join(root, relativePath))
+          : await inspectDirectoryLocation(root, sessionId, relativePath),
+      );
+    } catch {
+      diagnostics.push({
+        relativePath,
+        sessionId,
+        ...(rootSessionId === undefined ? {} : { rootSessionId }),
+        message: "日志身份、路径或 Header 无法核验",
+      });
+    }
+  };
+  for (const name of await readNames(root)) {
+    if (!complete) break;
+    if (name.endsWith(".jsonl") && isUuid(name.slice(0, -6))) {
+      await inspect(name, name.slice(0, -6), true);
+      continue;
+    }
+    if (!DATE_DIRECTORY_PATTERN.test(name)) continue;
+    let dateDirectory: string | null;
+    try {
+      dateDirectory = await resolveExistingDateDirectory(root, name);
+      if (dateDirectory === null) throw new Error("missing date directory");
+    } catch {
+      complete = false;
+      diagnostics.push({ relativePath: name, message: "日期目录无法安全枚举" });
+      break;
+    }
+    for (const directoryName of await readNames(dateDirectory)) {
+      if (!complete) break;
+      const sessionId = SESSION_DIRECTORY_PATTERN.exec(directoryName)?.[2];
+      if (!isUuid(sessionId)) continue;
+      const relativeDirectory = join(name, directoryName);
+      await inspect(relativeDirectory, sessionId);
+      if (!complete) break;
+      try {
+        const storageDirectory = await resolveExistingDirectChild(dateDirectory, directoryName);
+        if (storageDirectory === null) continue;
+        const membersDirectory = await resolveExistingDirectChild(storageDirectory, "members");
+        if (membersDirectory === null) continue;
+        const containingHeader = entries.find(
+          (entry) => entry.location.relativeStorageDirectory === relativeDirectory,
+        )?.header;
+        const knownRoot =
+          containingHeader?.schemaVersion === 3 && containingHeader.sessionKind === "primary"
+            ? { rootSessionId: containingHeader.sessionId }
+            : {};
+        for (const memberId of await readNames(membersDirectory)) {
+          if (!complete) break;
+          const memberRelativePath = join(relativeDirectory, "members", memberId);
+          if (!isUuid(memberId)) {
+            diagnostics.push({
+              relativePath: memberRelativePath,
+              ...knownRoot,
+              message: "成员目录包含未知内容",
+            });
+            continue;
+          }
+          await inspect(memberRelativePath, memberId, false, knownRoot.rootSessionId);
+          try {
+            await lstat(join(root, memberRelativePath, "members"));
+            diagnostics.push({
+              relativePath: memberRelativePath,
+              sessionId: memberId,
+              ...knownRoot,
+              message: "成员目录包含未受管的派生层级",
+            });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+              diagnostics.push({
+                relativePath: memberRelativePath,
+                sessionId: memberId,
+                ...knownRoot,
+                message: "成员目录完整性无法核验",
+              });
+            }
+          }
+        }
+      } catch {
+        complete = false;
+        diagnostics.push({
+          relativePath: relativeDirectory,
+          sessionId,
+          message: "成员目录无法安全枚举",
+        });
+      }
+    }
+  }
+  if (!complete)
+    diagnostics.push({ relativePath: "", message: "Session 位置扫描未完成，不能确认全部候选" });
+  return Object.freeze({
+    entries: Object.freeze(entries),
+    complete,
+    diagnostics: Object.freeze(diagnostics),
+  });
+}
+
 async function inspectLegacyLocation(
   sessionDirectory: string,
   sessionId: string,
   legacyFilePath: string,
-): Promise<SessionStorageLocation> {
-  const canonicalFilePath = await realpath(legacyFilePath);
-  assertDirectChild(sessionDirectory, canonicalFilePath, `${sessionId}.jsonl`);
-  const header = parseSessionHeader((await readFile(canonicalFilePath, "utf8")).split("\n", 1)[0]);
-  if (header.schemaVersion !== 1 || header.sessionId !== sessionId) {
+): Promise<SessionStorageEntry> {
+  const header = await readHeaderFile(sessionDirectory, legacyFilePath);
+  if (header.schemaVersion !== 1 || header.sessionId !== sessionId)
     throw new Error("Legacy Session Header 无效。");
-  }
   return Object.freeze({
-    sessionId,
-    storageDirectory: sessionDirectory,
-    sessionFilePath: canonicalFilePath,
-    relativeStorageDirectory: null,
-    source: "schema1",
+    header,
+    location: Object.freeze({
+      sessionId,
+      storageDirectory: sessionDirectory,
+      sessionFilePath: await realpath(legacyFilePath),
+      relativeStorageDirectory: null,
+      source: "legacy",
+    }),
   });
 }
 
@@ -409,26 +610,30 @@ async function resolveLocationCandidates(
   if (distinctCandidates.length === 1) {
     return distinctCandidates[0] as SessionStorageLocation;
   }
-  const schema2Location = distinctCandidates.find((candidate) => candidate.source === "schema2");
-  const schema1Location = distinctCandidates.find((candidate) => candidate.source === "schema1");
+  const directoryLocation = distinctCandidates.find(
+    (candidate) => candidate.source === "directory",
+  );
+  const legacyLocation = distinctCandidates.find((candidate) => candidate.source === "legacy");
   if (
     distinctCandidates.length === 2 &&
-    schema2Location !== undefined &&
-    schema1Location !== undefined &&
-    (await hasMatchingMigrationBackup(schema2Location, schema1Location.sessionFilePath))
+    directoryLocation !== undefined &&
+    legacyLocation !== undefined &&
+    (await hasMatchingMigrationBackup(directoryLocation, legacyLocation.sessionFilePath))
   ) {
-    return Object.freeze({ ...schema2Location, legacyFilePath: schema1Location.sessionFilePath });
+    return Object.freeze({ ...directoryLocation, legacyFilePath: legacyLocation.sessionFilePath });
   }
   throw new Error("Session ID 存在多个无法确认权威来源的位置。");
 }
 
 async function hasMatchingMigrationBackup(
-  schema2Location: SessionStorageLocation,
+  directoryLocation: SessionStorageLocation,
   legacyFilePath: string,
 ): Promise<boolean> {
   try {
     const [backup, legacy] = await Promise.all([
-      readFile(join(schema2Location.storageDirectory, "migration-backup", "legacy-session.jsonl")),
+      readFile(
+        join(directoryLocation.storageDirectory, "migration-backup", "legacy-session.jsonl"),
+      ),
       readFile(legacyFilePath),
     ]);
     return (
@@ -442,22 +647,6 @@ async function hasMatchingMigrationBackup(
     return false;
   }
 }
-function isRelativeStorageDirectoryForSession(
-  relativeStorageDirectory: string,
-  sessionId: string,
-): boolean {
-  const segments = relativeStorageDirectory.split(/[\\/]/u);
-  if (segments.length !== 2 || !DATE_DIRECTORY_PATTERN.test(segments[0] ?? "")) {
-    return false;
-  }
-  return isSessionDirectoryForId(segments[1] ?? "", sessionId);
-}
-
-function isSessionDirectoryForId(directoryName: string, sessionId: string): boolean {
-  const match = SESSION_DIRECTORY_PATTERN.exec(directoryName);
-  return match?.[2]?.toLocaleLowerCase("en-US") === sessionId.toLocaleLowerCase("en-US");
-}
-
 async function ensureDateDirectory(
   sessionDirectory: string,
   dateDirectoryName: string,
@@ -487,7 +676,11 @@ async function resolveExistingDirectChild(
   childName: string,
 ): Promise<string | null> {
   try {
-    const canonicalChildPath = await realpath(join(parentDirectory, childName));
+    const childPath = join(parentDirectory, childName);
+    const stats = await lstat(childPath);
+    if (!stats.isDirectory() || stats.isSymbolicLink())
+      throw new Error("Session 路径不是受管目录。");
+    const canonicalChildPath = await realpath(childPath);
     assertDirectChild(parentDirectory, canonicalChildPath, childName);
     return canonicalChildPath;
   } catch (error) {

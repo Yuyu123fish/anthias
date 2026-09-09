@@ -1,6 +1,6 @@
-import { readdir, realpath } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { lstat } from "node:fs/promises";
 import { readSessionJournal } from "./journal.js";
+import { enumerateSessionStorage, type SessionStorageScan } from "./locations.js";
 import {
   getSessionOwnership,
   isUuid,
@@ -8,10 +8,6 @@ import {
   type SessionHeader,
   type SessionRecord,
 } from "./schema.js";
-
-const DATE_DIRECTORY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
-const SESSION_DIRECTORY_PATTERN = /^\d{8}T\d{9}Z-([0-9a-f-]{36})$/iu;
-export const MAXIMUM_MANAGED_SESSION_DIRECTORIES = 4096;
 
 export type LocatedGroupSession = Readonly<{
   sessionId: string;
@@ -26,124 +22,80 @@ export type LocatedSessionGroup = Readonly<{
   rootSessionId: string;
   sessions: readonly LocatedGroupSession[];
   complete: boolean;
+  diagnostics: readonly string[];
 }>;
 
-/** 只按 Header 归属定位同根日志；任务、交付与资源终态由清理调用方解释。 */
+/** 已知物理根的损坏成员只影响该组；归属未知的候选可能属于任一组，必须保守保留。 */
 export async function locateSessionGroup(
   sessionDirectory: string,
   sessionId: string,
+  scannedStorage?: SessionStorageScan,
 ): Promise<LocatedSessionGroup> {
-  if (!isUuid(sessionId)) {
-    throw new Error("Session group 身份无效。");
-  }
-  const root = await realpath(sessionDirectory);
-  const candidates: LocatedGroupSession[] = [];
-  let scannedManagedDirectories = 0;
-  let exceededScanLimit = false;
-
-  const dateDirectoryNames = (await readdir(root))
-    .filter((name) => DATE_DIRECTORY_PATTERN.test(name))
-    .sort();
-  for (const dateDirectoryName of dateDirectoryNames) {
-    const dateDirectory = join(root, dateDirectoryName);
-    const sessionDirectoryNames = (await readdir(dateDirectory).catch(() => [] as string[])).sort();
-    for (const sessionDirectoryName of sessionDirectoryNames) {
-      const matchedSessionId = SESSION_DIRECTORY_PATTERN.exec(sessionDirectoryName)?.[1];
-      if (matchedSessionId === undefined || !isUuid(matchedSessionId)) {
-        continue;
-      }
-      scannedManagedDirectories += 1;
-      if (scannedManagedDirectories > MAXIMUM_MANAGED_SESSION_DIRECTORIES) {
-        exceededScanLimit = true;
-        break;
-      }
-      const storageDirectory = await realpath(join(dateDirectory, sessionDirectoryName)).catch(
-        () => null,
-      );
+  if (!isUuid(sessionId)) throw new Error("Session group 身份无效。");
+  const scan = scannedStorage ?? (await enumerateSessionStorage(sessionDirectory));
+  const requestedCandidates = scan.entries.filter(
+    ({ location }) => location.source === "directory" && location.sessionId === sessionId,
+  );
+  if (requestedCandidates.length !== 1) throw new Error("Session group 的请求身份不存在或重复。");
+  const requested = requestedCandidates[0];
+  if (requested === undefined) throw new Error("Session group 身份不存在。");
+  const rootSessionId = getSessionOwnership(requested.header).rootSessionId;
+  const candidates = scan.entries.filter(
+    ({ location, header }) =>
+      location.source === "directory" &&
+      getSessionOwnership(header).rootSessionId === rootSessionId,
+  );
+  const diagnostics = scan.diagnostics
+    .filter(
+      (diagnostic) =>
+        diagnostic.rootSessionId === undefined || diagnostic.rootSessionId === rootSessionId,
+    )
+    .map((diagnostic) => diagnostic.message);
+  const sessions: LocatedGroupSession[] = [];
+  for (const { location, header } of candidates) {
+    try {
       if (
-        storageDirectory === null ||
-        !isPathInside(root, storageDirectory) ||
-        relative(dateDirectory, storageDirectory) !== sessionDirectoryName
+        header.schemaVersion === 1 ||
+        location.relativeStorageDirectory === null ||
+        (await lstat(location.sessionFilePath)).size > 64 * 1024 * 1024
       ) {
-        continue;
+        throw new Error("Session journal exceeds group read budget");
       }
-      const sessionFilePath = join(storageDirectory, "session.jsonl");
-      const journal = await readSessionJournal(sessionFilePath).catch(() => null);
-      if (
-        journal === null ||
-        journal.header.schemaVersion === 1 ||
-        journal.header.sessionId !== matchedSessionId
-      ) {
-        continue;
+      const journal = await readSessionJournal(location.sessionFilePath);
+      if (JSON.stringify(journal.header) !== JSON.stringify(header)) {
+        throw new Error("Session Header changed during enumeration");
       }
-      candidates.push(
+      sessions.push(
         Object.freeze({
-          sessionId: matchedSessionId,
-          storageDirectory,
-          sessionFilePath,
-          relativeStorageDirectory: `${dateDirectoryName}/${sessionDirectoryName}`,
-          header: journal.header,
+          sessionId: location.sessionId,
+          storageDirectory: location.storageDirectory,
+          sessionFilePath: location.sessionFilePath,
+          relativeStorageDirectory: location.relativeStorageDirectory.replaceAll("\\", "/"),
+          header,
           records: journal.records,
         }),
       );
+    } catch {
+      diagnostics.push("组成员日志无法核验");
     }
-    if (exceededScanLimit) {
-      break;
-    }
   }
-
-  const requestedCandidates = candidates.filter((candidate) => candidate.sessionId === sessionId);
-  if (requestedCandidates.length !== 1) {
-    throw new Error("Session group 的请求身份不存在或重复。");
-  }
-  const requestedSession = requestedCandidates[0] as LocatedGroupSession;
-  const requestedOwnership = getSessionOwnership(requestedSession.header);
-  if (requestedSession.header.schemaVersion === 2) {
-    return Object.freeze({
-      rootSessionId: requestedSession.sessionId,
-      sessions: Object.freeze([requestedSession]),
-      complete: !exceededScanLimit,
-    });
-  }
-
-  const groupSessions = candidates.filter(
-    (candidate) =>
-      candidate.header.schemaVersion === 3 &&
-      candidate.header.rootSessionId === requestedOwnership.rootSessionId,
+  const identities = new Set(sessions.map((session) => session.sessionId));
+  const roots = sessions.filter(
+    (session) =>
+      session.sessionId === rootSessionId &&
+      getSessionOwnership(session.header).sessionKind === "primary",
   );
-  const sessionIdentityCounts = new Map<string, number>();
-  for (const candidate of groupSessions) {
-    sessionIdentityCounts.set(
-      candidate.sessionId,
-      (sessionIdentityCounts.get(candidate.sessionId) ?? 0) + 1,
-    );
-  }
-  const rootSessions = groupSessions.filter(
-    (candidate) =>
-      candidate.header.schemaVersion === 3 &&
-      candidate.sessionId === requestedOwnership.rootSessionId &&
-      candidate.header.sessionKind === "primary",
-  );
-  const complete =
-    !exceededScanLimit &&
-    rootSessions.length === 1 &&
-    groupSessions.every((candidate) => sessionIdentityCounts.get(candidate.sessionId) === 1);
   return Object.freeze({
-    rootSessionId: requestedOwnership.rootSessionId,
+    rootSessionId,
     sessions: Object.freeze(
-      [...groupSessions].sort((left, right) => left.sessionId.localeCompare(right.sessionId)),
+      sessions.sort((left, right) => left.sessionId.localeCompare(right.sessionId)),
     ),
-    complete,
+    complete:
+      scan.complete &&
+      diagnostics.length === 0 &&
+      roots.length === 1 &&
+      identities.size === sessions.length &&
+      sessions.length === candidates.length,
+    diagnostics: Object.freeze(diagnostics),
   });
-}
-
-function isPathInside(root: string, candidate: string): boolean {
-  const relativePath = relative(resolve(root), resolve(candidate));
-  return (
-    relativePath !== "" &&
-    relativePath !== ".." &&
-    !relativePath.startsWith(".." + sep) &&
-    !relativePath.startsWith("/") &&
-    !relativePath.startsWith("\\")
-  );
 }

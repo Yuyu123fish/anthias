@@ -5,10 +5,16 @@ import {
   type LocatedGroupSession,
   type LocatedSessionGroup,
   locateSessionGroup,
-  MAXIMUM_MANAGED_SESSION_DIRECTORIES,
 } from "./groups.js";
 import { readSessionJournal } from "./journal.js";
-import { locateSessionStorage, removeSessionLocation } from "./locations.js";
+import {
+  enumerateSessionStorage,
+  getContainingSessionStorageDirectory,
+  isSessionStorageRelativeDirectory,
+  locateSessionStorage,
+  MAXIMUM_MANAGED_SESSION_DIRECTORIES,
+  removeSessionLocation,
+} from "./locations.js";
 import {
   acquireSessionLock,
   DEFAULT_SESSION_LOCK_SYSTEM,
@@ -32,8 +38,6 @@ import {
 const RETENTION_MILLISECONDS = 14 * 24 * 60 * 60 * 1_000;
 const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 const MAX_CLEANUP_STATE_BYTES = 1024 * 1024;
-const DATE_DIRECTORY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
-const SESSION_DIRECTORY_PATTERN = /^\d{8}T\d{9}Z-([0-9a-f-]{36})$/iu;
 
 type SinglePendingDeletion = Readonly<{
   kind?: "single";
@@ -129,70 +133,72 @@ export async function cleanupExpiredSessions({
       deleted += await countMissingPendingSources(root, pending);
     }
 
+    if (stopped()) return result("bounded");
+    const storageScan = await enumerateSessionStorage(root);
+    if (!storageScan.complete) {
+      skipReasons.add("位置扫描不完整，保留所有会话");
+      return result("bounded");
+    }
     const processedSessionIds = new Set<string>();
-    const dateDirectories = (await readdir(root))
-      .filter((name) => DATE_DIRECTORY_PATTERN.test(name))
-      .sort();
-    for (const dateDirectory of dateDirectories) {
-      if (!(await isSafeOwnedPath(root, join(root, dateDirectory), "directory"))) {
+    const directories = storageScan.entries
+      .filter(({ location }) => location.source === "directory")
+      .sort((left, right) =>
+        (left.location.relativeStorageDirectory ?? "").localeCompare(
+          right.location.relativeStorageDirectory ?? "",
+        ),
+      );
+    for (const { location } of directories) {
+      const sessionId = location.sessionId;
+      const relativeDirectory = location.relativeStorageDirectory?.replaceAll("\\", "/");
+      if (
+        relativeDirectory === undefined ||
+        (state.cursor !== null && relativeDirectory <= state.cursor)
+      )
         continue;
-      }
-      const sessionDirectories = (await readdir(join(root, dateDirectory))).sort();
-      for (const sessionDirectoryName of sessionDirectories) {
-        const matchedDirectory = SESSION_DIRECTORY_PATTERN.exec(sessionDirectoryName);
-        const sessionId = matchedDirectory?.[1];
-        if (sessionId === undefined || !isUuid(sessionId)) {
-          continue;
-        }
-        const relativeDirectory = `${dateDirectory}/${sessionDirectoryName}`;
-        if (state.cursor !== null && relativeDirectory <= state.cursor) {
-          continue;
-        }
-        if (processedSessionIds.has(sessionId)) {
-          state.cursor = relativeDirectory;
-          await writeCleanupState(statePath, state);
-          continue;
-        }
-        if (stopped() || inspected >= maximumCandidates) {
-          await writeCleanupState(statePath, state);
-          return result("bounded");
-        }
-
-        inspected += 1;
-        try {
-          const group = await locateSessionGroup(root, sessionId);
-          for (const groupedSession of group.sessions) {
-            processedSessionIds.add(groupedSession.sessionId);
-          }
-          if (!group.complete) {
-            throw new Error("group ownership incomplete");
-          }
-          if (group.sessions[0]?.header.schemaVersion === 2) {
-            deleted += await cleanSchema2Session(root, group.sessions[0], state, statePath, {
-              now,
-              stopped,
-              lockSystem,
-            });
-          } else {
-            deleted += await cleanSchema3Group(root, group, relativeDirectory, state, statePath, {
-              now,
-              stopped,
-              lockSystem,
-            });
-          }
-        } catch (error) {
-          skipReasons.add(safeCleanupSkipReason(error));
-          skipped += 1;
-          if (state.pending !== null) {
-            return result("bounded");
-          }
-        }
+      if (processedSessionIds.has(sessionId)) {
         state.cursor = relativeDirectory;
         await writeCleanupState(statePath, state);
+        continue;
       }
+      if (stopped() || inspected >= maximumCandidates) {
+        await writeCleanupState(statePath, state);
+        return result("bounded");
+      }
+      inspected += 1;
+      try {
+        const group = await locateSessionGroup(root, sessionId, storageScan);
+        for (const session of group.sessions) processedSessionIds.add(session.sessionId);
+        if (!group.complete) throw new Error("group ownership incomplete");
+        if (group.sessions[0]?.header.schemaVersion === 2) {
+          deleted += await cleanSchema2Session(root, group.sessions[0], state, statePath, {
+            now,
+            stopped,
+            lockSystem,
+          });
+        } else {
+          deleted += await cleanSchema3Group(root, group, relativeDirectory, state, statePath, {
+            now,
+            stopped,
+            lockSystem,
+          });
+        }
+      } catch (error) {
+        skipReasons.add(safeCleanupSkipReason(error));
+        skipped += 1;
+        if (state.pending !== null) return result("bounded");
+      }
+      state.cursor = relativeDirectory;
+      await writeCleanupState(statePath, state);
+    }
+    if (storageScan.diagnostics.length > 0) {
+      skipped += storageScan.diagnostics.length;
+      skipReasons.add("日志身份或归属无法核验");
     }
 
-    const legacyResult = await cleanLegacySessions(root, state, statePath, {
+    const legacyNames = storageScan.entries
+      .filter(({ location }) => location.source === "legacy")
+      .map(({ location }) => `${location.sessionId}.jsonl`);
+    const legacyResult = await cleanLegacySessions(root, state, statePath, legacyNames, {
       now,
       stopped,
       remainingCandidates: maximumCandidates - inspected,
@@ -242,11 +248,13 @@ async function cleanSchema2Session(
     if (journal.header.schemaVersion !== 2) {
       throw new Error("Session identity mismatch");
     }
-    assertSessionCreationPath(located, journal.header);
     assertCompletedRecords(journal.records, journal.header);
     assertExpiredGroup([{ header: journal.header, records: journal.records }], options.now);
     await assertUnused(root, located.sessionId, options.lockSystem);
-    if (options.stopped() || !(await isSafeTree(root, located.storageDirectory, options.stopped))) {
+    if (
+      options.stopped() ||
+      !(await isSafeSessionContents(root, located.storageDirectory, options.stopped))
+    ) {
       throw new Error("Session tree cannot be safely deleted");
     }
 
@@ -300,6 +308,21 @@ async function cleanSchema3Group(
       );
     }
 
+    const lockedGroup = await locateSessionGroup(root, group.rootSessionId);
+    if (
+      !lockedGroup.complete ||
+      lockedGroup.sessions.length !== sortedSessions.length ||
+      lockedGroup.sessions.some(
+        (session) =>
+          !sortedSessions.some(
+            (candidate) =>
+              candidate.sessionId === session.sessionId &&
+              candidate.storageDirectory === session.storageDirectory,
+          ),
+      )
+    ) {
+      throw new Error("group ownership incomplete");
+    }
     const verifiedSessions: VerifiedManagedSession[] = [];
     for (const located of sortedSessions) {
       const journal = await verifyManagedJournal(root, located);
@@ -309,7 +332,6 @@ async function cleanSchema3Group(
       ) {
         throw new Error("group ownership incomplete");
       }
-      assertSessionCreationPath(located, journal.header);
       assertCompletedRecords(journal.records, journal.header);
       verifiedSessions.push(
         Object.freeze({
@@ -334,7 +356,7 @@ async function cleanSchema3Group(
       await assertUnused(root, session.header.sessionId, options.lockSystem);
       if (
         options.stopped() ||
-        !(await isSafeTree(root, session.located.storageDirectory, options.stopped))
+        !(await isSafeSessionContents(root, session.located.storageDirectory, options.stopped))
       ) {
         throw new Error("Session tree cannot be safely deleted");
       }
@@ -357,10 +379,10 @@ async function cleanSchema3Group(
         ),
       ),
     });
-    // 先刷新完整成员清单，再逐个移入同一隔离目录；中断恢复会继续余下成员。
+    // 清单保留全部身份供锁和缓存失效；物理移动去掉嵌套子路径，避免根已移动后再移动成员。
     await writeCleanupState(statePath, state);
-    for (const session of verifiedSessions) {
-      await rename(session.located.storageDirectory, join(root, trash, session.header.sessionId));
+    for (const session of pendingMoveRoots(state.pending)) {
+      await rename(join(root, session.source), join(root, trash, session.sessionId));
     }
     if (!(await finishPendingDeletion(root, state, statePath, options.stopped))) {
       throw new Error("pending deletion incomplete");
@@ -382,7 +404,7 @@ async function verifyManagedJournal(root: string, located: LocatedGroupSession) 
   }
   const location = await locateSessionStorage(root, located.sessionId, { updateCache: false });
   if (
-    location.source !== "schema2" ||
+    location.source !== "directory" ||
     location.storageDirectory !== located.storageDirectory ||
     location.legacyFilePath !== undefined
   ) {
@@ -403,17 +425,6 @@ async function verifyManagedJournal(root: string, located: LocatedGroupSession) 
     throw new Error("Session identity mismatch");
   }
   return journal;
-}
-
-function assertSessionCreationPath(
-  located: LocatedGroupSession,
-  header: SessionHeader | Schema2SessionHeader,
-): void {
-  const creationTimestamp = new Date(header.createdAt).toISOString();
-  const expectedRelativeDirectory = `${creationTimestamp.slice(0, 10)}/${creationTimestamp.replace(/[-:.]/gu, "")}-${header.sessionId}`;
-  if (located.relativeStorageDirectory.replaceAll("\\", "/") !== expectedRelativeDirectory) {
-    throw new Error("Session creation path mismatch");
-  }
 }
 
 function assertCompletedRecords(
@@ -573,6 +584,16 @@ async function finishPendingDeletion(
     : finishPendingSingleDeletion(root, state, statePath, pending, stopped);
 }
 
+/** 清单保留全体身份；这里只选择互不包含的物理源，旧平铺记录保持逐目录处理。 */
+function pendingMoveRoots(pending: GroupPendingDeletion) {
+  return pending.sessions.filter(
+    (session) =>
+      !pending.sessions.some(
+        (parent) => parent !== session && session.source.startsWith(parent.source + "/"),
+      ),
+  );
+}
+
 async function finishPendingGroupDeletion(
   root: string,
   state: CleanupState,
@@ -605,9 +626,10 @@ async function finishPendingGroupDeletion(
     return false;
   }
 
-  const expectedTrashEntries = new Set(pending.sessions.map((session) => session.sessionId));
+  const moves = pendingMoveRoots(pending);
+  const expectedTrashEntries = new Set(moves.map((session) => session.sessionId));
   const sourcePresence = await Promise.all(
-    pending.sessions.map((session) => pathExists(join(root, session.source))),
+    moves.map((session) => pathExists(join(root, session.source))),
   );
   if (sourcePresence.some(Boolean)) {
     const trashEntries = await readdir(trashPath);
@@ -615,7 +637,7 @@ async function finishPendingGroupDeletion(
       return false;
     }
     // 跨进程重启后不继承旧删除授权；先恢复已移动成员，再由正常组检查重新决定。
-    for (const [index, session] of pending.sessions.entries()) {
+    for (const [index, session] of moves.entries()) {
       const sourcePath = join(root, session.source);
       const destinationPath = join(trashPath, session.sessionId);
       const sourceExists = sourcePresence[index] === true;
@@ -629,6 +651,7 @@ async function finishPendingGroupDeletion(
       if (!destinationExists || stopped() || !(await isSafeTree(root, destinationPath, stopped))) {
         return false;
       }
+      if (!(await isSafeOwnedPath(root, resolve(sourcePath, ".."), "directory"))) return false;
       await rename(destinationPath, sourcePath);
     }
     if ((await readdir(trashPath)).length !== 0) {
@@ -642,13 +665,18 @@ async function finishPendingGroupDeletion(
 
   const trashEntries = await readdir(trashPath);
   if (
-    trashEntries.length !== expectedTrashEntries.size ||
     trashEntries.some((entry) => !expectedTrashEntries.has(entry)) ||
     stopped() ||
-    !(await isSafeTree(root, trashPath, stopped))
+    !(await isSafeTree(root, trashPath, stopped)) ||
+    !(
+      await Promise.all(
+        trashEntries.map((entry) => isSafeSessionContents(root, join(trashPath, entry), stopped)),
+      )
+    ).every(Boolean)
   ) {
     return false;
   }
+  // 所有源均已移走后，trash 少项可能是上次递归删除中断；仅允许既定移动根的剩余内容。
   await rm(trashPath, { recursive: true, force: true });
   for (const session of pending.sessions) {
     await removeSessionLocation(root, session.sessionId);
@@ -791,27 +819,30 @@ function validateGroupPendingDeletion(pending: Record<string, unknown>): void {
     if (
       !isUuid(session.sessionId) ||
       !isSessionRelativeDirectory(session.source) ||
-      !session.source.endsWith(`-${session.sessionId}`) ||
+      !isSessionStorageRelativeDirectory(session.source, session.sessionId) ||
       sessionIds.has(session.sessionId)
     ) {
       throw new Error("invalid group deletion member");
     }
     sessionIds.add(session.sessionId);
   }
-  if (!sessionIds.has(pending.rootSessionId)) {
+  const sessions = pending.sessions as Array<{ source: string; sessionId: string }>;
+  const rootSession = sessions.find((session) => session.sessionId === pending.rootSessionId);
+  if (
+    rootSession === undefined ||
+    getContainingSessionStorageDirectory(rootSession.source) !== null ||
+    sessions.some((session) => {
+      const containingDirectory = getContainingSessionStorageDirectory(session.source);
+      return containingDirectory !== null && containingDirectory !== rootSession.source;
+    })
+  ) {
     throw new Error("invalid group deletion root");
   }
 }
 
 function isSessionRelativeDirectory(value: unknown): value is string {
-  if (typeof value !== "string") {
-    return false;
-  }
-  const segments = value.split("/");
   return (
-    segments.length === 2 &&
-    DATE_DIRECTORY_PATTERN.test(segments[0] ?? "") &&
-    SESSION_DIRECTORY_PATTERN.test(segments[1] ?? "")
+    typeof value === "string" && !value.includes("\\") && isSessionStorageRelativeDirectory(value)
   );
 }
 
@@ -888,6 +919,56 @@ async function isSafeOwnedPath(
   }
 }
 
+/** 目录位于历史根内并不等于内容归 Agent 所有；未知项目文件必须留给用户处理。 */
+async function isSafeSessionContents(
+  root: string,
+  directory: string,
+  stopped: () => boolean,
+  allowMembers = true,
+): Promise<boolean> {
+  if (stopped() || !(await isSafeOwnedPath(root, directory, "directory"))) return false;
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (stopped() || entry.isSymbolicLink()) return false;
+    const child = join(directory, entry.name);
+    if (entry.isFile()) {
+      if (
+        entry.name !== "session.jsonl" &&
+        entry.name !== "session.index.json" &&
+        !(
+          entry.name.startsWith(".session.index.json.") &&
+          entry.name.endsWith(".tmp") &&
+          isUuid(entry.name.slice(".session.index.json.".length, -4))
+        )
+      )
+        return false;
+      if (!(await isSafeOwnedPath(root, child, "file"))) return false;
+      continue;
+    }
+    if (!entry.isDirectory() || !(await isSafeOwnedPath(root, child, "directory"))) return false;
+    if (entry.name === "members" && allowMembers) {
+      for (const member of await readdir(child, { withFileTypes: true })) {
+        if (
+          !isUuid(member.name) ||
+          !member.isDirectory() ||
+          !(await isSafeSessionContents(root, join(child, member.name), stopped, false))
+        )
+          return false;
+      }
+    } else if (entry.name === "artifacts" || entry.name === "migration-backup") {
+      for (const file of await readdir(child, { withFileTypes: true })) {
+        if (
+          stopped() ||
+          !file.isFile() ||
+          (entry.name === "migration-backup" && file.name !== "legacy-session.jsonl") ||
+          !(await isSafeOwnedPath(root, join(child, file.name), "file"))
+        )
+          return false;
+      }
+    } else return false;
+  }
+  return true;
+}
+
 async function isSafeTree(
   root: string,
   directory: string,
@@ -916,6 +997,7 @@ async function cleanLegacySessions(
   root: string,
   state: CleanupState,
   statePath: string,
+  legacyNames: readonly string[],
   options: Readonly<{
     now: number;
     stopped: () => boolean;
@@ -927,10 +1009,7 @@ async function cleanLegacySessions(
   let deleted = 0;
   let skipped = 0;
   const skipReasons = new Set<string>();
-  for (const name of (await readdir(root)).sort()) {
-    if (!name.endsWith(".jsonl") || !isUuid(name.slice(0, -6))) {
-      continue;
-    }
+  for (const name of [...legacyNames].sort()) {
     const cursor = `~${name}`;
     if (state.cursor !== null && cursor <= state.cursor) {
       continue;
@@ -957,7 +1036,7 @@ async function cleanLegacySessions(
         throw new Error("legacy Session path is unsafe");
       }
       const location = await locateSessionStorage(root, sessionId, { updateCache: false });
-      if (location.source !== "schema1") {
+      if (location.source !== "legacy") {
         throw new Error("legacy Session has another authority");
       }
       const journal = await readSessionJournal(path);

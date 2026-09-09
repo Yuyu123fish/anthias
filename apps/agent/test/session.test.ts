@@ -114,7 +114,12 @@ describe("Session", () => {
   it("validates preallocated member ownership", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-member-");
     const sessionDirectory = join(fixtureRoot, "sessions");
-    const rootSessionId = randomUUID();
+    const rootSession = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    const rootSessionId = rootSession.sessionId;
     const memberSessionId = randomUUID();
     const member = await createSession({
       workspaceRoot: fixtureRoot,

@@ -706,7 +706,12 @@ describe("Session recovery storage", () => {
     const storageRoot = await createTemporaryDirectory("anthias-session-history-store-");
     const workspaceRoot = await createTemporaryDirectory("anthias-session-history-worktree-");
     const sessionDirectory = join(storageRoot, "sessions");
-    const rootSessionId = randomUUID();
+    const root = await createSession({
+      workspaceRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    const rootSessionId = root.sessionId;
     const member = await createSession({
       workspaceRoot,
       sessionDirectory,
@@ -728,6 +733,7 @@ describe("Session recovery storage", () => {
     await acquisition.lease.appendRunFinished({ status: "completed" });
     await acquisition.lease.release();
     await member.close();
+    await root.close();
     await rm(workspaceRoot, { recursive: true });
 
     const history = await readSessionHistory({

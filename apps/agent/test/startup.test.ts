@@ -366,7 +366,7 @@ async function createAgentFromEnvironment(
 
 async function expectSessionStorage(sessionDirectory: string, sessionId: string): Promise<void> {
   const location = await locateSessionStorage(sessionDirectory, sessionId);
-  expect(location.source).toBe("schema2");
+  expect(location.source).toBe("directory");
   const sessionText = await readFile(location.sessionFilePath, "utf8");
   const header = JSON.parse(sessionText.trimEnd().split("\n")[0] ?? "") as Record<string, unknown>;
   expect(header).toMatchObject({

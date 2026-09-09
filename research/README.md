@@ -40,3 +40,4 @@ research/archive/YYYY-MM-DD-topic/
 
 - [2026-08-19 初始方向调查](archive/2026-08-19-initial-direction/README.md)
 - [2026-09-06 上下文工程调研](archive/2026-09-06-context-engineering/README.md)：原 Feature 008 已整体搁置；收益证据不足，新增复杂度尚缺乏依据，未进入 Spec 或实施。
+- [2026-09-09 Windows 沙箱与 AutoAllow 调研](archive/2026-09-09-windows-sandbox-autoallow/README.md)：已确认共享受限账号及首期简化方向；执行器仍是方案候选，未安装或实施。

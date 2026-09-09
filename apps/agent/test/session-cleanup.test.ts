@@ -363,6 +363,141 @@ describe("Session cleanup", () => {
       await reopenedRoot.close();
     }
   });
+  it("deletes mixed flat and nested histories together while leaving project output alone", async () => {
+    const root = await fixtureRoot();
+    const group = await fixtureMixedGroup(root);
+    const workspace = await fixtureRoot();
+    await writeFile(join(workspace, "result.txt"), "project output");
+    for (const session of group.sessions) {
+      await mkdir(join(session.directory, "artifacts"));
+      await writeFile(join(session.directory, "artifacts", "result.txt"), session.id);
+    }
+    expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+      deleted: 3,
+      status: "completed",
+    });
+    for (const session of group.sessions)
+      await expect(stat(session.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(workspace, "result.txt"), "utf8")).toBe("project output");
+  });
+
+  it.each(["root", "flat"] as const)(
+    "restores a mixed group after the %s physical source moved and another source was reopened",
+    async (movedSource) => {
+      const root = await fixtureRoot();
+      const group = await fixtureMixedGroup(root);
+      const moved = movedSource === "root" ? group.primary : group.flat;
+      const active = movedSource === "root" ? group.flat : group.nested;
+      const trash = await fixturePendingGroup(root, group);
+      await rename(moved.directory, join(root, trash, moved.id));
+      const usageMarker = await acquireSessionUsageMarker(
+        root,
+        active.id,
+        DEFAULT_SESSION_LOCK_SYSTEM,
+      );
+      try {
+        expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+          deleted: 0,
+          status: "completed",
+        });
+        for (const session of group.sessions)
+          expect((await stat(session.directory)).isDirectory()).toBe(true);
+        await expect(stat(join(root, trash))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await releaseSessionUsageMarker(usageMarker);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "finishes a fully moved mixed group after partial deletion %s",
+    async (partiallyDeleted) => {
+      const root = await fixtureRoot();
+      const group = await fixtureMixedGroup(root);
+      const trash = await fixturePendingGroup(root, group);
+      await rename(group.primary.directory, join(root, trash, group.primary.id));
+      await rename(group.flat.directory, join(root, trash, group.flat.id));
+      if (partiallyDeleted) await rm(join(root, trash, group.flat.id), { recursive: true });
+      expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+        deleted: 3,
+        status: "completed",
+      });
+      await expect(stat(join(root, trash))).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each(["missing", "damaged", "foreign"] as const)(
+    "preserves a mixed group with a %s nested member",
+    async (failure) => {
+      const root = await fixtureRoot();
+      const group = await fixtureMixedGroup(root);
+      const journalPath = join(group.nested.directory, "session.jsonl");
+      if (failure === "missing") {
+        await rm(group.nested.directory, { recursive: true });
+      } else if (failure === "damaged") {
+        await writeFile(journalPath, "broken\n");
+      } else {
+        const header = JSON.parse(await readFile(journalPath, "utf8")) as Record<string, unknown>;
+        header.rootSessionId = randomUUID();
+        await writeFile(journalPath, JSON.stringify(header) + "\n");
+      }
+      const result = await cleanupExpiredSessions({ sessionDirectory: root, now: NOW });
+      expect(result.deleted).toBe(0);
+      expect(result.skipReasons.length).toBeGreaterThan(0);
+      expect((await stat(group.primary.directory)).isDirectory()).toBe(true);
+      expect((await stat(group.flat.directory)).isDirectory()).toBe(true);
+    },
+  );
+
+  it.each(["root", "member"] as const)(
+    "preserves unowned files inside the %s Session directory",
+    async (owner) => {
+      const root = await fixtureRoot();
+      const group = await fixtureMixedGroup(root);
+      const directory = owner === "root" ? group.primary.directory : group.nested.directory;
+      await mkdir(join(directory, "unexpected"));
+      const path = join(directory, "unexpected", "keep.txt");
+      await writeFile(path, "user data");
+      expect((await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).deleted).toBe(0);
+      expect(await readFile(path, "utf8")).toBe("user data");
+      for (const session of group.sessions)
+        expect((await stat(session.directory)).isDirectory()).toBe(true);
+    },
+  );
+
+  it("preserves unexpected contents after all physical sources have moved", async () => {
+    const root = await fixtureRoot();
+    const group = await fixtureMixedGroup(root);
+    const trash = await fixturePendingGroup(root, group);
+    await rename(group.primary.directory, join(root, trash, group.primary.id));
+    await rename(group.flat.directory, join(root, trash, group.flat.id));
+    const path = join(root, trash, group.primary.id, "keep.txt");
+    await writeFile(path, "user data");
+    expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+      deleted: 0,
+      status: "bounded",
+    });
+    expect(await readFile(path, "utf8")).toBe("user data");
+  });
+
+  it("cleans an unrelated healthy root while preserving a known damaged member group", async () => {
+    const root = await fixtureRoot();
+    const damaged = await fixtureMixedGroup(root);
+    const healthyId = randomUUID();
+    const healthy = await fixtureSchema3Session(root, {
+      id: healthyId,
+      rootSessionId: healthyId,
+      sessionKind: "primary",
+    });
+    await writeFile(join(damaged.nested.directory, "session.jsonl"), "broken\n");
+    expect(await cleanupExpiredSessions({ sessionDirectory: root, now: NOW })).toMatchObject({
+      deleted: 1,
+    });
+    await expect(stat(healthy.directory)).rejects.toMatchObject({ code: "ENOENT" });
+    for (const session of damaged.sessions)
+      expect((await stat(session.directory)).isDirectory()).toBe(true);
+  });
+
   it("does not scan when another cleanup owns the global lock or cancellation has arrived", async () => {
     const root = await fixtureRoot();
     const session = await fixtureSession(root);
@@ -393,6 +528,70 @@ async function fixtureRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "anthias-cleanup-"));
   roots.add(root);
   return root;
+}
+
+async function fixtureMixedGroup(root: string) {
+  const primaryId = randomUUID();
+  const flatId = randomUUID();
+  const nestedId = randomUUID();
+  const primary = await fixtureSchema3Session(root, {
+    id: primaryId,
+    rootSessionId: primaryId,
+    sessionKind: "primary",
+    coordination: [flatId, nestedId].map((id) => ({
+      kind: "member" as const,
+      key: id,
+      payload: {
+        sessionId: id,
+        kind: "subagent",
+        status: "closed",
+        workspaceRoot: root,
+        writable: false,
+      },
+    })),
+  });
+  const flat = await fixtureSchema3Session(root, {
+    id: flatId,
+    rootSessionId: primaryId,
+    sessionKind: "subagent",
+  });
+  const nestedFlat = await fixtureSchema3Session(root, {
+    id: nestedId,
+    rootSessionId: primaryId,
+    sessionKind: "subagent",
+  });
+  const nested = {
+    ...nestedFlat,
+    directory: join(primary.directory, "members", nestedId),
+    relativeDirectory: primary.relativeDirectory + "/members/" + nestedId,
+  };
+  await mkdir(join(primary.directory, "members"));
+  await rename(nestedFlat.directory, nested.directory);
+  return { primary, flat, nested, sessions: [primary, flat, nested] };
+}
+async function fixturePendingGroup(
+  root: string,
+  group: Awaited<ReturnType<typeof fixtureMixedGroup>>,
+) {
+  const trash = `.maintenance/trash/${group.primary.id}-${randomUUID()}`;
+  await mkdir(join(root, trash), { recursive: true });
+  await writeFile(
+    join(root, ".maintenance", "cleanup-state.json"),
+    JSON.stringify({
+      cursor: null,
+      pending: {
+        kind: "group",
+        rootSessionId: group.primary.id,
+        cursorAfter: group.primary.relativeDirectory,
+        trash,
+        sessions: group.sessions.map((session) => ({
+          source: session.relativeDirectory,
+          sessionId: session.id,
+        })),
+      },
+    }),
+  );
+  return trash;
 }
 
 async function fixtureSchema3Session(

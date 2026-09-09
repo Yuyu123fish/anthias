@@ -353,7 +353,7 @@ export async function openSession({
   let usageMarker: SessionUsageMarkerOwnership | null = null;
   try {
     location = await locateSessionStorage(normalizedSessionDirectory, sessionId);
-    if (location.source === "schema1") {
+    if (location.source === "legacy") {
       const migratedSession = await migrateLegacySession(normalizedSessionDirectory, location);
       location = migratedSession.location;
     } else {
