@@ -1,6 +1,6 @@
 # Plan 02：运行核心的状态与顺序归属
 
-状态：已计划
+状态：已实现
 
 ## 开发者速览
 
@@ -8,7 +8,7 @@
 > **核心做法**：集中已有协议和事实投影，消除隐含装配、重复分组与可变请求快照。<br>
 > **边界**：保持执行、权限、事件、持久化及 Git 语义。<br>
 > **风险 / 未验证**：取消竞争、写锁交接与执行前复核必须保持原顺序。<br>
-> **当前 / 请审阅**：Plan 01 阶段提交后开始实施，完成后审查并提交。
+> **当前 / 请审阅**：实现、163 项定向验证及独立审查通过，提交后继续 Plan 03。
 
 ## 基线与范围
 
@@ -26,6 +26,16 @@
 ## 验证
 
 开始和结束对比 package 导出、真实消费者、状态持有者、调用链及提交/失败点；目录或接口数量只作辅助。使用已有 runtime、concurrency、session、context、MCP、Git 本地测试，只补能区分缺陷的必要竞态/快照隔离测试。开始本 Plan 时按实际文件补齐定向命令，不调用真实 Provider 或网络。
+
+本 Plan 的分区命令（Windows、Node v24.13.1、pnpm 10.33.0）：
+
+- Session：`pnpm exec vitest run apps/agent/test/session.test.ts apps/agent/test/session-recovery.test.ts`。
+- Context/MCP：`pnpm exec vitest run apps/agent/test/context-selection.test.ts apps/agent/test/context-integration.test.ts apps/agent/test/context-compaction.test.ts apps/agent/test/memory-context.test.ts apps/agent/test/mcp.test.ts apps/agent/test/mcp-tool-snapshot.test.ts`。
+- Git：`pnpm exec vitest run apps/agent/test/git-workspace.test.ts apps/agent/test/git-integration-ignored-collision.test.ts apps/agent/test/git-approval-state.test.ts`。
+- Runtime/Tool：`pnpm exec vitest run apps/agent/test/tool-loop.test.ts apps/agent/test/agent-loop-safety.test.ts apps/agent/test/agent-controls.test.ts apps/agent/test/agent-capability-boundaries.test.ts apps/agent/test/automatic-continuation.test.ts apps/agent/test/auto-review.test.ts apps/agent/test/complete-tool-loop.test.ts apps/agent/test/multi-agent.test.ts`。
+- 统筹：`pnpm check`、`pnpm build`；最终全量 `pnpm verify` 留到 Plan 03。
+
+请求快照接线：Context 保留进入包装器时的 ModelRequest 身份，准备后的请求和 MCP 工具快照一起返回；SessionAgent 在本 Run 的 WeakMap 中将该身份绑定到 ToolRunner，Loop 收齐该响应后取得对应 Runner。手动压缩只消费准备后的请求，不产生执行计划。ModelRequest 与 package 入口均不加入执行器字段。
 
 统筹执行一次 check/build，子 Agent 负责自己的定向验证，可信结果不重复。高风险判断作一次独立审查。若需改变公共行为、权限、事件、Schema 或职责合同，停止返回讨论。
 

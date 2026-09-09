@@ -3,6 +3,11 @@ import { lstat, mkdir, open, readlink, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { JsonValue } from "../message.js";
 import { GitCommandAbortedError, GitCommandError, runGit } from "./command.js";
+import {
+  createGitIntegration,
+  readIntegrationCommit,
+  type WorkingTreeChangeSet,
+} from "./integration.js";
 
 const MAXIMUM_QUERY_OUTPUT_BYTES = 128 * 1024;
 const MAXIMUM_INDEX_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -128,38 +133,6 @@ type RepositoryIdentity = Readonly<{
   branch: string | null;
 }>;
 
-type IntegrationPhase = "intent" | "staged" | "conflicted" | "committed" | "aborted" | "failed";
-
-type IntegrationOperation = Readonly<{
-  operationType: "integration";
-  operationId: string;
-  rootSessionId: string;
-  worktreeId: string;
-  sourceCommit: string;
-  targetHead: string;
-  allowedPaths: readonly string[];
-  phase: IntegrationPhase;
-  stagedTree?: string;
-  integrationCommit?: string;
-  error?: string;
-}>;
-
-type IntegrationOperationInput = Omit<
-  IntegrationOperation,
-  "stagedTree" | "integrationCommit" | "error"
-> &
-  Readonly<{
-    stagedTree?: string | undefined;
-    integrationCommit?: string | undefined;
-    error?: string | undefined;
-  }>;
-type WorkingTreeChangeSet = Readonly<{
-  staged: readonly string[];
-  unstaged: readonly string[];
-  unmerged: readonly string[];
-  untracked: readonly string[];
-}>;
-
 type ApprovalCaptureBudget = {
   bytes: number;
   files: number;
@@ -217,6 +190,16 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
     await options.appendRecord({ kind: "git_operation", key: operationId, payload });
     gitOperations.set(operationId, payload);
   };
+
+  const integration = createGitIntegration({
+    rootSessionId: options.rootSessionId,
+    operations: gitOperations,
+    appendOperation,
+    readWorkingTreeChanges,
+    resolveCommit,
+    assertNoUntrackedIntegrationCollisions,
+    isCoveredByRequests,
+  });
 
   const findWorktree = (id: string): ManagedWorktree => {
     const worktree = managedWorktrees.get(id);
@@ -530,7 +513,7 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
       assertNonEmptyText(input.message, "message", 16 * 1024);
       const target = await resolveCommitTarget(input.worktreeId, signal);
       const requestedPaths = await normalizeRequestedPaths(target.root, input.paths, signal);
-      if (input.worktreeId === undefined && findPendingIntegration(gitOperations) !== undefined) {
+      if (input.worktreeId === undefined && integration.pendingOperation() !== undefined) {
         throw new Error("根工作区存在待处理的集成，不能执行普通提交。");
       }
       if (await hasStagedChanges(target.root, signal)) {
@@ -639,7 +622,7 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
     signal?: AbortSignal,
   ): Promise<GitIntegrationResult> =>
     serializeGitMutation(signal, async () => {
-      if (findPendingIntegration(gitOperations) !== undefined) {
+      if (integration.pendingOperation() !== undefined) {
         throw new Error("已有待处理的 Git 集成，请先继续或中止。");
       }
       const worktree = await inspectManagedWorktree(
@@ -677,79 +660,16 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
       }
       const allowedPaths = await changedPathsForCommit(target.root, sourceCommit, signal);
       if (allowedPaths.length === 0) throw new Error("结果提交没有可集成的文件变化。");
-      await assertNoUntrackedIntegrationCollisions(target.root, allowedPaths, signal);
-      const operationId = randomUUID();
-      const intent: IntegrationOperation = Object.freeze({
-        operationType: "integration",
-        operationId,
-        rootSessionId: options.rootSessionId,
-        worktreeId: worktree.id,
-        sourceCommit,
-        targetHead: target.head,
-        allowedPaths: Object.freeze([...allowedPaths]),
-        phase: "intent",
-      });
-      await appendOperation(operationId, toJsonValue(intent));
-      try {
-        await assertNoUntrackedIntegrationCollisions(target.root, allowedPaths, signal);
-        await runGit({
-          cwd: target.root,
-          arguments: ["cherry-pick", "--no-commit", sourceCommit],
-          ...(signal === undefined ? {} : { signal }),
-        });
-      } catch (error) {
-        const workingTreeChanges = await readWorkingTreeChanges(target.root);
-        assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, allowedPaths);
-        if (workingTreeChanges.unmerged.length > 0) {
-          const conflicted: IntegrationOperation = Object.freeze({
-            ...intent,
-            phase: "conflicted",
-            error: safeErrorMessage(error),
-          });
-          await appendOperation(operationId, toJsonValue(conflicted));
-          if (error instanceof GitCommandAbortedError) throw error;
-          return integrationResult(conflicted, workingTreeChanges.unmerged);
-        }
-        if (hasWorkingTreeChanges(workingTreeChanges)) {
-          const uncertain: IntegrationOperation = Object.freeze({
-            ...intent,
-            error: `操作结果需要核对：${safeErrorMessage(error)}`,
-          });
-          await appendOperation(operationId, toJsonValue(uncertain));
-        } else {
-          await appendOperation(
-            operationId,
-            toJsonValue({ ...intent, phase: "failed", error: safeErrorMessage(error) }),
-          );
-        }
-        throw error;
-      }
-
-      if ((await resolveCommit(target.root, "HEAD", signal)) !== target.head) {
-        throw new Error("集成期间目标 HEAD 已变化，结果需要人工核对。");
-      }
-      const workingTreeChanges = await readWorkingTreeChanges(target.root, signal);
-      assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, allowedPaths);
-      if (workingTreeChanges.unmerged.length > 0) {
-        const conflicted: IntegrationOperation = Object.freeze({ ...intent, phase: "conflicted" });
-        await appendOperation(operationId, toJsonValue(conflicted));
-        return integrationResult(conflicted, workingTreeChanges.unmerged);
-      }
-      if (
-        workingTreeChanges.staged.length === 0 ||
-        workingTreeChanges.unstaged.length > 0 ||
-        workingTreeChanges.untracked.length > 0
-      ) {
-        throw new Error("集成没有形成可独立核对的暂存结果。");
-      }
-      const stagedTree = await writeTree(target.root, signal);
-      const staged: IntegrationOperation = Object.freeze({
-        ...intent,
-        phase: "staged",
-        stagedTree,
-      });
-      await appendOperation(operationId, toJsonValue(staged));
-      return integrationResult(staged, []);
+      return integration.stage(
+        {
+          root: target.root,
+          targetHead: target.head,
+          worktreeId: worktree.id,
+          sourceCommit,
+          allowedPaths,
+        },
+        signal,
+      );
     });
 
   const resolveIntegration = (
@@ -757,7 +677,7 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
     signal?: AbortSignal,
   ): Promise<GitIntegrationResolution> =>
     serializeGitMutation(signal, async () => {
-      const operation = findPendingIntegration(gitOperations);
+      const operation = integration.pendingOperation();
       if (operation === undefined) throw new Error("当前没有待处理的 Git 集成。");
       const worktree = findWorktree(operation.worktreeId);
       const target = await loadRepository(workspaceRoot, signal);
@@ -769,91 +689,20 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
       ) {
         throw new Error("集成目标的 HEAD 或仓库身份已经变化，拒绝继续修改。");
       }
-      const workingTreeChanges = await readWorkingTreeChanges(target.root, signal);
-      assertIntegrationOwnsWorkingTreeChanges(workingTreeChanges, operation.allowedPaths);
-      if (input.action === "abort") {
-        await abortIntegration(target.root, operation, workingTreeChanges, signal);
-        const aborted: IntegrationOperation = Object.freeze({ ...operation, phase: "aborted" });
-        await appendOperation(operation.operationId, toJsonValue(aborted));
-        return Object.freeze({
-          operationId: operation.operationId,
-          worktreeId: operation.worktreeId,
-          status: "aborted",
-        });
+      const resolution = await integration.resolve(target.root, operation, input.action, signal);
+      if (resolution.status === "committed") {
+        // 集成事实先落盘，worktree 摘要写入失败时仍可在重开后恢复交付状态。
+        await appendWorktree(
+          freezeWorktree({
+            ...worktree,
+            status: "ready",
+            integrated: true,
+            integrationCommit: resolution.integrationCommit,
+            error: undefined,
+          }),
+        );
       }
-
-      if (workingTreeChanges.unmerged.length > 0)
-        throw new Error("仍有未解决的冲突，不能继续集成。");
-      if (workingTreeChanges.staged.length === 0) throw new Error("没有待提交的集成结果。");
-      if (workingTreeChanges.unstaged.length > 0 || workingTreeChanges.untracked.length > 0) {
-        throw new Error("集成路径仍含未暂存或未跟踪内容，不能继续。");
-      }
-      if (operation.phase === "staged" && operation.stagedTree !== undefined) {
-        const currentTree = await writeTree(target.root, signal);
-        if (currentTree !== operation.stagedTree) {
-          throw new Error("暂存结果在审批后已经变化，拒绝继续集成。");
-        }
-      }
-      const cherryPickHead = await hasCherryPickHead(target.root, signal);
-      try {
-        if (cherryPickHead) {
-          await runGit({
-            cwd: target.root,
-            arguments: ["cherry-pick", "--continue"],
-            ...(signal === undefined ? {} : { signal }),
-          });
-        } else {
-          await runGit({
-            cwd: target.root,
-            arguments: [
-              "-c",
-              "commit.gpgsign=false",
-              "commit",
-              "--no-verify",
-              "-C",
-              operation.sourceCommit,
-            ],
-            ...(signal === undefined ? {} : { signal }),
-          });
-        }
-      } catch (error) {
-        const retained: IntegrationOperation = Object.freeze({
-          ...operation,
-          error: safeErrorMessage(error),
-        });
-        await appendOperation(operation.operationId, toJsonValue(retained));
-        throw error;
-      }
-      const integrationCommit = await resolveCommit(target.root, "HEAD", signal);
-      if (integrationCommit === operation.targetHead) {
-        throw new Error("Git 未产生新的集成提交。");
-      }
-      const integrationParent = await resolveCommit(target.root, `${integrationCommit}^`, signal);
-      if (integrationParent !== operation.targetHead) {
-        throw new Error("集成提交不再直接基于记录的目标 HEAD，结果需要人工核对。");
-      }
-      const committed = freezeIntegrationOperation({
-        ...operation,
-        phase: "committed",
-        integrationCommit,
-        error: undefined,
-      });
-      await appendOperation(operation.operationId, toJsonValue(committed));
-      await appendWorktree(
-        freezeWorktree({
-          ...worktree,
-          status: "ready",
-          integrated: true,
-          integrationCommit,
-          error: undefined,
-        }),
-      );
-      return Object.freeze({
-        operationId: operation.operationId,
-        worktreeId: operation.worktreeId,
-        status: "committed",
-        integrationCommit,
-      });
+      return resolution;
     });
 
   async function resolveQueryTarget(
@@ -1407,80 +1256,6 @@ async function listGitPaths(
   return Object.freeze(splitNull(result.stdout).map((path) => path.replaceAll("\\", "/")));
 }
 
-function assertIntegrationOwnsWorkingTreeChanges(
-  workingTreeChanges: WorkingTreeChangeSet,
-  allowedPaths: readonly string[],
-): void {
-  const paths = new Set([
-    ...workingTreeChanges.staged,
-    ...workingTreeChanges.unstaged,
-    ...workingTreeChanges.unmerged,
-    ...workingTreeChanges.untracked,
-  ]);
-  if ([...paths].some((path) => !isCoveredByRequests(path, allowedPaths))) {
-    throw new Error("根工作区出现不属于当前成果的修改，拒绝继续集成。");
-  }
-}
-
-async function abortIntegration(
-  root: string,
-  operation: IntegrationOperation,
-  workingTreeChanges: WorkingTreeChangeSet,
-  signal?: AbortSignal,
-): Promise<void> {
-  if (!hasWorkingTreeChanges(workingTreeChanges)) return;
-  if (workingTreeChanges.untracked.length > 0) {
-    throw new Error("集成期间出现未跟踪文件，需先人工核对，不能自动中止。");
-  }
-  if (operation.phase === "staged" && operation.stagedTree !== undefined) {
-    const currentTree = await writeTree(root, signal);
-    if (currentTree !== operation.stagedTree || workingTreeChanges.unstaged.length > 0) {
-      throw new Error("集成暂存结果已经变化，不能自动中止。");
-    }
-  }
-  if (await hasCherryPickHead(root, signal)) {
-    await runGit({
-      cwd: root,
-      arguments: ["cherry-pick", "--abort"],
-      ...(signal === undefined ? {} : { signal }),
-    });
-  } else {
-    await runGit({
-      cwd: root,
-      arguments: [
-        "restore",
-        `--source=${operation.targetHead}`,
-        "--staged",
-        "--worktree",
-        "--",
-        ...literalPathspecs(operation.allowedPaths),
-      ],
-      ...(signal === undefined ? {} : { signal }),
-    });
-  }
-  if (!(await isClean(root, signal))) throw new Error("Git 中止后根工作区未恢复 clean 状态。");
-}
-
-async function hasCherryPickHead(root: string, signal?: AbortSignal): Promise<boolean> {
-  const result = await runGit({
-    cwd: root,
-    arguments: ["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"],
-    ...(signal === undefined ? {} : { signal }),
-    allowedExitCodes: [0, 1],
-    readOnly: true,
-  });
-  return result.exitCode === 0;
-}
-
-async function writeTree(root: string, signal?: AbortSignal): Promise<string> {
-  const result = await runGit({
-    cwd: root,
-    arguments: ["write-tree"],
-    ...(signal === undefined ? {} : { signal }),
-  });
-  return result.stdout.trim();
-}
-
 async function isClean(root: string, signal?: AbortSignal): Promise<boolean> {
   const workingTreeChanges = await readWorkingTreeChanges(root, signal);
   return !hasWorkingTreeChanges(workingTreeChanges);
@@ -1627,23 +1402,6 @@ function hasWorkingTreeChanges(workingTreeChanges: WorkingTreeChangeSet): boolea
   );
 }
 
-function integrationResult(
-  operation: IntegrationOperation,
-  conflicts: readonly string[],
-): GitIntegrationResult {
-  if (operation.phase !== "staged" && operation.phase !== "conflicted") {
-    throw new Error("集成尚未形成可返回的状态。");
-  }
-  return Object.freeze({
-    operationId: operation.operationId,
-    worktreeId: operation.worktreeId,
-    sourceCommit: operation.sourceCommit,
-    targetHead: operation.targetHead,
-    status: operation.phase,
-    conflicts: Object.freeze([...conflicts]),
-  });
-}
-
 function restoreRecords(
   records: readonly { kind: string; key: string; payload: JsonValue }[],
   rootSessionId: string,
@@ -1675,17 +1433,14 @@ function restoreRecords(
         freezeWorktree({ ...worktree, resultCommit: payload.commit, integrated: false }),
       );
     }
-    if (
-      payload.operationType === "integration" &&
-      payload.phase === "committed" &&
-      typeof payload.integrationCommit === "string"
-    ) {
+    const integrationCommit = readIntegrationCommit(payload);
+    if (integrationCommit !== undefined) {
       managedWorktrees.set(
         worktree.id,
         freezeWorktree({
           ...worktree,
           integrated: true,
-          integrationCommit: payload.integrationCommit,
+          integrationCommit,
         }),
       );
     }
@@ -1693,53 +1448,6 @@ function restoreRecords(
       managedWorktrees.set(worktree.id, freezeWorktree({ ...worktree, status: "removed" }));
     }
   }
-}
-
-function findPendingIntegration(
-  operations: ReadonlyMap<string, JsonValue>,
-): IntegrationOperation | undefined {
-  const pending = [...operations.values()]
-    .map(parseIntegrationOperation)
-    .filter(
-      (operation): operation is IntegrationOperation =>
-        operation !== undefined && ["intent", "staged", "conflicted"].includes(operation.phase),
-    );
-  if (pending.length > 1) throw new Error("存在多个未收口的 Git 集成记录，需要人工核对。");
-  return pending[0];
-}
-
-function parseIntegrationOperation(value: JsonValue): IntegrationOperation | undefined {
-  if (
-    !isObject(value) ||
-    value.operationType !== "integration" ||
-    typeof value.operationId !== "string" ||
-    typeof value.rootSessionId !== "string" ||
-    typeof value.worktreeId !== "string" ||
-    typeof value.sourceCommit !== "string" ||
-    typeof value.targetHead !== "string" ||
-    !Array.isArray(value.allowedPaths) ||
-    !value.allowedPaths.every((path) => typeof path === "string") ||
-    !["intent", "staged", "conflicted", "committed", "aborted", "failed"].includes(
-      String(value.phase),
-    )
-  ) {
-    return undefined;
-  }
-  return Object.freeze({
-    operationType: "integration",
-    operationId: value.operationId,
-    rootSessionId: value.rootSessionId,
-    worktreeId: value.worktreeId,
-    sourceCommit: value.sourceCommit,
-    targetHead: value.targetHead,
-    allowedPaths: Object.freeze([...value.allowedPaths] as string[]),
-    phase: value.phase as IntegrationPhase,
-    ...(typeof value.stagedTree === "string" ? { stagedTree: value.stagedTree } : {}),
-    ...(typeof value.integrationCommit === "string"
-      ? { integrationCommit: value.integrationCommit }
-      : {}),
-    ...(typeof value.error === "string" ? { error: value.error } : {}),
-  });
 }
 
 function parseManagedWorktree(value: JsonValue): ManagedWorktree | undefined {
@@ -1786,12 +1494,6 @@ function freezeWorktree(worktree: ManagedWorktreeInput): ManagedWorktree {
   return Object.freeze(defined);
 }
 
-function freezeIntegrationOperation(operation: IntegrationOperationInput): IntegrationOperation {
-  const defined = Object.fromEntries(
-    Object.entries(operation).filter(([, value]) => value !== undefined),
-  ) as IntegrationOperation;
-  return Object.freeze(defined);
-}
 function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }

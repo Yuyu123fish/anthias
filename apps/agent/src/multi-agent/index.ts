@@ -476,3 +476,13 @@ export type CollaborationControls = Readonly<{
     action: CollaborationAction,
   ): Promise<Readonly<{ ok: true; value: string } | { ok: false; error: string }>>;
 }>;
+
+/** 查询、等待和停止必须能作用于活动 Run；其余动作通过持久化 Tool Run 进入权限与取消协议。 */
+export function isDirectCollaborationControl(action: CollaborationAction): boolean {
+  return (
+    action.action === "list" ||
+    action.action === "result" ||
+    action.action === "wait" ||
+    action.action === "stop"
+  );
+}

@@ -11,21 +11,16 @@ import {
   type PersistedUsage,
   type RequestUsageDetails,
 } from "../session/schema.js";
-import { assembleContext, snapshotSources } from "./assembly.js";
 import { type ContextBudget, estimateModelRequestTokens } from "./budget.js";
 import { generateCompactionSummary } from "./compaction.js";
+import { projectCompactionContext, projectContextHistory, snapshotSources } from "./projection.js";
 import {
   createContextVersion,
   createUsageAnchor,
   measureRequest,
   type UsageAnchor,
 } from "./request.js";
-import {
-  createCompactionMessage,
-  includeAgentInputs,
-  projectContextHistory,
-  selectCompaction,
-} from "./selection.js";
+import { selectCompaction } from "./selection.js";
 import { type ContextSources, MEMORY_REVOKED_ERROR } from "./sources.js";
 
 type RequestPurpose = RequestUsageDetails["purpose"];
@@ -99,9 +94,17 @@ export function createContextController(options: {
   const contextRecords = () => sources?.safeRecords() ?? session.records;
   const projectHistory = (
     messages: readonly import("../model/model-stream.js").ModelInputMessage[],
-  ) => projectContextHistory(contextRecords(), sources?.filterMessages(messages) ?? messages);
-  const assemble = (projection: import("./selection.js").ContextProjection) =>
-    sources ? assembleContext(contextRecords(), projection) : projection.messages;
+  ) => {
+    const records = contextRecords();
+    const validIds = new Set(records.map((record) => record.entryId));
+    return projectContextHistory(
+      records,
+      sources
+        ? messages.filter((message) => !message.entryId || validIds.has(message.entryId))
+        : messages,
+      sources !== undefined,
+    );
+  };
   let usageAnchor: UsageAnchor | null = null;
   let inputTokens: number | null = null;
   let source: ContextUsage["source"] = "unknown";
@@ -133,7 +136,7 @@ export function createContextController(options: {
   function wrapRun(run: {
     lease: Pick<SessionRunLease, "appendCompaction" | "appendRequestUsage">;
     manual?: boolean;
-    extendRequest?: (request: ModelRequest) => ModelRequest;
+    extendRequest?: (request: ModelRequest, requestIdentity: ModelRequest) => ModelRequest;
     beforeRequest?: (signal: AbortSignal) => Promise<void>;
     remainingTaskTimeMs?: () => number;
     emit: (event: ContextEvent) => void;
@@ -163,19 +166,13 @@ export function createContextController(options: {
     }
 
     const contextAwareModelStream: ModelStream = async function* (rawRequest, abortSignal) {
+      const requestIdentity = rawRequest;
       const recoveryAttempt = rawRequest.recoveryAttempt ?? 0;
       const { recoveryAttempt: _recoveryAttempt, ...providerRequest } = rawRequest;
       rawRequest = providerRequest;
       await run.beforeRequest?.(abortSignal);
-      rawRequest = {
-        ...rawRequest,
-        messages: includeAgentInputs(
-          contextRecords(),
-          sources?.filterMessages(rawRequest.messages) ?? rawRequest.messages,
-        ),
-      };
       const originalRequest = rawRequest;
-      rawRequest = run.extendRequest?.(rawRequest) ?? rawRequest;
+      rawRequest = run.extendRequest?.(rawRequest, requestIdentity) ?? rawRequest;
 
       toolDefinitionTokens =
         estimateModelRequestTokens({ ...rawRequest, messages: [], systemPrompt: "" }) -
@@ -183,7 +180,7 @@ export function createContextController(options: {
       let projection = projectHistory(rawRequest.messages);
       let request: ModelRequest = {
         ...rawRequest,
-        messages: assemble(projection),
+        messages: projection.messages,
         tools: [...rawRequest.tools].sort((left, right) => left.name.localeCompare(right.name)),
         purpose: "response",
         maxOutputTokens: budget.responseOutputTokens,
@@ -193,7 +190,7 @@ export function createContextController(options: {
         estimateModelRequestTokens({ ...request, tools: [] }) -
           estimateModelRequestTokens({
             ...originalRequest,
-            messages: projection.messages,
+            messages: projection.historyMessages,
             tools: [],
           }),
       );
@@ -242,14 +239,14 @@ export function createContextController(options: {
         }
         compactionAttempted = true;
         const before = inputTokens ?? estimateModelRequestTokens(request);
-        const fixedSourceSnapshot = sources ? snapshotSources(contextRecords(), []) : undefined;
-        const fixedMessages = fixedSourceSnapshot
-          ? assembleContext(
-              contextRecords(),
-              { checkpoint: null, entries: [], messages: [] },
-              fixedSourceSnapshot,
-            )
-          : [];
+        const fixedRecords = contextRecords();
+        const fixedSourceSnapshot = sources ? snapshotSources(fixedRecords, []) : undefined;
+        const fixedMessages = projectCompactionContext(
+          fixedRecords,
+          [],
+          null,
+          fixedSourceSnapshot,
+        ).messages;
         const fixedTokens = estimateModelRequestTokens({ ...request, messages: fixedMessages });
         const retainedTarget = Math.max(
           0,
@@ -279,9 +276,10 @@ export function createContextController(options: {
           if (abortSignal.aborted) throw new Error("cancelled");
           await sources?.checkExecution(abortSignal);
           await sources?.prepare(abortSignal);
+          const candidateRecords = contextRecords();
           const sourceSnapshot = sources
             ? snapshotSources(
-                contextRecords(),
+                candidateRecords,
                 selection.retainedEntries.map((entry) => entry.entryId),
               )
             : undefined;
@@ -293,23 +291,19 @@ export function createContextController(options: {
                 firstKeptEntryId: selection.firstKeptEntryId,
                 retainedUserEntryIds: selection.retainedUserEntryIds,
               },
-              new Map(contextRecords().map((record) => [record.entryId, record])),
+              new Map(candidateRecords.map((record) => [record.entryId, record])),
             )
           )
             throw new Error(COMPACTION_ERROR);
-          const candidateProjection = {
-            checkpoint: null,
-            entries: selection.retainedEntries,
-            messages: [
-              createCompactionMessage(summary),
-              ...selection.retainedEntries.map((entry) => entry.message),
-            ],
-          };
+          const candidateProjection = projectCompactionContext(
+            candidateRecords,
+            selection.retainedEntries,
+            summary,
+            sourceSnapshot,
+          );
           const candidate: ModelRequest = {
             ...request,
-            messages: sourceSnapshot
-              ? assembleContext(contextRecords(), candidateProjection, sourceSnapshot)
-              : candidateProjection.messages,
+            messages: candidateProjection.messages,
           };
           const after = estimateModelRequestTokens(candidate);
           if (after >= threshold || after >= before) throw new Error(CAPACITY_ERROR);
@@ -334,7 +328,7 @@ export function createContextController(options: {
           }
           // 刷盘成功才切换投影。取消发生在提交期间也不允许发起下一次模型请求。
           projection = projectHistory(rawRequest.messages);
-          request = { ...candidate, messages: assemble(projection) };
+          request = { ...candidate, messages: projection.messages };
           sources?.markRequest();
           contextVersion = createContextVersion(
             modelId,

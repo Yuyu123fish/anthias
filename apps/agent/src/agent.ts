@@ -1,28 +1,20 @@
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ActionResult, AgentControls, AgentOperation } from "./agent-controls.js";
-import { createGitWorkspace } from "./git/index.js";
-import { createMemory } from "./memory/index.js";
-import {
-  type CollaborationAction,
-  createMultiAgent,
-  type MultiAgent,
-} from "./multi-agent/index.js";
-import { createWorkspacePermissions } from "./permission/workspace-permissions.js";
+import { type CollaborationAction, isDirectCollaborationControl } from "./multi-agent/index.js";
+import { createAgentRuntime } from "./runtime.js";
 import type { Session } from "./session/index.js";
 import { createSession, openSession } from "./session/index.js";
 import { listSessions } from "./session/list.js";
-import type { PermissionMode, ToolApprovalRequest } from "./session-agent.js";
-import {
-  type AgentEvent,
-  type AgentListener,
-  type CreateAgentWithModelStreamOptions,
-  createSessionAgent,
-  type SessionAgent,
+import type {
+  AgentEvent,
+  AgentListener,
+  CreateAgentWithModelStreamOptions,
+  PermissionMode,
+  SessionAgent,
+  ToolApprovalRequest,
 } from "./session-agent.js";
-import { createGitTools, executeGitAction, type GitAction, isGitQuery } from "./tool/git-tools.js";
-import type { AgentToolExtension } from "./tool/managed-tool.js";
-import { collaborationToolCall, createMultiAgentTools } from "./tool/multi-agent-tools.js";
+import { executeGitAction, type GitAction, isGitQuery } from "./tool/git-tools.js";
+import { collaborationToolCall } from "./tool/multi-agent-tools.js";
 
 export type {
   ActiveRun,
@@ -48,13 +40,11 @@ export type Agent = Omit<
 
 /** 稳定 Agent 持有当前会话及所有外部连接；切换准备失败不影响原会话。 */
 export function createAgentWithModelStream(options: CreateAgentWithModelStreamOptions): Agent {
-  const { startCleanup, worktreeDirectory, ...sessionOptions } = options;
+  const { startCleanup, ...sessionOptions } = options;
   let currentSession = options.session;
   const memoryDirectory =
     options.memoryDirectory ?? resolve(options.session.sessionDirectory, "memory");
   const pendingApprovals = new Map<string, ToolApprovalRequest>();
-  let currentRuntime = createRuntime(currentSession, options.permissionMode);
-  let currentAgent = currentRuntime.agent;
   const listeners = new Set<AgentListener>();
   let operation: AgentOperation = null;
   let operationController: AbortController | null = null;
@@ -62,6 +52,8 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
   let closed = false;
   let closePromise: Promise<void> | null = null;
   const directControls = new Map<AbortController, Promise<unknown>>();
+  let currentRuntime = createRuntime(currentSession, options.permissionMode);
+  let currentAgent = currentRuntime.agent;
 
   async function runDirectControl<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (closed || operation !== null) throw new Error("Agent 已关闭或正在切换会话。");
@@ -123,115 +115,12 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     if (
       rootSession.sessionKind !== "primary" ||
       rootSession.rootSessionId !== rootSession.sessionId
-    ) {
+    )
       fail("成员 Session 必须从其根 Session 查看或继续，不能作为主 Agent 打开。");
-    }
-    const permissions = createWorkspacePermissions({
-      workspaceRoot: rootSession.workspaceRoot,
-      directory:
-        options.permissionDirectory ?? resolve(rootSession.sessionDirectory, "permissions"),
-    });
-    const memory = createMemory({
-      directory: memoryDirectory,
-      workspaceRoot: rootSession.workspaceRoot,
-    });
-    const git = createGitWorkspace({
-      workspaceRoot: rootSession.workspaceRoot,
-      worktreeDirectory:
-        worktreeDirectory ?? fileURLToPath(new URL("../../../data/worktrees", import.meta.url)),
-      rootSessionId: rootSession.sessionId,
-      readRecords: () => rootSession.records.filter((record) => record.type === "coordination"),
-      appendRecord: (details) => rootSession.appendCoordination(details),
-    });
-    let primary: SessionAgent;
-    let coordinator: MultiAgent;
-    function toolsFor(session: Session): AgentToolExtension {
-      const member =
-        session.sessionId === rootSession.sessionId
-          ? undefined
-          : coordinator.member(session.sessionId);
-      const extensions = [
-        ...(options.managedTools ? [options.managedTools] : []),
-        createMultiAgentTools({
-          callerSessionId: session.sessionId,
-          rootSessionId: rootSession.sessionId,
-          coordinator,
-        }),
-        createGitTools({
-          git,
-          primary: !member,
-          ...(member?.worktreeId ? { memberWorktreeId: member.worktreeId } : {}),
-          assertIdle: (id) => coordinator.assertWorktreeIdle(id),
-        }),
-      ];
-      return {
-        definitions: (permissionMode) =>
-          extensions.flatMap((extension) => extension.definitions(permissionMode)),
-        createPlan: (call, permissionMode) => {
-          for (const extension of extensions) {
-            const plan = extension.createPlan(call, permissionMode);
-            if (plan) return plan;
-          }
-          return null;
-        },
-      };
-    }
-    coordinator = createMultiAgent({
-      root: rootSession,
-      git,
-      modelStream: sessionOptions.modelStream,
-      permissionMode: () => primary?.state.permissionMode ?? mode ?? "agent",
-      abortRoot: (source) => primary?.abort(source),
-      changed: (snapshot) => emit({ type: "collaboration_changed", snapshot }),
-      memberEvent: (member, event) => routeEvent(event, member),
-      createMember(session, permissionMode) {
-        const memberMemory = createMemory({
-          directory: memoryDirectory,
-          workspaceRoot: session.workspaceRoot,
-        });
-        return createSessionAgent({
-          session,
-          permissionMode,
-          modelStream: coordinator.modelStream,
-          ...(sessionOptions.modelContext ? { modelContext: sessionOptions.modelContext } : {}),
-          ...(sessionOptions.skills ? { skills: sessionOptions.skills } : {}),
-          ...(sessionOptions.mcp ? { mcp: sessionOptions.mcp } : {}),
-          memory: memberMemory,
-          maintainMemory: async (action, writer, signal) => {
-            if (action.action !== "save" || action.id)
-              throw new Error("成员只能提交新候选，不能覆盖共享记忆。");
-            const snapshot = await memberMemory.execute(
-              action,
-              { ...writer, explicit: false, candidate: true },
-              signal,
-            );
-            emit({ type: "memory_changed" });
-            return snapshot;
-          },
-          managedTools: toolsFor(session),
-          beforeRequest: (lease, signal) => coordinator.drain(session.sessionId, lease, signal),
-          authorizationRecords: () => rootSession.records,
-          workspacePermissions: permissions,
-          permissionMember: true,
-          ...(sessionOptions.protectedPaths
-            ? { protectedPaths: sessionOptions.protectedPaths }
-            : {}),
-          remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
-        });
-      },
-    });
-    primary = createSessionAgent({
-      ...sessionOptions,
-      session: rootSession,
-      permissionMode: mode,
-      modelStream: coordinator.modelStream,
-      memory,
-      workspacePermissions: permissions,
-      remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
-      managedTools: toolsFor(rootSession),
-      beforeRequest: (lease, signal) => coordinator.drain(rootSession.sessionId, lease, signal),
-    });
-    return { agent: primary, coordinator, git, memory, permissions };
+    return createAgentRuntime(
+      { ...sessionOptions, session: rootSession, permissionMode: mode, memoryDirectory },
+      { emit, memberEvent: routeEvent },
+    );
   }
 
   async function invokeTool(
@@ -326,13 +215,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       await preparedAgent.external.diagnoseSkills();
       if (signal.aborted || closed) throw new Error("cancelled");
     } catch (error) {
-      await preparedRuntime?.coordinator.close();
-      if (preparedAgent) await preparedAgent.close();
+      if (preparedRuntime) await preparedRuntime.close();
       else await target.close();
       throw error;
     }
-    const previousAgent = currentAgent;
-    const previousCoordinator = currentRuntime.coordinator;
+    const previousRuntime = currentRuntime;
     unsubscribe();
     currentSession = target;
     currentAgent = preparedAgent;
@@ -342,8 +229,7 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     unsubscribe = currentAgent.subscribe((event) => routeEvent(event));
     emit({ type: "session_changed", sessionId: target.sessionId });
     emit({ type: "skills_changed" });
-    await previousCoordinator.close();
-    await previousAgent.close();
+    await previousRuntime.close();
   }
 
   const agent: Agent = {
@@ -377,25 +263,19 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     abort() {
       operationController?.abort();
       for (const controller of directControls.keys()) controller.abort();
-      currentAgent.abort();
-      currentRuntime.coordinator.abort();
+      currentRuntime.abort();
     },
     close() {
       if (closePromise !== null) return closePromise;
       closed = true;
       operationController?.abort();
       for (const controller of directControls.keys()) controller.abort();
-      currentAgent.abort("shutdown");
-      currentRuntime.coordinator.abort("shutdown");
+      currentRuntime.abort("shutdown");
       closePromise = (async () => {
         try {
           await operationPromise;
           await Promise.allSettled([...directControls.values()]);
-          try {
-            await currentRuntime.coordinator.close();
-          } finally {
-            await currentAgent.close();
-          }
+          await currentRuntime.close();
         } finally {
           try {
             await options.mcp?.close();
@@ -477,12 +357,7 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       async execute(action: CollaborationAction) {
         try {
           if (closed) return { ok: false, error: "Agent 已关闭。" };
-          if (
-            action.action === "list" ||
-            action.action === "result" ||
-            action.action === "wait" ||
-            action.action === "stop"
-          ) {
+          if (isDirectCollaborationControl(action)) {
             return {
               ok: true,
               value: await runDirectControl((signal) =>

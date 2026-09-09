@@ -8,7 +8,7 @@ import {
 } from "./agent-loop.js";
 import { type ContextBudget, createContextBudget } from "./context/budget.js";
 import { type ContextUsage, createContextController } from "./context/index.js";
-import { agentInputMessage } from "./context/selection.js";
+import { agentInputMessage } from "./context/projection.js";
 import { createContextSources } from "./context/sources.js";
 import { createExternalCapabilities } from "./external-capabilities.js";
 import type { McpConnections } from "./mcp/index.js";
@@ -22,7 +22,12 @@ import type {
   UserMessage,
 } from "./message.js";
 import { createRunDiagnostic } from "./model/model-diagnostics.js";
-import { ModelRequestError, type ModelStream, type ModelUsage } from "./model/model-stream.js";
+import {
+  type ModelRequest,
+  ModelRequestError,
+  type ModelStream,
+  type ModelUsage,
+} from "./model/model-stream.js";
 import type { CollaborationSnapshot } from "./multi-agent/index.js";
 import { reviewToolApproval } from "./permission/auto-review.js";
 import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission/permission-mode.js";
@@ -42,8 +47,6 @@ import { createMemoryTools, type MaintainMemory } from "./tool/memory-tools.js";
 import { createToolRunner, type ToolApprovalPlan, type ToolRunner } from "./tool/tool-runner.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
-
-/** 枚举 Run 对外交付的活动阶段。 */
 export type RunPhase =
   | "requesting_model"
   | "retrying_model"
@@ -51,21 +54,15 @@ export type RunPhase =
   | "reviewing_tool"
   | "awaiting_tool_approval"
   | "executing_tool";
-
-/** 描述公开状态中当前 Run 的身份与阶段。 */
 export type ActiveRun = Readonly<{
   runId: string;
   phase: RunPhase;
 }>;
-
-/** 描述一个已经通过校验和预检、即将真实执行的 Tool 动作。 */
 export type ToolActivity = Readonly<{
   toolCallId: string;
   toolName: string;
   summary: string;
 }>;
-
-/** 描述交互 Adapter 需要呈现的一次副作用 Tool 确认请求。 */
 export type ToolApprovalRequest = Readonly<{
   toolApprovalRequestId: string;
   toolCallId: string;
@@ -79,18 +76,12 @@ export type ToolApprovalRequest = Readonly<{
   riskSummary: string;
   executionBoundary: string;
 }>;
-
-/** 表示 TUI 对当前 Tool 确认响应的同步接纳结果。 */
 export type ToolApprovalResponse =
   | Readonly<{ status: "accepted" }>
   | Readonly<{ status: "rejected"; reason: "not_pending" | "request_mismatch" }>;
-
-/** 表示权限模式切换已经生效，或因活动 Run 被拒绝。 */
 export type PermissionModeChangeResult =
   | Readonly<{ status: "accepted"; permissionMode: PermissionMode }>
   | Readonly<{ status: "rejected"; reason: "busy" | "closed" }>;
-
-/** 提供交互 Adapter 可读取但不能修改的 Agent 状态快照。 */
 export type AgentState = Readonly<{
   sessionId: string;
   workspaceRoot: string;
@@ -106,14 +97,10 @@ export type AgentState = Readonly<{
   lastRunDiagnostic?: RunDiagnostic | null;
   collaboration?: CollaborationSnapshot;
 }>;
-
-/** 枚举一个已接受 Run 的公开终态。 */
 export type FinishedPromptResult =
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "aborted" }>
   | Readonly<{ status: "failed"; error: string }>;
-
-/** 表示提示词被拒绝或完成一次 Run 后的结果。 */
 export type PromptResult =
   | Readonly<{
       status: "rejected";
@@ -203,11 +190,7 @@ export type AgentEvent = Readonly<{ memberSessionId?: string; memberName?: strin
         diagnostic?: RunDiagnostic;
       }>
   );
-
-/** 定义同步观察 AgentEvent 的监听器。 */
 export type AgentListener = (event: AgentEvent) => void;
-
-/** 暴露交互 Adapter 操作 Agent 所需的最小公开 Interface。 */
 export type SessionAgent = Readonly<{
   readonly state: AgentState;
   prompt(promptText: string): Promise<PromptResult>;
@@ -224,8 +207,6 @@ export type SessionAgent = Readonly<{
   external: ReturnType<typeof createExternalCapabilities>;
   subscribe(listener: AgentListener): () => void;
 }>;
-
-/** 配置内部 Model Stream 与已打开 Session 的 Agent 运行宿主。 */
 export type CreateAgentWithModelStreamOptions = Readonly<{
   modelStream: ModelStream;
   memoryDirectory?: string;
@@ -300,8 +281,6 @@ const SESSION_CHANGED_PROMPT_RESULT = Object.freeze({
 } as const);
 const CLOSED_PROMPT_RESULT = Object.freeze({ status: "rejected", reason: "closed" } as const);
 const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
-
-/** 使用内部 Model Stream 与已打开 Session 创建 Agent 运行宿主。 */
 export function createSessionAgent({
   modelStream,
   modelContext,
@@ -392,13 +371,18 @@ export function createSessionAgent({
         },
       })
     : undefined;
-  const toolRunner: ToolRunner = {
-    createPlan: (call, mode) =>
-      memoryTools?.createPlan(call, mode) ??
-      managedTools?.createPlan(call, mode) ??
-      external.createPlan(call, mode) ??
-      localToolRunner.createPlan(call, mode),
-  };
+  function createRequestToolRunner(
+    snapshot?: ReturnType<typeof external.prepareRequest>["mcpSnapshot"],
+  ): ToolRunner {
+    return {
+      createPlan: (call, mode) =>
+        memoryTools?.createPlan(call, mode) ??
+        managedTools?.createPlan(call, mode) ??
+        external.createPlan(call, mode, snapshot) ??
+        localToolRunner.createPlan(call, mode),
+    };
+  }
+  const toolRunner = createRequestToolRunner();
   const eventListeners = new Set<AgentListener>();
   let permissionMode = initialPermissionMode;
   let activeAssistantMessage: AssistantMessage | null = null;
@@ -471,8 +455,6 @@ export function createSessionAgent({
     currentRun.visibleReasoningActive = false;
     publishEvent({ type: "reasoning_end", runId: currentRun.runId });
   }
-
-  /** 注册事件监听器，并返回可重复调用的取消订阅函数。 */
   function subscribeToEvents(listener: AgentListener): () => void {
     eventListeners.add(listener);
     let subscribed = true;
@@ -828,8 +810,6 @@ export function createSessionAgent({
     })();
     return closeCompletionPromise;
   }
-
-  /** 接纳提示词、建立一次 Run，并把实际迭代委托给 Agent Loop。 */
   async function submitPrompt(
     promptText: string,
     internalInput?: AgentInputDetails,
@@ -914,6 +894,7 @@ export function createSessionAgent({
         return finishRun(currentRun, ABORTED_PROMPT_RESULT);
       }
       let contextFailure: string | null = null;
+      const requestToolRunners = new WeakMap<ModelRequest, ToolRunner>();
       const contextModelStream = contextController.wrapRun({
         ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
         lease: currentRun.sessionLease,
@@ -926,7 +907,12 @@ export function createSessionAgent({
             throw error;
           }
         },
-        extendRequest: (request) => external.project(request, currentRun.permissionMode),
+        extendRequest: (request, requestIdentity) => {
+          const prepared = external.prepareRequest(request, currentRun.permissionMode);
+          // 模型回复只能执行该请求看见的工具；并行成员和后续请求不会替换这里的快照。
+          requestToolRunners.set(requestIdentity, createRequestToolRunner(prepared.mcpSnapshot));
+          return prepared.request;
+        },
         emit: (event) => {
           if (event.type === "context_usage") publishEvent(event);
           else {
@@ -957,6 +943,7 @@ export function createSessionAgent({
         ],
         permissionMode: currentRun.permissionMode,
         toolRunner,
+        toolRunnerForRequest: (request) => requestToolRunners.get(request),
         artifactStore,
         abortController: currentRun.abortController,
         ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
@@ -1172,8 +1159,6 @@ export function createSessionAgent({
     }
     publishEvent({ type: "message_end", message });
   }
-
-  /** 将当前 Run 收敛到唯一终态。 */
   function finishRun(
     currentRun: ActiveRunOwnership,
     requestedResult: FinishedPromptResult,
@@ -1288,7 +1273,7 @@ export function createSessionAgent({
     async compact(signal: AbortSignal) {
       await sources.prepare(signal);
       await contextController.compact(
-        external.project(
+        external.prepareRequest(
           {
             systemPrompt: createCodingSystemPrompt(),
             messages: messageHistory.map((message) => {
@@ -1298,7 +1283,7 @@ export function createSessionAgent({
             tools: getToolDefinitions(permissionMode),
           },
           permissionMode,
-        ),
+        ).request,
         signal,
         (event) => {
           if (event.type === "context_usage") publishEvent(event);
@@ -1316,8 +1301,6 @@ export function createSessionAgent({
     subscribe: subscribeToEvents,
   });
 }
-
-/** 把内部 Loop 终态复制为由 Agent 拥有的公开结果。 */
 function toFinishedPromptResult(loopResult: AgentLoopResult): FinishedPromptResult {
   switch (loopResult.status) {
     case "completed":

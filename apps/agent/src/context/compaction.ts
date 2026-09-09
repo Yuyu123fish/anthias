@@ -12,7 +12,7 @@ import {
 } from "../prompts/compaction-prompt.js";
 import type { ContextBudget } from "./budget.js";
 import { estimateModelRequestTokens, estimateTextTokens } from "./budget.js";
-import type { ContextMessageEntry } from "./selection.js";
+import type { ContextMessageEntry } from "./projection.js";
 
 /** 摘要失败时交给上层的安全分类，不暴露 Provider 原始错误。 */
 export type CompactionErrorReason =

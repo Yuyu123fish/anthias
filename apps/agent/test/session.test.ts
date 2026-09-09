@@ -22,7 +22,7 @@ import {
   type SessionRunLease,
   type SessionShell,
 } from "../src/session/index.js";
-import { getSessionLockDirectory } from "../src/session/lock.js";
+import { getSessionLockDirectory, getSessionUsageDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
 const activeSessions = new Set<Session>();
@@ -357,6 +357,112 @@ describe("Session", () => {
         content: "different payload",
       }),
     ).rejects.toThrow("已绑定其他内容");
+  });
+  it.each(["idle", "held Run"] as const)(
+    "drains accepted coordination before closing a Session with %s writes and rejects later writes",
+    async (writeMode) => {
+      const fixtureRoot = await createTemporaryDirectory("anthias-session-close-queue-");
+      const sessionDirectory = join(fixtureRoot, "sessions");
+      const session = await createSession({
+        workspaceRoot: fixtureRoot,
+        sessionDirectory,
+        shell: TEST_SHELL,
+      });
+      const runLease =
+        writeMode === "held Run" ? await acquireSessionRun(session, randomUUID()) : null;
+      if (runLease !== null) {
+        await runLease.appendMessage({ role: "user", content: "finish before closing" });
+        await runLease.appendMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "finished" }],
+          status: "completed",
+        });
+      }
+      const finishPromise = runLease?.appendRunFinished({ status: "completed" });
+      const coordinationKey = randomUUID();
+      const acceptedAppend = session.appendCoordination({
+        kind: "team",
+        key: coordinationKey,
+        payload: { status: "closed" },
+      });
+      let closeCompleted = false;
+      const closePromise = session.close().then(() => {
+        closeCompleted = true;
+      });
+      await expect(
+        session.appendCoordination({ kind: "team", key: randomUUID(), payload: {} }),
+      ).rejects.toThrow("Session 已关闭");
+      await expect(session.acquireRun(randomUUID())).rejects.toThrow("Session 已关闭");
+      await Promise.all([finishPromise, acceptedAppend]);
+      if (runLease !== null) {
+        expect(closeCompleted).toBe(false);
+        await runLease.release();
+      }
+      await closePromise;
+      const persistedRecords = (
+        await readFile(join(session.storageDirectory, "session.jsonl"), "utf8")
+      )
+        .trimEnd()
+        .split("\n")
+        .slice(1)
+        .map(parseRecord);
+      expect(persistedRecords.at(-1)).toMatchObject({
+        type: "coordination",
+        key: coordinationKey,
+      });
+      expect(persistedRecords.at(-1)?.runId).toBeUndefined();
+      expect(persistedRecords).toEqual(session.records);
+      expectValidRecordChain(persistedRecords);
+      await expect(
+        access(getSessionUsageDirectory(sessionDirectory, session.sessionId)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
+      ).rejects.toThrow();
+    },
+  );
+
+  it("closes during Run lock acquisition without handing out a lease or retaining its usage marker", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-close-acquisition-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    let closeDuringAcquisition = false;
+    let sessionToClose: Session | null = null;
+    const closeCompletion = Promise.withResolvers<void>();
+    const session = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+      lockSystem: {
+        processId: process.pid,
+        createOwnerToken() {
+          if (closeDuringAcquisition) {
+            closeDuringAcquisition = false;
+            if (sessionToClose === null) {
+              throw new Error("expected Session before acquiring a Run");
+            }
+            // 锁目录已经创建、凭据尚未交付时关闭，验证获取操作本身也受关闭队列收口。
+            sessionToClose.close().then(closeCompletion.resolve, closeCompletion.reject);
+          }
+          return randomUUID();
+        },
+        createTimestamp: () => new Date().toISOString(),
+        inspectProcess: () => "alive",
+      },
+    });
+    sessionToClose = session;
+    closeDuringAcquisition = true;
+    await expect(session.acquireRun(randomUUID())).resolves.toEqual({
+      status: "rejected",
+      reason: "session_busy",
+    });
+    await closeCompletion.promise;
+    expect(session.records).toEqual([]);
+    await expect(
+      access(getSessionUsageDirectory(sessionDirectory, session.sessionId)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
+    ).rejects.toThrow();
   });
   it("appends one completed text run and reopens its message projection", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-reopen-");

@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
-import type { JSONSchema7 } from "ai";
 import type { SkillSummary } from "./agent-controls.js";
-import { estimateTextTokens } from "./context/budget.js";
 import type { ContextSources } from "./context/sources.js";
 import type { McpConnections, McpContent } from "./mcp/index.js";
+import {
+  createMcpToolSnapshot,
+  type McpToolSnapshot,
+  resolveMcpTool,
+} from "./mcp/tool-snapshot.js";
 import type { AssistantToolCallPart } from "./message.js";
 import type { ModelRequest } from "./model/model-stream.js";
 import type { PermissionMode } from "./permission/permission-mode.js";
@@ -24,8 +27,7 @@ export function createExternalCapabilities(options: {
 }) {
   const activeSources = options.sources.active;
   const skillDiagnostics = new Map<string, string>();
-  let visibleMcpTools = new Set<string>();
-  let omittedMcpTools = 0;
+  let lastPreparedMcpDiagnostics: readonly string[] = [];
   const saveSource = options.sources.save;
 
   async function activate(id: string | null, signal?: AbortSignal, replace = true) {
@@ -143,7 +145,7 @@ export function createExternalCapabilities(options: {
     return directory;
   }
 
-  function project(request: ModelRequest, permissionMode: PermissionMode): ModelRequest {
+  function prepareRequest(request: ModelRequest, permissionMode: PermissionMode) {
     const directory = directoryItems();
     const hasSkills =
       directory.length > 0 || [...activeSources.values()].some((source) => source.kind === "skill");
@@ -188,28 +190,21 @@ export function createExternalCapabilities(options: {
           },
         },
       });
-    let omittedTools = 0;
-    if (permissionMode !== "plan")
-      for (const tool of [...(options.mcp?.tools() ?? [])].sort((left, right) =>
-        left.name.localeCompare(right.name),
-      )) {
-        const definition = {
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema as JSONSchema7,
-        };
-        if (
-          extraTools.length >= 64 ||
-          estimateTextTokens(JSON.stringify([...extraTools, definition])) > 12000
-        ) {
-          omittedTools += 1;
-          continue;
-        }
-        extraTools.push(definition);
-      }
-    omittedMcpTools = omittedTools;
-    visibleMcpTools = new Set(extraTools.map((tool) => tool.name));
-    return { ...request, tools: [...request.tools, ...extraTools] };
+    const mcpSnapshot = createMcpToolSnapshot({
+      tools: options.mcp?.tools() ?? [],
+      reservedDefinitions: extraTools,
+      permissionMode,
+    });
+    lastPreparedMcpDiagnostics = mcpSnapshot.omittedToolCount
+      ? [`${mcpSnapshot.omittedToolCount} 个工具定义超出当前请求预算，未提供给模型。`]
+      : [];
+    return Object.freeze({
+      request: {
+        ...request,
+        tools: [...request.tools, ...extraTools, ...mcpSnapshot.definitions],
+      },
+      mcpSnapshot,
+    });
   }
 
   async function saveMcpContent(
@@ -242,9 +237,11 @@ export function createExternalCapabilities(options: {
   function createPlan(
     call: AssistantToolCallPart,
     permissionMode: PermissionMode,
+    mcpSnapshot?: McpToolSnapshot,
   ): ToolCallPlan | null {
     const managed = ["load_skill", "read_skill", "read_mcp_resource"].includes(call.toolName);
-    const mcpTool = options.mcp?.tools().find((tool) => tool.name === call.toolName);
+    const snapshotTool = resolveMcpTool(mcpSnapshot, call.toolName);
+    const mcpTool = snapshotTool?.tool;
     if (!managed && !mcpTool) return null;
     if (call.invalid || !isRecord(call.input)) return rejected("外部 Tool 输入必须是有效对象。");
     const input = call.input;
@@ -265,8 +262,7 @@ export function createExternalCapabilities(options: {
     }
     if (mcpTool && permissionMode === "plan")
       return rejected("Plan 模式不允许执行未知副作用的 MCP Tool。", true);
-    if (mcpTool && !visibleMcpTools.has(mcpTool.name))
-      return rejected("MCP Tool 定义未进入当前请求预算。");
+    if (mcpTool && !snapshotTool?.visible) return rejected("MCP Tool 定义未进入当前请求预算。");
     if (mcpTool) {
       const validation = options.mcp?.validateToolCall(mcpTool.name, input, mcpTool.generation);
       if (!validation?.ok)
@@ -390,10 +386,9 @@ export function createExternalCapabilities(options: {
   }
 
   return {
-    project,
+    prepareRequest,
     directory: () => JSON.stringify(directoryItems()),
-    mcpDiagnostics: () =>
-      omittedMcpTools ? [`${omittedMcpTools} 个工具定义超出当前请求预算，未提供给模型。`] : [],
+    mcpDiagnostics: () => lastPreparedMcpDiagnostics,
     createPlan,
     activate,
     listSkills,

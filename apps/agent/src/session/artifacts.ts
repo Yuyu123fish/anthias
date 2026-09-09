@@ -68,17 +68,17 @@ export type SessionArtifactStore = Readonly<{
 }>;
 
 type WriterState = {
-  readonly artifactId: string; // 产物 ID
-  readonly toolCallId: string; // 绑定的 ToolCall ID
-  readonly temporaryPath: string; // 临时文件路径
-  readonly finalPath: string; // 最终文件路径
-  fileHandle: FileHandle | null; // 当前文件句柄
-  queue: Promise<void>; // 写入队列链
-  finishPromise: Promise<ToolArtifactReference | null> | null; // 完成写入的 Promise
-  pendingByteLength: number; // 队列待写入的字节数
-  byteLength: number; // 已写入的总字节数
-  incompleteReason: ToolArtifactIncompleteReason | null; // 不完整的原因（如果有）
-  finalized: boolean; // 是否已完成和关闭
+  readonly artifactId: string;
+  readonly toolCallId: string;
+  readonly temporaryPath: string;
+  readonly finalPath: string;
+  fileHandle: FileHandle | null;
+  queue: Promise<void>;
+  finishPromise: Promise<ToolArtifactReference | null> | null;
+  pendingByteLength: number;
+  byteLength: number;
+  incompleteReason: ToolArtifactIncompleteReason | null;
+  finalized: boolean;
 };
 
 type ArtifactCursor = Readonly<{
@@ -325,7 +325,7 @@ export function createSessionArtifactStore(
             ? "aborted"
             : "source_failed";
       await closeFileHandle(state);
-      const incompleteReason = state.incompleteReason ?? sourceReason; // 不完整的原因（如果有）
+      const incompleteReason = state.incompleteReason ?? sourceReason;
 
       if (!retain) {
         await removeTemporaryFile(state.temporaryPath);

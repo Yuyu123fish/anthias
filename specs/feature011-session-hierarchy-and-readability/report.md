@@ -4,11 +4,11 @@
 
 ## 开发者速览
 
-> **一句话**：Plan 01 已实现新成员归入根目录，并兼容旧历史与整组清理。<br>
-> **核心做法**：位置规则集中在 locations，清理记录全部身份、只移动互不包含的物理源。<br>
-> **边界**：核心 Runtime 整理与 TUI 呈现尚未实施，未改公开 Agent 接口。<br>
-> **风险 / 未验证**：真实 Provider、人工终端体验与后续两个 Plan 尚未验证。<br>
-> **当前 / 请审阅**：Plan 01 已实现，等待开发者审查；后续两个 Plan 尚未开始。
+> **一句话**：Plan 01、02 已完成实现和本地验证，核心独立审查通过。<br>
+> **核心做法**：会话归属、完整 Tool 批次、写入队列和请求投影各有明确持有者。<br>
+> **边界**：核心保持既有权限与持久化语义，TUI 尚未实施。<br>
+> **风险 / 未验证**：真实 Provider、人工终端体验与最终全量验证尚未完成。<br>
+> **当前 / 请审阅**：Plan 01 已提交 aea8813；Plan 02 审查通过，提交后继续 Plan 03。
 
 ## Plan 01 的结果
 
@@ -67,10 +67,45 @@
 
 本增量完成一次独立有界源码核对，统筹复核关键清理判断。核对发现未知目录内容删除与已知坏成员影响无关组两处缺口，修复后只复验定位/清理套件。关于旧 Windows pending 分隔符的疑点，经 HEAD 基线确认 groups 与 cleanup 持久化始终写入正斜杠，未确认实际兼容回退；没有借此扩大状态迁移范围。完整 Feature 的最终独立审查仍在 Plan 03。
 
+
+## Plan 02 的结果
+
+接续 aea8813。运行核心保持现有公开行为、日志 Schema、权限及并发语义，集中原来散在装配、循环和转换闭包中的协议。Agent package 入口与 AgentControls 改动均为 0，仍为两个生产 package；新文件均为内部实现。
+
+| 真实调用者 | 之前的阅读负担 | 当前入口与保证 |
+| --- | --- | --- |
+| Agent 创建、切换与关闭 | 根/成员装配嵌在公开控制里，primary/coordinator 通过未初始化捕获互访 | runtime.createAgentRuntime 按共享资源 → coordinator → primary → 发布绑定装配；运行回调须在绑定后使用；close 先收齐成员再关根，MCP 连接和清理任务仍由稳定 Agent 关闭 |
+| collaboration.execute | 直接控制动作在公开路由逐项拼条件 | multi-agent.isDirectCollaborationControl 集中 list/result/wait/stop 分类，其余继续以 Tool Run 进入审批、持久化与取消协议 |
+| runAgentLoop | 模型生成和四并发 worker、审批门、结果预算互相穿插 | tool-batch.runToolBatch 完整推进一个响应的准备/屏障/审批/执行/提交；下游工具仍持有执行前复核，批次仍等待 worker 收齐，结果刷盘后才进入下一请求 |
+| SessionAgent、Context、协调层追加 | index 同时持有打开、恢复、多套追加状态及 activeRunAppend accessor 包 | writer 统一持有持久投影、Session 接受队列和 RunWriteState；运行/空闲复用 persistRecord，封口接受和持久终态明确区分，等待已接受写入后交还锁 |
+| Context 请求与摘要选择 | assembly、selection 和 includeAgentInputs 重复补位置，以小数 seq 约定插入点 | projection 对同一记录快照计算身份、完整 Tool 组与来源位置；selection 复用分组选择覆盖范围；真实用户边界、来源撤销和先持久化摘要再采用继续保持 |
+| SessionAgent 模型请求到 MCP Tool | 最近一次投影覆盖闭包里的可见集合 | prepareRequest 同时返回请求和不可变快照；本 Run 按原 ModelRequest 身份绑定 Runner，执行只消费该快照，mcp/index 的连接 generation/schema 执行前校验继续保持 |
+| Git 继续/中止与恢复 | 两条操作各自解释集成阶段和实际状态 | integration.planIntegrationResolution 共用恢复判断；intent → cherry-pick → staged/conflicted，Git commit → committed 事实 → worktree 摘要顺序保持 |
+
+Context 的 assembly.ts 已删除，历史装配实质归入 projection.ts；mcp/index.ts 不增加一层转发，继续持有原连接生命周期。Session index 保留创建/打开、恢复和身份绑定，writer 持有可变写入状态；原 Session 的 17 个成员及 lease 的 10 个行为保持兼容。
+
+本次还删除了 Runtime/Loop/SessionAgent 和 artifacts 触及链中复述类型、字段、循环或函数名的注释。保留或重写构造可用时点、成员候选记忆限制、持久化前后、取消收齐与执行来源的中文原因；没有按注释覆盖率批量补说明。
+
+独立审查分两组完成：Session writer 由非作者核对；Runtime、Tool、Context/MCP 和 Git 由另一位非作者核对，未发现阻塞问题。审查没有重复已执行的测试。
+
+### Plan 02 验证
+
+| 验证 | 结果 |
+| --- | --- |
+| Runtime/Tool 分区（Plan 所列 8 文件） | 70/70 通过，覆盖直接控制、忙闲、审批、取消、续轮、完整工具循环及多 Agent 衔接 |
+| Session 分区（2 文件） | 40/40 通过，新增关闭前已接受追加、关闭后拒绝新请求、锁凭据创建期间关闭三个场景 |
+| Context/MCP 分区（6 文件，含新增 mcp-tool-snapshot.test.ts） | 最终 41/41 通过；旧预算夹具补持久 entryId 后只复跑 selection 的 6 项，其余 5 文件结果复用 |
+| Git 分区（3 文件） | 12/12 通过，新增 staged 树变化时恢复拒绝及 committed 已落盘但摘要失败后的恢复 |
+| pnpm check / pnpm build | 集成版本通过；首次 check 在协作文件尚未格式化时失败，格式完成后通过，旧 useTemplate 仅信息提示 |
+
+合计 163 项不同测试通过。Context 回归同时覆盖完整双 ToolResult、穿插的 agent_input、来源更新/撤销、持久切点与恢复；MCP 回归验证连续请求的可见性隔离、预算省略与执行时 generation 复核。测试均在 Windows、Node v24.13.1、pnpm 10.33.0 下使用本地确定性流或本地 MCP/Git 夹具。没有真实 Provider 或远端 Git 调用。
+
+Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建期间关闭；既有 refreshAfterUsageOnlyAppend 等待期间仍可能交付 lease，close 随后等待持有者释放。该判断与 aea8813 相同，本次未扩张为新的取消语义，也不宣称测试覆盖获取锁全过程。
+
 ## 未完成范围与验收
 
-- Plan 02：Runtime、Tool 批次、Session writer、Context 投影、MCP 请求快照、Git 集成及对应命名/注释尚未实施。
+- Plan 02：实现、定向验证与独立衔接审查已完成。
 - Plan 03：根会话概览、成员过程收拢、TUI 呈现状态、共享文案与命令声明尚未实施；当前 TUI 行为不作为归组呈现已完成的证据。
-- Spec A01–A03、A05–A08 对应本增量；A04、A09–A13 及完整 A14–A15 仍待后续 Plan。当前源码与注释整改仅覆盖本次存储链。
+- Spec A01–A03、A05–A12 已有分区证据；A04、A13 及完整 A14–A15 留到 Plan 03。
 - 未做真实 Provider、OS 沙箱、真实用户数据迁移/删除或人工终端验收。已完成 Research 归档不表示沙箱能力已实现。
-- 分支仍为 main，未提交、未推送、未创建 PR。开发者于 2026-09-09 明确授权连续完成 Feature，每个 Plan 审查通过后提交；本 Feature 不再逐阶段等待用户确认。
+- 分支仍为 main，Plan 01 已提交 aea8813，未推送、未创建 PR。开发者于 2026-09-09 明确授权连续完成 Feature，每个 Plan 审查通过后提交；本 Feature 不再逐阶段等待用户确认。

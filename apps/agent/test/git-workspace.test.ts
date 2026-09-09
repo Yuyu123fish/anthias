@@ -199,6 +199,73 @@ describe("Git workspace", { timeout: 60_000 }, () => {
     );
   });
 
+  it("refuses both recovery actions when a restored staged tree has changed", async () => {
+    const fixture = await createRepositoryFixture();
+    const worktree = await fixture.workspace.createWorktree({});
+    await writeFile(join(worktree.path, "a.txt"), "member result\n");
+    const result = await fixture.workspace.commit({
+      worktreeId: worktree.id,
+      paths: ["a.txt"],
+      message: "staged result",
+    });
+    await fixture.workspace.integrate({ worktreeId: worktree.id, commit: result.commit });
+
+    const restored = createGitWorkspace(fixture.workspaceOptions);
+    await writeFile(join(fixture.repositoryRoot, "a.txt"), "changed after staging\n");
+    await git(fixture.repositoryRoot, "add", "a.txt");
+    const recordCount = fixture.workspaceOptions.readRecords().length;
+
+    await expect(restored.resolveIntegration({ action: "continue" })).rejects.toThrow(
+      "暂存结果在审批后已经变化",
+    );
+    await expect(restored.resolveIntegration({ action: "abort" })).rejects.toThrow(
+      "集成暂存结果已经变化",
+    );
+    expect(fixture.workspaceOptions.readRecords()).toHaveLength(recordCount);
+    expect((await git(fixture.repositoryRoot, "rev-parse", "HEAD")).trim()).toBe(
+      fixture.baseCommit,
+    );
+    expect(normalizeLines(await readFile(join(fixture.repositoryRoot, "a.txt"), "utf8"))).toBe(
+      "changed after staging\n",
+    );
+  });
+
+  it("restores committed integration when the worktree summary could not be persisted", async () => {
+    const fixture = await createRepositoryFixture();
+    const worktree = await fixture.workspace.createWorktree({});
+    await writeFile(join(worktree.path, "a.txt"), "member result\n");
+    const result = await fixture.workspace.commit({
+      worktreeId: worktree.id,
+      paths: ["a.txt"],
+      message: "durable integration",
+    });
+    const interrupted = createGitWorkspace({
+      ...fixture.workspaceOptions,
+      appendRecord: async (record) => {
+        if (record.kind === "worktree") throw new Error("worktree summary unavailable");
+        await fixture.workspaceOptions.appendRecord(record);
+      },
+    });
+    await interrupted.integrate({ worktreeId: worktree.id, commit: result.commit });
+
+    await expect(interrupted.resolveIntegration({ action: "continue" })).rejects.toThrow(
+      "worktree summary unavailable",
+    );
+    const integrationCommit = (await git(fixture.repositoryRoot, "rev-parse", "HEAD")).trim();
+    expect(integrationCommit).not.toBe(fixture.baseCommit);
+    expect(interrupted.listWorktrees()[0]?.integrated).toBe(false);
+
+    const restored = createGitWorkspace(fixture.workspaceOptions);
+    expect(restored.listWorktrees()[0]).toMatchObject({
+      integrated: true,
+      integrationCommit,
+    });
+    await expect(restored.resolveIntegration({ action: "continue" })).rejects.toThrow(
+      "当前没有待处理的 Git 集成",
+    );
+    expect((await git(fixture.repositoryRoot, "rev-parse", "HEAD")).trim()).toBe(integrationCommit);
+  });
+
   it("removes clean empty or explicitly discarded worktrees but keeps dirty worktrees", async () => {
     const fixture = await createRepositoryFixture();
     const empty = await fixture.workspace.createWorktree({});

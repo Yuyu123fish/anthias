@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ContextBudget } from "../src/context/budget.js";
 import { generateCompactionSummary } from "../src/context/compaction.js";
-import type { ContextMessageEntry } from "../src/context/selection.js";
+import type { ContextMessageEntry } from "../src/context/projection.js";
 import type {
   ModelRequest,
   ModelStream,
@@ -29,6 +29,7 @@ function createBudget(
 
 function createEntry(entryId: string, seq: number, content: string): ContextMessageEntry {
   return Object.freeze({
+    recordType: "message",
     entryId,
     seq,
     message: Object.freeze({ role: "user" as const, content }),
