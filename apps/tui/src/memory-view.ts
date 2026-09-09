@@ -1,4 +1,5 @@
 import type { Agent, MemoryAction, MemoryEntry, MemorySnapshot } from "@anthias/agent";
+import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 
 export function formatMemory(snapshot: MemorySnapshot): string {
@@ -61,16 +62,15 @@ export async function runMemoryCommand(
   argumentsText: string,
   agent: Agent,
   notice: (text: string) => void,
-  rejected: (() => void) | undefined = undefined,
-) {
+): Promise<CommandResult> {
   const [operation = "", first, second, ...remaining] = argumentsText.trim().split(/\s+/u);
-  const report = (result: Awaited<ReturnType<Agent["memory"]["query"]>>) => {
-    if (!result.ok) rejected?.();
+  const report = (result: Awaited<ReturnType<Agent["memory"]["query"]>>): CommandResult => {
     notice(result.ok ? formatMemory(result.value) : result.error);
+    return { kind: result.ok ? "handled" : "rejected" };
   };
   if (operation === "help") {
     notice(MEMORY_HELP);
-    return;
+    return { kind: "handled" };
   }
   if (operation === "" || operation === "list" || operation === "all") {
     const kind = first === "user" || first === "experience" ? first : undefined;
@@ -78,28 +78,25 @@ export async function runMemoryCommand(
       (value) => value === second,
     );
     if ((first && !kind) || (second && !status) || remaining.length) {
-      rejected?.();
       notice(MEMORY_HELP);
-      return;
+      return { kind: "rejected" };
     }
-    report(
+    return report(
       await agent.memory.query({
         status: status ?? "all",
         scope: operation === "all" ? "all" : "current",
         ...(kind ? { kind } : {}),
       }),
     );
-    return;
   }
   if (operation === "show" && first && !second) {
     const result = await agent.memory.query({ id: first, scope: "all", status: "all" });
-    if (!result.ok) rejected?.();
     notice(
       result.ok
         ? result.value.entries.map(formatEntry).join("\n\n") || "未找到记忆。"
         : result.error,
     );
-    return;
+    return { kind: result.ok ? "handled" : "rejected" };
   }
   let action: MemoryAction;
   if ((operation === "on" || operation === "off") && !first) {
@@ -122,9 +119,8 @@ export async function runMemoryCommand(
       const snapshot = await agent.memory.query({ id: first, status: "all" });
       const entry = snapshot.ok ? snapshot.value.entries[0] : undefined;
       if (!entry) {
-        rejected?.();
         notice(snapshot.ok ? "未找到当前范围的记忆。" : snapshot.error);
-        return;
+        return { kind: "rejected" };
       }
       action = {
         action: "save",
@@ -142,14 +138,12 @@ export async function runMemoryCommand(
     )
       action = { action: "forget", id: first, revision, stopSending: remaining[0] === "no-send" };
     else {
-      rejected?.();
       notice(MEMORY_HELP);
-      return;
+      return { kind: "rejected" };
     }
   } else {
-    rejected?.();
     notice(MEMORY_HELP);
-    return;
+    return { kind: "rejected" };
   }
-  report(await agent.memory.execute(action));
+  return report(await agent.memory.execute(action));
 }

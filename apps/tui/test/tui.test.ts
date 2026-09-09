@@ -843,6 +843,29 @@ describe("daily usage interactions", () => {
     expect(harness.agent.prompt).not.toHaveBeenCalled();
   });
 
+  it("restores permission preview commands rejected by a pending tool approval", async () => {
+    const harness = createHarness(true, 140, 36, undefined, {
+      pendingToolApproval: approvalRequest(),
+      running: true,
+    });
+    await screenContains(harness.terminal, "Workspace:");
+    for (const command of ["/permissions grant", "/permissions command -- pnpm test"]) {
+      harness.terminal.send("\u0015");
+      harness.terminal.send(command);
+      harness.terminal.send("\r");
+      await vi.waitFor(async () => {
+        await harness.terminal.flush();
+        expect(harness.terminal.text().replace(/\s/gu, "")).toContain(
+          "新增工作区授权不会批准当前动作",
+        );
+        expect(harness.terminal.text().split("\n").slice(-5).join("\n")).toContain(command);
+      });
+    }
+    expect(harness.agent.permissions.grant).not.toHaveBeenCalled();
+    expect(harness.agent.respondToToolApproval).not.toHaveBeenCalled();
+    expect(harness.agent.prompt).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit reviewed grant and keeps revocation available during a run", async () => {
     const harness = createHarness(true, 110, 30);
     await screenContains(harness.terminal, "Workspace:");

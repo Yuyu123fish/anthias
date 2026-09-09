@@ -164,7 +164,6 @@ type SourceOrderStartGate = Readonly<{
 type ToolResultBudget = {
   tokenBudgetPerResult: number;
   remainingTokens: number;
-  remainingResults: number;
 };
 
 const SAFE_MODEL_ERROR = "模型请求失败，请检查模型配置或稍后重试。";
@@ -460,8 +459,8 @@ async function executeConcurrentToolBatch(
 async function formToolResultMessage(
   plannedToolCall: PlannedToolCall,
   options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
-  resultTokenBudget?: number,
+  startGate: SourceOrderStartGate,
+  resultTokenBudget: number,
 ): Promise<ToolResultMessage> {
   const { plan, toolCall } = plannedToolCall;
   const preparationWaitResult = await waitForPreparationOrAbort(
@@ -510,14 +509,14 @@ async function executePreparedToolCall(
   plannedToolCall: PlannedToolCall,
   preparedExecution: PreparedToolExecution,
   options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
-  resultTokenBudget?: number,
+  startGate: SourceOrderStartGate,
+  resultTokenBudget: number,
 ): Promise<ToolResultMessage> {
   const { toolCall, sourceIndex } = plannedToolCall;
   let toolApprovalRequestId: string | null = null;
   const approvalPlan = preparedExecution.approval;
   if (approvalPlan !== null) {
-    await startGate?.waitForTurn(sourceIndex);
+    await startGate.waitForTurn(sourceIndex);
     // 需要人工确认的 ToolCall，切换到等待人工确认阶段
     options.updatePhase("awaiting_tool_approval");
     const approval = await options.requestToolApproval(toolCall, approvalPlan);
@@ -703,11 +702,8 @@ function createSourceOrderStartGate(toolCallCount: number): SourceOrderStartGate
 /** 对不执行的调用也按源顺序释放后续 start gate。 */
 async function skipExecutionStart(
   sourceIndex: number,
-  startGate: SourceOrderStartGate | null,
+  startGate: SourceOrderStartGate,
 ): Promise<void> {
-  if (startGate === null) {
-    return;
-  }
   await startGate.waitForTurn(sourceIndex);
   startGate.completeTurn(sourceIndex);
 }
@@ -718,11 +714,9 @@ async function publishExecutionStart(
   toolApprovalRequestId: string | null,
   activitySummary: string,
   options: RunAgentLoopOptions,
-  startGate: SourceOrderStartGate | null,
+  startGate: SourceOrderStartGate,
 ): Promise<boolean> {
-  if (startGate !== null) {
-    await startGate.waitForTurn(plannedToolCall.sourceIndex);
-  }
+  await startGate.waitForTurn(plannedToolCall.sourceIndex);
   try {
     if (options.abortController.signal.aborted) {
       return false;
@@ -736,7 +730,7 @@ async function publishExecutionStart(
     });
     return true;
   } finally {
-    startGate?.completeTurn(plannedToolCall.sourceIndex);
+    startGate.completeTurn(plannedToolCall.sourceIndex);
   }
 }
 
@@ -786,7 +780,6 @@ function createToolResultBudget(resultCount = 1): ToolResultBudget {
       Math.max(1, Math.floor(TOOL_RESULT_BATCH_TOKEN_LIMIT / normalizedResultCount)),
     ),
     remainingTokens: TOOL_RESULT_BATCH_TOKEN_LIMIT,
-    remainingResults: normalizedResultCount,
   };
 }
 
@@ -811,7 +804,6 @@ function boundToolResultForBudget(
   const resultContent = boundedContent.content || getTerminalStateContent(toolResultMessage.status);
   const consumedTokens = Math.min(availableTokenBudget, estimateTextTokens(resultContent));
   toolResultBudget.remainingTokens = Math.max(0, toolResultBudget.remainingTokens - consumedTokens);
-  toolResultBudget.remainingResults = Math.max(0, toolResultBudget.remainingResults - 1);
   return Object.freeze({
     ...toolResultMessage,
     content: resultContent,

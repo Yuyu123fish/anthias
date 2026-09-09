@@ -5,6 +5,7 @@ import type {
   GitAction,
   MemberSummary,
 } from "@anthias/agent";
+import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 
 const statusNames: Record<MemberSummary["status"], string> = {
@@ -68,9 +69,7 @@ export async function runCollaborationCommand(
   args: string,
   agent: Agent,
   notice: (text: string) => void,
-  rejected: (() => void) | undefined = undefined,
-): Promise<boolean> {
-  if (!["agents", "agent", "team", "git"].includes(name)) return false;
+): Promise<CommandResult> {
   const tokens = args.trim().split(/\s+/u).filter(Boolean);
   const operation = tokens[0];
   function after(count: number) {
@@ -78,17 +77,17 @@ export async function runCollaborationCommand(
     for (let index = 0; index < count; index++) rest = rest.replace(/^\S+\s*/u, "");
     return rest;
   }
-  async function dispatch(action: CollaborationAction) {
+  async function dispatch(action: CollaborationAction): Promise<CommandResult> {
     const result = await agent.collaboration.execute(action);
-    if (!result.ok) rejected?.();
     notice(result.ok ? renderResult(result.value) : result.error);
+    return { kind: result.ok ? "handled" : "rejected" };
   }
   if (name === "agents" || (name === "team" && (!operation || operation === "tasks"))) {
     if (name === "agents" && tokens.length) {
-      rejected?.();
       notice("用法：/agents");
+      return { kind: "rejected" };
     } else notice(formatCollaboration(agent.collaboration.snapshot()));
-    return true;
+    return { kind: "handled" };
   }
   try {
     if (name === "git") {
@@ -131,15 +130,14 @@ export async function runCollaborationCommand(
         action = { ...input, action: "commit" } as GitAction;
       } else throw new Error("使用 /help 查看 Git 命令。");
       const result = await agent.git.execute(action);
-      if (!result.ok) rejected?.();
       notice(result.ok ? renderResult(result.value) : result.error);
-      return true;
+      return { kind: result.ok ? "handled" : "rejected" };
     }
     if ((name === "agent" && operation === "spawn") || (name === "team" && operation === "add")) {
       const writable = tokens[1] === "--write";
       const task = after(writable ? 2 : 1);
       if (!task) throw new Error("请给出成员任务。");
-      await dispatch({
+      return await dispatch({
         action: name === "agent" ? "spawn" : "team_add",
         task,
         writable,
@@ -149,7 +147,7 @@ export async function runCollaborationCommand(
       const offset = tokens[2] === undefined ? undefined : Number(tokens[2]);
       if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0))
         throw new Error("历史偏移必须是非负整数。");
-      await dispatch({
+      return await dispatch({
         action: "result",
         memberId: tokens[1],
         ...(offset === undefined ? {} : { offset }),
@@ -161,7 +159,7 @@ export async function runCollaborationCommand(
       tokens[2] &&
       tokens.length <= 4
     ) {
-      await dispatch({
+      return await dispatch({
         action: "result",
         memberId: tokens[1],
         artifactId: tokens[2],
@@ -173,29 +171,32 @@ export async function runCollaborationCommand(
       tokens[1] &&
       tokens.length === 2
     ) {
-      await dispatch({ action: "stop", memberId: tokens[1], release: operation === "release" });
+      return await dispatch({
+        action: "stop",
+        memberId: tokens[1],
+        release: operation === "release",
+      });
     } else if (name === "agent" && operation === "wait" && tokens[1] && tokens.length <= 4) {
-      await dispatch({ action: "wait", memberIds: tokens.slice(1) });
+      return await dispatch({ action: "wait", memberIds: tokens.slice(1) });
     } else if (name === "agent" && operation === "resume" && tokens[1]) {
-      await dispatch({
+      return await dispatch({
         action: "resume",
         memberId: tokens[1],
         ...(after(2) ? { task: after(2) } : {}),
       });
     } else if (name === "team" && operation === "create" && after(1)) {
-      await dispatch({ action: "team_create", name: after(1) });
+      return await dispatch({ action: "team_create", name: after(1) });
     } else if (name === "team" && operation === "close" && tokens.length === 1) {
-      await dispatch({ action: "team_close" });
+      return await dispatch({ action: "team_close" });
     } else if (name === "team" && operation === "assign" && tokens[1] && after(2)) {
-      await dispatch({ action: "task_assign", memberId: tokens[1], task: after(2) });
+      return await dispatch({ action: "task_assign", memberId: tokens[1], task: after(2) });
     } else if (name === "team" && operation === "message" && tokens[1] && after(2)) {
-      await dispatch({ action: "message", memberId: tokens[1], content: after(2) });
+      return await dispatch({ action: "message", memberId: tokens[1], content: after(2) });
     } else throw new Error("使用 /help 查看成员和 Team 命令。");
   } catch (error) {
-    rejected?.();
     notice(error instanceof Error ? error.message : "命令参数无效。");
+    return { kind: "rejected" };
   }
-  return true;
 }
 
 function renderResult(text: string): string {

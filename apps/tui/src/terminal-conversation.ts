@@ -196,8 +196,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     }
     const parsed = parseInput(text);
     try {
-      let promptText: string | undefined;
-      let commandRejected = false;
+      let promptText: string;
       if (parsed.type === "command") {
         const title = `/${parsed.name}`;
         if (parsed.name === "permissions" && parsed.argumentsText.trim() === "revoke") {
@@ -210,12 +209,9 @@ export function runTui(options: RunTuiOptions): Promise<number> {
           (["mcp", "resume", "skills"].includes(parsed.name) && parsed.argumentsText.trim())
         )
           notice("正在执行；Ctrl+C 可停止活动操作。", title);
-        promptText = await executeCommand(parsed, {
+        const commandResult = await executeCommand(parsed, {
           agent,
           notice: (message) => notice(message, title),
-          rejected() {
-            commandRejected = true;
-          },
           recoverDraft() {
             if (view !== undefined) view.recoverDraft();
             else notice("非交互输入不能编辑草稿，请重新输入上一条任务。", "/draft");
@@ -234,14 +230,13 @@ export function runTui(options: RunTuiOptions): Promise<number> {
           },
           permissions(choice) {
             if (agent.state.pendingToolApproval !== null) {
-              commandRejected = true;
               pendingWorkspaceGrantReview = undefined;
               view?.reviewPermissions(null);
               notice(
                 "当前有待执行的工具审批，请先用 /approval 处理；新增工作区授权不会批准当前动作。",
                 "/permissions",
               );
-              return;
+              return false;
             }
             const snapshot = agent.permissions.snapshot();
             pendingWorkspaceGrantReview = {
@@ -251,6 +246,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
             const text = formatPermissions(snapshot, agent.state.permissionMode, choice);
             if (view !== undefined) view.reviewPermissions(text);
             else notice(text, "/permissions");
+            return true;
           },
           details(direction) {
             if (view !== undefined) view.details(direction);
@@ -267,8 +263,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
             void exit();
           },
         });
+        if (commandResult.kind !== "prompt") return commandResult.kind === "handled";
+        promptText = commandResult.text;
       } else promptText = parsed.text;
-      if (promptText === undefined || exiting) return !commandRejected;
+      if (exiting) return true;
       if (submissionPending) {
         notice("Agent 正在处理当前输入，请等待完成或按 Ctrl+C 停止；本条输入未排队。");
         return false;

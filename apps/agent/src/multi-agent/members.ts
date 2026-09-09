@@ -274,6 +274,7 @@ export function createMembers(options: {
         summary: {
           sessionId: memberId,
           name: details.name?.trim() || "成员",
+          // 没有 Team 时是 subagent，否则是 teammate
           kind: details.teamId ? "teammate" : "subagent",
           status: "preparing",
           workspaceRoot: options.root.workspaceRoot,
@@ -295,6 +296,7 @@ export function createMembers(options: {
           signal.throwIfAborted();
           await save(member, member.summary);
           if (member.summary.writable) {
+            // 创建可写成员时，创建 worktree
             const worktree = await options.git.createWorktree(
               { memberSessionId: memberId, ...(details.ref ? { ref: details.ref } : {}) },
               member.controller.signal,

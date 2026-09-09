@@ -1,6 +1,7 @@
 import type { Agent, ContextUsage, PermissionMode, WorkspaceCommand } from "@anthias/agent";
 import type { AutocompleteProvider, SlashCommand } from "@earendil-works/pi-tui";
 import { createInputAutocomplete } from "./autocomplete.js";
+import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 import { formatRunDiagnostic } from "./diagnostic-view.js";
 import { runMemoryCommand } from "./memory-view.js";
@@ -234,39 +235,36 @@ export async function executeCommand(
     agent: Agent;
     notice(text: string): void;
     details(direction?: "prev" | "next"): void;
-    rejected?(): void;
     recoverDraft?(): void;
     approval?(): void;
-    permissions?(choice: PermissionGrantChoice): void;
+    permissions?(choice: PermissionGrantChoice): boolean;
     exit(): void;
   },
-): Promise<string | undefined> {
+): Promise<CommandResult> {
   const { agent, notice } = options;
   const argumentsText = command.argumentsText.trim();
   const args = argumentsText ? argumentsText.split(/\s+/u) : [];
-  if (command.name === "memory") {
-    await runMemoryCommand(command.argumentsText, agent, notice, options.rejected);
-    return;
-  }
-  if (await runCollaborationCommand(command.name, argumentsText, agent, notice, options.rejected))
-    return;
-  const report = (result: { ok: boolean; error?: string }, success: string) => {
-    if (!result.ok) options.rejected?.();
+  if (command.name === "memory") return runMemoryCommand(command.argumentsText, agent, notice);
+  if (["agents", "agent", "team", "git"].includes(command.name))
+    return runCollaborationCommand(command.name, argumentsText, agent, notice);
+  const report = (result: { ok: boolean; error?: string }, success: string): CommandResult => {
     notice(result.ok ? success : (result.error ?? "操作失败。"));
+    return { kind: result.ok ? "handled" : "rejected" };
   };
-  const invalid = () => {
-    options.rejected?.();
+  const invalid = (): CommandResult => {
     notice(`参数无效。使用 /help 查看 /${command.name} 的用法。`);
+    return { kind: "rejected" };
   };
   if (command.name.startsWith("skill:")) {
     const identity = command.name.slice(6);
     if (!identity) {
-      invalid();
-      return;
+      return invalid();
     }
     const result = await agent.skills.activate(identity);
-    report(result, `已激活 Skill ${identity}。`);
-    return result.ok && argumentsText ? command.argumentsText : undefined;
+    const commandResult = report(result, `已激活 Skill ${identity}。`);
+    return result.ok && argumentsText
+      ? { kind: "prompt", text: command.argumentsText }
+      : commandResult;
   }
   switch (command.name) {
     case "permissions": {
@@ -286,8 +284,7 @@ export async function executeCommand(
       } else if (args[0] === "command") {
         const addition = parsePermissionCommand(command.argumentsText.trimStart().slice(7));
         if (addition === null) {
-          invalid();
-          break;
+          return invalid();
         }
         const snapshot = agent.permissions.snapshot();
         const commands = [...(snapshot.grant?.commands ?? snapshot.availableCommands)];
@@ -300,59 +297,60 @@ export async function executeCommand(
           )
         )
           commands.push(addition.command);
-        options.permissions?.({
+        const accepted = options.permissions?.({
           remember: addition.remember || snapshot.grant?.remember || false,
           includeMembers: addition.includeMembers || snapshot.grant?.includeMembers || false,
           commands,
         });
+        return { kind: accepted === false ? "rejected" : "handled" };
       } else if (
         args[0] === "grant" &&
         args.slice(1).every((argument) => argument === "--remember" || argument === "--members") &&
         new Set(args.slice(1)).size === args.length - 1
       ) {
-        options.permissions?.({
+        const accepted = options.permissions?.({
           remember: args.includes("--remember"),
           includeMembers: args.includes("--members"),
         });
-      } else invalid();
+        return { kind: accepted === false ? "rejected" : "handled" };
+      } else return invalid();
       break;
     }
     case "diagnostics":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else notice(formatRunDiagnostic(agent.state.lastRunDiagnostic));
       break;
     case "continue":
-      return argumentsText
-        ? `继续上一任务。补充要求：\n${command.argumentsText}`
-        : "继续上一任务。先依据已保存消息、工具结果和当前工作区核对剩余工作，保留已经完成的成果，不重复已成功的副作用。";
+      return {
+        kind: "prompt",
+        text: argumentsText
+          ? `继续上一任务。补充要求：\n${command.argumentsText}`
+          : "继续上一任务。先依据已保存消息、工具结果和当前工作区核对剩余工作，保留已经完成的成果，不重复已成功的副作用。",
+      };
     case "draft":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else options.recoverDraft?.();
       break;
     case "approval":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else options.approval?.();
       break;
     case "help":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else notice(commandHelp());
       break;
     case "new":
-      if (args.length) invalid();
-      else report(await agent.sessions.create(), `新会话已创建。`);
-      break;
+      if (args.length) return invalid();
+      else return report(await agent.sessions.create(), `新会话已创建。`);
     case "resume": {
       if (args.length > 1) {
-        invalid();
-        break;
+        return invalid();
       }
       const identity = args[0];
       if (identity) {
-        report(await agent.sessions.open(identity), "会话已恢复。");
-        break;
+        return report(await agent.sessions.open(identity), "会话已恢复。");
       }
       const result = await agent.sessions.list();
-      if (!result.ok) options.rejected?.();
       notice(
         result.ok
           ? result.value.length
@@ -366,21 +364,19 @@ export async function executeCommand(
             : "没有可恢复的会话。"
           : result.error,
       );
-      break;
+      return { kind: result.ok ? "handled" : "rejected" };
     }
     case "context":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else notice(formatContextUsage(agent.state.contextUsage));
       break;
     case "compact":
-      if (args.length) invalid();
-      else report(await agent.compact(), "上下文已压缩，原始历史已保留。");
-      break;
+      if (args.length) return invalid();
+      else return report(await agent.compact(), "上下文已压缩，原始历史已保留。");
     case "mode": {
       const mode = args[0];
       if (args.length > 1 || (mode !== undefined && !isPermissionMode(mode))) {
-        invalid();
-        break;
+        return invalid();
       }
       if (mode === undefined)
         notice(
@@ -393,7 +389,6 @@ export async function executeCommand(
         );
       else {
         const result = agent.setPermissionMode(mode);
-        if (result.status === "rejected") options.rejected?.();
         notice(
           result.status === "accepted"
             ? [
@@ -404,6 +399,7 @@ export async function executeCommand(
                 .join("\n")
             : `暂时不能切换模式：${result.reason}`,
         );
+        return { kind: result.status === "accepted" ? "handled" : "rejected" };
       }
       break;
     }
@@ -412,12 +408,12 @@ export async function executeCommand(
         args.length > 1 ||
         (args[0] !== undefined && args[0] !== "reload" && args[0] !== "clear")
       ) {
-        invalid();
-        break;
+        return invalid();
       }
-      if (args[0] === "reload") report(await agent.skills.reload(), "Skill 目录已重新加载。");
+      if (args[0] === "reload")
+        return report(await agent.skills.reload(), "Skill 目录已重新加载。");
       else if (args[0] === "clear")
-        report(await agent.skills.activate(null), "当前激活的 Skill 内容已清除。");
+        return report(await agent.skills.activate(null), "当前激活的 Skill 内容已清除。");
       else {
         const skills = agent.skills.list();
         notice(
@@ -451,13 +447,12 @@ export async function executeCommand(
         identity &&
         args.length === 2
       ) {
-        report(
+        return report(
           await agent.mcp[operation](identity),
           `${identity} 已${operation === "connect" ? "连接" : "断开"}。`,
         );
       } else if (operation === "inspect" && identity && args.length === 2) {
         const result = await agent.mcp.inspect(identity);
-        if (!result.ok) options.rejected?.();
         notice(
           result.ok
             ? [
@@ -476,8 +471,12 @@ export async function executeCommand(
               ].join("\n")
             : result.error,
         );
+        return { kind: result.ok ? "handled" : "rejected" };
       } else if (operation === "read" && identity && name && args.length === 3) {
-        report(await agent.mcp.readResource(identity, name), "Resource 已加入当前外部上下文。");
+        return report(
+          await agent.mcp.readResource(identity, name),
+          "Resource 已加入当前外部上下文。",
+        );
       } else if (operation === "prompt" && identity && name) {
         const jsonText = argumentsText.replace(/^\S+\s+\S+\s+\S+\s*/u, "");
         let promptArguments: Record<string, string> | undefined;
@@ -490,37 +489,36 @@ export async function executeCommand(
               Array.isArray(parsed) ||
               Object.values(parsed).some((value) => typeof value !== "string")
             ) {
-              invalid();
-              break;
+              return invalid();
             }
             promptArguments = parsed as Record<string, string>;
           } catch {
-            invalid();
-            break;
+            return invalid();
           }
         }
-        report(
+        return report(
           await agent.mcp.getPrompt(identity, name, promptArguments),
           "Prompt 模板已加入当前外部上下文。",
         );
-      } else invalid();
+      } else return invalid();
       break;
     }
     case "details":
       if (args.length > 1 || (args[0] !== undefined && args[0] !== "prev" && args[0] !== "next"))
-        invalid();
+        return invalid();
       else options.details(args[0]);
       break;
     case "exit":
-      if (args.length) invalid();
+      if (args.length) return invalid();
       else options.exit();
       break;
     default:
-      options.rejected?.();
       notice(
         command.name ? `未知命令 /${command.name}。输入 /help 查看支持的命令。` : commandHelp(),
       );
+      return { kind: "rejected" };
   }
+  return { kind: "handled" };
 }
 
 export function formatContextUsage(usage: ContextUsage): string {

@@ -23,7 +23,9 @@ describe("slash commands", () => {
     ]) {
       const command = parseInput(line);
       if (command.type === "command")
-        await executeCommand(command, { agent, notice, details() {}, exit() {} });
+        await expect(
+          executeCommand(command, { agent, notice, details() {}, exit() {} }),
+        ).resolves.toEqual({ kind: "handled" });
     }
     expect(agent.memory.query).toHaveBeenCalledWith({ status: "all", scope: "current" });
     expect(agent.memory.query).toHaveBeenCalledWith({
@@ -93,7 +95,9 @@ describe("slash commands", () => {
     ]) {
       const command = parseInput(line);
       if (command.type === "command")
-        await executeCommand(command, { agent, notice, details, exit });
+        await expect(executeCommand(command, { agent, notice, details, exit })).resolves.toEqual({
+          kind: "handled",
+        });
     }
     expect(agent.prompt).not.toHaveBeenCalled();
     expect(agent.sessions.create).toHaveBeenCalledOnce();
@@ -123,15 +127,43 @@ describe("slash commands", () => {
       "/skill:",
       "/memory list invalid",
       "/memory list user invalid",
+      "/agents extra",
+      "/agent spawn",
     ]) {
       const command = parseInput(line);
       if (command.type === "command")
-        await executeCommand(command, { agent, notice, details() {}, exit() {} });
+        await expect(
+          executeCommand(command, { agent, notice, details() {}, exit() {} }),
+        ).resolves.toEqual({ kind: "rejected" });
     }
-    expect(notice).toHaveBeenCalledTimes(12);
+    expect(notice).toHaveBeenCalledTimes(14);
     expect(agent.sessions.create).not.toHaveBeenCalled();
     expect(agent.mcp.getPrompt).not.toHaveBeenCalled();
     expect(agent.skills.activate).not.toHaveBeenCalled();
+    expect(agent.prompt).not.toHaveBeenCalled();
+  });
+
+  it("propagates rejected memory and collaboration operations without command fallthrough", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    vi.mocked(agent.memory.query).mockResolvedValueOnce({ ok: false, error: "memory unavailable" });
+    vi.mocked(agent.collaboration.execute).mockResolvedValueOnce({
+      ok: false,
+      error: "member unavailable",
+    });
+    vi.mocked(agent.git.execute).mockResolvedValueOnce({ ok: false, error: "git unavailable" });
+    for (const line of ["/memory", "/agent spawn inspect files", "/git status"]) {
+      const command = parseInput(line);
+      if (command.type !== "command") throw new Error("Expected a local command");
+      await expect(
+        executeCommand(command, { agent, notice, details() {}, exit() {} }),
+      ).resolves.toEqual({ kind: "rejected" });
+    }
+    expect(notice.mock.calls.flat()).toEqual([
+      "memory unavailable",
+      "member unavailable",
+      "git unavailable",
+    ]);
     expect(agent.prompt).not.toHaveBeenCalled();
   });
 
@@ -144,12 +176,15 @@ describe("slash commands", () => {
       revoked: false,
       availableCommands: [{ command: "pnpm test", cwd: "." }],
     });
-    const permissions = vi.fn();
+    const permissions = vi.fn(() => true);
     const command = parseInput(
       '/permissions command --prefix --cwd "web app" -- python -u "check page.py"',
     );
     if (command.type !== "command") throw new Error("Expected a local command");
-    await executeCommand(command, { agent, permissions, notice: vi.fn(), details() {}, exit() {} });
+    const options = { agent, permissions, notice: vi.fn(), details() {}, exit() {} };
+    await expect(executeCommand(command, options)).resolves.toEqual({ kind: "handled" });
+    permissions.mockReturnValueOnce(false);
+    await expect(executeCommand(command, options)).resolves.toEqual({ kind: "rejected" });
     expect(permissions).toHaveBeenCalledWith({
       remember: true,
       includeMembers: true,
@@ -164,7 +199,7 @@ describe("slash commands", () => {
 
   it("starts command additions from the default scope and rejects malformed options", async () => {
     const { agent } = createFakeAgent();
-    const permissions = vi.fn();
+    const permissions = vi.fn(() => true);
     const notice = vi.fn();
     const options = { agent, permissions, notice, details() {}, exit() {} };
     for (const line of [
@@ -233,6 +268,14 @@ describe("slash commands", () => {
     expect(agent.permissions.revoke).toHaveBeenCalledOnce();
     expect(agent.state.permissionMode).toBe("full_access");
     expect(notice).toHaveBeenLastCalledWith(expect.stringContaining("FullAccess 仍然生效"));
+    vi.mocked(agent.permissions.revoke).mockResolvedValueOnce({
+      ok: false,
+      error: "revocation persistence failed",
+    });
+    await expect(
+      executeCommand({ type: "command", name: "permissions", argumentsText: "revoke" }, options),
+    ).resolves.toEqual({ kind: "handled" });
+    expect(notice).toHaveBeenCalledWith("revocation persistence failed");
     await executeCommand({ type: "command", name: "permissions", argumentsText: "" }, options);
     expect(notice).toHaveBeenLastCalledWith(expect.stringContaining("权限模式：FullAccess"));
     expect(agent.prompt).not.toHaveBeenCalled();
@@ -247,9 +290,12 @@ describe("slash commands", () => {
       name: "skill:typescript",
       argumentsText: "check this\n  preserve indentation",
     };
-    await expect(executeCommand(command, options)).resolves.toBe(command.argumentsText);
+    await expect(executeCommand(command, options)).resolves.toEqual({
+      kind: "prompt",
+      text: command.argumentsText,
+    });
     vi.mocked(agent.skills.activate).mockResolvedValueOnce({ ok: false, error: "ambiguous skill" });
-    await expect(executeCommand(command, options)).resolves.toBeUndefined();
+    await expect(executeCommand(command, options)).resolves.toEqual({ kind: "rejected" });
     expect(options.notice).toHaveBeenLastCalledWith("ambiguous skill");
   });
 
@@ -278,7 +324,9 @@ describe("slash commands", () => {
     ]) {
       const command = parseInput(line);
       if (command.type === "command")
-        await executeCommand(command, { agent, notice, details() {}, exit() {} });
+        await expect(
+          executeCommand(command, { agent, notice, details() {}, exit() {} }),
+        ).resolves.toEqual({ kind: "handled" });
     }
     expect(agent.collaboration.execute).toHaveBeenCalledWith({
       action: "spawn",
