@@ -72,6 +72,8 @@ export type ModelRequest = Readonly<{
   tools: readonly ModelToolDefinition[];
   purpose?: "response" | "compaction" | "approval";
   maxOutputTokens?: number;
+  /** 当前未完成生成已消耗的恢复次数；仅由 Agent 使用，不是 Provider 参数。 */
+  recoveryAttempt?: number;
 }>;
 
 /** 枚举 Agent 理解的模型完成原因。 */
@@ -91,6 +93,7 @@ export type ModelStreamEvent =
       type: "model_retry";
       phase: "waiting" | "requesting";
       retryCount: 1 | 2;
+      recoveryKind?: "continuation" | "approval";
       delayMs: number;
       diagnostic: RunDiagnostic;
     }>
@@ -155,6 +158,7 @@ export type AssistantMessageStreamEvent =
       message: AssistantMessage;
       modelInputMessage: ModelAssistantInputMessage;
       finishReason: ModelFinishReason | null;
+      retryAfterMs: number | null;
     }>;
 
 /**
@@ -182,7 +186,8 @@ export async function* streamAssistantMessage(
   const preparingToolCallIds = new Set<string>();
   let failureDiagnostic: RunDiagnostic | null = null;
   let usage: ModelUsage | null = null;
-  let retryCount = 0;
+  let retryCount = modelRequest.recoveryAttempt ?? 0;
+  let retryAfterMs: number | null = null;
   let hasInputFragments = false;
   let finishReason: ModelFinishReason | null = null;
   let reasoningState: "idle" | "pending" | "active" = "idle";
@@ -327,6 +332,7 @@ export async function* streamAssistantMessage(
     failureDiagnostic =
       error instanceof ModelRequestError ? error.diagnostic : createRunDiagnostic("unknown");
     retryCount = failureDiagnostic.retryCount ?? retryCount;
+    retryAfterMs = error instanceof ModelRequestError ? error.retryAfterMs : null;
   }
 
   if (reasoningState === "active") {
@@ -383,6 +389,7 @@ export async function* streamAssistantMessage(
       content: Object.freeze([...modelContent]),
     }),
     finishReason,
+    retryAfterMs,
   });
 }
 

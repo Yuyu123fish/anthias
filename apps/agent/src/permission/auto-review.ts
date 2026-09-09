@@ -4,11 +4,14 @@ import {
   estimateTextTokens,
 } from "../context/budget.js";
 import type { AssistantToolCallPart } from "../message.js";
-import type {
-  ModelFinishReason,
-  ModelRequest,
-  ModelStream,
-  ModelUsage,
+import { isRetryableModelDiagnostic } from "../model/model-diagnostics.js";
+import {
+  type ModelFinishReason,
+  type ModelRequest,
+  ModelRequestError,
+  type ModelStream,
+  type ModelStreamEvent,
+  type ModelUsage,
 } from "../model/model-stream.js";
 import { APPROVAL_REVIEW_SYSTEM_PROMPT } from "../prompts/approval-review-prompt.js";
 import type { SessionRecord } from "../session/schema.js";
@@ -16,7 +19,7 @@ import { hasOnlyKeys, isRecord } from "../tool/input-validation.js";
 import type { ToolApprovalPlan } from "../tool/tool-runner.js";
 
 export type ToolApprovalReviewResult = Readonly<{
-  decision: "allow" | "needs_user" | "aborted";
+  decision: "allow" | "needs_user" | "deny" | "aborted";
   reason: string;
   authorizationEntryIds: readonly string[];
 }>;
@@ -25,11 +28,15 @@ type ReviewToolApprovalOptions = Readonly<{
   modelStream: ModelStream;
   budget: ContextBudget;
   records: readonly SessionRecord[];
+  executionRecords: readonly SessionRecord[];
+  runId: string;
   workspaceRoot: string;
   toolCall: AssistantToolCallPart;
   approvalPlan: ToolApprovalPlan;
   abortSignal: AbortSignal;
   onUsage: (usage: ModelUsage | undefined) => Promise<void>;
+  onRetry?: (event: Extract<ModelStreamEvent, { type: "model_retry" }>) => void;
+  remainingTaskTimeMs?: () => number;
 }>;
 
 type AuthorizationSource = Readonly<{
@@ -50,7 +57,7 @@ const APPROVAL_INPUT_TOKEN_LIMIT = 8_000;
 const APPROVAL_OUTPUT_TOKEN_LIMIT = 2_000;
 const APPROVAL_OUTPUT_CHARACTER_LIMIT = 8_000;
 
-/** 对固定准备动作最多发起一次审核；用量持久化失败必须交回 Run 停止处理。 */
+/** 每个新动作独立核验授权；技术故障最多恢复一次，用量持久化失败立即停止 Run。 */
 export async function reviewToolApproval(
   options: ReviewToolApprovalOptions,
 ): Promise<ToolApprovalReviewResult> {
@@ -61,7 +68,7 @@ export async function reviewToolApproval(
     options.budget.modelMaxOutputTokens !== undefined &&
     options.budget.modelMaxOutputTokens < APPROVAL_OUTPUT_TOKEN_LIMIT
   ) {
-    return needsUser("模型输出能力不足以完成 2,000 token 审核，请人工确认。");
+    throw new ModelRequestError("configuration", { retryCount: 0 });
   }
   const inputTokenLimit = Math.min(
     APPROVAL_INPUT_TOKEN_LIMIT,
@@ -72,7 +79,7 @@ export async function reviewToolApproval(
     options.toolCall.toolName !== options.approvalPlan.toolName ||
     !/^[a-f0-9]{64}$/u.test(options.approvalPlan.actionFingerprint)
   ) {
-    return needsUser("待审动作信息无效，无法自动审核，请人工确认。");
+    throw new ModelRequestError("invalid_request", { retryCount: 0 });
   }
   if (estimateModelRequestTokens(createReviewRequest(options, [])) > inputTokenLimit) {
     return needsUser("完整动作超过自动审核输入预算，请人工确认。");
@@ -132,17 +139,80 @@ export async function reviewToolApproval(
     return abortedReview();
   }
 
+  let retryCount = 0;
+  for (;;) {
+    const attemptResult = await requestApprovalReview(options, modelRequest, authorizationSources);
+    if ("decision" in attemptResult) return attemptResult;
+    const { failure, retryable } = attemptResult;
+    const delayMs = Math.max(500, failure.retryAfterMs ?? 0);
+    const retryStopReason = !retryable
+      ? null
+      : retryCount >= 1
+        ? "exhausted"
+        : delayMs > 30_000
+          ? "wait_too_long"
+          : delayMs >= (options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY)
+            ? "deadline"
+            : null;
+    const requestFailure = new ModelRequestError(failure.diagnostic.category, {
+      ...failure.diagnostic,
+      retryAfterMs: failure.retryAfterMs,
+      retryCount,
+      retryStopReason,
+    });
+    if (!retryable || retryStopReason !== null) throw requestFailure;
+    options.onRetry?.({
+      type: "model_retry",
+      phase: "waiting",
+      retryCount: 1,
+      delayMs,
+      diagnostic: requestFailure.diagnostic,
+    });
+    if (!(await waitForReviewRetry(delayMs, options.abortSignal))) return abortedReview();
+    if ((options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY) <= 0)
+      throw new ModelRequestError(failure.diagnostic.category, {
+        ...failure.diagnostic,
+        retryCount,
+        retryStopReason: "deadline",
+      });
+    options.onRetry?.({
+      type: "model_retry",
+      phase: "requesting",
+      retryCount: 1,
+      delayMs: 0,
+      diagnostic: new ModelRequestError(failure.diagnostic.category, {
+        ...failure.diagnostic,
+        retryCount: 1,
+      }).diagnostic,
+    });
+    // 订阅者可同步取消；尚未进入下一次审核不能消耗用量或重新作出授权判断。
+    if (options.abortSignal.aborted) return abortedReview();
+    if ((options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY) <= 0)
+      throw new ModelRequestError(failure.diagnostic.category, {
+        ...failure.diagnostic,
+        retryCount,
+        retryStopReason: "deadline",
+      });
+    retryCount = 1;
+  }
+}
+
+async function requestApprovalReview(
+  options: ReviewToolApprovalOptions,
+  modelRequest: ModelRequest,
+  authorizationSources: readonly AuthorizationSource[],
+): Promise<
+  ToolApprovalReviewResult | Readonly<{ failure: ModelRequestError; retryable: boolean }>
+> {
   let responseText = "";
   let finishReason: ModelFinishReason | null = null;
   let usage: ModelUsage | undefined;
   let invalidResponse = false;
   let responseTooLarge = false;
-  let modelFailed = false;
+  let modelFailure: ModelRequestError | null = null;
   try {
     for await (const event of options.modelStream(modelRequest, options.abortSignal)) {
-      if (options.abortSignal.aborted) {
-        break;
-      }
+      if (options.abortSignal.aborted) break;
       if (event.type === "text_delta") {
         if (responseText.length + event.delta.length > APPROVAL_OUTPUT_CHARACTER_LIMIT) {
           responseTooLarge = true;
@@ -162,39 +232,79 @@ export async function reviewToolApproval(
       }
       // 审核 Reasoning 既不积累，也不发布到主对话或事件。
     }
-  } catch {
-    modelFailed = true;
+  } catch (error) {
+    modelFailure = error instanceof ModelRequestError ? error : new ModelRequestError("unknown");
   }
 
-  // 每个实际 attempt 恰好记一次；回调失败不能伪装为可继续执行的人工降级。
+  // 每个实际 attempt 恰好记一次；持久化失败不能进入模型重试或人工降级。
   await options.onUsage(usage);
-  if (options.abortSignal.aborted) {
-    return abortedReview();
+  if (options.abortSignal.aborted) return abortedReview();
+  if (modelFailure !== null)
+    return {
+      failure: modelFailure,
+      retryable: isRetryableModelDiagnostic(modelFailure.diagnostic),
+    };
+  if (finishReason === "error")
+    return { failure: new ModelRequestError("service", { usage: usage ?? null }), retryable: true };
+  if (
+    finishReason === "length" ||
+    responseTooLarge ||
+    estimateTextTokens(responseText) > APPROVAL_OUTPUT_TOKEN_LIMIT
+  )
+    return {
+      failure: new ModelRequestError("output_limit", {
+        providerFinishReason: finishReason,
+        usage: usage ?? null,
+      }),
+      retryable: true,
+    };
+  if (finishReason === "content_filter")
+    return {
+      failure: new ModelRequestError("content_filter", {
+        providerFinishReason: finishReason,
+        usage: usage ?? null,
+      }),
+      retryable: false,
+    };
+  if (invalidResponse || finishReason !== "stop" || usage === undefined)
+    return {
+      failure: new ModelRequestError("unknown", {
+        providerFinishReason: finishReason,
+        usage: usage ?? null,
+      }),
+      retryable: true,
+    };
+  try {
+    return parseReviewResult(
+      responseText,
+      new Set(authorizationSources.map((source) => source.entryId)),
+    );
+  } catch {
+    return {
+      failure: new ModelRequestError("unknown", {
+        providerFinishReason: finishReason,
+        usage: usage ?? null,
+      }),
+      retryable: true,
+    };
   }
-  if (modelFailed || finishReason === "error") {
-    return needsUser("自动审核模型调用失败，请人工确认。");
-  }
-  if (finishReason === "length") {
-    return needsUser("自动审核模型达到输出上限（output_limit），请人工确认。");
-  }
-  if (responseTooLarge || estimateTextTokens(responseText) > APPROVAL_OUTPUT_TOKEN_LIMIT) {
-    return needsUser("自动审核结果超过输出预算，请人工确认。");
-  }
-  if (invalidResponse) {
-    return needsUser("自动审核返回了不允许的工具调用，请人工确认。");
-  }
-  if (finishReason !== "stop") {
-    return needsUser("自动审核模型未正常结束，请人工确认。");
-  }
-  if (usage === undefined) {
-    return needsUser("自动审核缺少有效用量记录，请人工确认。");
-  }
-  return parseReviewResult(
-    responseText,
-    new Set(authorizationSources.map((source) => source.entryId)),
-  );
 }
 
+/** 等待只持有一个计时器；同一 AbortSignal 取消等待后不会再请求审核模型。 */
+function waitForReviewRetry(delayMs: number, abortSignal: AbortSignal): Promise<boolean> {
+  if (abortSignal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const finish = (ready: boolean) => {
+      clearTimeout(retryTimer);
+      abortSignal.removeEventListener("abort", handleAbort);
+      resolve(ready);
+    };
+    const handleAbort = () => finish(false);
+    const retryTimer = setTimeout(() => finish(true), delayMs);
+    abortSignal.addEventListener("abort", handleAbort, { once: true });
+    if (abortSignal.aborted) handleAbort();
+  });
+}
 function createReviewRequest(
   options: ReviewToolApprovalOptions,
   authorizationSources: readonly AuthorizationSource[],
@@ -223,12 +333,67 @@ function createReviewRequest(
           },
           authorizationSources,
           assistantContext,
+          executionHistory: createActionExecutionHistory(options),
         }),
       }),
     ]),
   });
 }
 
+/** 只统计当前 Run 已刷新执行开始的同一动作；审批记录本身不代表已执行。 */
+function createActionExecutionHistory(options: ReviewToolApprovalOptions) {
+  const matchingApprovals = new Map(
+    options.executionRecords.flatMap((record) =>
+      record.type === "approval_decision" &&
+      record.runId === options.runId &&
+      record.decision === "allowed" &&
+      record.actionFingerprint === options.approvalPlan.actionFingerprint &&
+      record.toolApprovalRequestId !== undefined
+        ? [[record.toolApprovalRequestId, record] as const]
+        : [],
+    ),
+  );
+  const startedExecutions = options.executionRecords.filter(
+    (record) =>
+      record.type === "tool_execution_started" &&
+      record.runId === options.runId &&
+      matchingApprovals.get(record.toolApprovalRequestId)?.toolCallId === record.toolCallId &&
+      matchingApprovals.get(record.toolApprovalRequestId)?.toolName === record.toolName,
+  );
+  const latestExecution = startedExecutions.at(-1);
+  if (latestExecution?.type !== "tool_execution_started")
+    return { runId: options.runId, startedCount: 0, latestExecution: null };
+  const latestResult = options.executionRecords.findLast(
+    (record) =>
+      record.type === "message" &&
+      record.runId === options.runId &&
+      record.seq > latestExecution.seq &&
+      record.message.type === "tool_result" &&
+      record.message.toolCallId === latestExecution.toolCallId,
+  );
+  const resultMessage =
+    latestResult?.type === "message" && latestResult.message.type === "tool_result"
+      ? latestResult.message
+      : null;
+  return {
+    runId: options.runId,
+    startedCount: startedExecutions.length,
+    latestExecution: {
+      toolCallId: latestExecution.toolCallId,
+      startedEntryId: latestExecution.entryId,
+      // 开始后缺少持久结果仍占一次；未知结果不能被解释成未执行或自动重做的授权。
+      result:
+        resultMessage === null
+          ? null
+          : {
+              entryId: latestResult?.entryId,
+              status: resultMessage.status,
+              content: resultMessage.content.slice(0, 600),
+              truncated: resultMessage.truncated || resultMessage.content.length > 600,
+            },
+    },
+  };
+}
 function parseReviewResult(
   responseText: string,
   suppliedEntryIds: ReadonlySet<string>,
@@ -237,7 +402,7 @@ function parseReviewResult(
   try {
     response = JSON.parse(responseText);
   } catch {
-    return needsUser("自动审核结果 JSON 解析失败，请人工确认。");
+    throw new ModelRequestError("unknown");
   }
   if (
     !isRecord(response) ||
@@ -259,10 +424,10 @@ function parseReviewResult(
     new Set(response.authorizationEntryIds).size !== response.authorizationEntryIds.length ||
     (response.decision === "allow" && response.authorizationEntryIds.length === 0)
   ) {
-    return needsUser("自动审核结果或授权引用无效，请人工确认。");
+    throw new ModelRequestError("unknown");
   }
   return Object.freeze({
-    decision: response.decision === "allow" ? "allow" : "needs_user",
+    decision: response.decision,
     reason: response.reason.trim(),
     authorizationEntryIds: Object.freeze([...response.authorizationEntryIds]),
   });

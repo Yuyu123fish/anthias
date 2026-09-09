@@ -1,6 +1,6 @@
 import type { RunDiagnostic } from "@anthias/agent";
 import { describe, expect, it } from "vitest";
-import { formatRunDiagnostic } from "../src/diagnostic-view.js";
+import { formatModelRecovery, formatRunDiagnostic } from "../src/diagnostic-view.js";
 
 const usage = {
   inputTokens: 500,
@@ -49,4 +49,28 @@ describe("safe run diagnostic display", () => {
     expect(historical).toContain("思考 未知 tokens");
     expect(historical).toContain("请求结构：未知");
   });
+});
+
+it("distinguishes bounded approval recovery from same-run continuation without asking to continue", () => {
+  const event = {
+    type: "model_retry" as const,
+    runId: "run",
+    phase: "waiting" as const,
+    retryCount: 1 as const,
+    delayMs: 500,
+    diagnostic,
+  };
+  expect(formatModelRecovery({ ...event, recoveryKind: "approval" }).status).toBe(
+    "等待审核恢复 1/1",
+  );
+  const recovery = formatModelRecovery({ ...event, recoveryKind: "continuation" });
+  expect(recovery.status).toBe("等待任务续跑 1/2");
+  expect(recovery.detail).toContain("实际工具结果");
+  expect(recovery.detail).not.toContain("/continue");
+});
+
+it("preserves the approval failure source alongside provider diagnostics", () => {
+  const error = "自动审核技术故障：模型配置不可用。";
+  expect(formatRunDiagnostic(diagnostic, error)).toContain(error);
+  expect(formatRunDiagnostic(undefined, error)).toContain(error);
 });

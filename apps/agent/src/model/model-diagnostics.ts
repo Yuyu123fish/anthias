@@ -4,13 +4,13 @@ const SUMMARIES: Readonly<Record<RunDiagnostic["category"], string>> = Object.fr
   completed: "模型已正常结束。",
   storage: "Session 写入失败，请检查本地存储后重试。",
   context_overflow: "模型上下文容量不足，已保留历史；请缩短输入或开启新对话。",
-  output_limit: "模型输出达到上限，已保留现有内容；请明确继续或缩小本次输出。",
+  output_limit: "模型输出达到上限，已保留现有内容。",
   authentication: "模型认证失败；请检查 API Key 及其访问权限。",
   configuration: "模型配置不可用；请检查服务地址、模型名称或账户配置。",
   invalid_request: "模型服务拒绝了请求参数；请检查模型配置或缩短输入。",
-  rate_limit: "模型服务触发限流；请稍后明确继续。",
-  network: "模型请求遇到暂时网络错误；请检查连接后明确继续。",
-  service: "模型服务暂时不可用；请稍后明确继续。",
+  rate_limit: "模型服务触发限流。",
+  network: "模型请求遇到暂时网络错误。",
+  service: "模型服务暂时不可用。",
   empty_response: "模型未返回有效正文或完整工具请求；请明确继续或调整要求。",
   content_filter: "模型服务因内容过滤停止输出；已保留现有内容，请调整要求。",
   unknown: "模型请求失败，请检查模型配置或稍后重试。",
@@ -48,7 +48,7 @@ export function createRunDiagnostic(
     diagnostic.retryStopReason === "exhausted"
       ? " 自动重试已用完，不再发起请求。"
       : diagnostic.retryStopReason === "content_delivered"
-        ? " 已交付部分内容或收到完整工具请求，不自动重试。"
+        ? " 已交付部分内容，本次响应已封存。"
         : diagnostic.retryStopReason === "wait_too_long"
           ? " 服务端要求等待超过 30 秒，本次不再自动重试。"
           : diagnostic.retryStopReason === "deadline"

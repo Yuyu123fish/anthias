@@ -8,7 +8,7 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
-import { formatRunDiagnostic } from "./diagnostic-view.js";
+import { formatModelRecovery, formatRunDiagnostic } from "./diagnostic-view.js";
 import { collaborationStatus } from "./multi-agent-view.js";
 import {
   formatPermissions,
@@ -385,11 +385,14 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       case "tool_execution_end":
         plainToolResult(event.result, event.memberSessionId, event.memberName);
         break;
-      case "model_retry":
-        write(
-          `\n${event.memberSessionId ? `成员 ${event.memberName ?? event.memberSessionId} · ` : ""}${event.phase === "waiting" ? `等待 ${(event.delayMs / 1000).toFixed(1)} 秒后重试` : "正在重试"} ${event.retryCount}/2 · Ctrl+C 停止\n${event.diagnostic.summary}\n`,
-        );
+      case "model_retry": {
+        const recovery = formatModelRecovery(event);
+        const member = event.memberSessionId
+          ? "成员 " + (event.memberName ?? event.memberSessionId) + " · "
+          : "";
+        write("\n" + member + recovery.status + "\n" + recovery.detail + "\n");
         break;
+      }
       case "tool_execution_start":
         write(
           `\n${event.activity.toolName} [${event.activity.toolCallId.slice(-8)}] · 运行中\n${event.activity.summary}\n`,

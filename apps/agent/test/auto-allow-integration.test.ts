@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAgentWithModelStream } from "../src/agent.js";
 import type { AssistantToolCallPart } from "../src/message.js";
-import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
+import {
+  type ModelRequest,
+  ModelRequestError,
+  type ModelStream,
+} from "../src/model/model-stream.js";
 import { createSession, openSession, type Session } from "../src/session/index.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -152,6 +156,71 @@ it("skips both approval paths in Full Access despite workspace revocation and re
 });
 
 describe("AutoAllow Agent integration", () => {
+  it("reviews repeated command calls against actual executions and preserves a two-call user limit", async () => {
+    const session = await createFixture();
+    let responseCount = 0;
+    let manualRequests = 0;
+    const executionHistories: unknown[] = [];
+    const agent = createAgentWithModelStream({
+      session,
+      permissionMode: "auto_allow",
+      modelStream: async function* (request) {
+        if (request.purpose === "approval") {
+          const message = request.messages[0];
+          if (message?.role !== "user") throw new Error("Missing review input");
+          const executionHistory = JSON.parse(message.content).executionHistory;
+          executionHistories.push(executionHistory);
+          const decision = (executionHistory?.startedCount ?? 0) < 2 ? "allow" : "needs_user";
+          yield { type: "text_delta", delta: reviewJson(session, decision) };
+          yield { type: "finish", finishReason: "stop", usage };
+        } else if (responseCount++ < 3) {
+          yield {
+            ...toolCall({ command: "Write-Output 'diagnostic-ok'", cwd: "." }, "execute_command"),
+            type: "tool_call",
+          };
+          yield { type: "finish", finishReason: "tool_calls", usage };
+        } else {
+          yield { type: "text_delta", delta: "已执行两次并尊重次数限制。" };
+          yield { type: "finish", finishReason: "stop", usage };
+        }
+      },
+    });
+    cleanup.push(() => agent.close());
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        manualRequests++;
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
+      }
+    });
+    expect(
+      (await agent.prompt("只执行两次 Write-Output 'diagnostic-ok'，不要执行第三次。")).status,
+    ).toBe("completed");
+    expect(executionHistories).toEqual([
+      expect.objectContaining({ startedCount: 0, latestExecution: null }),
+      expect.objectContaining({
+        startedCount: 1,
+        latestExecution: expect.objectContaining({
+          result: expect.objectContaining({ status: "completed" }),
+        }),
+      }),
+      expect.objectContaining({
+        startedCount: 2,
+        latestExecution: expect.objectContaining({
+          result: expect.objectContaining({ status: "completed" }),
+        }),
+      }),
+    ]);
+    expect(manualRequests).toBe(1);
+    expect(
+      session.records.filter((record) => record.type === "tool_execution_started"),
+    ).toHaveLength(2);
+    expect(
+      agent.state.messageHistory
+        .filter((message) => message.role === "tool")
+        .map((message) => message.status),
+    ).toEqual(["completed", "completed", "denied"]);
+  });
+
   it("does not review a repeated action after the user has denied its first call", async () => {
     const session = await createFixture();
     let normalRequests = 0;
@@ -308,25 +377,22 @@ describe("AutoAllow Agent integration", () => {
     expect(reopenedAgent.state.permissionMode).toBe("agent");
   });
 
-  it.each(["malformed", "deny"])(
-    "falls back to one manual decision for %s review",
-    async (kind) => {
+  it.each(["needs_user", "deny"])(
+    "asks once for a manual decision after a valid %s review",
+    async (decision) => {
       const session = await createFixture();
       const { agent, purposes } = makeAgent(
         session,
         toolCall({ path: "note.txt", content: "approved" }),
         async function* () {
-          yield {
-            type: "text_delta",
-            delta: kind === "malformed" ? "invalid" : reviewJson(session, "deny"),
-          };
+          yield { type: "text_delta", delta: reviewJson(session, decision) };
           yield { type: "finish", finishReason: "stop", usage };
         },
       );
       let manualCount = 0;
       agent.subscribe((event) => {
         if (event.type === "tool_approval_requested") {
-          manualCount += 1;
+          manualCount++;
           agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
         }
       });
@@ -337,11 +403,8 @@ describe("AutoAllow Agent integration", () => {
         [
           {
             decisionSource: "auto_review",
-            decision: "needs_user",
-            reason:
-              kind === "malformed"
-                ? "自动审核结果 JSON 解析失败，请人工确认。"
-                : "当前用户明确授权本次临时文件操作。",
+            decision: decision === "deny" ? "denied" : "needs_user",
+            reason: "当前用户明确授权本次临时文件操作。",
           },
           { decisionSource: "user", decision: "denied" },
         ],
@@ -349,7 +412,6 @@ describe("AutoAllow Agent integration", () => {
       await expect(access(join(session.workspaceRoot, "note.txt"))).rejects.toThrow();
     },
   );
-
   it("keeps hard denials ahead of model review even with explicit permission", async () => {
     const session = await createFixture();
     const { agent, purposes } = makeAgent(
@@ -366,6 +428,48 @@ describe("AutoAllow Agent integration", () => {
     });
   });
 
+  it("stops with a paired unexecuted tool result after review recovery is exhausted", async () => {
+    const session = await createFixture();
+    const call = toolCall({ path: "review-failed.txt", content: "must not execute" });
+    let manualRequests = 0;
+    let attempts = 0;
+    const { agent, purposes } = makeAgent(session, call, () => {
+      attempts++;
+      throw new ModelRequestError("service");
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_approval_requested") {
+        manualRequests++;
+        agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
+      }
+    });
+    expect(await agent.prompt("请创建 review-failed.txt。")).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("自动审核"),
+    });
+    expect(attempts).toBe(2);
+    expect(purposes).toEqual(["response", "approval", "approval"]);
+    expect(manualRequests).toBe(0);
+    expect(agent.state.messageHistory.find((message) => message.role === "tool")).toMatchObject({
+      toolCallId: call.toolCallId,
+      status: "aborted",
+    });
+    expect(
+      session.records.filter(
+        (record) => record.type === "request_usage" && record.purpose === "approval",
+      ),
+    ).toHaveLength(2);
+    expect(
+      session.records.some(
+        (record) => record.type === "tool_execution_started" || record.type === "approval_decision",
+      ),
+    ).toBe(false);
+    expect(session.records.findLast((record) => record.type === "run_finished")).toMatchObject({
+      status: "failed",
+      diagnostic: { category: "service", retryCount: 1, retryStopReason: "exhausted" },
+    });
+    await expect(access(join(session.workspaceRoot, "review-failed.txt"))).rejects.toThrow();
+  });
   it("discards a late automatic approval after cancellation", async () => {
     const session = await createFixture();
     const started = Promise.withResolvers<void>();

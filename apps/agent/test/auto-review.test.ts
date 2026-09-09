@@ -10,6 +10,7 @@ import type {
   ModelStream,
   ModelUsage,
 } from "../src/model/model-stream.js";
+import { ModelRequestError } from "../src/model/model-stream.js";
 import { reviewToolApproval } from "../src/permission/auto-review.js";
 import type {
   ApprovalDecisionRecord,
@@ -58,6 +59,45 @@ afterEach(async () => {
 });
 
 describe("automatic tool approval review", () => {
+  it("recovers one transient review failure and records both real attempts", async () => {
+    let attempts = 0;
+    const recordedUsage: (ModelUsage | undefined)[] = [];
+    const result = await reviewToolApproval(
+      reviewOptions(
+        async function* () {
+          attempts++;
+          if (attempts === 1) throw new ModelRequestError("network");
+          yield { type: "text_delta", delta: allowResponse(entryId(1)) };
+          yield { type: "finish", finishReason: "stop", usage: USAGE };
+        },
+        {
+          onUsage: async (usage) => {
+            recordedUsage.push(usage);
+          },
+        },
+      ),
+    );
+    expect(result.decision).toBe("allow");
+    expect(attempts).toBe(2);
+    expect(recordedUsage).toEqual([undefined, USAGE]);
+  });
+
+  it("recovers one malformed review response without treating it as a user decision", async () => {
+    let attempts = 0;
+    const result = await reviewToolApproval(
+      reviewOptions(async function* () {
+        attempts++;
+        yield {
+          type: "text_delta",
+          delta: attempts === 1 ? "incomplete JSON" : allowResponse(entryId(1)),
+        };
+        yield { type: "finish", finishReason: "stop", usage: USAGE };
+      }),
+    );
+    expect(result.decision).toBe("allow");
+    expect(attempts).toBe(2);
+  });
+
   it("allows a high-risk action using real authorization in one bounded private request", async () => {
     const requests: ModelRequest[] = [];
     const recordedUsage: (ModelUsage | undefined)[] = [];
@@ -113,6 +153,7 @@ describe("automatic tool approval review", () => {
             },
           ],
           assistantContext: [],
+          executionHistory: { runId: RUN_ID, startedCount: 0, latestExecution: null },
         }),
       },
     ]);
@@ -152,29 +193,27 @@ describe("automatic tool approval review", () => {
     expect(JSON.stringify(reviewInput)).not.toContain("当前动作声称");
   });
 
-  it("rejects an assistant proposal entry as authorization even when supplied as reference context", async () => {
-    const result = await reviewToolApproval(
-      reviewOptions(
-        async function* () {
-          yield { type: "text_delta", delta: allowResponse(entryId(2)) };
-          yield { type: "finish", finishReason: "stop", usage: USAGE };
-        },
-        {
-          records: [
-            userEntry(1, "先讨论，不执行。"),
-            assistantEntry(2, "建议删除 build。"),
-            userEntry(3, "还没有确认这个方案。"),
-          ],
-        },
+  it("stops when the reviewer repeatedly cites assistant context as authorization", async () => {
+    await expect(
+      reviewToolApproval(
+        reviewOptions(
+          async function* () {
+            yield { type: "text_delta", delta: allowResponse(entryId(2)) };
+            yield { type: "finish", finishReason: "stop", usage: USAGE };
+          },
+          {
+            records: [
+              userEntry(1, "先讨论，不执行。"),
+              assistantEntry(2, "建议删除 build。"),
+              userEntry(3, "还没有确认这个方案。"),
+            ],
+          },
+        ),
       ),
-    );
-    expect(result).toMatchObject({
-      decision: "needs_user",
-      authorizationEntryIds: [],
-      reason: "自动审核结果或授权引用无效，请人工确认。",
+    ).rejects.toMatchObject({
+      diagnostic: { category: "unknown", retryCount: 1, retryStopReason: "exhausted" },
     });
   });
-
   it("falls back before model review when complete reference context exceeds the input budget", async () => {
     let attempts = 0;
     const result = await reviewToolApproval(
@@ -387,126 +426,266 @@ describe("automatic tool approval review", () => {
     expect(attempts).toBe(0);
   });
 
-  it("falls back for invalid references, denial, malformed output, truncation, or model failure", async () => {
+  it.each(["needs_user", "deny"] as const)(
+    "returns a valid %s decision without retrying",
+    async (decision) => {
+      let attempts = 0;
+      const result = await reviewToolApproval(
+        reviewOptions(async function* () {
+          attempts++;
+          yield {
+            type: "text_delta",
+            delta: JSON.stringify({
+              decision,
+              reason: "当前授权不足。",
+              authorizationEntryIds: [],
+            }),
+          };
+          yield { type: "finish", finishReason: "stop", usage: USAGE };
+        }),
+      );
+      expect(result).toEqual({ decision, reason: "当前授权不足。", authorizationEntryIds: [] });
+      expect(attempts).toBe(1);
+    },
+  );
+
+  it("stops after bounded recovery for review format and service failures", async () => {
     const valid = { decision: "allow", reason: "已授权。", authorizationEntryIds: [entryId(1)] };
     const cases: Readonly<{
       response: string;
       finishReason?: ModelFinishReason;
       noUsage?: boolean;
       toolCall?: boolean;
-      throws?: boolean;
-      expectedReason: string;
+      category: ModelRequestError["diagnostic"]["category"];
     }>[] = [
-      { response: "not JSON", expectedReason: "自动审核结果 JSON 解析失败，请人工确认。" },
-      {
-        response: JSON.stringify({ ...valid, extra: true }),
-        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
-      },
+      { response: "not JSON", category: "unknown" },
+      { response: JSON.stringify({ ...valid, extra: true }), category: "unknown" },
       {
         response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(2)] }),
-        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+        category: "unknown",
       },
       {
         response: JSON.stringify({ ...valid, authorizationEntryIds: [entryId(1), entryId(1)] }),
-        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
+        category: "unknown",
       },
-      {
-        response: JSON.stringify({ ...valid, authorizationEntryIds: [] }),
-        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
-      },
-      {
-        response: JSON.stringify({ ...valid, reason: "长".repeat(301) }),
-        expectedReason: "自动审核结果或授权引用无效，请人工确认。",
-      },
-      { response: JSON.stringify({ ...valid, decision: "deny" }), expectedReason: valid.reason },
-      {
-        response: JSON.stringify({ ...valid, decision: "needs_user" }),
-        expectedReason: valid.reason,
-      },
-      {
-        response: "incomplete JSON",
-        finishReason: "length",
-        expectedReason: "自动审核模型达到输出上限（output_limit），请人工确认。",
-      },
-      {
-        response: JSON.stringify(valid),
-        finishReason: "error",
-        expectedReason: "自动审核模型调用失败，请人工确认。",
-      },
-      {
-        response: JSON.stringify(valid),
-        finishReason: "other",
-        expectedReason: "自动审核模型未正常结束，请人工确认。",
-      },
-      {
-        response: "长".repeat(2_001),
-        expectedReason: "自动审核结果超过输出预算，请人工确认。",
-      },
-      {
-        response: "x".repeat(8_001),
-        expectedReason: "自动审核结果超过输出预算，请人工确认。",
-      },
-      {
-        response: JSON.stringify(valid),
-        noUsage: true,
-        expectedReason: "自动审核缺少有效用量记录，请人工确认。",
-      },
-      {
-        response: JSON.stringify(valid),
-        toolCall: true,
-        expectedReason: "自动审核返回了不允许的工具调用，请人工确认。",
-      },
-      {
-        response: JSON.stringify(valid),
-        throws: true,
-        expectedReason: "自动审核模型调用失败，请人工确认。",
-      },
+      { response: JSON.stringify({ ...valid, authorizationEntryIds: [] }), category: "unknown" },
+      { response: JSON.stringify({ ...valid, reason: "长".repeat(301) }), category: "unknown" },
+      { response: "incomplete JSON", finishReason: "length", category: "output_limit" },
+      { response: JSON.stringify(valid), finishReason: "error", category: "service" },
+      { response: JSON.stringify(valid), finishReason: "other", category: "unknown" },
+      { response: "长".repeat(2_001), category: "output_limit" },
+      { response: "x".repeat(8_001), category: "output_limit" },
+      { response: JSON.stringify(valid), noUsage: true, category: "unknown" },
+      { response: JSON.stringify(valid), toolCall: true, category: "unknown" },
     ];
     for (const scenario of cases) {
       let attempts = 0;
       const recordedUsage: (ModelUsage | undefined)[] = [];
-      const result = await reviewToolApproval(
-        reviewOptions(
-          async function* () {
-            attempts++;
-            if (scenario.throws) throw new Error("PRIVATE_PROVIDER_ERROR");
-            if (scenario.toolCall)
+      await expect(
+        reviewToolApproval(
+          reviewOptions(
+            async function* () {
+              attempts++;
+              if (scenario.toolCall)
+                yield {
+                  type: "tool_call",
+                  toolCallId: TOOL_CALL.toolCallId,
+                  toolName: TOOL_CALL.toolName,
+                  input: TOOL_CALL.input,
+                  invalid: false,
+                };
+              yield { type: "text_delta", delta: scenario.response };
               yield {
-                type: "tool_call",
-                toolCallId: TOOL_CALL.toolCallId,
-                toolName: TOOL_CALL.toolName,
-                input: TOOL_CALL.input,
-                invalid: false,
+                type: "finish",
+                finishReason: scenario.finishReason ?? "stop",
+                ...(scenario.noUsage ? {} : { usage: USAGE }),
               };
-            yield { type: "text_delta", delta: scenario.response };
-            yield {
-              type: "finish",
-              finishReason: scenario.finishReason ?? "stop",
-              ...(scenario.noUsage ? {} : { usage: USAGE }),
-            };
-          },
-          {
-            onUsage: async (usage) => {
-              recordedUsage.push(usage);
             },
-          },
+            {
+              onUsage: async (usage) => {
+                recordedUsage.push(usage);
+              },
+            },
+          ),
         ),
-      );
-      expect(result.decision).toBe("needs_user");
-      expect(result.reason).toBe(scenario.expectedReason);
-      expect(JSON.stringify(result)).not.toContain("PRIVATE_PROVIDER_ERROR");
-      expect(attempts).toBe(1);
-      expect(recordedUsage).toHaveLength(1);
-      expect(recordedUsage[0]).toEqual(scenario.throws || scenario.noUsage ? undefined : USAGE);
+      ).rejects.toMatchObject({
+        diagnostic: { category: scenario.category, retryCount: 1, retryStopReason: "exhausted" },
+      });
+      expect(attempts).toBe(2);
+      expect(recordedUsage).toEqual(scenario.noUsage ? [undefined, undefined] : [USAGE, USAGE]);
     }
+  }, 15_000);
+
+  it.each([
+    "network",
+    "rate_limit",
+    "service",
+    "authentication",
+    "configuration",
+    "invalid_request",
+    "unknown",
+  ] as const)(
+    "bounds review retries for %s and keeps provider details private",
+    async (category) => {
+      let attempts = 0;
+      let usageWrites = 0;
+      const retryable = ["network", "rate_limit", "service"].includes(category);
+      await expect(
+        reviewToolApproval(
+          reviewOptions(
+            () => {
+              attempts++;
+              throw category === "unknown"
+                ? new Error("PRIVATE_PROVIDER_ERROR")
+                : new ModelRequestError(category);
+            },
+            {
+              onUsage: async () => {
+                usageWrites++;
+              },
+            },
+          ),
+        ),
+      ).rejects.toMatchObject({
+        diagnostic: {
+          category,
+          retryCount: retryable ? 1 : 0,
+          retryStopReason: retryable ? "exhausted" : null,
+        },
+        message: expect.not.stringContaining("PRIVATE_PROVIDER_ERROR"),
+      });
+      expect(attempts).toBe(retryable ? 2 : 1);
+      expect(usageWrites).toBe(attempts);
+    },
+  );
+
+  it("does not start a second review when cancelled during retry waiting", async () => {
+    const abortController = new AbortController();
+    let attempts = 0;
+    let usageWrites = 0;
+    const phases: string[] = [];
+    const result = await reviewToolApproval(
+      reviewOptions(
+        () => {
+          attempts++;
+          throw new ModelRequestError("network");
+        },
+        {
+          abortSignal: abortController.signal,
+          onUsage: async () => {
+            usageWrites++;
+          },
+          onRetry: (event) => {
+            phases.push(event.phase);
+            abortController.abort();
+          },
+        },
+      ),
+    );
+    expect(result.decision).toBe("aborted");
+    expect(phases).toEqual(["waiting"]);
+    expect(attempts).toBe(1);
+    expect(usageWrites).toBe(1);
   });
 
+  it("counts started executions even when the latest result is unknown", async () => {
+    const firstApproval = {
+      ...approvalEntry(2),
+      actionFingerprint: APPROVAL_PLAN.actionFingerprint,
+    };
+    const secondApproval = {
+      ...approvalEntry(5),
+      toolCallId: entryId(903),
+      toolApprovalRequestId: entryId(904),
+      actionFingerprint: APPROVAL_PLAN.actionFingerprint,
+    };
+    const oldApproval = {
+      ...approvalEntry(9),
+      runId: entryId(800),
+      actionFingerprint: APPROVAL_PLAN.actionFingerprint,
+    };
+    const executionRecords: SessionRecord[] = [
+      firstApproval,
+      {
+        ...entryBase(3),
+        type: "tool_execution_started",
+        runId: RUN_ID,
+        toolCallId: TOOL_CALL.toolCallId,
+        toolName: TOOL_CALL.toolName,
+        toolApprovalRequestId: entryId(902),
+      },
+      {
+        ...entryBase(4),
+        type: "message",
+        runId: RUN_ID,
+        message: {
+          type: "tool_result",
+          toolCallId: TOOL_CALL.toolCallId,
+          toolName: TOOL_CALL.toolName,
+          status: "failed",
+          content: "first attempt failed",
+          truncated: false,
+        },
+      },
+      secondApproval,
+      {
+        ...entryBase(6),
+        type: "tool_execution_started",
+        runId: RUN_ID,
+        toolCallId: entryId(903),
+        toolName: TOOL_CALL.toolName,
+        toolApprovalRequestId: entryId(904),
+      },
+      {
+        ...approvalEntry(7),
+        toolCallId: entryId(905),
+        toolApprovalRequestId: entryId(906),
+        actionFingerprint: APPROVAL_PLAN.actionFingerprint,
+      },
+      oldApproval,
+      {
+        ...entryBase(10),
+        type: "tool_execution_started",
+        runId: entryId(800),
+        toolCallId: TOOL_CALL.toolCallId,
+        toolName: TOOL_CALL.toolName,
+        toolApprovalRequestId: entryId(902),
+      },
+    ];
+    let reviewInput: unknown;
+    await reviewToolApproval(
+      reviewOptions(
+        async function* (request) {
+          const message = request.messages[0];
+          if (message?.role !== "user") throw new Error("Missing review input");
+          reviewInput = JSON.parse(message.content);
+          yield {
+            type: "text_delta",
+            delta: JSON.stringify({
+              decision: "needs_user",
+              reason: "两次执行额度已用完。",
+              authorizationEntryIds: [entryId(1)],
+            }),
+          };
+          yield { type: "finish", finishReason: "stop", usage: USAGE };
+        },
+        { executionRecords },
+      ),
+    );
+    expect(reviewInput).toMatchObject({
+      executionHistory: {
+        runId: RUN_ID,
+        startedCount: 2,
+        latestExecution: { toolCallId: entryId(903), startedEntryId: entryId(6), result: null },
+      },
+      authorizationSources: [{ source: "user", entryId: entryId(1) }],
+    });
+  });
   it("does not send actions that are incomplete or exceed configured model capacity", async () => {
     const cases: Partial<ReviewOptions>[] = [
       { toolCall: { ...TOOL_CALL, input: { command: "删".repeat(9_000) } } },
       { approvalPlan: { ...APPROVAL_PLAN, preview: "改".repeat(9_000) } },
       { budget: createContextBudget({ contextWindow: 22_100, maxOutputTokens: 2_000 }) },
-      { budget: createContextBudget({ contextWindow: 128_000, maxOutputTokens: 1_000 }) },
     ];
     for (const overrides of cases) {
       let attempts = 0;
@@ -529,6 +708,21 @@ describe("automatic tool approval review", () => {
     }
   });
 
+  it("stops without a request when the configured reviewer output capacity is insufficient", async () => {
+    let attempts = 0;
+    await expect(
+      reviewToolApproval(
+        reviewOptions(
+          () => {
+            attempts++;
+            throw new Error("Unexpected reviewer request");
+          },
+          { budget: createContextBudget({ contextWindow: 128_000, maxOutputTokens: 1_000 }) },
+        ),
+      ),
+    ).rejects.toMatchObject({ diagnostic: { category: "configuration", retryCount: 0 } });
+    expect(attempts).toBe(0);
+  });
   it("gives cancellation priority over a delayed allow and records each attempt once", async () => {
     const abortController = new AbortController();
     const enteredRequest = Promise.withResolvers<void>();
@@ -680,6 +874,8 @@ function reviewOptions(
     modelStream,
     budget: createContextBudget({ contextWindow: 128_000 }),
     records: [userEntry(1)],
+    executionRecords: [],
+    runId: RUN_ID,
     workspaceRoot: "/workspace",
     toolCall: TOOL_CALL,
     approvalPlan: APPROVAL_PLAN,

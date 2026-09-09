@@ -888,10 +888,14 @@ export function validateSessionRecords(
       lastAssistantStatus === "completed" &&
       lastAssistantHasToolCall &&
       (record.status === "aborted" || record.status === "failed");
+    // 失败响应已封存后，用户仍可在自动恢复等待期间停止同一个 Run。
+    const runAbortedAfterFailedResponse =
+      lastAssistantStatus === "failed" && record.status === "aborted";
     if (
       record.status !== "interrupted" &&
       record.status !== lastAssistantStatus &&
-      !runCanEndAfterCompletedToolCalls
+      !runCanEndAfterCompletedToolCalls &&
+      !runAbortedAfterFailedResponse
     ) {
       throw new Error("Session RunFinished 与最终 AssistantMessage 状态不匹配。");
     }

@@ -13,11 +13,13 @@ import {
   type ToolArtifactReference,
   type ToolResultMessage,
 } from "./message.js";
-import { createRunDiagnostic } from "./model/model-diagnostics.js";
+import { createRunDiagnostic, isRetryableModelDiagnostic } from "./model/model-diagnostics.js";
+import { waitForRetry } from "./model/model-retry.js";
 import {
   type ModelFinishReason,
   type ModelInputMessage,
   type ModelRequest,
+  ModelRequestError,
   type ModelStream,
   streamAssistantMessage,
   toModelInputMessage,
@@ -63,6 +65,7 @@ export type AgentLoopEvent =
       type: "model_retry";
       phase: "waiting" | "requesting";
       retryCount: 1 | 2;
+      recoveryKind?: "continuation" | "approval";
       delayMs: number;
       diagnostic: RunDiagnostic;
     }>
@@ -126,6 +129,7 @@ export type RunAgentLoopOptions = Readonly<{
   toolRunner: ToolRunner;
   artifactStore?: SessionArtifactStore;
   abortController: AbortController;
+  remainingTaskTimeMs?: () => number;
   emit(event: AgentLoopEvent): Promise<void>;
   updatePhase(phase: AgentLoopPhase): void;
   requestToolApproval(
@@ -139,6 +143,7 @@ type AssistantResponseResult = Readonly<{
   message: AssistantMessage;
   modelInputMessage: Extract<ModelInputMessage, { role: "assistant" }>;
   finishReason: ModelFinishReason | null;
+  retryAfterMs: number | null;
 }>;
 
 /** 保存批次中一个 ToolCall 的源位置和一次性执行计划。 */
@@ -180,6 +185,8 @@ const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
   const messageHistory = [...options.messages];
   let runRetryCount = 0;
+  let generationRetryCount = 0;
+  let recoveryInstruction: string | null = null;
   let latestDiagnostic: RunDiagnostic | undefined;
   const abortedResult = (): AgentLoopResult =>
     Object.freeze({
@@ -204,9 +211,16 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       messageHistory,
       transientModelMessages,
       options,
+      generationRetryCount,
+      recoveryInstruction,
     );
     if (assistantResponseResult.message.diagnostic !== undefined) {
-      runRetryCount += assistantResponseResult.message.diagnostic.retryCount ?? 0;
+      const reportedRetries = Math.max(
+        generationRetryCount,
+        assistantResponseResult.message.diagnostic.retryCount ?? 0,
+      );
+      runRetryCount += reportedRetries - generationRetryCount;
+      generationRetryCount = reportedRetries;
       latestDiagnostic = createRunDiagnostic(assistantResponseResult.message.diagnostic.category, {
         ...assistantResponseResult.message.diagnostic,
         retryCount: runRetryCount,
@@ -217,13 +231,89 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       return abortedResult();
     }
     if (assistantResponseResult.message.status === "failed") {
+      // 先封存失败消息和未执行 ToolCall，再以新生成恢复；绝不拼接旧流或重放工具。
       await appendUnresolvedToolResults(assistantResponseResult.message, messageHistory, options);
+      const diagnostic = assistantResponseResult.message.diagnostic;
+      const recoverable =
+        diagnostic !== undefined &&
+        (diagnostic.category === "output_limit" ||
+          (isRetryableModelDiagnostic(diagnostic) &&
+            diagnostic.retryStopReason === "content_delivered"));
+      if (recoverable && diagnostic !== undefined) {
+        const delayMs = Math.max(
+          500 * 2 ** generationRetryCount,
+          assistantResponseResult.retryAfterMs ?? 0,
+        );
+        const remainingTime = () => options.remainingTaskTimeMs?.() ?? Number.POSITIVE_INFINITY;
+        const stopReason =
+          generationRetryCount >= 2
+            ? "exhausted"
+            : delayMs > 30_000
+              ? "wait_too_long"
+              : delayMs >= remainingTime()
+                ? "deadline"
+                : null;
+        if (stopReason === null) {
+          const retryCount = generationRetryCount === 0 ? 1 : 2;
+          const recoveryDiagnostic = createRunDiagnostic(diagnostic.category, {
+            ...diagnostic,
+            retryStopReason: null,
+          });
+          await options.emit({
+            type: "model_retry",
+            recoveryKind: "continuation",
+            phase: "waiting",
+            retryCount,
+            delayMs,
+            diagnostic: recoveryDiagnostic,
+          });
+          if (!(await waitForRetry(delayMs, options.abortController.signal)))
+            return abortedResult();
+          if (remainingTime() > 0) {
+            await options.emit({
+              type: "model_retry",
+              recoveryKind: "continuation",
+              phase: "requesting",
+              retryCount,
+              delayMs: 0,
+              diagnostic: recoveryDiagnostic,
+            });
+            if (options.abortController.signal.aborted) return abortedResult();
+            if (remainingTime() > 0) {
+              generationRetryCount = retryCount;
+              runRetryCount += 1;
+              recoveryInstruction = [
+                "运行时恢复提示：上一条模型响应未完成，已保存实际消息与工具结果。继续完成原用户任务；本提示不构成新用户授权。",
+                "先依据已保存工具结果和当前工作区核对剩余工作；已成功操作不得重放，结果不明时先检查，不把未执行或不完整参数视为已落盘。",
+                diagnostic.category === "output_limit"
+                  ? "上次达到输出上限。缩小单次输出，按文件或完整功能片段分批写入，再继续必要验证。"
+                  : "上次模型连接暂时失败。基于实际历史发起新的生成，不续拼失败响应中的参数。",
+              ].join("\n");
+              continue;
+            }
+          }
+          latestDiagnostic = createRunDiagnostic(diagnostic.category, {
+            ...diagnostic,
+            retryCount: runRetryCount,
+            retryStopReason: "deadline",
+          });
+        } else {
+          latestDiagnostic = createRunDiagnostic(diagnostic.category, {
+            ...diagnostic,
+            retryCount: runRetryCount,
+            retryStopReason: stopReason,
+          });
+        }
+      }
       return {
         status: "failed",
         error: latestDiagnostic?.summary ?? SAFE_MODEL_ERROR,
         ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
       };
     }
+
+    generationRetryCount = 0;
+    recoveryInstruction = null;
 
     // 获取 ToolCall 列表
     const toolCalls = assistantResponseResult.message.content.filter(isToolCallPart);
@@ -283,12 +373,12 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       const batch = plannedToolCalls
         .slice(offset, offset + selectedPlans.length)
         .map((plannedToolCall, sourceIndex) => ({ ...plannedToolCall, sourceIndex }));
-      const toolResults = await executeConcurrentToolBatch(
+      const toolBatchResult = await executeConcurrentToolBatch(
         batch,
         options,
         toolResultBudget.tokenBudgetPerResult,
       );
-      for (const toolResult of toolResults) {
+      for (const toolResult of toolBatchResult.toolResults) {
         await appendToolResultMessage(
           boundToolResultForBudget(toolResult, toolResultBudget),
           messageHistory,
@@ -296,6 +386,21 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
         );
       }
       offset += batch.length;
+      if (toolBatchResult.approvalFailure !== null) {
+        await appendToolResults(
+          plannedToolCalls.slice(offset).map(({ toolCall }) => toolCall),
+          "aborted",
+          "自动审核技术故障，后续调用未执行。",
+          messageHistory,
+          options,
+          toolResultBudget,
+        );
+        return {
+          status: "failed",
+          error: "自动审核技术故障：" + toolBatchResult.approvalFailure.diagnostic.summary,
+          diagnostic: toolBatchResult.approvalFailure.diagnostic,
+        };
+      }
       if (options.abortController.signal.aborted) {
         await appendToolResults(
           plannedToolCalls.slice(offset).map(({ toolCall }) => toolCall),
@@ -316,13 +421,17 @@ async function streamAssistantResponse(
   messageHistory: Message[],
   transientModelMessages: Map<AssistantMessage, Extract<ModelInputMessage, { role: "assistant" }>>,
   options: RunAgentLoopOptions,
+  recoveryAttempt: number,
+  recoveryInstruction: string | null,
 ): Promise<AssistantResponseResult> {
   let finalMessage: AssistantMessage | null = null;
   let finalModelInputMessage: Extract<ModelInputMessage, { role: "assistant" }> | null = null;
   let finishReason: ModelFinishReason | null = null;
+  let retryAfterMs: number | null = null;
 
   const modelRequest: ModelRequest = Object.freeze({
-    systemPrompt: options.systemPrompt,
+    systemPrompt: [options.systemPrompt, recoveryInstruction].filter(Boolean).join("\n"),
+    recoveryAttempt,
     messages: Object.freeze(
       messageHistory.map((message) => {
         const modelMessage =
@@ -377,18 +486,21 @@ async function streamAssistantResponse(
     finalMessage = messageEvent.message;
     finalModelInputMessage = messageEvent.modelInputMessage;
     finishReason = messageEvent.finishReason;
+    retryAfterMs = messageEvent.retryAfterMs;
   }
 
   if (finalMessage === null || finalModelInputMessage === null) {
     throw new Error("Model Stream 未形成最终 AssistantMessage。");
   }
   await options.emit({ type: "assistant_message_end", message: finalMessage });
-  transientModelMessages.set(finalMessage, finalModelInputMessage);
+  if (finalMessage.status === "completed")
+    transientModelMessages.set(finalMessage, finalModelInputMessage);
   messageHistory.push(finalMessage);
   return Object.freeze({
     message: finalMessage,
     modelInputMessage: finalModelInputMessage,
     finishReason,
+    retryAfterMs,
   });
 }
 
@@ -397,7 +509,12 @@ async function executeConcurrentToolBatch(
   plannedToolCalls: readonly PlannedToolCall[],
   options: RunAgentLoopOptions,
   resultTokenBudget: number,
-): Promise<readonly ToolResultMessage[]> {
+): Promise<
+  Readonly<{
+    toolResults: readonly ToolResultMessage[];
+    approvalFailure: ModelRequestError | null;
+  }>
+> {
   const toolResultMessages: Array<ToolResultMessage | undefined> = Array.from({
     length: plannedToolCalls.length,
   });
@@ -437,22 +554,30 @@ async function executeConcurrentToolBatch(
   const workerResults = await Promise.allSettled(
     Array.from({ length: workerCount }, () => runWorker()),
   );
-  const failedWorker = workerResults.find((result) => result.status === "rejected");
-  if (failedWorker?.status === "rejected") throw failedWorker.reason;
+  // 审核技术故障仍须保存其他 worker 的真实结果；存储失败优先向外传播。
+  const rejectedWorkers = workerResults.filter((result) => result.status === "rejected");
+  const unexpectedFailure = rejectedWorkers.find(
+    (result) => !(result.reason instanceof ModelRequestError),
+  );
+  if (unexpectedFailure !== undefined) throw unexpectedFailure.reason;
+  const approvalFailure = rejectedWorkers[0]?.reason;
+  if (approvalFailure !== undefined && !(approvalFailure instanceof ModelRequestError))
+    throw approvalFailure;
   for (const plannedToolCall of plannedToolCalls) {
     toolResultMessages[plannedToolCall.sourceIndex] ??= createAbortedToolResultMessage(
       plannedToolCall.toolCall,
       "Run 已停止，调用未执行。",
     );
   }
-  return Object.freeze(
-    toolResultMessages.map((toolResultMessage) => {
-      if (toolResultMessage === undefined) {
-        throw new Error("ToolCall 结果缺失。");
-      }
-      return toolResultMessage;
-    }),
-  );
+  return Object.freeze({
+    approvalFailure: approvalFailure ?? null,
+    toolResults: Object.freeze(
+      toolResultMessages.map((toolResultMessage) => {
+        if (toolResultMessage === undefined) throw new Error("ToolCall 结果缺失。");
+        return toolResultMessage;
+      }),
+    ),
+  });
 }
 
 /** 通过统一 Tool Module 预检、确认并形成一条尚未提交的结果消息。 */

@@ -163,6 +163,9 @@ export function createContextController(options: {
     }
 
     const contextAwareModelStream: ModelStream = async function* (rawRequest, abortSignal) {
+      const recoveryAttempt = rawRequest.recoveryAttempt ?? 0;
+      const { recoveryAttempt: _recoveryAttempt, ...providerRequest } = rawRequest;
+      rawRequest = providerRequest;
       await run.beforeRequest?.(abortSignal);
       rawRequest = {
         ...rawRequest,
@@ -359,7 +362,7 @@ export function createContextController(options: {
         }
         if (measure().inputTokens >= threshold) await compact(false);
         let overflowRecoveryAttempted = false;
-        const retryState = { retryCount: 0, deliveredContent: false };
+        const retryState = { retryCount: recoveryAttempt, deliveredContent: false };
         for (;;) {
           if (abortSignal.aborted) return;
           if (measure().inputTokens >= threshold) throw new Error(CAPACITY_ERROR);

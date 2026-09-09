@@ -22,7 +22,7 @@ import type {
   UserMessage,
 } from "./message.js";
 import { createRunDiagnostic } from "./model/model-diagnostics.js";
-import type { ModelStream, ModelUsage } from "./model/model-stream.js";
+import { ModelRequestError, type ModelStream, type ModelUsage } from "./model/model-stream.js";
 import type { CollaborationSnapshot } from "./multi-agent/index.js";
 import { reviewToolApproval } from "./permission/auto-review.js";
 import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./permission/permission-mode.js";
@@ -139,6 +139,7 @@ export type AgentEvent = Readonly<{ memberSessionId?: string; memberName?: strin
         runId: string;
         phase: "waiting" | "requesting";
         retryCount: 1 | 2;
+        recoveryKind?: "continuation" | "approval";
         delayMs: number;
         diagnostic: RunDiagnostic;
       }>
@@ -264,7 +265,6 @@ type ActiveRunOwnership = {
   memoryCommittedBeforeFailure?: boolean;
   toolAuthorizations: Map<string, string>;
   toolAuthorizationRevisions: Map<string, string>;
-  reviewedToolActionFingerprints: Set<string>;
   deniedToolActionFingerprints: Set<string>;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
 };
@@ -671,7 +671,6 @@ export function createSessionAgent({
     const permissionRevision = workspacePermissions?.revision();
     if (permissionRevision)
       currentRun.toolAuthorizationRevisions.set(toolCall.toolCallId, permissionRevision);
-    const reviewed = currentRun.reviewedToolActionFingerprints.has(fingerprint);
     const denied = currentRun.deniedToolActionFingerprints.has(fingerprint);
     if (
       currentRun.permissionMode === "auto_allow" &&
@@ -690,24 +689,21 @@ export function createSessionAgent({
       return { toolApprovalRequestId, decision: "approve" };
     }
     const workspaceRevoked = workspacePermissions?.isRevoked() === true;
-    // ToolCall ID 不是新授权；重提同一动作不能反复审核直到放行。
-    if (currentRun.permissionMode === "auto_allow" && (reviewed || denied || workspaceRevoked)) {
+    // 明确拒绝与授权撤销持续生效；其他新 ToolCall 仍按真实用户原文重新审核。
+    if (currentRun.permissionMode === "auto_allow" && (denied || workspaceRevoked)) {
       const toolApprovalRequestId = randomUUID();
       await saveToolAuthorization(currentRun, toolCall, {
         source: "policy",
         decision: denied ? "denied" : "needs_user",
         reason: denied
           ? "用户已在当前 Run 拒绝同一动作，重提调用不会重新放行。"
-          : workspaceRevoked
-            ? "工作区授权已撤销，旧授权不再适用，请明确批准本次动作。"
-            : "当前 Run 已审核同一动作，请人工确认本次执行。",
+          : "工作区授权已撤销，旧授权不再适用，请明确批准本次动作。",
         authorizationEntryIds: [],
         actionFingerprint: fingerprint,
         toolApprovalRequestId,
       });
       if (denied) return { toolApprovalRequestId, decision: "deny" };
     } else if (currentRun.permissionMode === "auto_allow") {
-      currentRun.reviewedToolActionFingerprints.add(fingerprint);
       const toolApprovalRequestId = randomUUID();
       updateRunPhase(currentRun, "reviewing_tool");
       publishEvent({
@@ -719,18 +715,36 @@ export function createSessionAgent({
         modelStream,
         budget: contextBudget,
         records: authorizationRecords?.() ?? session.records,
+        executionRecords: session.records,
+        runId: currentRun.runId,
+        ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
         workspaceRoot: session.workspaceRoot,
         toolCall,
         approvalPlan,
         abortSignal: currentRun.abortController.signal,
         onUsage: (usage) => recordUsage(usage, approvalPlan.actionFingerprint),
+        onRetry: (event) => {
+          updateRunPhase(
+            currentRun,
+            event.phase === "waiting" ? "retrying_model" : "reviewing_tool",
+          );
+          publishEvent({ ...event, recoveryKind: "approval", runId: currentRun.runId });
+        },
+      }).catch((error: unknown) => {
+        if (error instanceof ModelRequestError) currentRun.diagnostic = error.diagnostic;
+        throw error;
       });
       if (currentRun.sessionWriteFailed) throw new Error(SAFE_SESSION_ERROR);
       if (reviewResult.decision === "aborted" || currentRun.abortController.signal.aborted)
         return { toolApprovalRequestId, decision: "aborted" };
       await saveToolAuthorization(currentRun, toolCall, {
         source: "auto_review",
-        decision: reviewResult.decision === "allow" ? "allowed" : "needs_user",
+        decision:
+          reviewResult.decision === "allow"
+            ? "allowed"
+            : reviewResult.decision === "deny"
+              ? "denied"
+              : "needs_user",
         reason: reviewResult.reason,
         authorizationEntryIds: reviewResult.authorizationEntryIds,
         actionFingerprint: approvalPlan.actionFingerprint,
@@ -870,7 +884,6 @@ export function createSessionAgent({
       sessionWriteFailed: false,
       toolAuthorizations: new Map(),
       toolAuthorizationRevisions: new Map(),
-      reviewedToolActionFingerprints: new Set(),
       deniedToolActionFingerprints: new Set(),
       terminalResultPromise: null,
     };
@@ -946,6 +959,7 @@ export function createSessionAgent({
         toolRunner,
         artifactStore,
         abortController: currentRun.abortController,
+        ...(remainingTaskTimeMs ? { remainingTaskTimeMs } : {}),
         emit: (event) => processAgentLoopEvent(currentRun, event),
         updatePhase: (phase) => updateRunPhase(currentRun, phase),
         requestToolApproval: (toolCall, approvalPlan) =>

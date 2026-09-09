@@ -69,6 +69,7 @@ export async function* retryModelStream(options: {
           ...requestFailure.diagnostic,
           retryCount: retryState.retryCount,
           retryStopReason,
+          retryAfterMs: requestFailure.retryAfterMs,
         });
       }
       const retryCount = retryState.retryCount === 0 ? 1 : 2;
@@ -138,7 +139,7 @@ function isDeliveredContent(event: ModelStreamEvent): boolean {
 }
 
 /** 取消释放计时器与监听器，并在发起下一次请求前再次检查同一 Signal。 */
-function waitForRetry(delayMs: number, abortSignal: AbortSignal): Promise<boolean> {
+export function waitForRetry(delayMs: number, abortSignal: AbortSignal): Promise<boolean> {
   if (abortSignal.aborted) return Promise.resolve(false);
   return new Promise((resolve) => {
     const finish = (ready: boolean) => {

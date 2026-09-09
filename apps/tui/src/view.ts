@@ -28,7 +28,7 @@ import {
   sanitizeTerminalText,
   type TerminalCapabilities,
 } from "./content-renderer.js";
-import { formatRunDiagnostic } from "./diagnostic-view.js";
+import { formatModelRecovery, formatRunDiagnostic } from "./diagnostic-view.js";
 import {
   createExecutionTurn,
   type ExecutionControl,
@@ -1123,8 +1123,9 @@ export function createConversationView(options: {
           detail.step.summary = `授权来源：${source}\n${sanitizeTerminalText(event.reason)}`;
           break;
         }
-        case "model_retry":
-          if (event.phase === "requesting") {
+        case "model_retry": {
+          const recovery = formatModelRecovery(event);
+          if (event.phase === "requesting" && event.recoveryKind !== "approval") {
             for (const detail of toolDetails.values()) {
               if (
                 !detail.id.startsWith(`${event.memberSessionId ?? agent.state.sessionId}:`) ||
@@ -1139,20 +1140,15 @@ export function createConversationView(options: {
             }
             invalidateConversation();
           }
-          if (event.memberSessionId === undefined)
-            retryStatusText =
-              event.phase === "waiting"
-                ? `等待重试 ${event.retryCount}/2 · Ctrl+C 停止`
-                : `正在重试 ${event.retryCount}/2`;
+          if (event.memberSessionId === undefined) retryStatusText = recovery.status;
           appendNotice(
             event.memberSessionId
-              ? `成员 ${event.memberName ?? event.memberSessionId} · 模型重试`
-              : "模型重试",
-            event.phase === "waiting"
-              ? `${event.diagnostic.summary}\n等待 ${(event.delayMs / 1000).toFixed(1)} 秒后重试 ${event.retryCount}/2；Ctrl+C 可停止。`
-              : `正在发起重试 ${event.retryCount}/2。`,
+              ? "成员 " + (event.memberName ?? event.memberSessionId) + " · " + recovery.title
+              : recovery.title,
+            recovery.status + "\n" + recovery.detail,
           );
           break;
+        }
         case "compaction_start":
           appendExecutionText("Context", "正在压缩上下文，完整历史会保留。");
           break;
@@ -1179,9 +1175,10 @@ export function createConversationView(options: {
           if (event.result.status !== "completed")
             appendNotice(
               event.result.status === "failed" ? "运行失败" : "已停止",
-              event.diagnostic
-                ? formatRunDiagnostic(event.diagnostic)
-                : `${event.result.status === "failed" ? event.result.error + "\n" : ""}${formatRunDiagnostic(undefined)}`,
+              formatRunDiagnostic(
+                event.diagnostic,
+                event.result.status === "failed" ? event.result.error : undefined,
+              ),
             );
           break;
       }
