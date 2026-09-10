@@ -3,7 +3,7 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Message } from "../src/message.js";
+import type { CompletedMessage as Message } from "../src/message.js";
 import { createSession, openSession, type SessionShell } from "../src/session/index.js";
 import { readSessionJournal } from "../src/session/journal.js";
 import { getSessionStorageRelativeDirectory } from "../src/session/locations.js";
@@ -108,7 +108,7 @@ describe("Session recovery storage", () => {
     const migratedJournal = await readSessionJournal(
       join(reopenedSession.storageDirectory, "session.jsonl"),
     );
-    expect(migratedJournal.header.schemaVersion).toBe(2);
+    expect(migratedJournal.header.schemaVersion).toBe(4);
     expect(migratedJournal.records.map((record) => record.seq)).toEqual([1, 2, 3, 4]);
     expect(migratedJournal.records.map((record) => record.parentEntryId)).toEqual([
       null,
@@ -292,8 +292,8 @@ describe("Session recovery storage", () => {
     await reopenedSession.close();
   });
 
-  it("rebuilds a corrupted UTF-8 byte-offset index and supports fact appends inside one Run lease", async () => {
-    const fixtureRoot = await createTemporaryDirectory("anthias-session-resume-index-");
+  it("publishes two linked compactions and ignores an obsolete corrupted resume index", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-compaction-chain-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     const session = await createSession({
       workspaceRoot: fixtureRoot,
@@ -301,113 +301,50 @@ describe("Session recovery storage", () => {
       shell: TEST_SHELL,
     });
     const runId = randomUUID();
-    const acquisition = await session.acquireRun(runId);
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
-    await acquisition.lease.appendMessage(USER_MESSAGE);
-    await acquisition.lease.appendRequestUsage({
-      purpose: "response",
-      requestEntryId: session.records.at(-1)?.entryId ?? null,
-      contextVersion: "context-v1",
-      usage: {
-        inputTokens: 12,
-        outputTokens: 7,
-        cachedInputTokens: null,
-        cacheWriteInputTokens: 3,
-        reasoningTokens: 2,
-      },
-    });
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    const userEntryId = session.records.find(
-      (record) => record.type === "message" && record.message.type === "user",
-    )?.entryId;
-    const assistantEntryId = session.records.find(
-      (record) => record.type === "message" && record.message.type === "assistant",
-    )?.entryId;
-    if (userEntryId === undefined || assistantEntryId === undefined) {
-      throw new Error("expected persisted user and assistant entries");
-    }
-    await acquisition.lease.appendCompaction({
-      summary: "保留中文用户请求",
-      coversThroughEntryId: userEntryId,
-      firstKeptEntryId: assistantEntryId,
-      retainedUserEntryIds: [userEntryId],
-      usageBefore: { inputTokens: 12, outputTokens: 7, cachedInputTokens: null },
-      inputTokenEstimateAfter: 8,
-      modelId: "deterministic-test-model",
-      contextVersion: "context-v2",
-    });
-    await acquisition.lease.appendRunFinished({ status: "completed" });
-    await acquisition.lease.release();
-
-    const journalBytes = await readFile(join(session.storageDirectory, "session.jsonl"));
-    const resumeIndex = JSON.parse(
-      await readFile(join(session.storageDirectory, "session.index.json"), "utf8"),
-    ) as {
-      latestCompaction: {
-        entryId: string;
-        byteOffset: number;
-        firstKeptEntryId: string | null;
-        firstKeptByteOffset: number | null;
-      } | null;
-      retainedUserEntries: Array<{ entryId: string; byteOffset: number }>;
+    const user = await session.appendMessage(runId, USER_MESSAGE);
+    const assistant = await session.appendMessage(runId, ASSISTANT_MESSAGE);
+    const details = {
+      summary: "中文摘要",
+      coversThroughEntryId: user.entryId,
+      firstKeptEntryId: assistant.entryId,
+      retainedUserEntryIds: [user.entryId],
+      usageBefore: { inputTokens: 12, outputTokens: 4, cachedInputTokens: null },
+      inputTokenEstimateAfter: 7,
+      modelId: "deterministic-test",
+      contextVersion: "context-1",
     };
-    const compactionRecord = session.records.find((record) => record.type === "compaction");
-    const requestUsageRecord = session.records.find((record) => record.type === "request_usage");
-    expect(compactionRecord).toMatchObject({ type: "compaction", runId });
-    expect(requestUsageRecord).toMatchObject({
-      type: "request_usage",
-      runId,
-      usage: { cacheWriteInputTokens: 3, reasoningTokens: 2 },
+    const first = await session.appendCompaction(runId, details);
+    const second = await session.appendCompaction(runId, { ...details, summary: "第二摘要" });
+    expect(session.header.latestCompactionEntryId).toBe(second.entryId);
+    expect(session.getEntry(first.entryId)).toMatchObject({
+      previousCompactionEntryId: null,
+      nextCompactionEntryId: second.entryId,
     });
-    expect(resumeIndex.latestCompaction).toMatchObject({
-      entryId: compactionRecord?.entryId,
-      byteOffset: expect.any(Number),
-      firstKeptEntryId: assistantEntryId,
-      firstKeptByteOffset: expect.any(Number),
+    expect(second).toMatchObject({
+      previousCompactionEntryId: first.entryId,
+      nextCompactionEntryId: null,
     });
-    expect(
-      journalBytes
-        .subarray(resumeIndex.latestCompaction?.byteOffset)
-        .toString("utf8")
-        .startsWith(JSON.stringify(compactionRecord)),
-    ).toBe(true);
-    const firstKeptByteOffset = resumeIndex.latestCompaction?.firstKeptByteOffset;
-    if (firstKeptByteOffset === null || firstKeptByteOffset === undefined) {
-      throw new Error("expected a first-kept byte offset");
-    }
-    expect(
-      journalBytes
-        .subarray(firstKeptByteOffset)
-        .toString("utf8")
-        .includes('"content":[{"type":"text","text":"中文回答"}]'),
-    ).toBe(true);
-    expect(resumeIndex.retainedUserEntries).toHaveLength(1);
-    expect(
-      journalBytes
-        .subarray(resumeIndex.retainedUserEntries[0]?.byteOffset)
-        .toString("utf8")
-        .includes('"content":[{"type":"text","text":"中文问题"}]'),
-    ).toBe(true);
-
-    await writeFile(join(session.storageDirectory, "session.index.json"), "{broken}\n", "utf8");
+    await session.appendRunFinished(runId, { status: "completed" });
+    expect(session.header.latestCompactionEntryId).toBe(second.entryId);
+    const indexPath = join(session.storageDirectory, "session.index.json");
+    await expect(readFile(indexPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(indexPath, "{broken}\n");
     await session.close();
-    const reopenedSession = await openSession({
+    const reopened = await openSession({
       sessionId: session.sessionId,
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const rebuiltIndex = JSON.parse(
-      await readFile(join(reopenedSession.storageDirectory, "session.index.json"), "utf8"),
-    ) as { journalFileSize: number };
-    expect(rebuiltIndex.journalFileSize).toBe(
-      await readFile(join(reopenedSession.storageDirectory, "session.jsonl")).then(
-        (journal) => journal.byteLength,
-      ),
-    );
-    await reopenedSession.close();
+    expect(reopened.header.latestCompactionEntryId).toBe(second.entryId);
+    expect(reopened.getEntry(first.entryId)).toMatchObject({
+      nextCompactionEntryId: second.entryId,
+    });
+    expect(await readFile(indexPath, "utf8")).toBe("{broken}\n");
+    expect(
+      (await readSessionHistory({ sessionDirectory, sessionId: session.sessionId })).messages,
+    ).toEqual([USER_MESSAGE, ASSISTANT_MESSAGE]);
+    await reopened.close();
   });
 
   it("recovers a side-effect start only after its bound allowed approval", async () => {
@@ -422,16 +359,13 @@ describe("Session recovery storage", () => {
     const toolCallId = randomUUID();
     const toolApprovalRequestId = randomUUID();
     const actionFingerprint = "a".repeat(64);
-    const acquisition = await session.acquireRun(runId);
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
-    await acquisition.lease.appendMessage({ role: "user", content: "写入文件后回答" });
+    const acquiredRunId = runId;
+    await session.appendMessage(acquiredRunId, { role: "user", content: "写入文件后回答" });
     const authorizationEntryId = session.records.at(-1)?.entryId;
     if (authorizationEntryId === undefined) {
       throw new Error("expected a persisted authorization source");
     }
-    await acquisition.lease.appendMessage({
+    await session.appendMessage(acquiredRunId, {
       role: "assistant",
       content: [
         {
@@ -444,7 +378,7 @@ describe("Session recovery storage", () => {
       ],
       status: "completed",
     });
-    await acquisition.lease.appendApprovalDecision({
+    await session.appendApprovalDecision(acquiredRunId, {
       toolCallId,
       toolName: "write_file",
       permissionMode: "auto_allow",
@@ -455,12 +389,12 @@ describe("Session recovery storage", () => {
       actionFingerprint,
       toolApprovalRequestId,
     });
-    await acquisition.lease.appendToolExecutionStarted({
+    await session.appendToolExecutionStarted(acquiredRunId, {
       toolCallId,
       toolName: "write_file",
       toolApprovalRequestId,
     });
-    await acquisition.lease.appendMessage({
+    await session.appendMessage(acquiredRunId, {
       role: "tool",
       toolCallId,
       toolName: "write_file",
@@ -468,9 +402,8 @@ describe("Session recovery storage", () => {
       content: "已写入",
       truncated: false,
     });
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
-    await acquisition.lease.release();
+    await session.appendMessage(acquiredRunId, ASSISTANT_MESSAGE);
+    await session.appendRunFinished(acquiredRunId, { status: "completed" });
 
     expect(session.records.find((record) => record.type === "approval_decision")).toMatchObject({
       type: "approval_decision",
@@ -506,13 +439,10 @@ describe("Session recovery storage", () => {
       sessionDirectory: join(fixtureRoot, "sessions"),
       shell: TEST_SHELL,
     });
-    const acquisition = await session.acquireRun(randomUUID());
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
+    const acquiredRunId = randomUUID();
     const toolCallId = randomUUID();
-    await acquisition.lease.appendMessage({ role: "user", content: "读取后回答" });
-    await acquisition.lease.appendMessage({
+    await session.appendMessage(acquiredRunId, { role: "user", content: "读取后回答" });
+    await session.appendMessage(acquiredRunId, {
       role: "assistant",
       content: [
         {
@@ -530,7 +460,7 @@ describe("Session recovery storage", () => {
       throw new Error("expected a persisted Assistant entry");
     }
     await expect(
-      acquisition.lease.appendApprovalDecision({
+      session.appendApprovalDecision(acquiredRunId, {
         toolCallId,
         toolName: "read_file",
         permissionMode: "auto_allow",
@@ -542,7 +472,6 @@ describe("Session recovery storage", () => {
         toolApprovalRequestId: randomUUID(),
       }),
     ).rejects.toThrow("授权引用无效");
-    await acquisition.lease.release();
     await session.close();
   });
 
@@ -553,18 +482,15 @@ describe("Session recovery storage", () => {
       sessionDirectory: join(fixtureRoot, "sessions"),
       shell: TEST_SHELL,
     });
-    const acquisition = await session.acquireRun(randomUUID());
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
+    const acquiredRunId = randomUUID();
     const toolCallId = randomUUID();
     const toolApprovalRequestId = randomUUID();
-    await acquisition.lease.appendMessage({ role: "user", content: "写入文件" });
+    await session.appendMessage(acquiredRunId, { role: "user", content: "写入文件" });
     const authorizationEntryId = session.records.at(-1)?.entryId;
     if (authorizationEntryId === undefined) {
       throw new Error("expected a persisted authorization source");
     }
-    await acquisition.lease.appendMessage({
+    await session.appendMessage(acquiredRunId, {
       role: "assistant",
       content: [
         {
@@ -577,7 +503,7 @@ describe("Session recovery storage", () => {
       ],
       status: "completed",
     });
-    await acquisition.lease.appendApprovalDecision({
+    await session.appendApprovalDecision(acquiredRunId, {
       toolCallId,
       toolName: "write_file",
       permissionMode: "auto_allow",
@@ -589,91 +515,68 @@ describe("Session recovery storage", () => {
       toolApprovalRequestId,
     });
     await expect(
-      acquisition.lease.appendToolExecutionStarted({
+      session.appendToolExecutionStarted(acquiredRunId, {
         toolCallId,
         toolName: "write_file",
         toolApprovalRequestId: randomUUID(),
       }),
     ).rejects.toThrow("缺少匹配的允许审批");
-    await acquisition.lease.release();
     await session.close();
   });
-  it("falls back to the previous valid CompactionEntry while rejecting invalid new appends", async () => {
-    const fixtureRoot = await createTemporaryDirectory("anthias-session-compaction-fallback-");
+  it("repairs stale navigation only on execution open without changing committed messages", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-navigation-repair-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     const session = await createSession({
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const acquisition = await session.acquireRun(randomUUID());
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
-    await acquisition.lease.appendMessage(USER_MESSAGE);
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
-    await acquisition.lease.release();
-
-    const userEntryId = session.records.find(
-      (record) => record.type === "message" && record.message.type === "user",
-    )?.entryId;
-    const assistantEntryId = session.records.find(
-      (record) => record.type === "message" && record.message.type === "assistant",
-    )?.entryId;
-    if (userEntryId === undefined || assistantEntryId === undefined) {
-      throw new Error("expected persisted message entries");
-    }
-    const compactionDetails = {
-      summary: "有效压缩",
-      coversThroughEntryId: userEntryId,
-      firstKeptEntryId: assistantEntryId,
-      retainedUserEntryIds: [userEntryId],
+    const runId = randomUUID();
+    const user = await session.appendMessage(runId, USER_MESSAGE);
+    const assistant = await session.appendMessage(runId, ASSISTANT_MESSAGE);
+    await session.appendRunFinished(runId, { status: "completed" });
+    const details = {
+      summary: "摘要",
+      coversThroughEntryId: user.entryId,
+      firstKeptEntryId: assistant.entryId,
+      retainedUserEntryIds: [user.entryId],
       usageBefore: { inputTokens: 9, outputTokens: 4, cachedInputTokens: null },
       inputTokenEstimateAfter: 6,
-      modelId: "deterministic-test-model",
-      contextVersion: "context-v1",
+      modelId: "local",
+      contextVersion: "v1",
     };
-    await expect(
-      session.appendCompaction({ ...compactionDetails, coversThroughEntryId: randomUUID() }),
-    ).rejects.toThrow("CompactionEntry 引用无效。");
-    await session.appendCompaction(compactionDetails);
-    const validCompaction = session.records.at(-1);
-    if (validCompaction?.type !== "compaction") {
-      throw new Error("expected a valid CompactionEntry");
-    }
-
-    const invalidCompaction = {
-      ...validCompaction,
-      entryId: randomUUID(),
-      seq: validCompaction.seq + 1,
-      timestamp: new Date().toISOString(),
-      parentEntryId: validCompaction.entryId,
-      coversThroughEntryId: randomUUID(),
-    };
-    const sessionFilePath = join(session.storageDirectory, "session.jsonl");
-    await appendFile(sessionFilePath, `${JSON.stringify(invalidCompaction)}\n`, "utf8");
-    await expect(readSessionJournal(sessionFilePath)).resolves.toMatchObject({
-      records: expect.arrayContaining([
-        expect.objectContaining({ entryId: invalidCompaction.entryId }),
-      ]),
-    });
+    const first = await session.appendCompaction(null, details);
+    const second = await session.appendCompaction(null, details);
     await session.close();
-
-    const reopenedSession = await openSession({
+    const path = join(session.storageDirectory, "session.jsonl");
+    const records = (await readFile(path, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    records[0].latestCompactionEntryId = first.entryId;
+    records.find((entry) => entry.entryId === first.entryId).nextCompactionEntryId = null;
+    await writeFile(path, records.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const corrupted = await readFile(path);
+    await expect(
+      readSessionHistory({ sessionDirectory, sessionId: session.sessionId }),
+    ).rejects.toThrow("压缩导航不一致");
+    expect(await readFile(path)).toEqual(corrupted);
+    const reopened = await openSession({
       sessionId: session.sessionId,
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const resumeIndex = JSON.parse(
-      await readFile(join(reopenedSession.storageDirectory, "session.index.json"), "utf8"),
-    ) as { latestCompaction: { entryId: string } | null };
-    expect(resumeIndex.latestCompaction).toMatchObject({ entryId: validCompaction.entryId });
-    expect(
-      reopenedSession.records.some((record) => record.entryId === invalidCompaction.entryId),
-    ).toBe(true);
-    await reopenedSession.close();
+    expect(reopened.header.latestCompactionEntryId).toBe(second.entryId);
+    expect(reopened.getEntry(first.entryId)).toMatchObject({
+      nextCompactionEntryId: second.entryId,
+    });
+    expect(reopened.getEntry(user.entryId)).toEqual(user);
+    expect(reopened.getEntry(assistant.entryId)).toEqual(assistant);
+    await expect(
+      reopened.appendCompaction(null, { ...details, coversThroughEntryId: randomUUID() }),
+    ).rejects.toThrow("引用无效");
+    await reopened.close();
   });
 
   it("removes its own usage marker when marker persistence fails", async () => {
@@ -719,19 +622,16 @@ describe("Session recovery storage", () => {
       rootSessionId,
       sessionKind: "subagent",
     });
-    const acquisition = await member.acquireRun(randomUUID());
-    expect(acquisition.status).toBe("acquired");
-    if (acquisition.status !== "acquired") throw new Error("expected member Run lease");
-    await acquisition.lease.appendAgentInput({
+    const acquiredRunId = randomUUID();
+    await member.appendAgentInput(acquiredRunId, {
       messageId: randomUUID(),
       rootSessionId,
       fromSessionId: rootSessionId,
       kind: "task",
       content: "source task",
     });
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
-    await acquisition.lease.release();
+    await member.appendMessage(acquiredRunId, ASSISTANT_MESSAGE);
+    await member.appendRunFinished(acquiredRunId, { status: "completed" });
     await member.close();
     await root.close();
     await rm(workspaceRoot, { recursive: true });
@@ -742,7 +642,8 @@ describe("Session recovery storage", () => {
       rootSessionId,
     });
     expect(history.header).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
+      latestCompactionEntryId: null,
       rootSessionId,
       sessionKind: "subagent",
     });
@@ -757,7 +658,7 @@ describe("Session recovery storage", () => {
     ).rejects.toThrow("不属于请求的根 Session");
   });
 
-  it("reads Schema 2 without migration and upgrades it only for coordination", async () => {
+  it("reads Schema 2 without mutation and upgrades it on execution open", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-schema2-upgrade-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     await mkdir(sessionDirectory);
@@ -791,8 +692,8 @@ describe("Session recovery storage", () => {
     });
     expect(
       (await readSessionJournal(join(storageDirectory, "session.jsonl"))).header.schemaVersion,
-    ).toBe(2);
-    await session.appendCoordination({
+    ).toBe(4);
+    await session.appendCoordination(null, {
       kind: "team",
       key: randomUUID(),
       payload: { status: "closed" },
@@ -800,7 +701,8 @@ describe("Session recovery storage", () => {
     const upgraded = await readSessionJournal(join(storageDirectory, "session.jsonl"));
     expect(upgraded.header).toEqual({
       ...header,
-      schemaVersion: 3,
+      schemaVersion: 4,
+      latestCompactionEntryId: null,
       rootSessionId: sessionId,
       sessionKind: "primary",
     });
@@ -808,62 +710,167 @@ describe("Session recovery storage", () => {
     expect(upgraded.records.at(-1)).toMatchObject({ type: "coordination", kind: "team" });
     await session.close();
   });
-  it("accepts another opener's use record, retains independent markers, and closes idempotently", async () => {
+  it("reads and upgrades an old member input inside a pending Tool batch without reordering facts", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-old-input-order-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    const sessionId = randomUUID();
+    const runId = randomUUID();
+    const toolCallId = randomUUID();
+    const header = {
+      type: "session_header" as const,
+      schemaVersion: 3 as const,
+      sessionId,
+      rootSessionId: sessionId,
+      sessionKind: "primary" as const,
+      createdAt: new Date().toISOString(),
+      workspaceRoot: fixtureRoot,
+      shell: TEST_SHELL,
+    };
+    const facts = [
+      {
+        type: "message",
+        message: { type: "user", content: [{ type: "text", text: "read then answer" }] },
+      },
+      {
+        type: "message",
+        message: {
+          type: "assistant",
+          content: [
+            {
+              type: "tool_call",
+              toolCallId,
+              toolName: "read_file",
+              input: { path: "file.txt" },
+              invalid: false,
+            },
+          ],
+          status: "completed",
+        },
+      },
+      {
+        type: "agent_input",
+        messageId: randomUUID(),
+        rootSessionId: sessionId,
+        fromSessionId: randomUUID(),
+        kind: "message",
+        content: "legacy delivery",
+      },
+      {
+        type: "message",
+        message: {
+          type: "tool_result",
+          toolCallId,
+          toolName: "read_file",
+          status: "completed",
+          content: "file",
+          truncated: false,
+        },
+      },
+      {
+        type: "message",
+        message: {
+          type: "assistant",
+          content: [{ type: "text", text: "done" }],
+          status: "completed",
+        },
+      },
+      { type: "run_finished", status: "completed" },
+    ];
+    let parentEntryId: string | null = null;
+    const records = facts.map((fact, index) => {
+      const record = {
+        ...fact,
+        runId,
+        entryId: randomUUID(),
+        parentEntryId,
+        seq: index + 1,
+        timestamp: header.createdAt,
+      };
+      parentEntryId = record.entryId;
+      return record;
+    });
+    const storageDirectory = join(sessionDirectory, getSessionStorageRelativeDirectory(header));
+    await mkdir(storageDirectory, { recursive: true });
+    const path = join(storageDirectory, "session.jsonl");
+    await writeFile(
+      path,
+      `${[header, ...records].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    );
+    const original = await readFile(path);
+    const history = await readSessionHistory({ sessionDirectory, sessionId });
+    expect(history.records.map((entry) => entry.entryId)).toEqual(
+      records.map((entry) => entry.entryId),
+    );
+    expect(await readFile(path)).toEqual(original);
+    const session = await openSession({
+      sessionDirectory,
+      sessionId,
+      workspaceRoot: fixtureRoot,
+      shell: TEST_SHELL,
+    });
+    expect(session.header.schemaVersion).toBe(4);
+    expect(
+      session.records.slice(0, records.length).map((entry) => [entry.entryId, entry.parentEntryId]),
+    ).toEqual(records.map((entry) => [entry.entryId, entry.parentEntryId]));
+    const newRunId = randomUUID();
+    const newToolCallId = randomUUID();
+    await session.appendMessage(newRunId, USER_MESSAGE);
+    await session.appendMessage(newRunId, {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          toolCallId: newToolCallId,
+          toolName: "read_file",
+          input: {},
+          invalid: false,
+        },
+      ],
+      status: "completed",
+    });
+    await expect(
+      session.appendAgentInput(newRunId, {
+        messageId: randomUUID(),
+        rootSessionId: sessionId,
+        fromSessionId: randomUUID(),
+        kind: "message",
+        content: "must wait",
+      }),
+    ).rejects.toThrow("不能越过未决 ToolCall");
+    await session.close();
+  });
+
+  it("retains its usage marker across idle periods and closes idempotently", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-use-marker-");
     const sessionDirectory = join(fixtureRoot, "sessions");
-    const firstSession = await createSession({
+    const session = await createSession({
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
     });
+    const system = {
+      processId: process.pid,
+      createOwnerToken: randomUUID,
+      createTimestamp: () => new Date().toISOString(),
+      inspectProcess: () => "alive" as const,
+    };
     expect(
-      (
-        await inspectSessionUsageMarkers(sessionDirectory, firstSession.sessionId, {
-          processId: process.pid,
-          createOwnerToken: randomUUID,
-          createTimestamp: () => new Date().toISOString(),
-          inspectProcess: () => "alive",
-        })
-      ).status,
+      (await inspectSessionUsageMarkers(sessionDirectory, session.sessionId, system)).status,
     ).toBe("in_use");
-
-    const secondSession = await openSession({
-      sessionId: firstSession.sessionId,
-      workspaceRoot: fixtureRoot,
-      sessionDirectory,
-      shell: TEST_SHELL,
-    });
-    const acquisition = await firstSession.acquireRun(randomUUID());
-    expect(acquisition.status).toBe("acquired");
-    if (acquisition.status !== "acquired") {
-      throw new Error(`expected Session Run lease, received ${acquisition.reason}`);
-    }
-    await acquisition.lease.appendMessage(USER_MESSAGE);
-    await acquisition.lease.appendMessage(ASSISTANT_MESSAGE);
-    await acquisition.lease.appendRunFinished({ status: "completed" });
-    await acquisition.lease.release();
-
-    await Promise.all([firstSession.close(), firstSession.close()]);
+    await expect(
+      openSession({
+        sessionId: session.sessionId,
+        workspaceRoot: fixtureRoot,
+        sessionDirectory,
+        shell: TEST_SHELL,
+      }),
+    ).rejects.toThrow("正在被其他进程使用");
     expect(
-      (
-        await inspectSessionUsageMarkers(sessionDirectory, firstSession.sessionId, {
-          processId: process.pid,
-          createOwnerToken: randomUUID,
-          createTimestamp: () => new Date().toISOString(),
-          inspectProcess: () => "alive",
-        })
-      ).status,
+      (await inspectSessionUsageMarkers(sessionDirectory, session.sessionId, system)).status,
     ).toBe("in_use");
-    await Promise.all([secondSession.close(), secondSession.close()]);
+    await Promise.all([session.close(), session.close()]);
     expect(
-      (
-        await inspectSessionUsageMarkers(sessionDirectory, firstSession.sessionId, {
-          processId: process.pid,
-          createOwnerToken: randomUUID,
-          createTimestamp: () => new Date().toISOString(),
-          inspectProcess: () => "alive",
-        })
-      ).status,
+      (await inspectSessionUsageMarkers(sessionDirectory, session.sessionId, system)).status,
     ).toBe("unused");
   });
 });

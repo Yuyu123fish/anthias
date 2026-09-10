@@ -88,12 +88,16 @@ export async function reviewToolApproval(
   // 历史人工批准只审计已绑定动作；其文件正文不能挤掉当前任务或更新限制。
   const authorizationSources: AuthorizationSource[] = [];
   for (const record of options.records) {
-    if (record.type === "message" && record.message.type === "user") {
+    if (
+      record.type === "message" &&
+      record.message.role === "user" &&
+      record.message.source?.kind !== "agent"
+    ) {
       authorizationSources.push({
         entryId: record.entryId,
         seq: record.seq,
         source: "user",
-        content: record.message.content.map((part) => part.text).join(""),
+        content: record.message.content,
       });
     }
   }
@@ -114,7 +118,7 @@ export async function reviewToolApproval(
     if (
       record.seq >= lastUserSequence ||
       record.type !== "message" ||
-      record.message.type !== "assistant"
+      record.message.role !== "assistant"
     )
       continue;
     const content = record.message.content
@@ -368,11 +372,11 @@ function createActionExecutionHistory(options: ReviewToolApprovalOptions) {
       record.type === "message" &&
       record.runId === options.runId &&
       record.seq > latestExecution.seq &&
-      record.message.type === "tool_result" &&
+      record.message.role === "tool" &&
       record.message.toolCallId === latestExecution.toolCallId,
   );
   const resultMessage =
-    latestResult?.type === "message" && latestResult.message.type === "tool_result"
+    latestResult?.type === "message" && latestResult.message.role === "tool"
       ? latestResult.message
       : null;
   return {

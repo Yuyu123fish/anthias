@@ -3,7 +3,7 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolArtifactIncompleteReason } from "../../message.js";
-import { ARTIFACT_BYTE_LIMIT } from "../../session/artifacts.js";
+import { ARTIFACT_BYTE_LIMIT } from "../artifacts.js";
 import {
   boundToolOutput,
   TOOL_RESULT_BYTE_LIMIT,

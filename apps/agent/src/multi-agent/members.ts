@@ -6,7 +6,7 @@ import {
   type Session,
 } from "../session/index.js";
 import { readSessionHistory } from "../session/query.js";
-import type { AgentEvent, PermissionMode, PromptResult, SessionAgent } from "../session-agent.js";
+import type { AgentEvent, PermissionMode, SessionAgent } from "../session-agent.js";
 import type { GitWorkspace } from "../tool/basetool/git/index.js";
 import { isRecord } from "../tool/input-validation.js";
 
@@ -121,7 +121,7 @@ export function createMembers(options: {
     for (const waiter of [...waiters]) waiter();
   }
   async function save(member: MemberOwnership, summary: MemberSummary) {
-    await options.root.appendCoordination({
+    await options.root.appendCoordination(null, {
       kind: "member",
       key: summary.sessionId,
       payload: summary,
@@ -172,7 +172,7 @@ export function createMembers(options: {
   function start(member: MemberOwnership, input: AgentInputDetails) {
     const agent = member.agent;
     const completion = (async () => {
-      let result: PromptResult;
+      let result: Awaited<ReturnType<SessionAgent["promptInternal"]>>;
       try {
         member.controller.signal.throwIfAborted();
         if (!agent) throw new Error("成员执行者尚未就绪。");

@@ -1,7 +1,6 @@
 import type { Message } from "../message.js";
 import { readSessionJournal } from "./journal.js";
 import { enumerateSessionStorage, locateSessionStorage } from "./locations.js";
-import { fromDurableMessage } from "./message-codec.js";
 import {
   areSameWorkspace,
   getSessionOwnership,
@@ -67,7 +66,7 @@ export async function readSessionHistory({
   }
   const messages = journal.records
     .filter((record) => record.type === "message")
-    .map((record) => fromDurableMessage(record.message));
+    .map((record) => record.message);
   return Object.freeze({
     header: journal.header,
     records: Object.freeze([...journal.records]),

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { type AgentEvent, createAgentWithModelStream } from "../src/agent.js";
 import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import { createSession, resolveSessionDirectory } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -64,7 +65,9 @@ describe("read-only Agent Tool Loop", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("检查 target")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "检查 target")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(modelRequests).toHaveLength(4);
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
@@ -183,7 +186,9 @@ describe("read-only Agent Tool Loop", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("检查非法调用")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "检查非法调用")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
     expect(events.some((event) => event.type === "run_phase_changed")).toBe(false);

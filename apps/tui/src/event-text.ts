@@ -37,6 +37,31 @@ export function toolResultStatus(status: ToolResultMessage["status"]): string {
 /** 两种入口共用事件含义；流式状态、折叠和插入位置仍由各自呈现层决定。 */
 export function eventNotice(event: AgentEvent): Readonly<{ title: string; text: string }> | null {
   switch (event.type) {
+    case "input_queued":
+      return {
+        title:
+          event.input.source.kind === "agent"
+            ? "成员输入 · 已排队"
+            : event.input.mode === "steer"
+              ? "优先插入 · 已排队"
+              : "等待插入 · 已排队",
+        text: `[${event.input.inputId.slice(-8)}] ${event.input.content}\n${event.input.source.kind === "agent" ? "成员投递已保存在协作历史，等待安全点插入。" : "尚未保存；停止后用 /continue 恢复，关闭会丢弃。"}`,
+      };
+    case "input_consumed":
+      return {
+        title: "输入已插入",
+        text: `[${event.inputId.slice(-8)}] 已保存并进入${event.mode === "steer" ? "当前执行" : "后续任务"}。`,
+      };
+    case "input_discarded":
+      return {
+        title: event.source.kind === "agent" ? "成员投递已保留" : "排队输入未保存",
+        text: `[${event.inputId.slice(-8)}] ${event.reason === "closed" ? "Agent 已关闭" : "Session 已切换"}，${event.source.kind === "agent" ? "成员投递仍保存在协作历史，显式继续后处理。" : "该输入不会在重开后恢复。"}`,
+      };
+    case "session_unavailable":
+      return {
+        title: "Session 写入失败",
+        text: `${event.error}\n执行与队列已暂停。请 /exit 后用 --session <当前 Session ID> 重新启动，核对已保存历史。`,
+      };
     case "model_retry": {
       const recovery = formatModelRecovery(event);
       return {

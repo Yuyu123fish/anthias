@@ -1,8 +1,8 @@
 import {
   type AssistantMessage,
   type AssistantToolCallPart,
+  type CompletedMessage,
   isToolCallPart,
-  type Message,
   type RunDiagnostic,
   type ToolResultMessage,
 } from "./message.js";
@@ -14,10 +14,9 @@ import {
   type ModelRequest,
   type ModelStream,
   streamAssistantMessage,
-  toModelInputMessage,
 } from "./model/model-stream.js";
 import type { PermissionMode } from "./permission/permission-mode.js";
-import type { SessionArtifactStore } from "./session/artifacts.js";
+import type { SessionArtifactStore } from "./tool/artifacts.js";
 import type { ModelToolDefinition } from "./tool/definitions.js";
 import { appendToolResults, appendUnresolvedToolResults, runToolBatch } from "./tool/tool-batch.js";
 import type { ToolApprovalPlan, ToolRunner } from "./tool/tool-runner.js";
@@ -70,14 +69,6 @@ export type AgentLoopEvent =
       delta: string | null;
     }>
   | Readonly<{
-      type: "assistant_message_end";
-      message: AssistantMessage;
-    }>
-  | Readonly<{
-      type: "tool_result";
-      message: ToolResultMessage;
-    }>
-  | Readonly<{
       type: "tool_execution_start";
       toolCall: AssistantToolCallPart;
       toolApprovalRequestId: string | null;
@@ -98,8 +89,9 @@ export type AgentLoopEvent =
       cleanupUncertain: boolean;
     }>;
 export type RunAgentLoopOptions = Readonly<{
-  messages: readonly Message[];
-  messageEntryId?: (message: Message) => string | undefined;
+  readMessages(): readonly ModelInputMessage[];
+  recordMessage(message: CompletedMessage, messageStartAlreadyPublished: boolean): Promise<string>;
+  consumeSteer(): Promise<boolean>;
   modelStream: ModelStream;
   systemPrompt: string;
   toolDefinitions: readonly ModelToolDefinition[];
@@ -134,7 +126,6 @@ const TOOL_CALL_BATCH_LIMIT_RESULT = Object.freeze({
 
 /** 推进 Model → Tool → Model；取消、任务时限和批次资源限制分别由所属层持有。 */
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentLoopResult> {
-  const messageHistory = [...options.messages];
   let runRetryCount = 0;
   let generationRetryCount = 0;
   let recoveryInstruction: string | null = null;
@@ -149,7 +140,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       }),
     });
   const transientModelMessages = new Map<
-    AssistantMessage,
+    string,
     Extract<ModelInputMessage, { role: "assistant" }>
   >();
 
@@ -159,7 +150,6 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     }
     options.updatePhase("requesting_model");
     const assistantResponseResult = await streamAssistantResponse(
-      messageHistory,
       transientModelMessages,
       options,
       generationRetryCount,
@@ -178,12 +168,12 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       });
     }
     if (assistantResponseResult.message.status === "aborted") {
-      await appendUnresolvedToolResults(assistantResponseResult.message, messageHistory, options);
+      await appendUnresolvedToolResults(assistantResponseResult.message, options);
       return abortedResult();
     }
     if (assistantResponseResult.message.status === "failed") {
       // 先封存失败消息和未执行 ToolCall，再以新生成恢复；绝不拼接旧流或重放工具。
-      await appendUnresolvedToolResults(assistantResponseResult.message, messageHistory, options);
+      await appendUnresolvedToolResults(assistantResponseResult.message, options);
       const diagnostic = assistantResponseResult.message.diagnostic;
       const recoverable =
         diagnostic !== undefined &&
@@ -268,6 +258,8 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
 
     const toolCalls = assistantResponseResult.message.content.filter(isToolCallPart);
     if (toolCalls.length === 0) {
+      if (assistantResponseResult.finishReason === "stop" && (await options.consumeSteer()))
+        continue;
       return {
         ...(assistantResponseResult.finishReason === "stop"
           ? COMPLETED_LOOP_RESULT
@@ -276,20 +268,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
       };
     }
     if (assistantResponseResult.finishReason !== "tool_calls") {
-      await appendToolResults(
-        toolCalls,
-        "aborted",
-        "模型未正常结束 ToolCall。",
-        messageHistory,
-        options,
-      );
+      await appendToolResults(toolCalls, "aborted", "模型未正常结束 ToolCall。", options);
       return {
         status: "failed",
         error: latestDiagnostic?.summary ?? SAFE_MODEL_ERROR,
         ...(latestDiagnostic === undefined ? {} : { diagnostic: latestDiagnostic }),
       };
     }
-    const batchResult = await runToolBatch(toolCalls, messageHistory, {
+    const batchResult = await runToolBatch(toolCalls, {
       ...options,
       toolRunner: assistantResponseResult.toolRunner,
     });
@@ -304,13 +290,13 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     }
     if (batchResult.status === "aborted") return abortedResult();
     if (batchResult.status === "failed") return batchResult;
+    await options.consumeSteer();
   }
 }
 
 /** 流式形成一条完整 AssistantMessage，Tool 处理只能在其持久化后发生。 */
 async function streamAssistantResponse(
-  messageHistory: Message[],
-  transientModelMessages: Map<AssistantMessage, Extract<ModelInputMessage, { role: "assistant" }>>,
+  transientModelMessages: Map<string, Extract<ModelInputMessage, { role: "assistant" }>>,
   options: RunAgentLoopOptions,
   recoveryAttempt: number,
   recoveryInstruction: string | null,
@@ -324,14 +310,14 @@ async function streamAssistantResponse(
     systemPrompt: [options.systemPrompt, recoveryInstruction].filter(Boolean).join("\n"),
     recoveryAttempt,
     messages: Object.freeze(
-      messageHistory.map((message) => {
-        const modelMessage =
-          message.role === "assistant"
-            ? (transientModelMessages.get(message) ?? toModelInputMessage(message))
-            : toModelInputMessage(message);
-        const entryId = options.messageEntryId?.(message);
-        return entryId ? { ...modelMessage, entryId } : modelMessage;
-      }),
+      options.readMessages().map((message) =>
+        message.role === "assistant" && message.entryId
+          ? {
+              ...(transientModelMessages.get(message.entryId) ?? message),
+              entryId: message.entryId,
+            }
+          : message,
+      ),
     ),
     tools: options.toolDefinitions,
   });
@@ -382,10 +368,13 @@ async function streamAssistantResponse(
   if (finalMessage === null || finalModelInputMessage === null) {
     throw new Error("Model Stream 未形成最终 AssistantMessage。");
   }
-  await options.emit({ type: "assistant_message_end", message: finalMessage });
+  if (finalMessage.status === "streaming") throw new Error("完成消息不能仍处于 streaming。");
+  const entryId = await options.recordMessage(
+    { ...finalMessage, status: finalMessage.status },
+    true,
+  );
   if (finalMessage.status === "completed")
-    transientModelMessages.set(finalMessage, finalModelInputMessage);
-  messageHistory.push(finalMessage);
+    transientModelMessages.set(entryId, finalModelInputMessage);
   return Object.freeze({
     message: finalMessage,
     modelInputMessage: finalModelInputMessage,

@@ -9,7 +9,6 @@ import {
   type AssistantMessage,
   type AssistantToolCallPart,
   isToolCallPart,
-  type Message,
   type ToolArtifactReference,
   type ToolResultMessage,
 } from "../message.js";
@@ -24,6 +23,7 @@ type ToolBatchOptions = Pick<
   | "permissionMode"
   | "artifactStore"
   | "abortController"
+  | "recordMessage"
   | "emit"
   | "updatePhase"
   | "requestToolApproval"
@@ -52,7 +52,6 @@ type ToolResultBudget = {
 /** 一个响应内的预检、审批、资源屏障和结果提交共用同一协议；完成后才允许下一次模型请求。 */
 export async function runToolBatch(
   toolCalls: readonly AssistantToolCallPart[],
-  messageHistory: Message[],
   options: ToolBatchOptions,
 ): Promise<ToolBatchResult> {
   if (toolCalls.length > TOOL_CALL_BATCH_LIMIT) {
@@ -60,7 +59,6 @@ export async function runToolBatch(
       toolCalls,
       "failed",
       "单次模型响应包含过多 ToolCall，调用未执行。",
-      messageHistory,
       options,
     );
     return { status: "call_limit" };
@@ -91,7 +89,6 @@ export async function runToolBatch(
     for (const toolResult of toolBatchResult.toolResults) {
       await appendToolResultMessage(
         boundToolResultForBudget(toolResult, toolResultBudget),
-        messageHistory,
         options,
       );
     }
@@ -101,7 +98,6 @@ export async function runToolBatch(
         plannedToolCalls.slice(offset).map(({ toolCall }) => toolCall),
         "aborted",
         "自动审核技术故障，后续调用未执行。",
-        messageHistory,
         options,
         toolResultBudget,
       );
@@ -116,7 +112,6 @@ export async function runToolBatch(
         plannedToolCalls.slice(offset).map(({ toolCall }) => toolCall),
         "aborted",
         "Run 已停止，调用未执行。",
-        messageHistory,
         options,
         toolResultBudget,
       );
@@ -400,11 +395,9 @@ function createAbortedToolResultMessage(
 /** 串行提交已经形成的结果消息，再把它加入下一轮模型上下文。 */
 async function appendToolResultMessage(
   toolResultMessage: ToolResultMessage,
-  messageHistory: Message[],
   options: ToolBatchOptions,
 ): Promise<void> {
-  await options.emit({ type: "tool_result", message: toolResultMessage });
-  messageHistory.push(toolResultMessage);
+  await options.recordMessage(toolResultMessage, false);
 }
 
 function createToolResultMessage(
@@ -477,7 +470,6 @@ export async function appendToolResults(
   toolCalls: readonly AssistantToolCallPart[],
   status: Extract<ToolResultMessage["status"], "failed" | "aborted">,
   content: string,
-  messageHistory: Message[],
   options: ToolBatchOptions,
   toolResultBudget: ToolResultBudget = createToolResultBudget(toolCalls.length),
 ): Promise<void> {
@@ -489,7 +481,6 @@ export async function appendToolResults(
     });
     await appendToolResultMessage(
       boundToolResultForBudget(toolResultMessage, toolResultBudget),
-      messageHistory,
       options,
     );
   }
@@ -498,14 +489,12 @@ export async function appendToolResults(
 /** 为异常终止的 AssistantMessage 补齐其中尚未执行的 ToolCall。 */
 export async function appendUnresolvedToolResults(
   assistantMessage: AssistantMessage,
-  messageHistory: Message[],
   options: ToolBatchOptions,
 ): Promise<void> {
   await appendToolResults(
     assistantMessage.content.filter(isToolCallPart),
     "aborted",
     "模型请求未正常完成，ToolCall 未执行。",
-    messageHistory,
     options,
   );
 }

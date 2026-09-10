@@ -1,6 +1,6 @@
 import { access, stat } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { ARTIFACT_BYTE_LIMIT } from "../src/session/artifacts.js";
+import { ARTIFACT_BYTE_LIMIT } from "../src/tool/artifacts.js";
 import { createCommandOutputCapture } from "../src/tool/basetool/command-output.js";
 import { finalizeToolResult } from "../src/tool/tool-result.js";
 

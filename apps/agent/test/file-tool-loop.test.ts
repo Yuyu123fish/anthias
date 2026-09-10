@@ -15,6 +15,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -58,7 +59,7 @@ describe("file Agent Tool Loop", () => {
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
-    const promptResultPromise = agent.prompt("修改文件");
+    const promptResultPromise = promptToCompletion(agent, "修改文件");
 
     const editApproval = await waitForNextApproval(agent);
     expect(editApproval.preview).toContain("operation: edit");
@@ -104,7 +105,7 @@ describe("file Agent Tool Loop", () => {
         (record, index) =>
           index > startedIndex &&
           record.type === "message" &&
-          (record.message as Record<string, unknown> | undefined)?.type === "tool_result",
+          (record.message as Record<string, unknown> | undefined)?.role === "tool",
       );
       expect(resultIndex).toBeGreaterThan(startedIndex);
     }
@@ -127,7 +128,7 @@ describe("file Agent Tool Loop", () => {
       yield finishEvent("stop");
     };
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
-    const promptResultPromise = agent.prompt("编辑文件");
+    const promptResultPromise = promptToCompletion(agent, "编辑文件");
     const approval = await waitForNextApproval(agent);
 
     await writeFile(fixture.existingFilePath, "external\n", "utf8");
@@ -157,7 +158,7 @@ describe("file Agent Tool Loop", () => {
       yield finishEvent("stop");
     };
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
-    const promptResultPromise = agent.prompt("拒绝写入");
+    const promptResultPromise = promptToCompletion(agent, "拒绝写入");
     const approval = await waitForNextApproval(agent);
 
     expect(agent.respondToToolApproval(approval.toolApprovalRequestId, "deny")).toEqual({
@@ -190,7 +191,7 @@ describe("file Agent Tool Loop", () => {
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
-    const promptResultPromise = agent.prompt("停止确认");
+    const promptResultPromise = promptToCompletion(agent, "停止确认");
     const approval = await waitForNextApproval(agent);
 
     agent.abort();
@@ -208,13 +209,16 @@ describe("file Agent Tool Loop", () => {
     ).toMatchObject({
       status: "aborted",
     });
+    await agent.close();
     const reopenedSession = await openSession({
       sessionId: fixture.session.sessionId,
       workspaceRoot: fixture.workspaceRoot,
       sessionDirectory: fixture.sessionDirectory,
       shell: fixture.shell,
     });
-    expect(reopenedSession.messageHistory.at(-1)).toMatchObject({
+    expect(
+      reopenedSession.records.filter((entry) => entry.type === "message").at(-1)?.message,
+    ).toMatchObject({
       role: "tool",
       status: "aborted",
     });
@@ -248,7 +252,9 @@ describe("file Agent Tool Loop", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("非法文件调用")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "非法文件调用")).resolves.toEqual({
+      status: "completed",
+    });
 
     const toolResults = agent.state.messageHistory.filter((message) => message.role === "tool");
     expect(toolResults).toHaveLength(3);

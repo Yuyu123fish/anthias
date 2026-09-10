@@ -45,7 +45,7 @@ export function createAgentTeam(session: Session) {
     }
   }
   async function saveTask(task: TeamTask) {
-    await session.appendCoordination({ kind: "task", key: task.id, payload: task });
+    await session.appendCoordination(null, { kind: "task", key: task.id, payload: task });
     tasks.set(task.id, task);
     return task;
   }
@@ -59,14 +59,14 @@ export function createAgentTeam(session: Session) {
     async create(name: string) {
       if (team?.status === "active") throw new Error("已有活动 Team，请先结束。");
       const created: TeamSummary = { id: randomUUID(), name, status: "active" };
-      await session.appendCoordination({ kind: "team", key: created.id, payload: created });
+      await session.appendCoordination(null, { kind: "team", key: created.id, payload: created });
       team = created;
       return created;
     },
     async close() {
       if (team?.status !== "active") throw new Error("没有活动 Team。");
       const closed: TeamSummary = { ...team, status: "closed" };
-      await session.appendCoordination({ kind: "team", key: closed.id, payload: closed });
+      await session.appendCoordination(null, { kind: "team", key: closed.id, payload: closed });
       team = closed;
       return closed;
     },

@@ -50,7 +50,9 @@ export function createAgentRuntime(
       worktreeDirectory ?? fileURLToPath(new URL("../../../data/worktrees", import.meta.url)),
     rootSessionId: rootSession.sessionId,
     readRecords: () => rootSession.records.filter((record) => record.type === "coordination"),
-    appendRecord: (details) => rootSession.appendCoordination(details),
+    appendRecord: async (details) => {
+      await rootSession.appendCoordination(null, details);
+    },
   });
   let bindings: { agent: SessionAgent; coordinator: MultiAgent } | null = null;
   // 构造只恢复已有事实，不启动 Run；所有运行回调在装配发布后才能访问彼此。
@@ -102,7 +104,8 @@ export function createAgentRuntime(
       ...(sessionOptions.mcp ? { mcp: sessionOptions.mcp } : {}),
       ...(sessionOptions.protectedPaths ? { protectedPaths: sessionOptions.protectedPaths } : {}),
       managedTools: toolsFor(session, coordinator),
-      beforeRequest: (lease, signal) => coordinator.drain(session.sessionId, lease, signal),
+      pendingInputs: () => coordinator.pendingInputs(session.sessionId),
+      acknowledgeInput: (input) => coordinator.acknowledgeInput(input),
       workspacePermissions: permissions,
       remainingTaskTimeMs: () => coordinator.remainingTaskTimeMs(),
     };
@@ -112,6 +115,7 @@ export function createAgentRuntime(
     git,
     modelStream: sessionOptions.modelStream,
     permissionMode: () => boundRuntime().agent.state.permissionMode,
+    receiveRootInput: (input) => boundRuntime().agent.queueInternal(input),
     abortRoot: (source) => boundRuntime().agent.abort(source),
     changed: (snapshot) => emit({ type: "collaboration_changed", snapshot }),
     memberEvent: (member, event) => events.memberEvent(event, member),
@@ -156,12 +160,12 @@ export function createAgentRuntime(
       primary.abort(source);
       coordinator.abort(source);
     },
-    async close() {
+    async close(reason: "closed" | "session_changed" = "closed") {
       // 成员可能向根写入终态；必须先收齐成员，再释放根的 Session 与写锁。
       try {
         await coordinator.close();
       } finally {
-        await primary.close();
+        await primary.close(reason);
       }
     },
   };

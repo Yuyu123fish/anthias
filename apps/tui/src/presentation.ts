@@ -233,7 +233,11 @@ export function createConversationPresentation(options: {
       currentRunTurns.clear();
       activeExecutionTurn = undefined;
       renderedAssistantTextPrefix = "";
-      appendText("You", message.content, "coral");
+      appendText(
+        message.source?.kind === "agent" ? `成员输入 · ${message.source.fromSessionId}` : "You",
+        message.content,
+        "coral",
+      );
       ensureTurn();
     } else if (message.role === "assistant") {
       const turn = ensureTurn();
@@ -379,11 +383,15 @@ export function createConversationPresentation(options: {
     if (status === "unknown") detail.step.summary += "\n结果未知，不自动重放；先核对实际状态。";
     invalidateConversation();
   }
-  function finishUnresolvedTools(sessionId: string, runId: string, reason?: string): void {
+  function finishUnresolvedTools(
+    sessionId: string,
+    runId: string | undefined,
+    reason?: string,
+  ): void {
     for (const detail of toolDetails.values()) {
       if (
         !detail.id.startsWith(`${sessionId}:`) ||
-        (detail.runId !== undefined && detail.runId !== runId) ||
+        (runId !== undefined && detail.runId !== undefined && detail.runId !== runId) ||
         detail.toolStage === "finished" ||
         detail.toolStage === "retry"
       )
@@ -570,6 +578,23 @@ export function createConversationPresentation(options: {
       )
         retryStatusText = null;
       switch (event.type) {
+        case "input_queued":
+        case "input_consumed":
+        case "input_discarded": {
+          const notice = eventNotice(event);
+          if (notice) appendNotice(notice.title, notice.text);
+          break;
+        }
+        case "session_unavailable": {
+          finishUnresolvedTools(options.state().sessionId, undefined, event.error);
+          finishActiveTurn("failed");
+          retryStatusText = null;
+          activeAssistantView = undefined;
+          activeReasoningDetail = undefined;
+          const notice = eventNotice(event);
+          if (notice) appendNotice(notice.title, notice.text);
+          break;
+        }
         case "collaboration_changed":
           synchronizeMembers(event.snapshot);
           break;

@@ -9,6 +9,7 @@ import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import { COMPACTION_SECTION_TITLES } from "../src/prompts/compaction-prompt.js";
 import { createSession, type Session } from "../src/session/index.js";
 import { createSkillLibrary } from "../src/skill/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const roots: string[] = [];
 const agents: Agent[] = [];
@@ -40,7 +41,7 @@ describe("Agent capability controls", () => {
   it("keeps one subscribed Agent across session switches and preserves the old session on failure", async () => {
     const { session } = await setup();
     const agent = own(createAgentWithModelStream({ session, modelStream: reply }));
-    await agent.prompt("保留这条原始输入");
+    await promptToCompletion(agent, "保留这条原始输入");
     const events: string[] = [];
     agent.subscribe((event) => events.push(event.type));
     expect((await agent.sessions.open("invalid-id")).ok).toBe(false);
@@ -69,7 +70,7 @@ describe("Agent capability controls", () => {
         },
       }),
     );
-    const prompt = agent.prompt("等一下");
+    const prompt = promptToCompletion(agent, "等一下");
     await entered.promise;
     expect((await agent.sessions.create()).ok).toBe(false);
     expect((await agent.compact()).ok).toBe(false);
@@ -78,7 +79,10 @@ describe("Agent capability controls", () => {
     expect(agent.close()).toBe(completion);
     await completion;
     expect((await prompt).status).toBe("aborted");
-    expect(await agent.prompt("太晚了")).toEqual({ status: "rejected", reason: "closed" });
+    expect(await promptToCompletion(agent, "太晚了")).toEqual({
+      status: "rejected",
+      reason: "closed",
+    });
   });
 
   it("loads Skill instructions on demand as durable external facts and restores their saved version", async () => {
@@ -125,7 +129,7 @@ describe("Agent capability controls", () => {
         },
       }),
     );
-    expect((await agent.prompt("读这份说明")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "读这份说明")).status).toBe("completed");
     expect(requests[0]?.systemPrompt).not.toContain("SAVED_SKILL_BODY");
     expect(JSON.stringify(requests[1]?.messages)).toContain("SAVED_SKILL_BODY");
     expect(JSON.stringify(requests[2]?.messages)).toContain("SAVED_REFERENCE_BODY");
@@ -136,7 +140,11 @@ describe("Agent capability controls", () => {
           (record.kind === "skill" || record.kind === "skill_reference"),
       ),
     ).toHaveLength(2);
-    expect(session.messageHistory.filter((message) => message.role === "user")).toHaveLength(1);
+    expect(
+      session.records
+        .flatMap((entry) => (entry.type === "message" ? [entry.message] : []))
+        .filter((message) => message.role === "user"),
+    ).toHaveLength(1);
     expect((await agent.skills.activate("sample")).ok).toBe(true);
     expect(
       session.records.filter(
@@ -150,12 +158,12 @@ describe("Agent capability controls", () => {
     await writeFile(file, "---\nname: sample\ndescription: 测试指令\n---\nCHANGED_BODY");
     await agent.sessions.open(session.sessionId);
     expect(agent.skills.list()[0]?.error).toContain("变化");
-    await agent.prompt("继续");
+    await promptToCompletion(agent, "继续");
     expect(JSON.stringify(requests.at(-1)?.messages)).toContain("SAVED_SKILL_BODY");
     expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("CHANGED_BODY");
     expect(agent.skills.list()[0]?.error).toContain("变化");
     expect((await agent.skills.activate(null)).ok).toBe(true);
-    await agent.prompt("清除后");
+    await promptToCompletion(agent, "清除后");
     expect(JSON.stringify(requests.at(-1)?.messages)).toContain("该来源已撤销");
     expect(agent.skills.list()[0]?.active).toBe(false);
   });
@@ -180,8 +188,8 @@ describe("Agent capability controls", () => {
         },
       }),
     );
-    await agent.prompt("第一轮");
-    await agent.prompt("第二轮");
+    await promptToCompletion(agent, "第一轮");
+    await promptToCompletion(agent, "第二轮");
     const count = agent.state.messageHistory.length;
     const result = await agent.compact();
     expect(result).toEqual({ ok: true, value: undefined });
@@ -225,9 +233,11 @@ describe("Agent capability controls", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
       }
     });
-    expect((await agent.prompt("调用这个 MCP 工具")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "调用这个 MCP 工具")).status).toBe("completed");
     expect(called).toBe(1);
-    const toolMessage = session.messageHistory.find((message) => message.role === "tool");
+    const toolMessage = session.records
+      .flatMap((entry) => (entry.type === "message" ? [entry.message] : []))
+      .find((message) => message.role === "tool");
     expect(toolMessage).toMatchObject({
       role: "tool",
       status: "completed",

@@ -469,6 +469,7 @@ export async function isSafeSessionContents(
     if (entry.isFile()) {
       if (
         entry.name !== "session.jsonl" &&
+        entry.name !== "session.publish.tmp" &&
         entry.name !== "session.index.json" &&
         !(
           entry.name.startsWith(".session.index.json.") &&

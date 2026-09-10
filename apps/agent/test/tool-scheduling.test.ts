@@ -12,8 +12,8 @@ import {
   resolveSessionShell,
 } from "../src/session/index.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
-
 import { selectConcurrentToolBatch } from "../src/tool/tool-scheduling.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -77,7 +77,7 @@ describe("Tool batch scheduling", () => {
       }
     };
     const agent = createAgentWithModelStream({ modelStream, session });
-    const pendingResult = agent.prompt("写入并读取");
+    const pendingResult = promptToCompletion(agent, "写入并读取");
     try {
       await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
@@ -173,7 +173,7 @@ describe("Tool batch scheduling", () => {
       }
     });
     try {
-      await expect(agent.prompt("写入不同文件后继续编辑并读取")).resolves.toEqual({
+      await expect(promptToCompletion(agent, "写入不同文件后继续编辑并读取")).resolves.toEqual({
         status: "completed",
       });
       expect(maximumActiveWrites).toBe(2);
@@ -233,7 +233,7 @@ describe("Tool batch scheduling", () => {
     const fixture = await createTestAgent(modelStream, controlledRunner.toolRunner);
     const events: AgentEvent[] = [];
     fixture.agent.subscribe((event) => events.push(event));
-    const promptResultPromise = fixture.agent.prompt("并发读取");
+    const promptResultPromise = promptToCompletion(fixture.agent, "并发读取");
     let concurrencyFailure: unknown;
 
     try {
@@ -298,7 +298,7 @@ describe("Tool batch scheduling", () => {
         .filter(
           (record) =>
             record.type === "message" &&
-            (record.message as Record<string, unknown> | undefined)?.type === "tool_result",
+            (record.message as Record<string, unknown> | undefined)?.role === "tool",
         )
         .map(
           (record) => (record.message as Record<string, unknown> | undefined)?.toolCallId as string,
@@ -372,7 +372,9 @@ describe("Tool batch scheduling", () => {
       }
     });
 
-    await expect(fixture.agent.prompt("混合调用")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(fixture.agent, "混合调用")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(maximumActiveCount).toBe(1);
     expect(maximumPendingApprovals).toBe(1);
@@ -393,7 +395,7 @@ describe("Tool batch scheduling", () => {
     const fixture = await createTestAgent(modelStream, controlledRunner.toolRunner);
     const events: AgentEvent[] = [];
     fixture.agent.subscribe((event) => events.push(event));
-    const promptResultPromise = fixture.agent.prompt("停止并发读取");
+    const promptResultPromise = promptToCompletion(fixture.agent, "停止并发读取");
 
     await vi.waitFor(() => expect(controlledRunner.startedIndices).toHaveLength(4));
     fixture.agent.abort();
@@ -426,7 +428,7 @@ describe("Tool batch scheduling", () => {
       },
     });
     const fixture = await createTestAgent(createBatchModelStream([], ["read_file"]), toolRunner);
-    const promptResultPromise = fixture.agent.prompt("停止预检");
+    const promptResultPromise = promptToCompletion(fixture.agent, "停止预检");
     await preparationEntered.promise;
 
     fixture.agent.abort();
@@ -470,7 +472,9 @@ describe("Tool batch scheduling", () => {
     const fixture = await createTestAgent(createBatchModelStream([], ["read_file"]), toolRunner);
     abortAgent = () => fixture.agent.abort();
 
-    await expect(fixture.agent.prompt("完成后停止")).resolves.toEqual({ status: "aborted" });
+    await expect(promptToCompletion(fixture.agent, "完成后停止")).resolves.toEqual({
+      status: "aborted",
+    });
     expect(fixture.agent.state.messageHistory.filter((message) => message.role === "tool")).toEqual(
       [expect.objectContaining({ status: "completed", content: "effect completed" })],
     );

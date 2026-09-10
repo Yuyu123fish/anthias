@@ -19,6 +19,8 @@ import {
 } from "../src/session/index.js";
 import { FIXED_TOOL_DEFINITIONS } from "../src/tool/definitions.js";
 
+import { promptToCompletion } from "./prompt-helper.js";
+
 const servers = new Set<ReturnType<typeof createServer>>();
 const temporaryDirectories = new Set<string>();
 
@@ -145,16 +147,17 @@ describe("createOpenAICompatibleModelStream", () => {
     const sessionDirectory = join(workspaceRoot, "sessions");
     const shell = { kind: "powershell" as const, executable: "pwsh", arguments: [] };
     const session = await createSession({ workspaceRoot, sessionDirectory, shell });
-    const leaseResult = await session.acquireRun(randomUUID());
-    if (leaseResult.status !== "acquired") throw new Error("expected lease");
-    await leaseResult.lease.appendMessage({ role: "user", content: "old source ".repeat(3_000) });
-    await leaseResult.lease.appendMessage({
+    const previousRunId = randomUUID();
+    await session.appendMessage(previousRunId, {
+      role: "user",
+      content: "old source ".repeat(3_000),
+    });
+    await session.appendMessage(previousRunId, {
       role: "assistant",
       status: "completed",
       content: [{ type: "text", text: "previous plain answer" }],
     });
-    await leaseResult.lease.appendRunFinished({ status: "completed" });
-    await leaseResult.lease.release();
+    await session.appendRunFinished(previousRunId, { status: "completed" });
     const reasoningMarker = "CURRENT_RUN_REASONING";
     const toolCallIds = Array.from({ length: 3 }, () => randomUUID());
     const requestBodies: Array<{
@@ -220,7 +223,9 @@ describe("createOpenAICompatibleModelStream", () => {
     const executionEvents: AgentEvent[] = [];
     agent.subscribe((event) => executionEvents.push(event));
     try {
-      expect(await agent.prompt("读取 note.txt 三次")).toEqual({ status: "completed" });
+      expect(await promptToCompletion(agent, "读取 note.txt 三次")).toEqual({
+        status: "completed",
+      });
       expect(requestBodies).toHaveLength(4);
       const continuationToolMessages = requestBodies[3]?.messages.filter(
         (message) => message.tool_calls,
@@ -235,7 +240,7 @@ describe("createOpenAICompatibleModelStream", () => {
           .filter((message) => message.role === "tool")
           .map((message) => message.tool_call_id),
       ).toEqual(toolCallIds);
-      expect(await agent.prompt("解释已有结果")).toEqual({ status: "completed" });
+      expect(await promptToCompletion(agent, "解释已有结果")).toEqual({ status: "completed" });
       expect(requestBodies).toHaveLength(5);
       expect(JSON.stringify(requestBodies[4])).not.toContain(reasoningMarker);
 
@@ -257,7 +262,9 @@ describe("createOpenAICompatibleModelStream", () => {
     restoredAgent.subscribe((event) => executionEvents.push(event));
     try {
       expect(requestBodies).toHaveLength(5);
-      expect(await restoredAgent.prompt("恢复后继续")).toEqual({ status: "completed" });
+      expect(await promptToCompletion(restoredAgent, "恢复后继续")).toEqual({
+        status: "completed",
+      });
       expect(requestBodies).toHaveLength(6);
       expect(requestBodies[5]?.messages.filter((message) => message.role === "tool")).toHaveLength(
         3,
@@ -267,7 +274,9 @@ describe("createOpenAICompatibleModelStream", () => {
       expect(requestBodies).toHaveLength(7);
       expect(requestBodies[6]?.messages.map((message) => message.role)).toEqual(["system", "user"]);
       expect(requestBodies[6]?.tools ?? []).toEqual([]);
-      expect(await restoredAgent.prompt("压缩后继续")).toEqual({ status: "completed" });
+      expect(await promptToCompletion(restoredAgent, "压缩后继续")).toEqual({
+        status: "completed",
+      });
       expect(requestBodies).toHaveLength(8);
       expect(
         requestBodies[7]?.messages.some((message) => message.content?.includes("已保存历史的摘要")),
@@ -834,10 +843,12 @@ describe("createOpenAICompatibleModelStream", () => {
     });
 
     try {
-      await expect(agent.prompt("把 target.txt 更新为 new 并验证")).resolves.toEqual({
+      await expect(promptToCompletion(agent, "把 target.txt 更新为 new 并验证")).resolves.toEqual({
         status: "completed",
       });
-      await expect(agent.prompt("说明已经完成的验证")).resolves.toEqual({ status: "completed" });
+      await expect(promptToCompletion(agent, "说明已经完成的验证")).resolves.toEqual({
+        status: "completed",
+      });
     } finally {
       await agent.close();
       await closeServer(server);

@@ -13,20 +13,19 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Message } from "../src/message.js";
+import type { CompletedMessage as Message } from "../src/message.js";
 import {
   createSession as createSessionRuntime,
   openSession as openSessionRuntime,
+  readSessionHistory,
   resolveSessionShell,
   type Session,
-  type SessionRunLease,
   type SessionShell,
 } from "../src/session/index.js";
 import { getSessionLockDirectory, getSessionUsageDirectory } from "../src/session/lock.js";
 
 const temporaryDirectories = new Set<string>();
 const activeSessions = new Set<Session>();
-const activeRunLeases = new Set<SessionRunLease>();
 const TEST_SHELL: SessionShell = Object.freeze({
   kind: "powershell",
   executable: "pwsh",
@@ -34,8 +33,6 @@ const TEST_SHELL: SessionShell = Object.freeze({
 });
 
 afterEach(async () => {
-  await Promise.all([...activeRunLeases].map((runLease) => runLease.release()));
-  activeRunLeases.clear();
   await Promise.all([...activeSessions].map((session) => session.close()));
   activeSessions.clear();
   await Promise.all(
@@ -63,7 +60,7 @@ describe("Session", () => {
     ).rejects.toThrow("没有可用的 pwsh");
   });
 
-  it("creates one newline-terminated Schema 3 primary header in its UTC storage directory", async () => {
+  it("creates one newline-terminated Schema 4 primary header in its UTC storage directory", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-create-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     await mkdtemp(join(fixtureRoot, "workspace-seed-"));
@@ -79,7 +76,9 @@ describe("Session", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(session.workspaceRoot).toBe(existingWorkspaceRoot);
-    expect(session.messageHistory).toEqual([]);
+    expect(
+      session.records.filter((entry) => entry.type === "message").map((entry) => entry.message),
+    ).toEqual([]);
 
     const sessionText = await readFile(join(session.storageDirectory, "session.jsonl"), "utf8");
     expect(sessionText.endsWith("\n")).toBe(true);
@@ -88,7 +87,8 @@ describe("Session", () => {
     const sessionHeader = JSON.parse(sessionText.trimEnd()) as Record<string, unknown>;
     expect(sessionHeader).toEqual({
       type: "session_header",
-      schemaVersion: 3,
+      schemaVersion: 4,
+      latestCompactionEntryId: null,
       sessionId: session.sessionId,
       rootSessionId: session.sessionId,
       sessionKind: "primary",
@@ -108,7 +108,7 @@ describe("Session", () => {
     );
     await expect(
       access(join(session.storageDirectory, "session.index.json")),
-    ).resolves.toBeUndefined();
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("validates preallocated member ownership", async () => {
@@ -139,7 +139,8 @@ describe("Session", () => {
       (await readFile(join(member.storageDirectory, "session.jsonl"), "utf8")).trimEnd(),
     );
     expect(header).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
+      latestCompactionEntryId: null,
       sessionId: memberSessionId,
       rootSessionId,
       sessionKind: "subagent",
@@ -156,314 +157,109 @@ describe("Session", () => {
     ).rejects.toThrow("成员身份无效");
   });
 
-  it("serializes standalone, Run acquisition, and held-Run coordination while sourced input stays out of messages", async () => {
-    const fixtureRoot = await createTemporaryDirectory("anthias-session-coordination-");
+  it("serializes completed entries and retains sourced input identity without another message history", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-input-");
     const sessionDirectory = join(fixtureRoot, "sessions");
-    const rootRunId = randomUUID();
-    let rootForConcurrentAcquisition: Session | null = null;
-    let startConcurrentRun = false;
-    const concurrentRunAcquisition: { promise?: ReturnType<Session["acquireRun"]> } = {};
-    const coordinationLockSystem = Object.freeze({
-      processId: process.pid,
-      createOwnerToken() {
-        if (startConcurrentRun) {
-          startConcurrentRun = false;
-          if (rootForConcurrentAcquisition === null) {
-            throw new Error("expected root Session before concurrent acquisition");
-          }
-          // 在独立追加已创建锁目录时发起同实例 Run，固定复现两条获取路径争锁的窗口。
-          concurrentRunAcquisition.promise = rootForConcurrentAcquisition.acquireRun(rootRunId);
-        }
-        return randomUUID();
-      },
-      createTimestamp: () => new Date().toISOString(),
-      inspectProcess: () => "alive" as const,
-    });
     const root = await createSession({
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
-      lockSystem: coordinationLockSystem,
     });
-    rootForConcurrentAcquisition = root;
     const member = await createSession({
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
       rootSessionId: root.sessionId,
-      sessionKind: "teammate",
+      sessionKind: "subagent",
     });
-
-    const standaloneCoordinationWrites = [
-      root.appendCoordination({
-        kind: "team",
-        key: randomUUID(),
-        payload: { status: "active" },
-      }),
-      root.appendCoordination({
-        kind: "delivery",
-        key: randomUUID(),
-        payload: { status: "queued" },
-      }),
-    ];
-    await Promise.all(standaloneCoordinationWrites);
-    expect(
-      root.records
-        .filter((record) => record.type === "coordination")
-        .every((record) => record.runId === undefined),
-    ).toBe(true);
-    startConcurrentRun = true;
-    await root.appendCoordination({
-      kind: "team",
-      key: randomUUID(),
-      payload: { status: "active" },
-    });
-    const pendingRootRunAcquisition = concurrentRunAcquisition.promise;
-    if (pendingRootRunAcquisition === undefined) {
-      throw new Error("expected concurrent Session Run acquisition");
-    }
-    const rootRunAcquisition = await pendingRootRunAcquisition;
-    expect(rootRunAcquisition.status).toBe("acquired");
-    if (rootRunAcquisition.status !== "acquired") {
-      throw new Error(`expected acquired Session Run, received ${rootRunAcquisition.reason}`);
-    }
-    const rootLease = rootRunAcquisition.lease;
-    activeRunLeases.add(rootLease);
-    await rootLease.appendMessage({ role: "user", content: "coordinate" });
-    const firstCoordination = root.appendCoordination({
-      kind: "member",
-      key: member.sessionId,
-      payload: { sessionId: member.sessionId, status: "running" },
-    });
-    const secondCoordination = root.appendCoordination({
-      kind: "task",
-      key: randomUUID(),
-      payload: { status: "pending" },
-    });
-    await Promise.all([firstCoordination, secondCoordination]);
-    await rootLease.appendMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "coordinated" }],
-      status: "completed",
-    });
-    const finishWrite = rootLease.appendRunFinished({ status: "completed" });
-    const releaseWriteLock = rootLease.release();
-    const coordinationDuringRelease = root.appendCoordination({
-      kind: "team",
-      key: randomUUID(),
-      payload: { status: "closed" },
-    });
-    await Promise.all([finishWrite, releaseWriteLock, coordinationDuringRelease]);
-    const coordinationRecords = root.records.filter((record) => record.type === "coordination");
-    expect(coordinationRecords).toHaveLength(6);
-    expect(coordinationRecords.slice(3, 5).every((record) => record.runId === rootRunId)).toBe(
-      true,
-    );
-    expect(coordinationRecords.at(-1)?.runId).toBeUndefined();
-    expectValidRecordChain(root.records as readonly Record<string, unknown>[]);
-
-    const nextRootRunId = randomUUID();
-    const coordinationBeforeInputKey = randomUUID();
-    const nextRunAcquisitionPromise = root.acquireRun(nextRootRunId);
-    // acquisition 尚未向调用方交付 lease 时，后续协调事实不能抢先成为 Run 首记录。
-    const coordinationBeforeInputPromise = root.appendCoordination({
-      kind: "team",
-      key: coordinationBeforeInputKey,
-      payload: { status: "active" },
-    });
-    const nextRunAcquisition = await nextRunAcquisitionPromise;
-    expect(nextRunAcquisition.status).toBe("acquired");
-    if (nextRunAcquisition.status !== "acquired") {
-      throw new Error(`expected acquired Session Run, received ${nextRunAcquisition.reason}`);
-    }
-    const nextRootLease = nextRunAcquisition.lease;
-    activeRunLeases.add(nextRootLease);
-    await coordinationBeforeInputPromise;
-    const coordinationBeforeInputRecord = root.records.find(
-      (record) => record.type === "coordination" && record.key === coordinationBeforeInputKey,
-    );
-    if (coordinationBeforeInputRecord?.type !== "coordination") {
-      throw new Error("expected coordination before Run input");
-    }
-    expect(coordinationBeforeInputRecord.runId).toBeUndefined();
-    await nextRootLease.appendMessage({ role: "user", content: "start after coordination" });
-    await nextRootLease.appendMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "finished after coordination" }],
-      status: "completed",
-    });
-    await nextRootLease.appendRunFinished({ status: "completed" });
-    await nextRootLease.release();
-
-    const messageId = randomUUID();
-    const memberRunId = randomUUID();
-    const memberLease = await acquireSessionRun(member, memberRunId);
-    await memberLease.appendAgentInput({
-      messageId,
-      rootSessionId: root.sessionId,
-      fromSessionId: root.sessionId,
-      kind: "task",
-      content: "implement the bounded task",
-    });
-    const assistantMessage: Message = Object.freeze({
-      role: "assistant",
-      content: Object.freeze([{ type: "text" as const, text: "done" }]),
-      status: "completed",
-    });
-    await memberLease.appendMessage(assistantMessage);
-    await memberLease.appendRunFinished({ status: "completed" });
-    await memberLease.release();
-    expect(member.messageHistory).toEqual([assistantMessage]);
-    expect(member.records[0]).toMatchObject({
-      type: "agent_input",
-      runId: memberRunId,
-      messageId,
-      rootSessionId: root.sessionId,
-      fromSessionId: root.sessionId,
-      kind: "task",
-    });
-
-    const retryLease = await acquireSessionRun(member, randomUUID());
-    await retryLease.appendAgentInput({
+    const runId = randomUUID();
+    const first = root.appendMessage(runId, { role: "user", content: "same" });
+    const second = root.appendMessage(runId, { role: "user", content: "same" });
+    const [firstEntry, secondEntry] = await Promise.all([first, second]);
+    expect(firstEntry.entryId).not.toBe(secondEntry.entryId);
+    expect(secondEntry.parentEntryId).toBe(firstEntry.entryId);
+    expect(root.getEntry(secondEntry.entryId)).toBe(secondEntry);
+    expect("messageHistory" in root).toBe(false);
+    const details = {
       messageId: randomUUID(),
       rootSessionId: root.sessionId,
       fromSessionId: root.sessionId,
-      kind: "task",
-      content: "start another Run",
-    });
+      kind: "task" as const,
+      content: "inspect",
+    };
+    const memberRunId = randomUUID();
+    const inputEntry = await member.appendAgentInput(memberRunId, details);
+    expect(await member.appendAgentInput(memberRunId, details)).toBe(inputEntry);
+    expect(member.records.filter((entry) => entry.type === "agent_input")).toHaveLength(1);
     await expect(
-      retryLease.appendAgentInput({
-        messageId,
-        rootSessionId: root.sessionId,
-        fromSessionId: root.sessionId,
-        kind: "task",
-        content: "implement the bounded task",
-      }),
-    ).resolves.toBeUndefined();
-    await retryLease.appendMessage(assistantMessage);
-    await retryLease.appendRunFinished({ status: "completed" });
-    await retryLease.release();
-    expect(
-      member.records.filter(
-        (record) => record.type === "agent_input" && record.messageId === messageId,
-      ),
-    ).toHaveLength(1);
-    await expect(
-      member.appendAgentInput({
-        messageId,
-        rootSessionId: root.sessionId,
-        fromSessionId: root.sessionId,
-        kind: "message",
-        content: "different payload",
-      }),
+      member.appendAgentInput(memberRunId, { ...details, content: "changed" }),
     ).rejects.toThrow("已绑定其他内容");
   });
-  it.each(["idle", "held Run"] as const)(
-    "drains accepted coordination before closing a Session with %s writes and rejects later writes",
-    async (writeMode) => {
-      const fixtureRoot = await createTemporaryDirectory("anthias-session-close-queue-");
-      const sessionDirectory = join(fixtureRoot, "sessions");
-      const session = await createSession({
-        workspaceRoot: fixtureRoot,
-        sessionDirectory,
-        shell: TEST_SHELL,
-      });
-      const runLease =
-        writeMode === "held Run" ? await acquireSessionRun(session, randomUUID()) : null;
-      if (runLease !== null) {
-        await runLease.appendMessage({ role: "user", content: "finish before closing" });
-        await runLease.appendMessage({
-          role: "assistant",
-          content: [{ type: "text", text: "finished" }],
-          status: "completed",
-        });
-      }
-      const finishPromise = runLease?.appendRunFinished({ status: "completed" });
-      const coordinationKey = randomUUID();
-      const acceptedAppend = session.appendCoordination({
-        kind: "team",
-        key: coordinationKey,
-        payload: { status: "closed" },
-      });
-      let closeCompleted = false;
-      const closePromise = session.close().then(() => {
-        closeCompleted = true;
-      });
-      await expect(
-        session.appendCoordination({ kind: "team", key: randomUUID(), payload: {} }),
-      ).rejects.toThrow("Session 已关闭");
-      await expect(session.acquireRun(randomUUID())).rejects.toThrow("Session 已关闭");
-      await Promise.all([finishPromise, acceptedAppend]);
-      if (runLease !== null) {
-        expect(closeCompleted).toBe(false);
-        await runLease.release();
-      }
-      await closePromise;
-      const persistedRecords = (
-        await readFile(join(session.storageDirectory, "session.jsonl"), "utf8")
-      )
-        .trimEnd()
-        .split("\n")
-        .slice(1)
-        .map(parseRecord);
-      expect(persistedRecords.at(-1)).toMatchObject({
-        type: "coordination",
-        key: coordinationKey,
-      });
-      expect(persistedRecords.at(-1)?.runId).toBeUndefined();
-      expect(persistedRecords).toEqual(session.records);
-      expectValidRecordChain(persistedRecords);
-      await expect(
-        access(getSessionUsageDirectory(sessionDirectory, session.sessionId)),
-      ).rejects.toMatchObject({ code: "ENOENT" });
-      await expect(
-        access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
-      ).rejects.toThrow();
-    },
-  );
 
-  it("closes during Run lock acquisition without handing out a lease or retaining its usage marker", async () => {
-    const fixtureRoot = await createTemporaryDirectory("anthias-session-close-acquisition-");
+  it("holds the exclusive lock while idle and after a Run, while read-only history remains available", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-exclusive-");
     const sessionDirectory = join(fixtureRoot, "sessions");
-    let closeDuringAcquisition = false;
-    let sessionToClose: Session | null = null;
-    const closeCompletion = Promise.withResolvers<void>();
     const session = await createSession({
       workspaceRoot: fixtureRoot,
       sessionDirectory,
       shell: TEST_SHELL,
-      lockSystem: {
-        processId: process.pid,
-        createOwnerToken() {
-          if (closeDuringAcquisition) {
-            closeDuringAcquisition = false;
-            if (sessionToClose === null) {
-              throw new Error("expected Session before acquiring a Run");
-            }
-            // 锁目录已经创建、凭据尚未交付时关闭，验证获取操作本身也受关闭队列收口。
-            sessionToClose.close().then(closeCompletion.resolve, closeCompletion.reject);
-          }
-          return randomUUID();
-        },
-        createTimestamp: () => new Date().toISOString(),
-        inspectProcess: () => "alive",
-      },
     });
-    sessionToClose = session;
-    closeDuringAcquisition = true;
-    await expect(session.acquireRun(randomUUID())).resolves.toEqual({
-      status: "rejected",
-      reason: "session_busy",
+    const options = {
+      sessionId: session.sessionId,
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    };
+    await expect(openSession(options)).rejects.toThrow("正在被其他进程使用");
+    const runId = randomUUID();
+    await session.appendMessage(runId, { role: "user", content: "hello" });
+    await session.appendMessage(runId, {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      status: "completed",
     });
-    await closeCompletion.promise;
-    expect(session.records).toEqual([]);
+    await session.appendRunFinished(runId, { status: "completed" });
+    await expect(openSession(options)).rejects.toThrow("正在被其他进程使用");
+    const bytes = await readFile(join(session.storageDirectory, "session.jsonl"));
+    expect((await readSessionHistory(options)).messages).toHaveLength(2);
+    expect(await readFile(join(session.storageDirectory, "session.jsonl"))).toEqual(bytes);
+    await session.close();
+    await (await openSession(options)).close();
+  });
+
+  it("drains accepted appends before close releases ownership and rejects new writes", async () => {
+    const fixtureRoot = await createTemporaryDirectory("anthias-session-close-");
+    const sessionDirectory = join(fixtureRoot, "sessions");
+    const session = await createSession({
+      workspaceRoot: fixtureRoot,
+      sessionDirectory,
+      shell: TEST_SHELL,
+    });
+    const key = randomUUID();
+    const accepted = session.appendCoordination(null, {
+      kind: "team",
+      key,
+      payload: { status: "closed" },
+    });
+    const closing = session.close();
+    await expect(
+      session.appendCoordination(null, { kind: "team", key, payload: {} }),
+    ).rejects.toThrow("Session 已关闭");
+    const entry = await accepted;
+    await closing;
+    expect(session.records.at(-1)).toBe(entry);
+    expect(
+      (await readSessionHistory({ sessionDirectory, sessionId: session.sessionId })).records.at(-1),
+    ).toEqual(entry);
     await expect(
       access(getSessionUsageDirectory(sessionDirectory, session.sessionId)),
     ).rejects.toMatchObject({ code: "ENOENT" });
     await expect(
       access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(session.close()).toBe(closing);
   });
+
   it("appends one completed text run and reopens its message projection", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-reopen-");
     const sessionDirectory = join(fixtureRoot, "sessions");
@@ -481,11 +277,11 @@ describe("Session", () => {
       status: "completed",
     });
 
-    const runLease = await acquireSessionRun(session, runId);
-    await runLease.appendMessage(userMessage);
-    await runLease.appendMessage(assistantMessage);
-    await runLease.appendRunFinished({ status: "completed" });
-    await runLease.release();
+    const runLeaseId = runId;
+    await session.appendMessage(runLeaseId, userMessage);
+    await session.appendMessage(runLeaseId, assistantMessage);
+    await session.appendRunFinished(runLeaseId, { status: "completed" });
+    await session.close();
 
     const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const completedSessionText = await readFile(sessionFilePath, "utf8");
@@ -496,13 +292,13 @@ describe("Session", () => {
     expect(completedRecords[0]).toMatchObject({
       type: "message",
       runId,
-      message: { type: "user", content: [{ type: "text", text: "hello" }] },
+      message: { role: "user", content: "hello" },
     });
     expect(completedRecords[1]).toMatchObject({
       type: "message",
       runId,
       message: {
-        type: "assistant",
+        role: "assistant",
         content: [{ type: "text", text: "world" }],
         status: "completed",
       },
@@ -519,19 +315,23 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    expect(reopenedSession.messageHistory).toEqual([userMessage, assistantMessage]);
+    expect(
+      reopenedSession.records
+        .filter((entry) => entry.type === "message")
+        .map((entry) => entry.message),
+    ).toEqual([userMessage, assistantMessage]);
     expect(reopenedSession.storageDirectory).toBe(session.storageDirectory);
     expectOnlySessionUseAppended(
       Buffer.from(completedSessionText, "utf8"),
       await readFile(sessionFilePath),
     );
 
-    const continuedRunLease = await acquireSessionRun(reopenedSession, randomUUID());
-    await continuedRunLease.appendMessage({
+    const continuedRunLeaseId = randomUUID();
+    await reopenedSession.appendMessage(continuedRunLeaseId, {
       role: "user",
       content: "continue",
     });
-    await continuedRunLease.release();
+    await reopenedSession.close();
     const continuedSessionText = await readFile(sessionFilePath, "utf8");
     const continuedRecords = continuedSessionText.trimEnd().split("\n").slice(1).map(parseRecord);
     expect(continuedRecords.at(-1)?.seq).toBe(5);
@@ -547,27 +347,27 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
     const reusedRunId = randomUUID();
-    const runLease = await acquireSessionRun(session, reusedRunId);
-    await runLease.appendMessage({ role: "user", content: "first" });
-    await runLease.appendMessage({
+    const runLeaseId = reusedRunId;
+    await session.appendMessage(runLeaseId, { role: "user", content: "first" });
+    await session.appendMessage(runLeaseId, {
       role: "assistant",
       content: [{ type: "text", text: "first answer" }],
       status: "completed",
     });
-    await runLease.appendRunFinished({ status: "completed" });
-    await runLease.release();
+    await session.appendRunFinished(runLeaseId, { status: "completed" });
+    await session.close();
     const reusedRunRecords = withParentEntryIds(
       [
         {
           ...createRecordIdentity(4, reusedRunId),
           type: "message",
-          message: { type: "user", content: [{ type: "text", text: "second" }] },
+          message: { role: "user", content: "second" },
         },
         {
           ...createRecordIdentity(5, reusedRunId),
           type: "message",
           message: {
-            type: "assistant",
+            role: "assistant",
             content: [{ type: "text", text: "second answer" }],
             status: "completed",
           },
@@ -602,16 +402,16 @@ describe("Session", () => {
     });
     const runId = randomUUID();
     const toolCallId = randomUUID();
-    const runLease = await acquireSessionRun(session, runId);
-    await runLease.appendMessage({ role: "user", content: "read then answer" });
-    await runLease.release();
+    const runLeaseId = runId;
+    await session.appendMessage(runLeaseId, { role: "user", content: "read then answer" });
+    await session.close();
     const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const records = [
       {
         ...createRecordIdentity(2, runId),
         type: "message",
         message: {
-          type: "assistant",
+          role: "assistant",
           content: [
             {
               type: "tool_call",
@@ -628,7 +428,7 @@ describe("Session", () => {
         ...createRecordIdentity(3, runId),
         type: "message",
         message: {
-          type: "tool_result",
+          role: "tool",
           toolCallId,
           toolName: "read_file",
           status: "completed",
@@ -683,6 +483,7 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
 
+    await session.close();
     await expect(
       openSession({
         sessionId: session.sessionId,
@@ -701,9 +502,9 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const runLease = await acquireSessionRun(session, randomUUID());
-    await runLease.appendMessage({ role: "user", content: "hello" });
-    await runLease.release();
+    const runLeaseId = randomUUID();
+    await session.appendMessage(runLeaseId, { role: "user", content: "hello" });
+    await session.close();
     const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const validSessionText = await readFile(sessionFilePath, "utf8");
     await writeFile(sessionFilePath, validSessionText.replace('"seq":1', '"seq":2'), "utf8");
@@ -772,7 +573,7 @@ describe("Session", () => {
         lines[2] = {
           ...lines[2],
           message: {
-            type: "assistant",
+            role: "assistant",
             content: [
               {
                 type: "tool_call",
@@ -790,7 +591,7 @@ describe("Session", () => {
           parentEntryId: lines[2]?.entryId,
           type: "message",
           message: {
-            type: "tool_result",
+            role: "tool",
             toolCallId: randomUUID(),
             toolName: "read_file",
             status: "completed",
@@ -810,15 +611,15 @@ describe("Session", () => {
       shell: TEST_SHELL,
     });
     const runId = randomUUID();
-    const runLease = await acquireSessionRun(session, runId);
-    await runLease.appendMessage({ role: "user", content: "question" });
-    await runLease.appendMessage({
+    const runLeaseId = runId;
+    await session.appendMessage(runLeaseId, { role: "user", content: "question" });
+    await session.appendMessage(runLeaseId, {
       role: "assistant",
       content: [{ type: "text", text: "answer" }],
       status: "completed",
     });
-    await runLease.appendRunFinished({ status: "completed" });
-    await runLease.release();
+    await session.appendRunFinished(runLeaseId, { status: "completed" });
+    await session.close();
     const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     const sessionLines = (await readFile(sessionFilePath, "utf8"))
       .slice(0, -1)
@@ -856,6 +657,7 @@ describe("Session", () => {
     const completePrefix = await readFile(sessionFilePath);
     await appendFile(sessionFilePath, Buffer.from('{"type":"message","entryId":"'));
 
+    await session.close();
     await openSession({
       sessionId: session.sessionId,
       workspaceRoot: fixtureRoot,
@@ -914,9 +716,9 @@ describe("Session", () => {
       });
       const runId = randomUUID();
       const toolCallId = randomUUID();
-      const runLease = await acquireSessionRun(session, runId);
-      await runLease.appendMessage({ role: "user", content: "recover me" });
-      await runLease.release();
+      const runLeaseId = runId;
+      await session.appendMessage(runLeaseId, { role: "user", content: "recover me" });
+      await session.close();
       const sessionFilePath = join(session.storageDirectory, "session.jsonl");
       const existingRecords = (await readFile(sessionFilePath, "utf8")).slice(0, -1).split("\n");
       let nextSequence = 2;
@@ -926,7 +728,7 @@ describe("Session", () => {
             ...createRecordIdentity(nextSequence, runId),
             type: "message",
             message: {
-              type: "assistant",
+              role: "assistant",
               content: [
                 {
                   type: "tool_call",
@@ -962,7 +764,7 @@ describe("Session", () => {
         "utf8",
       );
 
-      await openSession({
+      const reopenedSession = await openSession({
         sessionId: session.sessionId,
         workspaceRoot: fixtureRoot,
         sessionDirectory,
@@ -977,7 +779,7 @@ describe("Session", () => {
       const recoveredToolResults = recoveredRecords.filter(
         (record) =>
           record.type === "message" &&
-          (record.message as Record<string, unknown> | undefined)?.type === "tool_result",
+          (record.message as Record<string, unknown> | undefined)?.role === "tool",
       );
       expect(recoveredToolResults).toHaveLength(resultStatus === undefined ? 0 : 1);
       if (resultStatus !== undefined) {
@@ -993,6 +795,7 @@ describe("Session", () => {
       expectValidRecordChain(recoveredRecords);
 
       const bytesAfterFirstRecovery = await readFile(sessionFilePath);
+      await reopenedSession.close();
       await openSession({
         sessionId: session.sessionId,
         workspaceRoot: fixtureRoot,
@@ -1011,6 +814,7 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
+    await session.close();
     const lockDirectory = getSessionLockDirectory(sessionDirectory, session.sessionId);
     await writeLockOwner(lockDirectory, process.pid, randomUUID());
 
@@ -1033,10 +837,11 @@ describe("Session", () => {
       lockSystem: createLockSystem("dead"),
     });
     expect(reopenedSession.sessionId).toBe(session.sessionId);
-    await expect(access(lockDirectory)).rejects.toThrow();
+    await expect(access(lockDirectory)).resolves.toBeUndefined();
+    await reopenedSession.close();
   });
 
-  it("does not remove a Run lock whose owner token changed", async () => {
+  it("does not remove a Session lock whose owner token changed", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-token-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     const session = await createSession({
@@ -1044,11 +849,6 @@ describe("Session", () => {
       sessionDirectory,
       shell: TEST_SHELL,
     });
-    const acquisition = await session.acquireRun(randomUUID());
-    expect(acquisition.status).toBe("acquired");
-    if (acquisition.status !== "acquired") {
-      throw new Error("expected Session Run lease");
-    }
     const lockDirectory = getSessionLockDirectory(sessionDirectory, session.sessionId);
     await writeFile(
       join(lockDirectory, "owner.json"),
@@ -1060,11 +860,12 @@ describe("Session", () => {
       "utf8",
     );
 
-    await expect(acquisition.lease.release()).rejects.toThrow("owner token");
+    await expect(session.close()).rejects.toThrow("owner token");
+    activeSessions.delete(session);
     await expect(access(lockDirectory)).resolves.toBeUndefined();
   });
 
-  it("rejects an externally changed checkpoint and releases the acquired lock", async () => {
+  it("rejects an externally changed file and releases ownership when closed", async () => {
     const fixtureRoot = await createTemporaryDirectory("anthias-session-checkpoint-");
     const sessionDirectory = join(fixtureRoot, "sessions");
     const session = await createSession({
@@ -1075,10 +876,10 @@ describe("Session", () => {
     const sessionFilePath = join(session.storageDirectory, "session.jsonl");
     await appendFile(sessionFilePath, " ");
 
-    await expect(session.acquireRun(randomUUID())).resolves.toEqual({
-      status: "rejected",
-      reason: "session_changed",
-    });
+    await expect(
+      session.appendMessage(randomUUID(), { role: "user", content: "no write" }),
+    ).rejects.toThrow("外部改写");
+    await session.close();
     await expect(
       access(getSessionLockDirectory(sessionDirectory, session.sessionId)),
     ).rejects.toThrow();
@@ -1089,15 +890,6 @@ async function createTemporaryDirectory(prefix: string): Promise<string> {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), prefix));
   temporaryDirectories.add(temporaryDirectory);
   return temporaryDirectory;
-}
-
-async function acquireSessionRun(session: Session, runId: string): Promise<SessionRunLease> {
-  const acquisition = await session.acquireRun(runId);
-  if (acquisition.status !== "acquired") {
-    throw new Error(`expected acquired Session Run, received ${acquisition.reason}`);
-  }
-  activeRunLeases.add(acquisition.lease);
-  return acquisition.lease;
 }
 
 async function createSession(

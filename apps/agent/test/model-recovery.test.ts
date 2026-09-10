@@ -16,6 +16,7 @@ import {
 import { createSession, openSession } from "../src/session/index.js";
 import { readSessionHistory } from "../src/session/query.js";
 import { isRunDiagnostic } from "../src/session/schema.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const request: ModelRequest = {
   systemPrompt: "local test",
@@ -500,7 +501,7 @@ describe("safe final model facts", () => {
       if (event.type === "tool_approval_requested")
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
     });
-    expect((await agent.prompt("保存结果并继续")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "保存结果并继续")).status).toBe("failed");
     expect(requests).toBe(2);
     expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(1);
     expect(agent.state.lastRunDiagnostic).toMatchObject({
@@ -526,7 +527,7 @@ describe("safe final model facts", () => {
     continued.subscribe((event) => events.push(event));
     expect(requests).toBe(2);
     expect(continued.state.lastRunDiagnostic).toMatchObject({ category: "authentication" });
-    expect((await continued.prompt("沿已经保存的结果继续")).status).toBe("completed");
+    expect((await promptToCompletion(continued, "沿已经保存的结果继续")).status).toBe("completed");
     expect(requests).toBe(3);
     expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(1);
     expect(events.filter((event) => event.type === "tool_approval_requested")).toHaveLength(1);
@@ -543,8 +544,7 @@ describe("safe final model facts", () => {
       sessionDirectory,
       shell: { kind: "powershell", executable: "pwsh", arguments: [] },
     });
-    const leaseResult = await session.acquireRun(randomUUID());
-    if (leaseResult.status !== "acquired") throw new Error("expected lease");
+    const runId = randomUUID();
     const diagnostic = createRunDiagnostic("output_limit", {
       providerErrorCode: "missing_reasoning_content",
       providerErrorParam: "messages[].reasoning_content",
@@ -569,25 +569,22 @@ describe("safe final model facts", () => {
         cacheWriteInputTokens: null,
       },
     });
-    await leaseResult.lease.appendMessage({ role: "user", content: "inspect" });
-    await leaseResult.lease.appendMessage({
+    await session.appendMessage(runId, { role: "user", content: "inspect" });
+    await session.appendMessage(runId, {
       role: "assistant",
       content: [{ type: "text", text: "partial" }],
       status: "failed",
       diagnostic,
     });
-    await leaseResult.lease.appendRunFinished({ status: "failed", diagnostic });
-    await leaseResult.lease.release();
-    const legacyLeaseResult = await session.acquireRun(randomUUID());
-    if (legacyLeaseResult.status !== "acquired") throw new Error("expected lease");
-    await legacyLeaseResult.lease.appendMessage({ role: "user", content: "legacy" });
-    await legacyLeaseResult.lease.appendMessage({
+    await session.appendRunFinished(runId, { status: "failed", diagnostic });
+    const legacyRunId = randomUUID();
+    await session.appendMessage(legacyRunId, { role: "user", content: "legacy" });
+    await session.appendMessage(legacyRunId, {
       role: "assistant",
       content: [{ type: "text", text: "old" }],
       status: "completed",
     });
-    await legacyLeaseResult.lease.appendRunFinished({ status: "completed" });
-    await legacyLeaseResult.lease.release();
+    await session.appendRunFinished(legacyRunId, { status: "completed" });
     await session.close();
     const history = await readSessionHistory({ sessionDirectory, sessionId: session.sessionId });
     expect(history.messages[1]).toMatchObject({ diagnostic });

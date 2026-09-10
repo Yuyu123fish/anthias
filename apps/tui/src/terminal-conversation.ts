@@ -64,13 +64,14 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   let view: ConversationView | undefined;
   let readlineInterface: Interface | undefined;
   let exiting = false;
+  let discardedUserInputCount = 0;
+  let retainedMemberInputCount = 0;
   let exitCode = 0;
   let plainAssistantStreaming = false;
   let plainAssistantNeedsLabel = false;
   let plainDetailsVisible = false;
   let latestPlainDetails = "";
   let renderedPlainCollaboration = "";
-  let submissionPending = false;
   let pendingWorkspaceGrantReview: { choice: PermissionGrantChoice; scope: string } | undefined;
   const renderedPlainToolResultIds = new Set<string>();
   let unsubscribe = () => {};
@@ -100,7 +101,6 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     exitCode = Math.max(exitCode, code);
     if (exiting) return;
     exiting = true;
-    unsubscribe();
     signalSource.off("SIGINT", interrupt);
     input.off("end", eof);
     input.off("error", inputFailure);
@@ -110,12 +110,18 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       await agent.close();
     } catch {
       exitCode = 1;
+    } finally {
+      unsubscribe();
     }
     try {
       await view?.close();
     } catch {
       exitCode = 1;
     }
+    if (discardedUserInputCount > 0)
+      write(`\n关闭时有 ${discardedUserInputCount} 条排队输入未保存，重新打开不会恢复。\n`);
+    if (retainedMemberInputCount > 0)
+      write(`\n${retainedMemberInputCount} 条成员投递仍保存在协作历史，显式继续后处理。\n`);
     tuiExitPromiseResolvers.resolve(exitCode);
   }
   function eof(): void {
@@ -215,6 +221,7 @@ export function runTui(options: RunTuiOptions): Promise<number> {
     const parsed = parseInput(text);
     try {
       let promptText: string;
+      let promptOptions: Parameters<Agent["prompt"]>[1];
       if (parsed.type === "command") {
         const title = `/${parsed.name}`;
         if (parsed.name === "permissions" && parsed.argumentsText.trim() === "revoke") {
@@ -283,30 +290,26 @@ export function runTui(options: RunTuiOptions): Promise<number> {
         });
         if (commandResult.kind !== "prompt") return commandResult.kind === "handled";
         promptText = commandResult.text;
+        promptOptions = commandResult.options;
       } else promptText = parsed.text;
       if (exiting) return true;
-      if (submissionPending) {
-        notice("Agent 正在处理当前输入，请等待完成或按 Ctrl+C 停止；本条输入未排队。");
+      const result = await (promptOptions === undefined
+        ? agent.prompt(promptText)
+        : agent.prompt(promptText, promptOptions));
+      if (result.status === "rejected") {
+        const reasons = {
+          empty: "请输入任务或 /help。",
+          busy: "Agent 正在切换会话或执行控制操作，本条输入未排队。",
+          session_busy: "此会话被其他运行占用。",
+          session_changed: "会话已经切换，请核对当前会话。",
+          session_unavailable:
+            "会话写入已失效。请 /exit 后用 --session <当前 Session ID> 重新启动，核对已保存历史。",
+          closed: "Agent 已关闭。",
+        };
+        notice(`当前输入未接受：${reasons[result.reason]}`);
         return false;
       }
-      submissionPending = true;
-      try {
-        const result = await agent.prompt(promptText);
-        if (result.status === "rejected") {
-          const reasons = {
-            empty: "请输入任务或 /help。",
-            busy: "Agent 正在运行，本条输入未排队。",
-            session_busy: "此会话被其他运行占用。",
-            session_changed: "会话已经切换，请核对当前会话。",
-            closed: "Agent 已关闭。",
-          };
-          notice(`当前输入未接受：${reasons[result.reason]}`);
-          return false;
-        }
-        return true;
-      } finally {
-        submissionPending = false;
-      }
+      return true;
     } catch {
       notice("操作失败，当前会话仍可继续使用。");
       return false;
@@ -314,7 +317,10 @@ export function runTui(options: RunTuiOptions): Promise<number> {
   }
 
   function plainMessage(message: Message): void {
-    if (message.role === "user") write(`\nYou\n${message.content}\n`);
+    if (message.role === "user")
+      write(
+        `\n${message.source?.kind === "agent" ? `成员输入 · ${message.source.fromSessionId}` : "You"}\n${message.content}\n`,
+      );
     else if (message.role === "assistant") {
       write(
         `\n><> Anthias\n${message.content
@@ -505,7 +511,13 @@ export function runTui(options: RunTuiOptions): Promise<number> {
       readlineInterface.on("close", eof);
     }
     unsubscribe = agent.subscribe((event) => {
-      if (exiting) return;
+      if (exiting) {
+        if (event.type === "input_discarded") {
+          if (event.source.kind === "agent") retainedMemberInputCount += 1;
+          else discardedUserInputCount += 1;
+        }
+        return;
+      }
       try {
         if (event.type === "session_changed") pendingWorkspaceGrantReview = undefined;
         if (event.type === "tool_approval_requested" && pendingWorkspaceGrantReview !== undefined) {

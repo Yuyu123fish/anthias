@@ -9,6 +9,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 const activeAgents = new Set<ReturnType<typeof createAgentWithModelStream>>();
@@ -75,7 +76,7 @@ describe("execute_command Agent Tool Loop", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    const promptResultPromise = agent.prompt("执行验证命令");
+    const promptResultPromise = promptToCompletion(agent, "执行验证命令");
     await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
     const approvalRequest = agent.state.pendingToolApproval;
     if (approvalRequest === null) {
@@ -187,7 +188,9 @@ describe("execute_command Agent Tool Loop", () => {
       }
     });
 
-    await expect(agent.prompt("检查失败命令")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "检查失败命令")).resolves.toEqual({
+      status: "completed",
+    });
 
     const toolResults = agent.state.messageHistory.filter((message) => message.role === "tool");
     expect(toolResults).toHaveLength(2);
@@ -243,7 +246,9 @@ describe("execute_command Agent Tool Loop", () => {
       }
     });
 
-    await expect(agent.prompt("验证命令输出截断")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "验证命令输出截断")).resolves.toEqual({
+      status: "completed",
+    });
 
     const toolResults = agent.state.messageHistory.filter((message) => message.role === "tool");
     expect(toolResults).toHaveLength(2);
@@ -311,7 +316,9 @@ describe("execute_command Agent Tool Loop", () => {
       }
     });
 
-    await expect(agent.prompt("写盘失败排空")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "写盘失败排空")).resolves.toEqual({
+      status: "completed",
+    });
     expect(
       await readFile(join(workspaceRoot, "drain-after-artifact-failure.txt"), "utf8"),
     ).toContain("yes");
@@ -362,7 +369,7 @@ describe("execute_command Agent Tool Loop", () => {
       }
     });
 
-    await expect(agent.prompt("停止命令")).resolves.toEqual({ status: "aborted" });
+    await expect(promptToCompletion(agent, "停止命令")).resolves.toEqual({ status: "aborted" });
 
     expect(abortRequested).toBe(true);
     expect(events.filter((event) => event.type === "run_end")).toHaveLength(1);

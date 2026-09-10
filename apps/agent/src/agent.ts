@@ -23,8 +23,11 @@ export type {
   AgentState,
   CreateAgentWithModelStreamOptions,
   FinishedPromptResult,
+  InputMode,
+  PendingInput,
   PermissionMode,
   PermissionModeChangeResult,
+  PromptOptions,
   PromptResult,
   RunPhase,
   ToolActivity,
@@ -33,10 +36,10 @@ export type {
 } from "./session-agent.js";
 export type Agent = Omit<
   SessionAgent,
-  "external" | "compact" | "promptInternal" | "runTool" | "abort"
+  "external" | "compact" | "promptInternal" | "queueInternal" | "runTool" | "abort" | "close"
 > &
   AgentControls &
-  Readonly<{ abort(): void }>;
+  Readonly<{ abort(): void; close(): Promise<void> }>;
 
 /** 稳定 Agent 持有当前会话及所有外部连接；切换准备失败不影响原会话。 */
 export function createAgentWithModelStream(options: CreateAgentWithModelStreamOptions): Agent {
@@ -220,7 +223,7 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       throw error;
     }
     const previousRuntime = currentRuntime;
-    unsubscribe();
+    const unsubscribePrevious = unsubscribe;
     currentSession = target;
     currentAgent = preparedAgent;
     if (!preparedRuntime) throw new Error("会话装配未完成。");
@@ -229,7 +232,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     unsubscribe = currentAgent.subscribe((event) => routeEvent(event));
     emit({ type: "session_changed", sessionId: target.sessionId });
     emit({ type: "skills_changed" });
-    await previousRuntime.close();
+    try {
+      await previousRuntime.close("session_changed");
+    } finally {
+      unsubscribePrevious();
+    }
   }
 
   const agent: Agent = {
@@ -242,11 +249,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
         collaboration: currentRuntime.coordinator.snapshot(),
       });
     },
-    prompt(text) {
+    prompt(text, promptOptions) {
       if (closed) return Promise.resolve({ status: "rejected", reason: "closed" });
       if (operation !== null) return Promise.resolve({ status: "rejected", reason: "busy" });
       if (!currentAgent.state.running) currentRuntime.coordinator.beginTask();
-      return currentAgent.prompt(text);
+      return currentAgent.prompt(text, promptOptions);
     },
     setPermissionMode(mode) {
       if (closed) return { status: "rejected", reason: "closed" };

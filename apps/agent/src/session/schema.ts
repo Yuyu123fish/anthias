@@ -1,4 +1,4 @@
-import type { JsonValue, RunDiagnostic } from "../message.js";
+import type { CompletedMessage, JsonValue, RunDiagnostic } from "../message.js";
 import {
   normalizeProviderErrorCode,
   normalizeProviderErrorParam,
@@ -26,17 +26,24 @@ export type ToolExecutionStartedDetails = Readonly<{
 
 export type SessionKind = "primary" | "subagent" | "teammate";
 
-/** Schema 3 不可变首行。可变索引永远不回写到 Header。 */
+/** 身份字段固定；压缩入口只随完整候选日志一起发布。 */
 export type SessionHeader = Readonly<{
   type: "session_header";
-  schemaVersion: 3;
+  schemaVersion: 4;
   sessionId: string;
   rootSessionId: string;
   sessionKind: SessionKind;
   createdAt: string;
   workspaceRoot: string;
   shell: SessionShell;
+  latestCompactionEntryId: string | null;
 }>;
+
+export type Schema3SessionHeader = Omit<
+  SessionHeader,
+  "schemaVersion" | "latestCompactionEntryId"
+> &
+  Readonly<{ schemaVersion: 3 }>;
 
 /** Schema 1 仅作为一次显式迁移的输入。 */
 export type LegacySessionHeader = Readonly<{
@@ -48,7 +55,7 @@ export type LegacySessionHeader = Readonly<{
   shell: SessionShell;
 }>;
 
-/** Schema 2 目录日志保持原格式可读，只有首次使用协作行为时才升级。 */
+/** Schema 2 保持只读兼容，执行打开取得写锁后才升级。 */
 export type Schema2SessionHeader = Readonly<{
   type: "session_header";
   schemaVersion: 2;
@@ -58,7 +65,11 @@ export type Schema2SessionHeader = Readonly<{
   shell: SessionShell;
 }>;
 
-export type ParsedSessionHeader = SessionHeader | Schema2SessionHeader | LegacySessionHeader;
+export type ParsedSessionHeader =
+  | SessionHeader
+  | Schema3SessionHeader
+  | Schema2SessionHeader
+  | LegacySessionHeader;
 
 /** 工具原文落盘后的可验证引用；不完整状态必须说明原因。 */
 export type ToolArtifactReference = Readonly<{
@@ -155,12 +166,12 @@ export type AgentInputDetails = Readonly<{
   content: string;
 }>;
 
-export type DurableTextPart = Readonly<{
+type LegacyTextPart = Readonly<{
   type: "text";
   text: string;
 }>;
 
-export type DurableToolCallPart = Readonly<{
+type LegacyToolCallPart = Readonly<{
   type: "tool_call";
   toolCallId: string;
   toolName: string;
@@ -168,14 +179,14 @@ export type DurableToolCallPart = Readonly<{
   invalid: boolean;
 }>;
 
-export type DurableMessage =
+type LegacyMessage =
   | Readonly<{
       type: "user";
-      content: readonly DurableTextPart[];
+      content: readonly LegacyTextPart[];
     }>
   | Readonly<{
       type: "assistant";
-      content: readonly (DurableTextPart | DurableToolCallPart)[];
+      content: readonly (LegacyTextPart | LegacyToolCallPart)[];
       status: "completed" | "aborted" | "failed";
       diagnostic?: RunDiagnostic;
     }>
@@ -196,15 +207,15 @@ type SessionEntryBase = Readonly<{
   parentEntryId: string | null;
 }>;
 
-/** 将一条完整消息绑定到稳定 Run 与线性父引用。 */
+/** 将一条完整消息绑定到稳定 Run 与历史父引用。 */
 export type MessageRecord = SessionEntryBase &
   Readonly<{
     type: "message";
     runId: string;
-    message: DurableMessage;
+    message: CompletedMessage;
   }>;
 
-type ToolExecutionStartedRecord = SessionEntryBase &
+export type ToolExecutionStartedRecord = SessionEntryBase &
   Readonly<{
     type: "tool_execution_started";
     runId: string;
@@ -231,6 +242,8 @@ export type SessionUseRecord = SessionEntryBase &
 export type CompactionRecord = SessionEntryBase &
   Readonly<{
     type: "compaction";
+    previousCompactionEntryId: string | null;
+    nextCompactionEntryId: string | null;
     projection?: CompactionProjection;
     runId?: string;
     summary: string;
@@ -339,7 +352,7 @@ export function parseSessionHeader(line: string | undefined): ParsedSessionHeade
     typeof value.workspaceRoot === "string" &&
     isSessionShell(value.shell);
   if (
-    value.schemaVersion === 3 &&
+    (value.schemaVersion === 3 || value.schemaVersion === 4) &&
     hasExactKeys(value, [
       "type",
       "schemaVersion",
@@ -349,14 +362,18 @@ export function parseSessionHeader(line: string | undefined): ParsedSessionHeade
       "createdAt",
       "workspaceRoot",
       "shell",
+      ...(value.schemaVersion === 4 ? ["latestCompactionEntryId"] : []),
     ]) &&
+    (value.schemaVersion !== 4 ||
+      value.latestCompactionEntryId === null ||
+      isUuid(value.latestCompactionEntryId)) &&
     hasCommonFields &&
     isUuid(value.rootSessionId) &&
     isSessionKind(value.sessionKind) &&
     ((value.sessionKind === "primary" && value.rootSessionId === value.sessionId) ||
       (value.sessionKind !== "primary" && value.rootSessionId !== value.sessionId))
   ) {
-    return value as SessionHeader;
+    return value as SessionHeader | Schema3SessionHeader;
   }
   if (
     (value.schemaVersion === 1 || value.schemaVersion === 2) &&
@@ -379,15 +396,23 @@ export function parseSessionHeader(line: string | undefined): ParsedSessionHeade
 export function parseSessionRecord(
   line: string,
   expectedSequence: number,
-  schemaVersion: 2 | 3 = 3,
+  schemaVersion: 2 | 3 | 4 = 4,
 ): SessionRecord {
-  const value = parseJsonObject(line);
+  return validateSessionRecord(parseJsonObject(line), expectedSequence, schemaVersion);
+}
+
+/** 新写入直接校验对象；旧消息只在版本化读取入口归一化。 */
+export function validateSessionRecord(
+  value: Record<string, unknown>,
+  expectedSequence: number,
+  schemaVersion: 2 | 3 | 4 = 4,
+): SessionRecord {
   if (!hasValidEntryIdentity(value, expectedSequence, true)) {
     throw new Error("Session record identity 无效。");
   }
   if (value.type === "coordination") {
     if (
-      schemaVersion !== 3 ||
+      schemaVersion === 2 ||
       !hasExactKeysWithOptionalRunId(value, [
         "type",
         "entryId",
@@ -411,7 +436,7 @@ export function parseSessionRecord(
   }
   if (value.type === "agent_input") {
     if (
-      schemaVersion !== 3 ||
+      schemaVersion === 2 ||
       !hasExactKeysWithOptionalRunId(value, [
         "type",
         "entryId",
@@ -494,11 +519,17 @@ export function parseSessionRecord(
         "message",
       ]) ||
       !isUuid(value.runId) ||
-      !isDurableMessage(value.message)
+      !(schemaVersion === 4 ? isCompletedMessage(value.message) : isLegacyMessage(value.message))
     ) {
       throw new Error("Session MessageRecord 无效。");
     }
-    return value as MessageRecord;
+    return {
+      ...value,
+      message:
+        schemaVersion === 4
+          ? value.message
+          : normalizeLegacyMessage(value.message as LegacyMessage),
+    } as MessageRecord;
   }
   if (value.type === "tool_execution_started") {
     if (
@@ -562,6 +593,7 @@ export function parseSessionRecord(
           "timestamp",
           "parentEntryId",
           "summary",
+          ...(schemaVersion === 4 ? ["previousCompactionEntryId", "nextCompactionEntryId"] : []),
           "coversThroughEntryId",
           "firstKeptEntryId",
           "retainedUserEntryIds",
@@ -574,6 +606,11 @@ export function parseSessionRecord(
       ) ||
       !(value.projection === undefined || isCompactionProjection(value.projection)) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
+      (schemaVersion === 4 &&
+        !(
+          (value.previousCompactionEntryId === null || isUuid(value.previousCompactionEntryId)) &&
+          (value.nextCompactionEntryId === null || isUuid(value.nextCompactionEntryId))
+        )) ||
       typeof value.summary !== "string" ||
       !isUuid(value.coversThroughEntryId) ||
       !(value.firstKeptEntryId === null || isUuid(value.firstKeptEntryId)) ||
@@ -585,7 +622,11 @@ export function parseSessionRecord(
     ) {
       throw new Error("CompactionRecord 无效。");
     }
-    return value as CompactionRecord;
+    return {
+      ...value,
+      previousCompactionEntryId: value.previousCompactionEntryId ?? null,
+      nextCompactionEntryId: value.nextCompactionEntryId ?? null,
+    } as CompactionRecord;
   }
   if (value.type === "request_usage") {
     if (
@@ -657,11 +698,11 @@ export function parseLegacySessionRecord(
   if (value.type === "message") {
     if (
       !hasExactKeys(value, ["type", "entryId", "seq", "timestamp", "runId", "message"]) ||
-      !isDurableMessage(value.message)
+      !isLegacyMessage(value.message)
     ) {
       throw new Error("Legacy Session MessageRecord 无效。");
     }
-    return value as LegacySessionRecord;
+    return { ...value, message: normalizeLegacyMessage(value.message) } as LegacySessionRecord;
   }
   if (value.type === "tool_execution_started") {
     if (
@@ -710,7 +751,7 @@ export function migrateLegacySessionRecords(
 export function getSessionOwnership(
   header: ParsedSessionHeader,
 ): Readonly<{ rootSessionId: string; sessionKind: SessionKind }> {
-  return header.schemaVersion === 3
+  return header.schemaVersion === 3 || header.schemaVersion === 4
     ? Object.freeze({
         rootSessionId: header.rootSessionId,
         sessionKind: header.sessionKind,
@@ -723,6 +764,13 @@ export function validateSessionRecords(
   records: readonly SessionRecord[],
   header?: ParsedSessionHeader,
 ): UnfinishedRun | null {
+  const validator = createSessionRecordValidator(header);
+  for (const record of records) validator.append(record, { readingHistory: true });
+  return validator.unfinishedRun();
+}
+
+/** 打开时按序重建；持锁追加只推进新 Entry 的关联状态。失败后调用方必须废弃实例。 */
+export function createSessionRecordValidator(header?: ParsedSessionHeader) {
   const entryIds = new Set<string>();
   const agentInputMessageIds = new Set<string>();
   const ownership = header === undefined ? null : getSessionOwnership(header);
@@ -741,8 +789,15 @@ export function validateSessionRecords(
   let lastAssistantStatus: "completed" | "aborted" | "failed" | null = null;
   let lastAssistantHasToolCall = false;
 
-  for (const record of records) {
-    if (entryIds.has(record.entryId) || record.parentEntryId !== expectedParentEntryId) {
+  function append(
+    record: SessionRecord,
+    options: Readonly<{ readingHistory?: boolean }> = {},
+  ): void {
+    if (
+      record.seq !== entryIds.size + 1 ||
+      entryIds.has(record.entryId) ||
+      record.parentEntryId !== expectedParentEntryId
+    ) {
       throw new Error("Session entryId 或 parentEntryId 无效。");
     }
     validateFactReferences(record, previousRecordsByEntryId, toolCalls, ownership);
@@ -778,10 +833,10 @@ export function validateSessionRecords(
     expectedParentEntryId = record.entryId;
 
     if (!isRunRecord(record)) {
-      continue;
+      return;
     }
     if (activeRunId === null) {
-      const startsWithUserMessage = record.type === "message" && record.message.type === "user";
+      const startsWithUserMessage = record.type === "message" && record.message.role === "user";
       if (!startsWithUserMessage && record.type !== "agent_input") {
         throw new Error("Session Run 必须由 UserMessage 或 AgentInputRecord 开始。");
       }
@@ -793,21 +848,26 @@ export function validateSessionRecords(
       activeRunToolCallIds = [];
       lastAssistantStatus = null;
       lastAssistantHasToolCall = false;
-      continue;
+      return;
     }
     if (record.runId !== activeRunId) {
       throw new Error("Session Run 不能交错。");
     }
     if (record.type === "agent_input") {
+      // 旧协作投递可能先于整批结果落盘；读取保留原事实，新追加只允许在完整批次后消费。
+      if (!options.readingHistory) assertNoPendingToolCalls();
       lastAssistantStatus = null;
       lastAssistantHasToolCall = false;
-      continue;
+      return;
     }
     if (record.type === "message") {
-      if (record.message.type === "user") {
-        throw new Error("Session Run 只能包含一个起始 UserMessage。");
+      if (record.message.role === "user") {
+        assertNoPendingToolCalls();
+        lastAssistantStatus = null;
+        lastAssistantHasToolCall = false;
+        return;
       }
-      if (record.message.type === "assistant") {
+      if (record.message.role === "assistant") {
         if (activeRunToolCallIds.some((toolCallId) => !toolCalls.get(toolCallId)?.resolved)) {
           throw new Error("Session AssistantMessage 不能越过未决 ToolCall。");
         }
@@ -828,7 +888,7 @@ export function validateSessionRecords(
           });
           activeRunToolCallIds.push(part.toolCallId);
         }
-        continue;
+        return;
       }
       const referencedToolCall = toolCalls.get(record.message.toolCallId);
       const firstUnresolvedToolCallId = activeRunToolCallIds.find(
@@ -844,7 +904,7 @@ export function validateSessionRecords(
         throw new Error("Session ToolResult 引用无效或错序。");
       }
       referencedToolCall.resolved = true;
-      continue;
+      return;
     }
     if (record.type === "tool_execution_started") {
       validateToolExecutionApproval(
@@ -865,7 +925,7 @@ export function validateSessionRecords(
       }
       referencedToolCall.started = true;
       toolApprovalRequestIds.add(record.toolApprovalRequestId);
-      continue;
+      return;
     }
     if (activeRunToolCallIds.some((toolCallId) => !toolCalls.get(toolCallId)?.resolved)) {
       throw new Error("Session RunFinished 不能越过未决 ToolCall。");
@@ -876,6 +936,7 @@ export function validateSessionRecords(
     ) {
       throw new Error("Session completed Run 缺少不含 ToolCall 的最终 AssistantMessage。");
     }
+    const runAbortedBeforeAssistant = lastAssistantStatus === null && record.status === "aborted";
     const runCanEndAfterCompletedToolCalls =
       lastAssistantStatus === "completed" &&
       lastAssistantHasToolCall &&
@@ -887,6 +948,7 @@ export function validateSessionRecords(
       record.status !== "interrupted" &&
       record.status !== lastAssistantStatus &&
       !runCanEndAfterCompletedToolCalls &&
+      !runAbortedBeforeAssistant &&
       !runAbortedAfterFailedResponse
     ) {
       throw new Error("Session RunFinished 与最终 AssistantMessage 状态不匹配。");
@@ -894,21 +956,29 @@ export function validateSessionRecords(
     activeRunId = null;
   }
 
-  if (activeRunId === null) {
-    return null;
+  function unfinishedRun(): UnfinishedRun | null {
+    if (activeRunId === null) {
+      return null;
+    }
+    return Object.freeze({
+      runId: activeRunId,
+      toolCalls: Object.freeze(
+        activeRunToolCallIds.map((toolCallId) => {
+          const toolCall = toolCalls.get(toolCallId);
+          if (toolCall === undefined) {
+            throw new Error("Session ToolCall 状态缺失。");
+          }
+          return Object.freeze({ toolCallId, ...toolCall });
+        }),
+      ),
+    });
   }
-  return Object.freeze({
-    runId: activeRunId,
-    toolCalls: Object.freeze(
-      activeRunToolCallIds.map((toolCallId) => {
-        const toolCall = toolCalls.get(toolCallId);
-        if (toolCall === undefined) {
-          throw new Error("Session ToolCall 状态缺失。");
-        }
-        return Object.freeze({ toolCallId, ...toolCall });
-      }),
-    ),
-  });
+  function assertNoPendingToolCalls(): void {
+    if (activeRunToolCallIds.some((toolCallId) => !toolCalls.get(toolCallId)?.resolved)) {
+      throw new Error("Session 输入不能越过未决 ToolCall。");
+    }
+  }
+  return Object.freeze({ append, unfinishedRun });
 }
 
 /** 判断结构有效的 CompactionEntry 是否能作为恢复 checkpoint。 */
@@ -978,7 +1048,7 @@ export function isValidCompactionRecord(
       const retainedRecord = previousRecordsByEntryId.get(entryId);
       return (
         retainedRecord?.type === "agent_input" ||
-        (retainedRecord?.type === "message" && retainedRecord.message.type === "user")
+        (retainedRecord?.type === "message" && retainedRecord.message.role === "user")
       );
     })
   );
@@ -1035,7 +1105,7 @@ function validateFactReferences(
     const trigger = previousRecordsByEntryId.get(record.projection.afterEntryId);
     if (
       trigger?.type !== "message" ||
-      trigger.message.type !== "assistant" ||
+      trigger.message.role !== "assistant" ||
       !trigger.message.content.some((part) => part.type === "tool_call")
     )
       throw new Error("上下文来源的 Tool 组引用无效。");
@@ -1076,7 +1146,7 @@ function validateFactReferences(
 }
 function isTrustedAuthorizationSource(record: SessionRecord): boolean {
   return (
-    (record.type === "message" && record.message.type === "user") ||
+    (record.type === "message" && record.message.role === "user") ||
     (record.type === "approval_decision" &&
       record.decisionSource === "user" &&
       record.decision === "allowed")
@@ -1223,7 +1293,7 @@ function hasValidEntryIdentity(
   );
 }
 
-function isDurableMessage(value: unknown): value is DurableMessage {
+function isLegacyMessage(value: unknown): value is LegacyMessage {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }
@@ -1266,7 +1336,115 @@ function isDurableMessage(value: unknown): value is DurableMessage {
   );
 }
 
-/** 编码与日志读取共用同一产物引用校验。 */
+/** 旧 Schema 的消息只在读取边界转换，运行与新持久记录共享同一个消息。 */
+function normalizeLegacyMessage(message: LegacyMessage): CompletedMessage {
+  if (message.type === "user")
+    return { role: "user", content: message.content.map((part) => part.text).join("") };
+  const { type, ...fields } = message;
+  return { role: type === "tool_result" ? "tool" : "assistant", ...fields } as CompletedMessage;
+}
+
+export function isCompletedMessage(value: unknown): value is CompletedMessage {
+  if (!isPlainObject(value)) return false;
+  if (value.role === "user")
+    return hasExactKeys(value, ["role", "content"]) && typeof value.content === "string";
+  if (value.role === "assistant") {
+    return (
+      hasExactKeys(value, [
+        "role",
+        "content",
+        "status",
+        ...(value.diagnostic === undefined ? [] : ["diagnostic"]),
+      ]) &&
+      Array.isArray(value.content) &&
+      value.content.every((part) => isTextPart(part) || isToolCallPart(part)) &&
+      isAssistantTerminalStatus(value.status) &&
+      (value.diagnostic === undefined || isRunDiagnostic(value.diagnostic))
+    );
+  }
+  return (
+    value.role === "tool" &&
+    hasExactKeys(value, [
+      "role",
+      "toolCallId",
+      "toolName",
+      "status",
+      "content",
+      "truncated",
+      ...(value.artifact === undefined ? [] : ["artifact"]),
+    ]) &&
+    isUuid(value.toolCallId) &&
+    isNonEmptyString(value.toolName) &&
+    isToolResultStatus(value.status) &&
+    typeof value.content === "string" &&
+    typeof value.truncated === "boolean" &&
+    (value.artifact === undefined ||
+      (isToolArtifactReference(value.artifact) && value.artifact.toolCallId === value.toolCallId))
+  );
+}
+
+/** 仅旧格式迁移和恢复写回旧 Schema 时使用。 */
+export function encodeLegacySessionRecord(record: SessionRecord): Record<string, unknown> {
+  if (record.type === "compaction") {
+    const {
+      previousCompactionEntryId: _previous,
+      nextCompactionEntryId: _next,
+      ...legacyRecord
+    } = record;
+    return legacyRecord;
+  }
+  if (record.type !== "message") return record;
+  const { role, ...fields } = record.message;
+  return {
+    ...record,
+    message:
+      role === "user"
+        ? { type: "user", content: [{ type: "text", text: fields.content }] }
+        : { type: role === "tool" ? "tool_result" : "assistant", ...fields },
+  };
+}
+
+/** 已校验历史只生成一条路径；重建导航不改变消息、父关系和执行事实。 */
+export function rebuildCompactionNavigation(records: readonly SessionRecord[]) {
+  const compactions = records.filter(
+    (record): record is CompactionRecord => record.type === "compaction",
+  );
+  const navigation = new Map(
+    compactions.map((record, index) => [
+      record.entryId,
+      Object.freeze({
+        ...record,
+        previousCompactionEntryId: compactions[index - 1]?.entryId ?? null,
+        nextCompactionEntryId: compactions[index + 1]?.entryId ?? null,
+      }),
+    ]),
+  );
+  return Object.freeze({
+    latestCompactionEntryId: compactions.at(-1)?.entryId ?? null,
+    records: Object.freeze(records.map((record) => navigation.get(record.entryId) ?? record)),
+  });
+}
+
+export function hasValidCompactionNavigation(
+  header: SessionHeader,
+  records: readonly SessionRecord[],
+): boolean {
+  const navigation = rebuildCompactionNavigation(records);
+  return (
+    header.latestCompactionEntryId === navigation.latestCompactionEntryId &&
+    records.every((record, index) => {
+      const expected = navigation.records[index];
+      return (
+        record.type !== "compaction" ||
+        (expected?.type === "compaction" &&
+          record.previousCompactionEntryId === expected.previousCompactionEntryId &&
+          record.nextCompactionEntryId === expected.nextCompactionEntryId)
+      );
+    })
+  );
+}
+
+/** 新消息与旧格式读取共用同一产物引用校验。 */
 export function isToolArtifactReference(value: unknown): value is ToolArtifactReference {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -1296,7 +1474,7 @@ function isTextPart(value: unknown): boolean {
   );
 }
 
-function isToolCallPart(value: unknown): value is DurableToolCallPart {
+function isToolCallPart(value: unknown): value is LegacyToolCallPart {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }

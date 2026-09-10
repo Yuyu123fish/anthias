@@ -9,6 +9,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -34,7 +35,7 @@ describe("Agent Loop safety limits", () => {
       }
     });
 
-    await expect(agent.prompt("loop")).resolves.toEqual({
+    await expect(promptToCompletion(agent, "loop")).resolves.toEqual({
       status: "completed",
     });
 
@@ -58,7 +59,7 @@ describe("Agent Loop safety limits", () => {
       yield toolCallEvent(requests, "unknown_tool", {});
       yield finishEvent("tool_calls");
     });
-    expect((await agent.prompt("deadline")).status).toBe("aborted");
+    expect((await promptToCompletion(agent, "deadline")).status).toBe("aborted");
     expect(requests).toBe(1);
     expect(JSON.stringify(agent.collaboration.snapshot())).toContain("运行时限");
     await agent.close();
@@ -74,7 +75,7 @@ describe("Agent Loop safety limits", () => {
       yield finishEvent("tool_calls");
     });
 
-    await expect(agent.prompt("many tools")).resolves.toEqual({
+    await expect(promptToCompletion(agent, "many tools")).resolves.toEqual({
       status: "failed",
       error: "单次模型响应包含过多 ToolCall，Run 已停止。",
     });

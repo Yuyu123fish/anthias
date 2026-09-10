@@ -10,6 +10,7 @@ import {
   type ModelStream,
 } from "../src/model/model-stream.js";
 import { createSession } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -72,7 +73,7 @@ describe("automatic continuation in the same run", () => {
         yield { type: "text_delta", delta: "finished answer" };
         yield { type: "finish", finishReason: "stop" };
       });
-      expect((await agent.prompt("完成任务，不重复确认。")).status).toBe("completed");
+      expect((await promptToCompletion(agent, "完成任务，不重复确认。")).status).toBe("completed");
       expect(requests).toBe(2);
       const continuedRequest = inputs[0];
       if (continuedRequest === undefined) throw new Error("missing continuation");
@@ -81,7 +82,7 @@ describe("automatic continuation in the same run", () => {
       expect(continuedRequest.systemPrompt).toContain("已获授权的后续步骤不再询问是否继续");
       expect(
         session.records.filter(
-          (record) => record.type === "message" && record.message.type === "user",
+          (record) => record.type === "message" && record.message.role === "user",
         ),
       ).toHaveLength(1);
       expect(JSON.stringify(continuedRequest.messages)).not.toContain("private unfinished thought");
@@ -100,9 +101,9 @@ describe("automatic continuation in the same run", () => {
       expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(0);
       expect(
         session.records
-          .filter((record) => record.type === "message" && record.message.type === "assistant")
+          .filter((record) => record.type === "message" && record.message.role === "assistant")
           .map((record) =>
-            record.type === "message" && record.message.type === "assistant"
+            record.type === "message" && record.message.role === "assistant"
               ? record.message.status
               : null,
           ),
@@ -139,7 +140,7 @@ describe("automatic continuation in the same run", () => {
         yield { type: "finish", finishReason: "stop" };
       }
     });
-    expect((await agent.prompt("保存结果并完成报告。")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "保存结果并完成报告。")).status).toBe("completed");
     expect(await readFile(join(workspaceRoot, "result.txt"), "utf8")).toBe("saved once");
     expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(1);
     expect(events.filter((event) => event.type === "tool_approval_requested")).toHaveLength(1);
@@ -159,7 +160,7 @@ describe("automatic continuation in the same run", () => {
           yield { type: "text_delta", delta: "partial" };
         throw new ModelRequestError("service");
       });
-      expect((await agent.prompt("finish")).status).toBe("failed");
+      expect((await promptToCompletion(agent, "finish")).status).toBe("failed");
       expect(requests).toBe(3);
       expect(agent.state.lastRunDiagnostic).toMatchObject({
         category: "service",
@@ -182,7 +183,7 @@ describe("automatic continuation in the same run", () => {
       agent.subscribe((event) => {
         if (event.type === "model_retry" && event.phase === phase) agent.abort();
       });
-      const result = await agent.prompt("finish");
+      const result = await promptToCompletion(agent, "finish");
       expect(
         result.status,
         JSON.stringify({ result, diagnostic: agent.state.lastRunDiagnostic }),
@@ -200,7 +201,7 @@ describe("automatic continuation in the same run", () => {
       yield { type: "text_delta", delta: "partial" };
       throw new ModelRequestError("rate_limit", { retryAfterMs: 31_000 });
     });
-    expect((await agent.prompt("finish")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "finish")).status).toBe("failed");
     expect(requests).toBe(1);
     expect(agent.state.lastRunDiagnostic).toMatchObject({ retryStopReason: "wait_too_long" });
   });
@@ -218,7 +219,7 @@ describe("automatic continuation in the same run", () => {
       yield { type: "text_delta", delta: "partial" };
       throw new ModelRequestError(category);
     });
-    expect((await agent.prompt("finish")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "finish")).status).toBe("failed");
     expect(requests).toBe(1);
     expect(agent.state.lastRunDiagnostic).toMatchObject({ category, retryCount: 0 });
   });

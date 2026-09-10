@@ -292,12 +292,17 @@ export function createConversationView(options: {
         usage.inputTokens === null
           ? "context 未知"
           : `context ${Math.round((100 * usage.inputTokens) / usage.contextWindow)}%`;
+      const inputQueue = state.inputQueue;
+      const queuedInputCount = inputQueue.steer.length + inputQueue.followUp.length;
+      const queueText = queuedInputCount
+        ? ` · 待插入 ${inputQueue.steer.length}/${inputQueue.followUp.length}${inputQueue.paused ? " · 已暂停 /continue" : ""}`
+        : "";
       const scrollText = !conversationScroll.isFollowingEnd ? " · 阅读历史 · Ctrl+End 跟随" : "";
       const detailHint = detailsVisible ? " · Ctrl+T 关闭详情" : " · / 命令 · Ctrl+T 详情";
       return [
         truncateToWidth(
           theme.muted(
-            `${state.permissionMode} · ${phase} · ${contextText}${collaborationStatus(state.collaboration)}${scrollText}${detailHint}`,
+            `${state.permissionMode} · ${phase}${queueText} · ${contextText}${collaborationStatus(state.collaboration)}${scrollText}${detailHint}`,
           ),
           width,
         ),
@@ -649,6 +654,11 @@ export function createConversationView(options: {
       }
       if (detailsVisible) updateDetails();
       requestRender();
+      if (event.type === "run_end" || event.type === "session_unavailable")
+        setImmediate(() => {
+          // 已持久化终态之后仍有一次所有权交接；状态栏在该微任务收尾后重新读取。
+          if (!closed) requestRender();
+        });
     },
     notice(text, title = "Anthias") {
       presentation.notice(title, text);

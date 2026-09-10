@@ -9,6 +9,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -72,7 +73,9 @@ describe("complete Coding Agent Tool Loop", { timeout: 20_000 }, () => {
       }
     });
 
-    await expect(agent.prompt("把 old 改成 new 并验证")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "把 old 改成 new 并验证")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(await readFile(targetFilePath, "utf8")).toBe("new\n");
     expect(approvedToolNames).toEqual(["edit_file", "execute_command"]);
@@ -90,7 +93,7 @@ describe("complete Coding Agent Tool Loop", { timeout: 20_000 }, () => {
     });
     expect(agent.state.running).toBe(false);
 
-    await expect(agent.prompt("继续")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "继续")).resolves.toEqual({ status: "completed" });
     expect(agent.state.running).toBe(false);
     await agent.close();
   });

@@ -1,7 +1,7 @@
 import type { AssistantToolCallPart } from "../../message.js";
 import type { PermissionMode } from "../../permission/permission-mode.js";
 import { decideToolPolicy } from "../../permission/tool-policy.js";
-import type { SessionArtifactStore } from "../../session/artifacts.js";
+import type { SessionArtifactStore } from "../artifacts.js";
 import {
   hasOnlyKeys,
   isNonEmptyString,

@@ -11,6 +11,7 @@ import {
   resolveSessionShell,
 } from "../src/session/index.js";
 import { prepareWriteFileTool } from "../src/tool/basetool/write-file.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -37,7 +38,7 @@ describe("external single-file approval", () => {
       yield finishEvent("stop");
     };
     const agent = createAgentWithModelStream({ modelStream, session: fixture.session });
-    const promptResultPromise = agent.prompt("写入外部文件");
+    const promptResultPromise = promptToCompletion(agent, "写入外部文件");
     await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
     const approval = agent.state.pendingToolApproval;
     if (approval === null) {
@@ -77,7 +78,7 @@ describe("external single-file approval", () => {
     agent.subscribe((event) => {
       if (event.type === "tool_approval_requested") approvalReady.resolve();
     });
-    const promptResultPromise = agent.prompt("修改外部文件");
+    const promptResultPromise = promptToCompletion(agent, "修改外部文件");
     await approvalReady.promise;
     const approval = agent.state.pendingToolApproval;
     if (approval === null) {

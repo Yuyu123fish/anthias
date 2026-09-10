@@ -16,8 +16,8 @@ import {
   type Session,
   type SessionShell,
 } from "../src/session/index.js";
-
 import { getSessionLockDirectory } from "../src/session/lock.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 const sessionFilePaths = new WeakMap<Agent, string>();
@@ -37,7 +37,7 @@ afterEach(async () => {
 });
 
 describe("Agent", () => {
-  it("waits for a pending lease acquisition before closing and never starts model work", async () => {
+  it("waits for an accepted input write before closing and never starts model work", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-agent-close-"));
     temporaryDirectories.add(workspaceRoot);
     const session = await createSession({
@@ -49,13 +49,29 @@ describe("Agent", () => {
     const continueAcquisition = Promise.withResolvers<void>();
     const closeSession = vi.fn(() => session.close());
     let modelRequests = 0;
+    let writeError: unknown;
     const delayedSession: Session = {
       ...session,
-      async acquireRun(runId) {
-        const result = await session.acquireRun(runId);
+      async appendMessage(runId, message) {
         acquired.resolve();
         await continueAcquisition.promise;
-        return result;
+        try {
+          return await session.appendMessage(runId, message);
+        } catch (error) {
+          writeError = error;
+          throw error;
+        }
+      },
+      async appendRunFinished(runId, details) {
+        try {
+          return await session.appendRunFinished(runId, details);
+        } catch (error) {
+          writeError = error;
+          throw error;
+        }
+      },
+      get records() {
+        return session.records;
       },
       close: closeSession,
     };
@@ -66,18 +82,23 @@ describe("Agent", () => {
         yield stopFinish();
       },
     });
-    const promptResult = agent.prompt("pending");
+    const promptResult = promptToCompletion(agent, "pending");
     await acquired.promise;
     const closed = agent.close();
     expect(agent.close()).toBe(closed);
     expect(closeSession).not.toHaveBeenCalled();
-    await expect(agent.prompt("late")).resolves.toEqual({ status: "rejected", reason: "closed" });
+    await expect(promptToCompletion(agent, "late")).resolves.toEqual({
+      status: "rejected",
+      reason: "closed",
+    });
     continueAcquisition.resolve();
-    await expect(promptResult).resolves.toEqual({ status: "aborted" });
+    const result = await promptResult;
     await closed;
+    expect(writeError).toBeUndefined();
+    expect(result).toEqual({ status: "aborted" });
     expect(closeSession).toHaveBeenCalledTimes(1);
     expect(modelRequests).toBe(0);
-    expect(agent.state.messageHistory).toEqual([]);
+    expect(agent.state.messageHistory).toEqual([{ role: "user", content: "pending" }]);
   });
 
   it("delivers the aborted Run before releasing Session resources on close", async () => {
@@ -92,7 +113,7 @@ describe("Agent", () => {
     });
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
-    const promptResult = agent.prompt("start");
+    const promptResult = promptToCompletion(agent, "start");
     await started.promise;
     await agent.close();
     await expect(promptResult).resolves.toEqual({ status: "aborted" });
@@ -221,7 +242,7 @@ describe("Agent", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("first")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "first")).resolves.toEqual({ status: "completed" });
 
     const firstRunId = events.find((event) => event.type === "run_start")?.runId;
     expect(
@@ -237,7 +258,7 @@ describe("Agent", () => {
     expect(JSON.stringify(agent.state)).not.toContain(reasoningMarker);
     expect(JSON.stringify(await readSessionRecords(agent))).not.toContain(reasoningMarker);
 
-    await expect(agent.prompt("second")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "second")).resolves.toEqual({ status: "completed" });
     expect(JSON.stringify(modelRequests[2])).not.toContain(reasoningMarker);
   });
 
@@ -263,7 +284,7 @@ describe("Agent", () => {
       }
     });
 
-    const promptResult = await agent.prompt("你好");
+    const promptResult = await promptToCompletion(agent, "你好");
 
     expect(promptResult).toEqual({ status: "completed" });
     expect(agent.state).toMatchObject({
@@ -287,16 +308,18 @@ describe("Agent", () => {
       permissionMode: "agent",
       contextUsage: expect.objectContaining({ contextWindow: 128000, source: "estimated" }),
     });
-    expect(events.filter((type) => type !== "context_usage")).toEqual([
-      "run_start",
-      "message_start",
-      "message_end",
-      "message_start",
-      "message_update",
-      "message_update",
-      "message_end",
-      "run_end",
-    ]);
+    expect(events.filter((type) => type !== "context_usage" && !type.startsWith("input_"))).toEqual(
+      [
+        "run_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_update",
+        "message_update",
+        "message_end",
+        "run_end",
+      ],
+    );
     expect(updateMessages.map(assistantText)).toEqual(["你", "你好"]);
     expect(Object.isFrozen(agent.state)).toBe(true);
     expect(Object.isFrozen(agent.state.messageHistory)).toBe(true);
@@ -364,13 +387,13 @@ describe("Agent", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("   ")).resolves.toEqual({
+    await expect(promptToCompletion(agent, "   ")).resolves.toEqual({
       status: "rejected",
       reason: "empty",
     });
     expect(events).toHaveLength(0);
-    await expect(agent.prompt("one")).resolves.toEqual({ status: "completed" });
-    await expect(agent.prompt("two")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "one")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "two")).resolves.toEqual({ status: "completed" });
 
     expect(modelMessageBatches).toEqual([
       [{ role: "user", content: "one" }],
@@ -382,72 +405,50 @@ describe("Agent", () => {
     ]);
   });
 
-  it("rejects a busy prompt without changing the active request", async () => {
+  it("queues a busy prompt until the current response is durable", async () => {
     const responseGate = Promise.withResolvers<void>();
     let modelCallCount = 0;
-    const modelStream: ModelStream = async function* () {
+    const agent = await createTestAgent(async function* () {
       modelCallCount += 1;
       yield textDelta("working");
       await responseGate.promise;
-      yield textDelta(" done");
       yield stopFinish();
-    };
-    const agent = await createTestAgent(modelStream);
-    const firstPromptResult = agent.prompt("first");
-    await vi.waitFor(() =>
-      expect(agent.state.activeAssistantMessage?.content).toEqual([
-        { type: "text", text: "working" },
-      ]),
-    );
-
-    await expect(agent.prompt("second")).resolves.toEqual({
-      status: "rejected",
-      reason: "busy",
     });
-    expect(modelCallCount).toBe(1);
+    const first = promptToCompletion(agent, "first");
+    await vi.waitFor(() => expect(modelCallCount).toBe(1));
+    expect(await agent.prompt("second")).toMatchObject({ status: "queued", durable: false });
     expect(agent.state.messageHistory).toEqual([{ role: "user", content: "first" }]);
-
     responseGate.resolve();
-    await expect(firstPromptResult).resolves.toEqual({ status: "completed" });
+    expect((await first).status).toBe("completed");
+    expect(modelCallCount).toBe(2);
+    expect(agent.state.messageHistory.filter((message) => message.role === "user")).toEqual([
+      { role: "user", content: "first" },
+      { role: "user", content: "second" },
+    ]);
+    await agent.close();
   });
 
-  it("stays busy until run_end has been delivered", async () => {
-    const modelStream: ModelStream = async function* () {
+  it("hands terminal subscriber input to the next Run and retains the Session lock", async () => {
+    const agent = await createTestAgent(async function* () {
       yield textDelta("done");
       yield stopFinish();
-    };
-    const agent = await createTestAgent(modelStream);
-    const eventTypes: string[] = [];
-    let reentrantPromptResult: ReturnType<typeof agent.prompt> | undefined;
-    let lockObservedDuringRunEnd: Promise<void> | undefined;
-    agent.subscribe((event) => {
-      eventTypes.push(event.type);
-      if (event.type === "message_end" && event.message.role === "assistant") {
-        reentrantPromptResult = agent.prompt("too early");
-      }
-      if (event.type === "run_end") {
-        lockObservedDuringRunEnd = access(getSessionLockPath(agent));
-      }
     });
-
-    await expect(agent.prompt("first")).resolves.toEqual({ status: "completed" });
-    if (!reentrantPromptResult) {
-      throw new Error("expected the terminal subscriber to attempt a prompt");
-    }
-    await expect(reentrantPromptResult).resolves.toEqual({ status: "rejected", reason: "busy" });
-    await expect(lockObservedDuringRunEnd).resolves.toBeUndefined();
+    const events: AgentEvent[] = [];
+    let second: ReturnType<typeof promptToCompletion> | undefined;
+    agent.subscribe((event) => {
+      events.push(event);
+      if (event.type === "run_end" && !second) second = promptToCompletion(agent, "next run");
+    });
+    await promptToCompletion(agent, "first");
+    await second;
+    expect(events.filter((event) => event.type === "run_end")).toHaveLength(2);
+    expect(
+      new Set(events.filter((event) => event.type === "run_start").map((event) => event.runId))
+        .size,
+    ).toBe(2);
+    await expect(access(getSessionLockPath(agent))).resolves.toBeUndefined();
+    await agent.close();
     await expect(access(getSessionLockPath(agent))).rejects.toThrow();
-    expect(eventTypes.filter((type) => type !== "context_usage")).toEqual([
-      "run_start",
-      "message_start",
-      "message_end",
-      "message_start",
-      "message_update",
-      "message_end",
-      "run_end",
-    ]);
-    expect(agent.state.running).toBe(false);
-    expect(agent.state.messageHistory).toHaveLength(2);
   });
 
   it("aborts immediately, ignores late deltas, and can continue", async () => {
@@ -485,7 +486,7 @@ describe("Agent", () => {
     const agent = await createTestAgent(modelStream);
     const eventTypes: string[] = [];
     agent.subscribe((event) => eventTypes.push(event.type));
-    const firstPromptResult = agent.prompt("stop this");
+    const firstPromptResult = promptToCompletion(agent, "stop this");
     await vi.waitFor(() =>
       expect(agent.state.activeAssistantMessage?.content).toEqual([
         { type: "text", text: "partial" },
@@ -508,7 +509,7 @@ describe("Agent", () => {
       status: "aborted",
     });
     expect(agent.state.messageHistory.at(-1)).toEqual(finalAssistantMessage);
-    await expect(agent.prompt("continue")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "continue")).resolves.toEqual({ status: "completed" });
   });
 
   it("keeps provider errors out of assistant text and recovers", async () => {
@@ -524,7 +525,7 @@ describe("Agent", () => {
     };
     const agent = await createTestAgent(modelStream);
 
-    const failedPromptResult = await agent.prompt("fail");
+    const failedPromptResult = await promptToCompletion(agent, "fail");
 
     expect(failedPromptResult.status).toBe("failed");
     if (failedPromptResult.status === "failed") {
@@ -541,283 +542,69 @@ describe("Agent", () => {
       type: "run_finished",
       status: "failed",
     });
-    await expect(agent.prompt("recover")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "recover")).resolves.toEqual({ status: "completed" });
     expect(agent.state.lastError).toBeNull();
   });
 
-  it("does not publish an assistant message when its persistence fails", async () => {
-    let appendedRunFinishedCount = 0;
-    let releasedLeaseCount = 0;
-    const session: Session = Object.freeze({
-      sessionId: "00000000-0000-4000-8000-000000000001",
-      rootSessionId: "00000000-0000-4000-8000-000000000001",
-      sessionKind: "primary" as const,
-      workspaceRoot: "C:\\workspace",
-      sessionDirectory: "C:\\workspace\\data\\conversation",
-      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
-      records: Object.freeze([]),
-      appendContextSource: async () => undefined,
-      appendCoordination: async () => undefined,
-      appendAgentInput: async () => undefined,
-      appendCompaction: async () => undefined,
-      appendRequestUsage: async () => undefined,
-      appendApprovalDecision: async () => undefined,
-      close: async () => undefined,
-      shell: TEST_SHELL,
-      messageHistory: Object.freeze([]),
-      async acquireRun() {
-        return Object.freeze({
-          status: "acquired",
-          lease: Object.freeze({
-            async appendMessage(message: Message) {
-              if (message.role === "assistant") {
-                throw new Error("disk failure with secret-value");
-              }
-            },
-            async appendToolExecutionStarted() {},
-            async appendContextSource() {},
-            async appendCoordination() {},
-            async appendAgentInput() {},
-            async appendCompaction() {},
-            async appendRequestUsage() {},
-            async appendApprovalDecision() {},
-            async appendRunFinished() {
-              appendedRunFinishedCount += 1;
-            },
-            async release() {
-              releasedLeaseCount += 1;
-            },
-          }),
-        });
-      },
-    });
-    const agent = createAgentWithModelStream({
-      session,
-      modelStream: async function* () {
-        yield textDelta("not durable");
-        yield stopFinish();
-      },
-    });
-    const assistantMessageEndEvents: AgentEvent[] = [];
-    agent.subscribe((event) => {
-      if (event.type === "message_end" && event.message.role === "assistant") {
-        assistantMessageEndEvents.push(event);
-      }
-    });
-
-    const promptResult = await agent.prompt("persist this");
-
-    expect(promptResult.status).toBe("failed");
-    expect(JSON.stringify(promptResult)).not.toContain("secret-value");
-    expect(agent.state.messageHistory).toEqual([{ role: "user", content: "persist this" }]);
-    expect(agent.state.activeAssistantMessage).toBeNull();
-    expect(assistantMessageEndEvents).toHaveLength(0);
-    expect(appendedRunFinishedCount).toBe(0);
-    expect(releasedLeaseCount).toBe(1);
-  });
-
-  it("reports and seals a Session when User persistence and lease release both fail", async () => {
-    let acquisitionCount = 0;
-    let modelCallCount = 0;
-    const session: Session = Object.freeze({
-      sessionId: "00000000-0000-4000-8000-000000000011",
-      rootSessionId: "00000000-0000-4000-8000-000000000011",
-      sessionKind: "primary" as const,
-      workspaceRoot: "C:\\workspace",
-      sessionDirectory: "C:\\workspace\\data\\conversation",
-      storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
-      records: Object.freeze([]),
-      appendContextSource: async () => undefined,
-      appendCoordination: async () => undefined,
-      appendAgentInput: async () => undefined,
-      appendCompaction: async () => undefined,
-      appendRequestUsage: async () => undefined,
-      appendApprovalDecision: async () => undefined,
-      close: async () => undefined,
-      shell: TEST_SHELL,
-      messageHistory: Object.freeze([]),
-      async acquireRun() {
-        acquisitionCount += 1;
-        return Object.freeze({
-          status: "acquired",
-          lease: Object.freeze({
-            async appendMessage() {
-              throw new Error("append secret-value");
-            },
-            async appendToolExecutionStarted() {
-              throw new Error("must not append ToolExecutionStarted");
-            },
-            async appendContextSource() {},
-            async appendCoordination() {},
-            async appendAgentInput() {},
-            async appendCompaction() {},
-            async appendRequestUsage() {},
-            async appendApprovalDecision() {},
-            async appendRunFinished() {
-              throw new Error("must not append RunFinished");
-            },
-            async release() {
-              throw new Error("release secret-value");
-            },
-          }),
-        });
-      },
-    });
-    const agent = createAgentWithModelStream({
-      session,
-      modelStream: async function* () {
-        modelCallCount += 1;
-        yield textDelta("must not run");
-      },
-    });
-    const events: AgentEvent[] = [];
-    agent.subscribe((event) => events.push(event));
-
-    const firstPromptResult = await agent.prompt("persist me");
-    const secondPromptResult = await agent.prompt("must stay sealed");
-
-    expect(firstPromptResult).toEqual({
-      status: "failed",
-      error: "Session 资源释放失败，已停止继续写入；请重新打开 Session。",
-    });
-    if (firstPromptResult.status !== "failed") {
-      throw new Error("expected Session release failure");
-    }
-    expect(secondPromptResult).toEqual(firstPromptResult);
-    expect(agent.state.lastError).toBe(firstPromptResult.error);
-    expect(JSON.stringify({ firstPromptResult, state: agent.state })).not.toContain("secret-value");
-    expect(acquisitionCount).toBe(1);
-    expect(modelCallCount).toBe(0);
-    expect(events).toHaveLength(0);
-  });
-
-  it("seals the Agent after run completion persistence fails", async () => {
-    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-completion-failure-"));
-    temporaryDirectories.add(workspaceRoot);
-    let appendedMessageCount = 0;
-    let appendedRunFinishedCount = 0;
-    let modelCallCount = 0;
-    let releasedLeaseCount = 0;
-    const session: Session = Object.freeze({
-      sessionId: "00000000-0000-4000-8000-000000000002",
-      rootSessionId: "00000000-0000-4000-8000-000000000002",
-      sessionKind: "primary" as const,
-      workspaceRoot,
-      sessionDirectory: join(workspaceRoot, "conversation"),
-      storageDirectory: join(workspaceRoot, "conversation", "test-session"),
-      records: Object.freeze([]),
-      appendContextSource: async () => undefined,
-      appendCoordination: async () => undefined,
-      appendAgentInput: async () => undefined,
-      appendCompaction: async () => undefined,
-      appendRequestUsage: async () => undefined,
-      appendApprovalDecision: async () => undefined,
-      close: async () => undefined,
-      shell: TEST_SHELL,
-      messageHistory: Object.freeze([]),
-      async acquireRun() {
-        return Object.freeze({
-          status: "acquired",
-          lease: Object.freeze({
-            async appendMessage() {
-              appendedMessageCount += 1;
-            },
-            async appendToolExecutionStarted() {},
-            async appendContextSource() {},
-            async appendCoordination() {},
-            async appendAgentInput() {},
-            async appendCompaction() {},
-            async appendRequestUsage() {},
-            async appendApprovalDecision() {},
-            async appendRunFinished() {
-              appendedRunFinishedCount += 1;
-              throw new Error("run completion persistence failed");
-            },
-            async release() {
-              releasedLeaseCount += 1;
-            },
-          }),
-        });
-      },
-    });
-    const agent = createAgentWithModelStream({
-      session,
-      modelStream: async function* () {
-        modelCallCount += 1;
-        yield textDelta("durable assistant");
-        yield stopFinish();
-      },
-    });
-    const eventTypes: string[] = [];
-    const terminalEvents: AgentEvent[] = [];
-    agent.subscribe((event) => {
-      eventTypes.push(event.type);
-      if (event.type === "run_end") terminalEvents.push(event);
-    });
-
-    const firstPromptResult = await agent.prompt("first");
-    const secondPromptResult = await agent.prompt("must not start");
-
-    expect(firstPromptResult.status).toBe("failed");
-    expect(agent.state.lastRunDiagnostic?.category).toBe("storage");
-    expect(terminalEvents[0]).toMatchObject({
-      type: "run_end",
-      result: { status: "failed" },
-      diagnostic: { category: "storage", summary: "Session 写入失败，请检查本地存储后重试。" },
-    });
-    expect(secondPromptResult).toEqual(firstPromptResult);
-    expect(appendedMessageCount).toBe(2);
-    expect(appendedRunFinishedCount).toBe(1);
-    expect(releasedLeaseCount).toBe(1);
-    expect(modelCallCount).toBe(1);
-    expect(eventTypes.filter((eventType) => eventType === "run_start")).toHaveLength(1);
-  });
-
-  it.each(["session_busy", "session_changed"] as const)(
-    "rejects %s before events or model work and seals only a changed Session",
-    async (reason) => {
-      let acquisitionCount = 0;
-      let modelCallCount = 0;
-      const session: Session = Object.freeze({
-        sessionId: randomSessionId(),
-        get rootSessionId() {
-          return this.sessionId;
-        },
-        sessionKind: "primary" as const,
-        workspaceRoot: "C:\\workspace",
-        sessionDirectory: "C:\\workspace\\data\\conversation",
-        storageDirectory: "C:\\workspace\\data\\conversation\\test-session",
-        records: Object.freeze([]),
-        appendContextSource: async () => undefined,
-        appendCoordination: async () => undefined,
-        appendAgentInput: async () => undefined,
-        appendCompaction: async () => undefined,
-        appendRequestUsage: async () => undefined,
-        appendApprovalDecision: async () => undefined,
-        close: async () => undefined,
+  it.each(["user", "assistant", "run_finished"] as const)(
+    "seals the Session when %s persistence fails without inventing durable completion",
+    async (failurePoint) => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-agent-persistence-"));
+      temporaryDirectories.add(workspaceRoot);
+      const session = await createSession({
+        workspaceRoot,
+        sessionDirectory: join(workspaceRoot, "sessions"),
         shell: TEST_SHELL,
-        messageHistory: Object.freeze([]),
-        async acquireRun() {
-          acquisitionCount += 1;
-          return Object.freeze({ status: "rejected", reason });
-        },
       });
+      let modelCalls = 0;
+      let messageWrites = 0;
+      let terminalWrites = 0;
+      const failingSession: Session = {
+        ...session,
+        get records() {
+          return session.records;
+        },
+        get header() {
+          return session.header;
+        },
+        async appendMessage(runId, message) {
+          messageWrites += 1;
+          if (message.role === failurePoint) throw new Error("disk secret-value");
+          return session.appendMessage(runId, message);
+        },
+        async appendRunFinished(runId, details) {
+          terminalWrites += 1;
+          if (failurePoint === "run_finished") throw new Error("terminal secret-value");
+          return session.appendRunFinished(runId, details);
+        },
+      };
       const agent = createAgentWithModelStream({
-        session,
+        session: failingSession,
         modelStream: async function* () {
-          modelCallCount += 1;
-          yield textDelta("must not run");
+          modelCalls += 1;
+          yield textDelta("answer");
+          yield stopFinish();
         },
       });
       const events: AgentEvent[] = [];
       agent.subscribe((event) => events.push(event));
-
-      await expect(agent.prompt("first")).resolves.toEqual({ status: "rejected", reason });
-      await expect(agent.prompt("second")).resolves.toEqual({ status: "rejected", reason });
-      expect(acquisitionCount).toBe(reason === "session_changed" ? 1 : 2);
-      expect(modelCallCount).toBe(0);
-      expect(events).toHaveLength(0);
-      expect(agent.state.messageHistory).toEqual([]);
+      const first = await promptToCompletion(agent, "persist this");
+      expect(first.status).toBe("failed");
+      expect(JSON.stringify({ first, state: agent.state })).not.toContain("secret-value");
+      expect(await agent.prompt("sealed")).toEqual({
+        status: "rejected",
+        reason: "session_unavailable",
+      });
+      expect(events.filter((event) => event.type === "run_end")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "session_unavailable")).toHaveLength(1);
+      expect(agent.state.messageHistory).toHaveLength(
+        failurePoint === "user" ? 0 : failurePoint === "assistant" ? 1 : 2,
+      );
+      expect(modelCalls).toBe(failurePoint === "user" ? 0 : 1);
+      expect(messageWrites).toBe(failurePoint === "user" ? 1 : 2);
+      expect(terminalWrites).toBe(failurePoint === "run_finished" ? 1 : 0);
+      expect(agent.state.inputQueue.paused).toBe(true);
+      await agent.close();
     },
   );
 
@@ -831,17 +618,19 @@ describe("Agent", () => {
     agent.subscribe((event) => events.push(event));
     await appendFile(getSessionFilePath(agent), " ");
 
-    await expect(agent.prompt("stale")).resolves.toEqual({
-      status: "rejected",
-      reason: "session_changed",
+    await expect(promptToCompletion(agent, "stale")).resolves.toEqual({
+      status: "failed",
+      error: "Session 写入失败，请检查本地存储后重试。",
     });
     expect(modelCallCount).toBe(0);
-    expect(events).toHaveLength(0);
+    expect(
+      events.filter((event) => event.type === "message_end" || event.type === "run_end"),
+    ).toHaveLength(0);
     expect(agent.state.messageHistory).toEqual([]);
   });
 
   it.each(["completed", "aborted", "failed"] as const)(
-    "releases the Session Run lock after a %s terminal result",
+    "retains the Session write lock after a %s terminal result until close",
     async (terminalStatus) => {
       const responseGate = Promise.withResolvers<void>();
       const agent = await createTestAgent(async function* () {
@@ -855,7 +644,7 @@ describe("Agent", () => {
           yield stopFinish();
         }
       });
-      const promptResultPromise = agent.prompt("terminal");
+      const promptResultPromise = promptToCompletion(agent, "terminal");
       if (terminalStatus === "aborted") {
         await vi.waitFor(() =>
           expect(agent.state.activeAssistantMessage?.content).toEqual([
@@ -868,6 +657,8 @@ describe("Agent", () => {
 
       const promptResult = await promptResultPromise;
       expect(promptResult.status).toBe(terminalStatus);
+      await expect(access(getSessionLockPath(agent))).resolves.toBeUndefined();
+      await agent.close();
       await expect(access(getSessionLockPath(agent))).rejects.toThrow();
     },
   );
@@ -885,13 +676,13 @@ describe("Agent", () => {
     });
     const unsubscribe = agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("one")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "one")).resolves.toEqual({ status: "completed" });
     expect(events.length).toBeGreaterThan(0);
     unsubscribe();
     unsubscribe();
     const receivedEventCount = events.length;
 
-    await expect(agent.prompt("two")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "two")).resolves.toEqual({ status: "completed" });
     expect(events).toHaveLength(receivedEventCount);
   });
 
@@ -901,7 +692,7 @@ describe("Agent", () => {
       yield stopFinish();
     };
     const agent = await createTestAgent(modelStream);
-    await agent.prompt("hello");
+    await promptToCompletion(agent, "hello");
     const state = agent.state;
 
     expect(() => {
@@ -922,7 +713,8 @@ describe("Agent", () => {
         yield stopFinish();
       },
     });
-    await firstAgent.prompt("first question");
+    await promptToCompletion(firstAgent, "first question");
+    await firstAgent.close();
 
     const reopenedSession = await openSession({
       sessionId: session.sessionId,
@@ -955,7 +747,7 @@ describe("Agent", () => {
         status: "completed",
       },
     ]);
-    await reopenedAgent.prompt("second question");
+    await promptToCompletion(reopenedAgent, "second question");
     expect(modelMessageBatches).toEqual([
       [
         { role: "user", content: "first question" },
@@ -1002,10 +794,6 @@ function getSessionLockPath(agent: Agent): string {
     dirname(dirname(dirname(getSessionFilePath(agent)))),
     agent.state.sessionId,
   );
-}
-
-function randomSessionId(): string {
-  return "00000000-0000-4000-8000-000000000003";
 }
 
 function assistantText(message: AssistantMessage): string {

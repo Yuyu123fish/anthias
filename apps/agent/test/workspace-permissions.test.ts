@@ -8,6 +8,7 @@ import type { ModelStream } from "../src/model/model-stream.js";
 import { createWorkspacePermissions } from "../src/permission/workspace-permissions.js";
 import { createSession } from "../src/session/index.js";
 import type { ToolApprovalPlan } from "../src/tool/tool-runner.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -204,7 +205,9 @@ describe("Workspace authorization", () => {
       }
     });
     await agent.permissions.grant({ remember: true, includeMembers: false });
-    expect(await agent.prompt("Write the two requested files.")).toEqual({ status: "completed" });
+    expect(await promptToCompletion(agent, "Write the two requested files.")).toEqual({
+      status: "completed",
+    });
     expect(await readFile(join(workspaceRoot, "two.txt"), "utf8")).toBe("saved");
     expect(manualApprovals).toBe(0);
     expect(
@@ -225,7 +228,7 @@ describe("Workspace authorization", () => {
       if (event.type === "tool_authorization" && event.source === "workspace")
         revocation = agent.permissions.revoke();
     });
-    await agent.prompt("Write the requested file.");
+    await promptToCompletion(agent, "Write the requested file.");
     await revocation;
     await expect(readFile(join(workspaceRoot, "must-not-exist.txt"))).rejects.toThrow();
     expect(agent.permissions.snapshot().revoked).toBe(true);
@@ -246,7 +249,7 @@ describe("Workspace authorization", () => {
         }
       });
       await agent.permissions.grant({ remember: false, includeMembers: true });
-      await agent.prompt("Write a file.");
+      await promptToCompletion(agent, "Write a file.");
       expect(manualRequests).toBe(mode === "agent" ? 1 : 0);
       await expect(readFile(join(workspaceRoot, "denied.txt"))).rejects.toThrow();
     },
@@ -257,7 +260,7 @@ describe("Workspace authorization", () => {
       writeSequence([".permissions/forged.json"]),
     );
     await agent.permissions.grant({ remember: true, includeMembers: false });
-    await agent.prompt("Write the requested file.");
+    await promptToCompletion(agent, "Write the requested file.");
     await expect(readFile(join(directory, "forged.json"))).rejects.toThrow();
     expect(
       agent.state.messageHistory.some(
@@ -296,7 +299,7 @@ describe("Workspace authorization", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
       }
     });
-    await agent.prompt("Check configuration access boundaries.");
+    await promptToCompletion(agent, "Check configuration access boundaries.");
     expect(JSON.stringify(session.records)).not.toContain(syntheticKey);
     expect(await readFile(join(workspaceRoot, ".env"), "utf8")).toContain(syntheticKey);
     expect(manualRequests).toBe(0);
@@ -444,7 +447,7 @@ it("executes different literal arguments of an explicitly granted command withou
   agent.subscribe((event) => {
     if (event.type === "tool_approval_requested") manualApprovals++;
   });
-  expect((await agent.prompt("检查两次输出")).status).toBe("completed");
+  expect((await promptToCompletion(agent, "检查两次输出")).status).toBe("completed");
   expect(manualApprovals).toBe(0);
   expect(
     session.records

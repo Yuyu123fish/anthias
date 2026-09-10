@@ -206,6 +206,7 @@ describe("createAgentFromEnvironment", () => {
       throw new Error("expected initial Agent creation to succeed");
     }
 
+    await firstCreationResult.agent.close();
     const reopenedCreationResult = await createAgentFromEnvironment({
       environment,
       workspaceRoot,
@@ -237,16 +238,8 @@ describe("createAgentFromEnvironment", () => {
       sessionDirectory,
       firstCreationResult.agent.state.sessionId,
     );
-    await mkdir(lockDirectory);
-    await writeFile(
-      join(lockDirectory, "owner.json"),
-      `${JSON.stringify({
-        pid: process.pid,
-        ownerToken: "00000000-0000-4000-8000-000000000010",
-        acquiredAt: new Date().toISOString(),
-      })}\n`,
-      "utf8",
-    );
+    const ownerFilePath = join(lockDirectory, "owner.json");
+    const originalOwnerBytes = await readFile(ownerFilePath);
 
     const busyCreationResult = await createAgentFromEnvironment({
       environment,
@@ -261,6 +254,7 @@ describe("createAgentFromEnvironment", () => {
       error: "Session 正被其他进程使用，请稍后重试。",
     });
     await expect(stat(lockDirectory)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    expect(await readFile(ownerFilePath)).toEqual(originalOwnerBytes);
   });
 
   it("rejects an empty requested Session ID without creating a Session", async () => {
@@ -330,6 +324,7 @@ describe("createAgentFromEnvironment", () => {
       throw new Error("expected initial Agent creation to succeed");
     }
 
+    await firstCreationResult.agent.close();
     const originalDirectoryEntries = await readdir(sessionDirectory);
     const originalLocation = await locateSessionStorage(
       sessionDirectory,
@@ -370,7 +365,8 @@ async function expectSessionStorage(sessionDirectory: string, sessionId: string)
   const sessionText = await readFile(location.sessionFilePath, "utf8");
   const header = JSON.parse(sessionText.trimEnd().split("\n")[0] ?? "") as Record<string, unknown>;
   expect(header).toMatchObject({
-    schemaVersion: 3,
+    schemaVersion: 4,
+    latestCompactionEntryId: null,
     sessionId,
     rootSessionId: sessionId,
     sessionKind: "primary",
@@ -385,7 +381,7 @@ async function expectSessionStorage(sessionDirectory: string, sessionId: string)
   );
   await expect(
     readFile(join(location.storageDirectory, "session.index.json"), "utf8"),
-  ).resolves.toContain(sessionId);
+  ).rejects.toMatchObject({ code: "ENOENT" });
   expect(await readdir(sessionDirectory)).toEqual([
     ".gitignore",
     ".maintenance",

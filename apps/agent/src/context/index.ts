@@ -5,7 +5,7 @@ import {
   type ModelStream,
   type ModelUsage,
 } from "../model/model-stream.js";
-import type { Session, SessionRunLease } from "../session/index.js";
+import type { Session } from "../session/index.js";
 import {
   isValidCompactionRecord,
   type PersistedUsage,
@@ -82,7 +82,7 @@ function addUsage(previous: RequestUsageTotals, usage: PersistedUsage): RequestU
   });
 }
 
-/** Context 仅持有模型投影和预算；所有事实写入都复用当前 Run 的 lease。 */
+/** Context 仅持有模型投影和预算；所有事实写入都经 Session 的串行提交。 */
 export function createContextController(options: {
   session: Session;
   modelStream: ModelStream;
@@ -96,14 +96,10 @@ export function createContextController(options: {
     messages: readonly import("../model/model-stream.js").ModelInputMessage[],
   ) => {
     const records = contextRecords();
-    const validIds = new Set(records.map((record) => record.entryId));
-    return projectContextHistory(
-      records,
-      sources
-        ? messages.filter((message) => !message.entryId || validIds.has(message.entryId))
-        : messages,
-      sources !== undefined,
-    );
+    return projectContextHistory(records, messages, sources !== undefined, {
+      latestCompactionEntryId: session.header.latestCompactionEntryId,
+      getEntry: session.getEntry,
+    });
   };
   let usageAnchor: UsageAnchor | null = null;
   let inputTokens: number | null = null;
@@ -134,7 +130,7 @@ export function createContextController(options: {
   }
 
   function wrapRun(run: {
-    lease: Pick<SessionRunLease, "appendCompaction" | "appendRequestUsage">;
+    runId: string | null;
     manual?: boolean;
     extendRequest?: (request: ModelRequest, requestIdentity: ModelRequest) => ModelRequest;
     beforeRequest?: (signal: AbortSignal) => Promise<void>;
@@ -151,7 +147,7 @@ export function createContextController(options: {
     ) {
       const normalizedUsage = usage ?? UNKNOWN_USAGE;
       try {
-        await run.lease.appendRequestUsage({
+        await session.appendRequestUsage(run.runId, {
           purpose,
           requestEntryId,
           contextVersion,
@@ -239,6 +235,7 @@ export function createContextController(options: {
         }
         compactionAttempted = true;
         const before = inputTokens ?? estimateModelRequestTokens(request);
+        // 冻结上下文
         const fixedRecords = contextRecords();
         const fixedSourceSnapshot = sources ? snapshotSources(fixedRecords, []) : undefined;
         const fixedMessages = projectCompactionContext(
@@ -283,6 +280,13 @@ export function createContextController(options: {
                 selection.retainedEntries.map((entry) => entry.entryId),
               )
             : undefined;
+          // 摘要期间来源换版时，不能用新来源快照替旧摘要背书。
+          if (
+            fixedSourceSnapshot &&
+            JSON.stringify(fixedSourceSnapshot.sourceVersions) !==
+              JSON.stringify(sourceSnapshot?.sourceVersions)
+          )
+            throw new Error(COMPACTION_ERROR);
           if (
             !isValidCompactionRecord(
               {
@@ -308,7 +312,7 @@ export function createContextController(options: {
           const after = estimateModelRequestTokens(candidate);
           if (after >= threshold || after >= before) throw new Error(CAPACITY_ERROR);
           try {
-            await run.lease.appendCompaction({
+            await session.appendCompaction(run.runId, {
               summary,
               ...(sourceSnapshot ? { projection: sourceSnapshot } : {}),
               coversThroughEntryId: selection.coversThroughEntryId,
@@ -443,6 +447,11 @@ export function createContextController(options: {
   return Object.freeze({
     snapshot,
     wrapRun,
+    projectMessages(
+      messages: readonly import("../model/model-stream.js").ModelInputMessage[] = [],
+    ) {
+      return projectHistory(messages).messages;
+    },
     async compact(
       request: ModelRequest,
       signal: AbortSignal,
@@ -450,7 +459,7 @@ export function createContextController(options: {
       onStorageFailure: () => void,
     ) {
       const wrapper = wrapRun({
-        lease: session,
+        runId: null,
         manual: true,
         emit,
         onFailure: () => undefined,

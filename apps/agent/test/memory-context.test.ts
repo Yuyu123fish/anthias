@@ -10,6 +10,7 @@ import { createMemory } from "../src/memory/index.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import { COMPACTION_SECTION_TITLES } from "../src/prompts/compaction-prompt.js";
 import { createSession } from "../src/session/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const agents: Agent[] = [];
 const roots: string[] = [];
@@ -43,23 +44,12 @@ async function setup(
         get records() {
           return session.records;
         },
-        get messageHistory() {
-          return session.messageHistory;
+        get header() {
+          return session.header;
         },
-        async acquireRun(runId) {
-          const acquired = await session.acquireRun(runId);
-          if (acquired.status !== "acquired") return acquired;
-          return {
-            status: "acquired",
-            lease: {
-              ...acquired.lease,
-              async appendContextSource(details) {
-                if (details.sourceId.startsWith("memory:"))
-                  throw new Error("synthetic adoption failure");
-                return acquired.lease.appendContextSource(details);
-              },
-            },
-          };
+        async appendContextSource(runId, details) {
+          if (details.sourceId.startsWith("memory:")) throw new Error("synthetic adoption failure");
+          return session.appendContextSource(runId, details);
         },
       }
     : session;
@@ -88,7 +78,7 @@ const writer = {
 const summary = COMPACTION_SECTION_TITLES.map((title) => "## " + title + "\n继续完成。").join("\n");
 
 describe("Memory and source orchestration", { timeout: 15_000 }, () => {
-  it("keeps the initial source order and appends changed project rules without rewriting the prefix", async () => {
+  it("keeps initial source order and uses current project rules without mutating history", async () => {
     const requests: ModelRequest[] = [];
     const { agent, memory, workspaceRoot, session } = await setup(async function* (request) {
       requests.push(request);
@@ -104,7 +94,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       writer,
     );
     await writeFile(join(workspaceRoot, "AGENTS.md"), "PROJECT_RULE_V1");
-    expect((await agent.prompt("build")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "build")).status).toBe("completed");
     const first = requests[0];
     if (!first) throw new Error("request");
     const records = new Map(session.records.map((record) => [record.entryId, record]));
@@ -125,16 +115,26 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       [...first.tools.map((tool) => tool.name)].sort(),
     );
     await writeFile(join(workspaceRoot, "AGENTS.md"), "PROJECT_RULE_V2");
-    expect((await agent.prompt("继续")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "继续")).status).toBe("completed");
     expect(requests[1]?.systemPrompt).toBe(first.systemPrompt);
-    expect(requests[1]?.messages.slice(0, first.messages.length)).toEqual(first.messages);
+    const unchangedMessages = first.messages.filter((message) => {
+      const record = message.entryId ? records.get(message.entryId) : undefined;
+      return record?.type !== "context_source" || record.kind !== "project_rules";
+    });
+    const unchangedEntryIds = new Set(unchangedMessages.map((message) => message.entryId));
+    expect(
+      requests[1]?.messages.filter((message) => unchangedEntryIds.has(message.entryId)),
+    ).toEqual(unchangedMessages);
+    expect(JSON.stringify(first.messages)).toContain("PROJECT_RULE_V1");
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("PROJECT_RULE_V1");
+    expect(JSON.stringify(session.records)).toContain("PROJECT_RULE_V1");
     expect(JSON.stringify(requests[1]?.messages)).toContain("PROJECT_RULE_V2");
     expect(
       session.records.filter(
         (record) => record.type === "context_source" && record.kind === "project_rules",
       ),
     ).toHaveLength(2);
-    expect((await agent.prompt("再继续")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "再继续")).status).toBe("completed");
     expect(
       session.records.filter(
         (record) => record.type === "context_source" && record.kind === "project_rules",
@@ -163,7 +163,9 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       }
     }, true);
     await writeFile(join(workspaceRoot, "note.txt"), "文档内容");
-    expect((await agent.prompt("不要修改代码，记住以后回答先给结论")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "不要修改代码，记住以后回答先给结论")).status).toBe(
+      "completed",
+    );
     expect((await memory.query()).entries[0]).toMatchObject({
       content: "回答先给结论",
       status: "active",
@@ -226,7 +228,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
         pathStyle === "subdirectory" ? join("packages", "app") : "",
       );
       await writeFile(join(workspaceRoot, "package.json"), '{"scripts":{"test":"pnpm test"}}');
-      expect((await agent.prompt("检查并记录测试配置")).status).toBe("completed");
+      expect((await promptToCompletion(agent, "检查并记录测试配置")).status).toBe("completed");
       const entry = (await memory.query()).entries[0];
       expect(entry).toMatchObject({
         status: "active",
@@ -274,12 +276,12 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       }
       yield toolFinish;
     });
-    expect((await agent.prompt("整理一下")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "整理一下")).status).toBe("completed");
     expect((await memory.query({ status: "all" })).entries.map((entry) => entry.status)).toEqual([
       "candidate",
     ]);
     expect((await agent.memory.execute({ action: "settings", automatic: false })).ok).toBe(true);
-    expect((await agent.prompt("继续")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "继续")).status).toBe("completed");
     expect((await memory.query({ status: "all" })).entries).toHaveLength(1);
     expect(
       agent.state.messageHistory.filter(
@@ -306,8 +308,8 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       )
     ).entries[0];
     if (!saved) throw new Error("memory");
-    await agent.prompt("任务一");
-    await agent.prompt("补充原文：" + privatePreference);
+    await promptToCompletion(agent, "任务一");
+    await promptToCompletion(agent, "补充原文：" + privatePreference);
     expect((await agent.compact()).ok).toBe(true);
     const checkpoint = session.records.findLast((record) => record.type === "compaction");
     expect(
@@ -317,9 +319,9 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       { action: "forget", id: saved.id, revision: saved.revision, stopSending: true },
       writer,
     );
-    await agent.prompt("继续任务");
+    await promptToCompletion(agent, "继续任务");
     expect(JSON.stringify(requests.at(-1)?.messages)).not.toContain("OLD_PRIVATE_PREFERENCE");
-    expect(JSON.stringify(session.messageHistory)).toContain("OLD_PRIVATE_PREFERENCE");
+    expect(JSON.stringify(session.records)).toContain("OLD_PRIVATE_PREFERENCE");
     await expect(
       memory.execute(
         { action: "save", kind: "user", scope: "global", content: privatePreference },
@@ -328,7 +330,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
     ).rejects.toThrow("遗忘");
     const requestCount = requests.length;
     await writeFile(join(root, "memory", "user", saved.id + ".json"), "{broken tombstone");
-    expect((await agent.prompt("再次继续")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "再次继续")).status).toBe("failed");
     expect(requests).toHaveLength(requestCount);
   });
 
@@ -350,7 +352,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       false,
       true,
     );
-    const result = await agent.prompt("以后回答先给结论");
+    const result = await promptToCompletion(agent, "以后回答先给结论");
     expect(result.status === "failed" && result.error).toContain("记忆已保存");
     expect((await memory.query()).entries[0]?.content).toBe("回答先给结论");
     expect(
@@ -358,7 +360,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
         (record) => record.type === "context_source" && record.sourceId.startsWith("memory:"),
       ),
     ).toBe(false);
-    expect((await agent.prompt("不重复写入")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "不重复写入")).status).toBe("failed");
     expect(requests).toBe(1);
   });
 
@@ -396,12 +398,12 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
     memoryId =
       (await memory.execute({ action: "save", kind: "user", content: "保留的偏好" }, writer))
         .entries[0]?.id ?? "";
-    await agent.prompt("请记住我偏好中文");
+    await promptToCompletion(agent, "请记住我偏好中文");
     expect((await memory.query()).automatic).toBe(true);
     expect((await memory.query()).entries[0]?.status).toBe("active");
-    await agent.prompt("不要修改记忆");
+    await promptToCompletion(agent, "不要修改记忆");
     expect((await memory.query({ status: "all" })).entries).toHaveLength(1);
-    await agent.prompt("忘记保留的偏好");
+    await promptToCompletion(agent, "忘记保留的偏好");
     expect((await memory.query({ status: "all" })).entries[0]?.status).toBe("forgotten");
   });
 
@@ -413,12 +415,12 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       yield finish;
     });
     await mkdir(join(workspaceRoot, "AGENTS.md"));
-    const result = await agent.prompt("开始");
+    const result = await promptToCompletion(agent, "开始");
     expect(result.status).toBe("failed");
     expect(requests).toBe(0);
     await rm(join(workspaceRoot, "AGENTS.md"), { recursive: true });
     await writeFile(join(workspaceRoot, "AGENTS.md"), "修复后的规则");
-    expect((await agent.prompt("继续")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "继续")).status).toBe("completed");
     expect(requests).toBe(1);
   });
 
@@ -472,7 +474,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
       )
     ).entries[0];
     if (!saved) throw new Error("memory");
-    const completion = agent.prompt("开始");
+    const completion = promptToCompletion(agent, "开始");
     await entered.promise;
     await memory.execute({ action: "forget", id: saved.id, revision: saved.revision }, writer);
     release.resolve();

@@ -1,5 +1,4 @@
 import type { ModelInputMessage } from "../model/model-stream.js";
-import { fromDurableMessage } from "../session/message-codec.js";
 import type {
   AgentInputDetails,
   AgentInputRecord,
@@ -65,11 +64,15 @@ export function createCompactionMessage(summary: string): ModelInputMessage {
   });
 }
 
-/** Raw 消息仅按持久身份关联；当前 Run 的 Reasoning 不从磁盘补造或按同文消息猜测。 */
+/** 正文只来自已提交 Entry；当前 Run 的 Reasoning 只按相同持久身份和正文合并。 */
 export function projectContextHistory(
   records: readonly SessionRecord[],
   rawMessages: readonly ModelInputMessage[],
   includeSources = true,
+  navigation?: Readonly<{
+    latestCompactionEntryId: string | null;
+    getEntry: (entryId: string) => SessionRecord | undefined;
+  }>,
 ): ContextProjection {
   const recordSnapshot = Object.freeze([...records]);
   const contextRecords = recordSnapshot.filter(
@@ -82,37 +85,35 @@ export function projectContextHistory(
   }
   const allEntries = contextRecords.map((record) => contextEntry(record, rawMessageByEntryId));
   const layout = groupHistory(allEntries);
-  const checkpoint = findLatestProjectableCheckpoint(recordSnapshot, contextRecords, layout);
+  const checkpoint = findLatestProjectableCheckpoint(
+    recordSnapshot,
+    contextRecords,
+    layout,
+    navigation,
+  );
   const selectedRecords = checkpoint
     ? selectCheckpointRecords(checkpoint, contextRecords)
-    : contextRecords.filter(
-        (record) => record.type === "agent_input" || rawMessageByEntryId.has(record.entryId),
-      );
+    : contextRecords;
   const selectedIds = new Set(selectedRecords.map((record) => record.entryId));
   const entries = Object.freeze(allEntries.filter((entry) => selectedIds.has(entry.entryId)));
-  const durableIds = new Set(contextRecords.map((record) => record.entryId));
-  const transientMessages = rawMessages.filter(
-    (message) =>
-      (!message.entryId || !durableIds.has(message.entryId)) &&
-      !(checkpoint && isCompactionHistoryMessage(message)),
-  );
   return assembleProjection(
     recordSnapshot,
     checkpoint,
     entries,
     layout,
-    transientMessages,
     checkpoint ? createCompactionMessage(checkpoint.summary) : null,
     includeSources,
     checkpoint?.projection,
   );
 }
 
-/** 候选与已提交历史复用排列规则；调用者必须先保存候选，才能将其用于后续模型请求。 */
+/**
+ * 按调用方指定的“保留哪些历史、用哪段摘要、用来源哪个快照”，拼出压缩后会发给模型的消息。
+ */
 export function projectCompactionContext(
-  records: readonly SessionRecord[],
-  entries: readonly ContextMessageEntry[],
-  summary: string | null,
+  records: readonly SessionRecord[], // 当前记录快照
+  entries: readonly ContextMessageEntry[], // 放进模型的消息列表
+  summary: string | null, // 新摘要（如果有）
   sourceCheckpoint?: CompactionProjection,
 ): ContextProjection {
   const recordSnapshot = Object.freeze([...records]);
@@ -126,7 +127,6 @@ export function projectCompactionContext(
     null,
     entries,
     groupHistory(allEntries),
-    [],
     summary === null ? null : createCompactionMessage(summary),
     sourceCheckpoint !== undefined,
     sourceCheckpoint,
@@ -137,14 +137,22 @@ function contextEntry(
   record: ContextRecord,
   rawMessageByEntryId: ReadonlyMap<string, ModelInputMessage>,
 ): ContextMessageEntry {
-  const durableMessage =
-    record.type === "agent_input" ? agentInputMessage(record) : fromDurableMessage(record.message);
-  const message = rawMessageByEntryId.get(record.entryId) ?? {
-    ...(durableMessage.role === "assistant"
-      ? { role: durableMessage.role, content: durableMessage.content }
-      : durableMessage),
-    entryId: record.entryId,
-  };
+  const committedMessage =
+    record.type === "agent_input" ? agentInputMessage(record) : record.message;
+  const rawMessage = rawMessageByEntryId.get(record.entryId);
+  const message: ModelInputMessage =
+    committedMessage.role === "assistant" &&
+    rawMessage?.role === "assistant" &&
+    rawMessage.content.some((part) => part.type === "reasoning") &&
+    JSON.stringify(rawMessage.content.filter((part) => part.type !== "reasoning")) ===
+      JSON.stringify(committedMessage.content)
+      ? rawMessage
+      : {
+          ...(committedMessage.role === "assistant"
+            ? { role: committedMessage.role, content: committedMessage.content }
+            : committedMessage),
+          entryId: record.entryId,
+        };
   return Object.freeze({
     entryId: record.entryId,
     seq: record.seq,
@@ -153,20 +161,24 @@ function contextEntry(
   });
 }
 
+/**
+ * 按照排列规则拼出发给模型的消息列表
+ */
 function assembleProjection(
   records: readonly SessionRecord[],
   checkpoint: CompactionRecord | null,
-  entries: readonly ContextMessageEntry[],
-  layout: HistoryLayout,
-  transientMessages: readonly ModelInputMessage[],
+  entries: readonly ContextMessageEntry[], // 要发给模型的消息列表
+  layout: HistoryLayout, // 历史消息的排列
   summaryMessage: ModelInputMessage | null,
   includeSources: boolean,
   sourceCheckpoint?: CompactionProjection,
 ): ContextProjection {
+  // 过滤出要放进模型的消息
   const selectedEntries = new Map(entries.map((entry) => [entry.entryId, entry]));
   const groups = Object.freeze(
     layout.groups.flatMap((group) => {
       const groupEntries = group.entries.flatMap((entry) => {
+        // 如果历史消息列表中的消息在要发给模型的消息列表中，则添加到组中
         const selected = selectedEntries.get(entry.entryId);
         return selected ? [selected] : [];
       });
@@ -184,12 +196,16 @@ function assembleProjection(
     message: entry.message,
     placement:
       entry.recordType === "agent_input"
-        ? inputPlacement(entry.seq, layout.toolGroups)
+        ? // 如果是 Agent 输入，且它刚好落在某次 ToolCalling 的调用和结果之间
+          // 后面它会被移动到 ToolCalling 的结果之后
+          inputPlacement(entry.seq, layout.toolGroups)
         : { kind: "record", sequence: entry.seq },
     originalSequence: entry.seq,
   }));
-  const prefix = summaryMessage ? [summaryMessage] : [];
-  const historyMessages = orderedMessages(historyItems, prefix, transientMessages);
+  const prefix = summaryMessage ? [summaryMessage] : []; // 如果有新摘要，则添加到消息列表前面
+  // 排序消息
+  const historyMessages = orderedMessages(historyItems, prefix);
+  // 把 上下文来源 部分先过滤出来（AGENTS.md Skill 等等）
   const sourceRecords = records.filter(
     (record): record is ContextSourceRecord => record.type === "context_source",
   );
@@ -205,7 +221,7 @@ function assembleProjection(
   const messages = includeSources
     ? Object.freeze([
         ...initialSources.map(sourceMessage),
-        ...orderedMessages([...historyItems, ...sourceItems], prefix, transientMessages),
+        ...orderedMessages([...historyItems, ...sourceItems], prefix),
       ])
     : historyMessages;
   return Object.freeze({ records, checkpoint, entries, groups, historyMessages, messages });
@@ -295,6 +311,10 @@ function enclosingToolGroup(sequence: number, groups: readonly ToolGroupBoundary
   );
 }
 
+/**
+ * 根据当前序号和所有工具消息分组
+ * 判断 agent_input 消息是否在一次工具调用组之间
+ */
 function inputPlacement(sequence: number, groups: readonly ToolGroupBoundary[]): MessagePlacement {
   const group = enclosingToolGroup(sequence, groups);
   if (!group) return { kind: "record", sequence };
@@ -331,55 +351,105 @@ function comparePlacement(left: MessagePlacement, right: MessagePlacement): numb
 function orderedMessages(
   items: readonly PositionedMessage[],
   prefix: readonly ModelInputMessage[],
-  transientMessages: readonly ModelInputMessage[],
 ): readonly ModelInputMessage[] {
   const ordered = [...items].sort(
     (left, right) =>
       comparePlacement(left.placement, right.placement) ||
       left.originalSequence - right.originalSequence,
   );
-  return Object.freeze([
-    ...prefix,
-    ...ordered
-      .filter((item) => item.placement.kind !== "pending_input")
-      .map((item) => item.message),
-    ...transientMessages,
-    ...ordered
-      .filter((item) => item.placement.kind === "pending_input")
-      .map((item) => item.message),
-  ]);
+  return Object.freeze([...prefix, ...ordered.map((item) => item.message)]);
 }
 
 function findLatestProjectableCheckpoint(
   records: readonly SessionRecord[],
   contextRecords: readonly ContextRecord[],
   layout: HistoryLayout,
+  navigation: Parameters<typeof projectContextHistory>[3],
 ): CompactionRecord | null {
-  const previousRecords = new Map<string, SessionRecord>();
-  const candidates: CompactionRecord[] = [];
-  for (const record of records) {
+  const validRecords = new Map(records.map((record) => [record.entryId, record]));
+  const currentSources = latestSourceRecords(records);
+  function canProject(candidate: CompactionRecord): boolean {
+    if (validRecords.get(candidate.entryId)?.type !== "compaction") return false;
+    const previousRecords = new Map(
+      records
+        .filter((record) => record.seq < candidate.seq)
+        .map((record) => [record.entryId, record]),
+    );
     if (
-      record.type === "compaction" &&
-      isValidCompactionRecord(record, previousRecords) &&
-      hasOrderedCheckpointBoundaries(record, previousRecords)
+      !isValidCompactionRecord(candidate, previousRecords) ||
+      !hasOrderedCheckpointBoundaries(candidate, previousRecords) ||
+      !hasCurrentCheckpointSources(candidate, previousRecords, currentSources)
     )
-      candidates.push(record);
-    previousRecords.set(record.entryId, record);
-  }
-  for (const candidate of candidates.reverse()) {
+      return false;
     const selectedIds = new Set(
       selectCheckpointRecords(candidate, contextRecords).map((record) => record.entryId),
     );
-    if (
-      layout.groups.every(
-        (group) =>
-          !group.entries.some((entry) => selectedIds.has(entry.entryId)) ||
-          (group.compactionSafe && group.entries.every((entry) => selectedIds.has(entry.entryId))),
+    return layout.groups.every(
+      (group) =>
+        !group.entries.some((entry) => selectedIds.has(entry.entryId)) ||
+        (group.compactionSafe && group.entries.every((entry) => selectedIds.has(entry.entryId))),
+    );
+  }
+
+  if (navigation) {
+    const visitedIds = new Set<string>();
+    let candidate = navigation.latestCompactionEntryId
+      ? navigation.getEntry(navigation.latestCompactionEntryId)
+      : undefined;
+    let nextEntryId: string | null = null;
+    while (candidate?.type === "compaction") {
+      if (visitedIds.has(candidate.entryId) || candidate.nextCompactionEntryId !== nextEntryId)
+        return null;
+      visitedIds.add(candidate.entryId);
+      if (canProject(candidate)) return candidate;
+      if (candidate.previousCompactionEntryId === null) return null;
+      // 被撤销的摘要不进入安全记录，但只有 Session 已校验且前后相符的引用才能用于回退。
+      const previous = navigation.getEntry(candidate.previousCompactionEntryId);
+      if (
+        previous?.type !== "compaction" ||
+        previous.seq >= candidate.seq ||
+        previous.nextCompactionEntryId !== candidate.entryId
       )
-    )
-      return candidate;
+        return null;
+      nextEntryId = candidate.entryId;
+      candidate = previous;
+    }
+    return null;
+  }
+
+  // 旧格式调用方没有 Header 导航；生产 Session 在打开时归一化并提供内存 Entry 查找。
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const candidate = records[index];
+    if (candidate?.type === "compaction" && canProject(candidate)) return candidate;
   }
   return null;
+}
+
+function latestSourceRecords(records: readonly SessionRecord[]): Map<string, ContextSourceRecord> {
+  const sources = new Map<string, ContextSourceRecord>();
+  for (const record of records)
+    if (record.type === "context_source") sources.set(record.sourceId, record);
+  return sources;
+}
+
+function hasCurrentCheckpointSources(
+  checkpoint: CompactionRecord,
+  previousRecords: ReadonlyMap<string, SessionRecord>,
+  currentSources: ReadonlyMap<string, ContextSourceRecord>,
+): boolean {
+  const adoptedSources =
+    checkpoint.projection?.sourceVersions ??
+    [...latestSourceRecords([...previousRecords.values()]).values()].filter(
+      (record) => record.content !== null,
+    );
+  return adoptedSources.every((adopted) => {
+    const current = currentSources.get(adopted.sourceId);
+    return (
+      current?.content !== null &&
+      current?.entryId === adopted.entryId &&
+      current.fingerprint === adopted.fingerprint
+    );
+  });
 }
 
 function hasOrderedCheckpointBoundaries(
@@ -387,7 +457,12 @@ function hasOrderedCheckpointBoundaries(
   previousRecords: ReadonlyMap<string, SessionRecord>,
 ): boolean {
   const covered = previousRecords.get(checkpoint.coversThroughEntryId);
-  if (!covered || covered.seq >= checkpoint.seq) return false;
+  if (
+    !covered ||
+    (covered.type !== "message" && covered.type !== "agent_input") ||
+    covered.seq >= checkpoint.seq
+  )
+    return false;
   if (checkpoint.firstKeptEntryId === null) return true;
   const firstKept = previousRecords.get(checkpoint.firstKeptEntryId);
   return (
@@ -413,12 +488,6 @@ function selectCheckpointRecords(
   return contextRecords.filter(
     (record) => retainedIds.has(record.entryId) || record.seq >= firstTailSequence,
   );
-}
-
-function isCompactionHistoryMessage(message: ModelInputMessage): boolean {
-  if (message.role !== "assistant" || message.content.length !== 1) return false;
-  const part = message.content[0];
-  return part?.type === "text" && part.text.startsWith(COMPACTION_MESSAGE_PREFIX);
 }
 
 function sourceMessage(record: ContextSourceRecord): ModelInputMessage {
@@ -455,6 +524,12 @@ function compareSources(left: ContextSourceRecord, right: ContextSourceRecord): 
   return orders[left.kind] - orders[right.kind] || left.sourceId.localeCompare(right.sourceId);
 }
 
+/**
+ * 如果存在压缩快照，则根据快照中的信息选择要保留的来源记录
+ * @param sourceRecords 上下文来源记录列表
+ * @param checkpoint 压缩快照
+ * @returns 要保留的来源记录列表和要更新的来源记录列表
+ */
 function selectSources(
   sourceRecords: readonly ContextSourceRecord[],
   checkpoint: CompactionProjection | undefined,
@@ -462,6 +537,7 @@ function selectSources(
   initialSources: readonly ContextSourceRecord[];
   updates: readonly ContextSourceRecord[];
 }> {
+  const currentSources = [...latestSourceRecords(sourceRecords).values()];
   if (checkpoint) {
     const byId = new Map(sourceRecords.map((record) => [record.entryId, record]));
     const foldedSequence = checkpoint.foldedThroughSourceEntryId
@@ -474,14 +550,16 @@ function selectSources(
           return record?.content !== null && record ? [record] : [];
         })
         .sort(compareSources),
-      updates: sourceRecords.filter((record) => record.seq > foldedSequence),
+      updates: currentSources.filter((record) => record.seq > foldedSequence),
     };
   }
   return {
-    initialSources: sourceRecords
+    initialSources: currentSources
       .filter((record) => record.projection?.initialOrder !== undefined && record.content !== null)
       .sort(compareSources),
-    updates: sourceRecords.filter((record) => record.projection?.initialOrder === undefined),
+    updates: currentSources.filter(
+      (record) => record.content === null || record.projection?.initialOrder === undefined,
+    ),
   };
 }
 

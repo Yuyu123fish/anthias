@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveStartupPaths } from "../src/startup.js";
 
 const temporaryDirectories = new Set<string>();
+const cliProcessTimeoutMs = 5_000;
 let isolatedMainPath: string;
 let isolatedAnthiasRoot: string;
 
@@ -120,54 +121,59 @@ describe("Anthias CLI", () => {
     });
   });
 
-  it("loads one root configuration from another workspace and honors process and CLI modes", async () => {
-    const workspaceRoot = await createTemporaryDirectory("anthias-cli-root-config-");
-    const configuration = [
-      "ANTHIAS_MODEL_BASE_URL=https://example.com/v1",
-      "ANTHIAS_MODEL_ID=fixture-model",
-      "ANTHIAS_MODEL_CONTEXT_WINDOW=128000",
-      "ANTHIAS_MODEL_API_KEY=synthetic-root-model-key",
-      "ANTHIAS_PERMISSION_MODE=auto_allow",
-      "",
-    ].join("\n");
-    await writeFile(join(isolatedAnthiasRoot, ".env"), configuration);
-    await writeFile(
-      join(workspaceRoot, ".env"),
-      "ANTHIAS_PERMISSION_MODE=invalid-workspace-mode\n",
-    );
-    const environment = createTestProcessEnvironment();
-    const fromFile = spawnCli([], environment, workspaceRoot, "/mode plan\n/exit\n");
-    expect(fromFile.status).toBe(0);
-    expect(fromFile.stdout).toContain("Mode: AutoAllow\n");
-    expect(fromFile.stderr).toBe("");
-    const fromProcess = spawnCli(
-      [],
-      { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
-      workspaceRoot,
-      "/exit\n",
-    );
-    expect(fromProcess.status).toBe(0);
-    expect(fromProcess.stdout).toContain("Mode: Plan\n");
-    const fromCli = spawnCli(
-      ["--mode", "agent"],
-      { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
-      workspaceRoot,
-      "/exit\n",
-    );
-    expect(fromCli.stdout).toContain("Mode: Agent\n");
-    const emptyKey = spawnCli(
-      [],
-      { ...environment, ANTHIAS_MODEL_API_KEY: "" },
-      workspaceRoot,
-      "/exit\n",
-    );
-    expect(emptyKey.status).toBe(1);
-    expect(emptyKey.stderr).toContain("ANTHIAS_MODEL_API_KEY");
-    expect(JSON.stringify([fromFile, fromProcess, fromCli, emptyKey])).not.toContain(
-      "synthetic-root-model-key",
-    );
-    expect(await readFile(join(isolatedAnthiasRoot, ".env"), "utf8")).toBe(configuration);
-  });
+  it(
+    "loads one root configuration from another workspace and honors process and CLI modes",
+    async () => {
+      const workspaceRoot = await createTemporaryDirectory("anthias-cli-root-config-");
+      const configuration = [
+        "ANTHIAS_MODEL_BASE_URL=https://example.com/v1",
+        "ANTHIAS_MODEL_ID=fixture-model",
+        "ANTHIAS_MODEL_CONTEXT_WINDOW=128000",
+        "ANTHIAS_MODEL_API_KEY=synthetic-root-model-key",
+        "ANTHIAS_PERMISSION_MODE=auto_allow",
+        "",
+      ].join("\n");
+      await writeFile(join(isolatedAnthiasRoot, ".env"), configuration);
+      await writeFile(
+        join(workspaceRoot, ".env"),
+        "ANTHIAS_PERMISSION_MODE=invalid-workspace-mode\n",
+      );
+      const environment = createTestProcessEnvironment();
+      const fromFile = spawnCli([], environment, workspaceRoot, "/mode plan\n/exit\n");
+      expect(fromFile.status).toBe(0);
+      expect(fromFile.stdout).toContain("Mode: AutoAllow\n");
+      expect(fromFile.stderr).toBe("");
+      const fromProcess = spawnCli(
+        [],
+        { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+        workspaceRoot,
+        "/exit\n",
+      );
+      expect(fromProcess.status).toBe(0);
+      expect(fromProcess.stdout).toContain("Mode: Plan\n");
+      const fromCli = spawnCli(
+        ["--mode", "agent"],
+        { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+        workspaceRoot,
+        "/exit\n",
+      );
+      expect(fromCli.stdout).toContain("Mode: Agent\n");
+      const emptyKey = spawnCli(
+        [],
+        { ...environment, ANTHIAS_MODEL_API_KEY: "" },
+        workspaceRoot,
+        "/exit\n",
+      );
+      expect(emptyKey.status).toBe(1);
+      expect(emptyKey.stderr).toContain("ANTHIAS_MODEL_API_KEY");
+      expect(JSON.stringify([fromFile, fromProcess, fromCli, emptyKey])).not.toContain(
+        "synthetic-root-model-key",
+      );
+      expect(await readFile(join(isolatedAnthiasRoot, ".env"), "utf8")).toBe(configuration);
+      // 四次串行启动共享场景预算，单个子进程仍独立限制为五秒。
+    },
+    4 * cliProcessTimeoutMs,
+  );
   it("creates a Session without arguments and reopens the same UUID", async () => {
     const workspaceRoot = await createTemporaryDirectory("anthias-cli-reopen-");
     const normalizedWorkspaceRoot = await realpath(workspaceRoot);
@@ -206,7 +212,8 @@ describe("Anthias CLI", () => {
     ) as Record<string, unknown>;
     expect(sessionHeader).toMatchObject({
       type: "session_header",
-      schemaVersion: 3,
+      schemaVersion: 4,
+      latestCompactionEntryId: null,
       sessionKind: "primary",
       rootSessionId: sessionId,
       sessionId,
@@ -329,35 +336,39 @@ describe("Anthias CLI", () => {
     await expect(stat(absoluteSessionDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("accepts Plan, AutoAllow and FullAccess modes and rejects an unknown mode before startup", async () => {
-    const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
-    const sessionDirectory = join(workspaceRoot, "sessions");
-    const environment = {
-      ...createTestProcessEnvironment(),
-      SEARCHAPI_API_KEY: "",
-      ANTHIAS_PERMISSION_MODE: "agent",
-      ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
-      ANTHIAS_MODEL_ID: "model-id",
-      ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
-      ANTHIAS_MODEL_API_KEY: "local-key",
-      ANTHIAS_SESSION_DIR: sessionDirectory,
-    };
+  it(
+    "accepts Plan, AutoAllow and FullAccess modes and rejects an unknown mode before startup",
+    async () => {
+      const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
+      const sessionDirectory = join(workspaceRoot, "sessions");
+      const environment = {
+        ...createTestProcessEnvironment(),
+        SEARCHAPI_API_KEY: "",
+        ANTHIAS_PERMISSION_MODE: "agent",
+        ANTHIAS_MODEL_BASE_URL: "https://example.com/v1/",
+        ANTHIAS_MODEL_ID: "model-id",
+        ANTHIAS_MODEL_CONTEXT_WINDOW: "128000",
+        ANTHIAS_MODEL_API_KEY: "local-key",
+        ANTHIAS_SESSION_DIR: sessionDirectory,
+      };
 
-    const planResult = spawnCli(["--mode", "plan"], environment, workspaceRoot, "/exit\n");
-    expect(planResult.status).toBe(0);
-    expect(planResult.stdout).toContain("Mode: Plan\n");
+      const planResult = spawnCli(["--mode", "plan"], environment, workspaceRoot, "/exit\n");
+      expect(planResult.status).toBe(0);
+      expect(planResult.stdout).toContain("Mode: Plan\n");
 
-    const autoResult = spawnCli(["--mode", "auto_allow"], environment, workspaceRoot, "/exit\n");
-    expect(autoResult.status).toBe(0);
-    expect(autoResult.stdout).toContain("Mode: AutoAllow\n");
-    const fullResult = spawnCli(["--mode", "full_access"], environment, workspaceRoot, "/exit\n");
-    expect(fullResult.status).toBe(0);
-    expect(fullResult.stdout).toContain("Mode: FullAccess\n");
-    expect(fullResult.stdout).toContain("访问能力不等于任务授权");
-    const invalidResult = spawnCli(["--mode", "unsafe"], environment, workspaceRoot);
-    expect(invalidResult.status).toBe(1);
-    expect(invalidResult.stderr).toContain("--mode <agent|plan|auto_allow|full_access>");
-  });
+      const autoResult = spawnCli(["--mode", "auto_allow"], environment, workspaceRoot, "/exit\n");
+      expect(autoResult.status).toBe(0);
+      expect(autoResult.stdout).toContain("Mode: AutoAllow\n");
+      const fullResult = spawnCli(["--mode", "full_access"], environment, workspaceRoot, "/exit\n");
+      expect(fullResult.status).toBe(0);
+      expect(fullResult.stdout).toContain("Mode: FullAccess\n");
+      expect(fullResult.stdout).toContain("访问能力不等于任务授权");
+      const invalidResult = spawnCli(["--mode", "unsafe"], environment, workspaceRoot);
+      expect(invalidResult.status).toBe(1);
+      expect(invalidResult.stderr).toContain("--mode <agent|plan|auto_allow|full_access>");
+    },
+    4 * cliProcessTimeoutMs,
+  );
 
   it("rejects an invalid --session UUID without a model request", async () => {
     const sessionDirectory = join(
@@ -392,7 +403,7 @@ function spawnCli(
     env: environment,
     encoding: "utf8",
     input,
-    timeout: 5_000,
+    timeout: cliProcessTimeoutMs,
   });
 }
 

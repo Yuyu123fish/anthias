@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { ModelStream } from "../model/model-stream.js";
-import { createSessionArtifactStore } from "../session/artifacts.js";
-import type { Session, SessionRunLease } from "../session/index.js";
+import type { AgentInputDetails, Session } from "../session/index.js";
 import { locateSessionStorage } from "../session/locations.js";
 import type { AgentEvent, PermissionMode } from "../session-agent.js";
+import { createSessionArtifactStore } from "../tool/artifacts.js";
 import type { GitWorkspace } from "../tool/basetool/git/index.js";
 import { isRecord } from "../tool/input-validation.js";
 import { createAgentTeam, type TeamSummary, type TeamTask } from "./agent-team.js";
@@ -68,6 +68,7 @@ export function createMultiAgent(options: {
   permissionMode(): PermissionMode;
   changed(snapshot: CollaborationSnapshot): void;
   memberEvent(member: MemberSummary, event: AgentEvent): void;
+  receiveRootInput(input: AgentInputDetails): void;
   abortRoot(source?: "parent" | "shutdown" | "task_deadline"): void;
 }) {
   const team = createAgentTeam(options.root);
@@ -223,30 +224,35 @@ export function createMultiAgent(options: {
       kind: "message",
       status: "queued",
     };
-    await options.root.appendCoordination({ kind: "delivery", key: id, payload: delivery });
+    await options.root.appendCoordination(null, { kind: "delivery", key: id, payload: delivery });
     deliveries.set(id, delivery);
+    if (delivery.toSessionId === options.root.sessionId) options.receiveRootInput(delivery);
+    else members.agent(delivery.toSessionId)?.queueInternal(delivery);
     changed();
     return delivery;
   }
-  async function drain(sessionId: string, lease: SessionRunLease, signal: AbortSignal) {
-    for (const delivery of deliveries.values()) {
-      if (delivery.toSessionId !== sessionId || delivery.status !== "queued") continue;
-      signal.throwIfAborted();
-      await lease.appendAgentInput({
-        messageId: delivery.messageId,
-        rootSessionId: delivery.rootSessionId,
-        fromSessionId: delivery.fromSessionId,
-        kind: delivery.kind,
-        content: delivery.content,
-      });
-      const delivered: Delivery = { ...delivery, status: "delivered" };
-      await options.root.appendCoordination({
-        kind: "delivery",
-        key: delivery.messageId,
-        payload: delivered,
-      });
-      deliveries.set(delivery.messageId, delivered);
-    }
+  function pendingInputs(sessionId: string): readonly AgentInputDetails[] {
+    return [...deliveries.values()].filter(
+      (delivery) => delivery.toSessionId === sessionId && delivery.status === "queued",
+    );
+  }
+  async function acknowledgeInput(input: AgentInputDetails): Promise<void> {
+    const delivery = deliveries.get(input.messageId);
+    if (!delivery || delivery.status === "delivered") return;
+    if (
+      delivery.rootSessionId !== input.rootSessionId ||
+      delivery.fromSessionId !== input.fromSessionId ||
+      delivery.content !== input.content
+    )
+      throw new Error("已消费输入与持久投递身份不匹配。");
+    const delivered: Delivery = { ...delivery, status: "delivered" };
+    await options.root.appendCoordination(null, {
+      kind: "delivery",
+      key: delivery.messageId,
+      payload: delivered,
+    });
+    deliveries.set(delivery.messageId, delivered);
+    changed();
   }
   async function readResult(
     caller: string,
@@ -435,7 +441,8 @@ export function createMultiAgent(options: {
     modelStream,
     beginTask,
     remainingTaskTimeMs: () => (deadline === 0 ? 30 * 60_000 : Math.max(0, deadline - Date.now())),
-    drain,
+    pendingInputs,
+    acknowledgeInput,
     execute,
     busy: members.busy,
     member: members.get,

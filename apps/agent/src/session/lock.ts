@@ -377,6 +377,14 @@ async function reclaimDeadSessionLock(
   }
 }
 
+/** 文件身份正常也不能替代写锁身份；外部改写所有者后停止后续追加。 */
+export async function assertSessionLockOwnership(ownership: SessionLockOwnership): Promise<void> {
+  const directory = await resolveExistingManagedLockDirectory(ownership.lockDirectory);
+  const owner = await readSessionLockOwner(directory.lockDirectory);
+  if (owner.ownerToken !== ownership.ownerToken)
+    throw new SessionBusyError("Session lock owner token 不匹配。");
+}
+
 /** 只有 owner token 仍匹配时才移除本次持有的锁目录。 */
 export async function releaseSessionLock(ownership: SessionLockOwnership): Promise<void> {
   const verifiedLockDirectory = await resolveExistingManagedLockDirectory(ownership.lockDirectory);

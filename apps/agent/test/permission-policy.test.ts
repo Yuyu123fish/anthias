@@ -23,11 +23,11 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
-
 import { prepareEditFileTool } from "../src/tool/basetool/edit-file.js";
 import { executePreparedFileTool } from "../src/tool/basetool/file-change.js";
 import { prepareWriteFileTool } from "../src/tool/basetool/write-file.js";
 import { resolveExistingWorkspacePath } from "../src/tool/workspace-path.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -58,7 +58,7 @@ describe("Permission Mode", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("只做分析")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "只做分析")).resolves.toEqual({ status: "completed" });
 
     expect(agent.state.permissionMode).toBe("plan");
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
@@ -115,7 +115,7 @@ describe("Permission Mode", () => {
       status: "accepted",
       permissionMode: "plan",
     });
-    const promptResultPromise = agent.prompt("inspect");
+    const promptResultPromise = promptToCompletion(agent, "inspect");
     await modelEntered.promise;
 
     expect(agent.setPermissionMode("agent")).toEqual({ status: "rejected", reason: "busy" });
@@ -270,7 +270,9 @@ describe("command safety policy", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("执行危险命令")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "执行危险命令")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(agent.state.messageHistory.filter((message) => message.role === "tool")).toEqual([
       expect.objectContaining({
@@ -298,7 +300,7 @@ describe("command safety policy", () => {
     const { agent } = await createTestAgent(modelStream);
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
-    const promptResultPromise = agent.prompt("查看状态");
+    const promptResultPromise = promptToCompletion(agent, "查看状态");
     await vi.waitFor(() => expect(agent.state.pendingToolApproval).not.toBeNull());
     const approval = agent.state.pendingToolApproval;
     if (approval === null) {
@@ -334,7 +336,9 @@ describe("command safety policy", () => {
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
 
-    await expect(agent.prompt("在 Session 目录运行")).resolves.toEqual({ status: "completed" });
+    await expect(promptToCompletion(agent, "在 Session 目录运行")).resolves.toEqual({
+      status: "completed",
+    });
 
     expect(
       agent.state.messageHistory.filter((message) => message.role === "tool").at(-1),

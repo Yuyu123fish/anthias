@@ -14,6 +14,7 @@ import {
 import { createCodingSystemPrompt } from "../src/prompts/coding-system-prompt.js";
 import { createSession, openSession, type Session } from "../src/session/index.js";
 import { getToolDefinitions } from "../src/tool/definitions.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const shell = {
   kind: "powershell" as const,
@@ -49,19 +50,17 @@ async function seed(): Promise<Session> {
     shell,
   });
   cleanup.push(() => session.close());
-  const acquired = await session.acquireRun(randomUUID());
-  if (acquired.status !== "acquired") throw new Error("lease");
-  await acquired.lease.appendMessage({
+  const runId = randomUUID();
+  await session.appendMessage(runId, {
     role: "user",
     content: "Historical source " + "x".repeat(24_000),
   });
-  await acquired.lease.appendMessage({
+  await session.appendMessage(runId, {
     role: "assistant",
     status: "completed",
     content: [{ type: "text", text: "旧内容已读。" }],
   });
-  await acquired.lease.appendRunFinished({ status: "completed" });
-  await acquired.lease.release();
+  await session.appendRunFinished(runId, { status: "completed" });
   return session;
 }
 function initialRequest(): ModelRequest {
@@ -131,7 +130,9 @@ describe("Context integration", () => {
       },
       3000,
     );
-    expect(await agent.prompt("请继续，保留我的表达。")).toEqual({ status: "completed" });
+    expect(await promptToCompletion(agent, "请继续，保留我的表达。")).toEqual({
+      status: "completed",
+    });
     expect(purposes).toEqual(["response", "compaction", "response"]);
     expect(
       session.records.find((record) => record.type === "compaction")?.usageBefore.inputTokens,
@@ -158,11 +159,13 @@ describe("Context integration", () => {
     });
     const events: string[] = [];
     agent.subscribe((event) => events.push(event.type));
-    expect(await agent.prompt("请继续，保留我的表达。")).toEqual({ status: "completed" });
+    expect(await promptToCompletion(agent, "请继续，保留我的表达。")).toEqual({
+      status: "completed",
+    });
     expect(requests.map((request) => request.purpose)).toEqual(["compaction", "response"]);
     expect(requests[1]?.messages.at(-1)).toEqual({
       entryId: session.records.findLast(
-        (record) => record.type === "message" && record.message.type === "user",
+        (record) => record.type === "message" && record.message.role === "user",
       )?.entryId,
       role: "user",
       content: "请继续，保留我的表达。",
@@ -187,7 +190,7 @@ describe("Context integration", () => {
       yield { type: "text_delta", delta: "第二次完成。" };
       yield { type: "finish", finishReason: "stop", usage };
     });
-    expect(await resumed.prompt("继续第二次")).toEqual({ status: "completed" });
+    expect(await promptToCompletion(resumed, "继续第二次")).toEqual({ status: "completed" });
     expect(restoredRequest?.purpose).toBe("response");
     expect(JSON.stringify(restoredRequest?.messages).split("已保存历史的摘要")).toHaveLength(2);
     expect(resumed.state.messageHistory).toHaveLength(6);
@@ -202,8 +205,27 @@ describe("Context integration", () => {
       yield { type: "text_delta", delta: "没有约定结构" };
       yield { type: "finish", finishReason: "stop", usage };
     });
-    expect((await agent.prompt("请继续，保留我的表达。")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "请继续，保留我的表达。")).status).toBe("failed");
     expect(calls).toBe(1);
+    expect(session.records.some((record) => record.type === "compaction")).toBe(false);
+    expect(JSON.stringify(agent.state.messageHistory)).toContain("x".repeat(100));
+  });
+
+  it("rejects a summary when an adopted source changes during its generation", async () => {
+    const session = await seed();
+    const rulesPath = join(session.workspaceRoot, "AGENTS.md");
+    await writeFile(rulesPath, "当前项目规则", "utf8");
+    let calls = 0;
+    const agent = create(session, async function* (request) {
+      calls += 1;
+      expect(request.purpose).toBe("compaction");
+      await writeFile(rulesPath, "已更新的项目规则", "utf8");
+      yield { type: "text_delta", delta: summary };
+      yield { type: "finish", finishReason: "stop", usage };
+    });
+    expect((await promptToCompletion(agent, "请继续，保留我的表达。")).status).toBe("failed");
+    expect(calls).toBe(1);
+    expect(session.header.latestCompactionEntryId).toBeNull();
     expect(session.records.some((record) => record.type === "compaction")).toBe(false);
     expect(JSON.stringify(agent.state.messageHistory)).toContain("x".repeat(100));
   });
@@ -221,7 +243,7 @@ describe("Context integration", () => {
       yield { type: "text_delta", delta: summary };
       yield { type: "finish", finishReason: "stop", usage };
     });
-    const result = agent.prompt("请继续，保留我的表达。");
+    const result = promptToCompletion(agent, "请继续，保留我的表达。");
     await started.promise;
     agent.abort();
     expect(await result).toEqual({ status: "aborted" });
@@ -242,7 +264,7 @@ describe("Context integration", () => {
       },
       5_000,
     );
-    expect((await agent.prompt("请继续，保留我的表达。")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "请继续，保留我的表达。")).status).toBe("failed");
     expect(purposes).toEqual(["response", "compaction", "response"]);
     expect(session.records.filter((record) => record.type === "compaction")).toHaveLength(1);
     expect(agent.state.contextUsage.requests.response.inputTokens).toBeNull();
@@ -267,7 +289,7 @@ describe("Context integration", () => {
       },
       5000,
     );
-    expect((await agent.prompt("请继续，保留我的表达。")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "请继续，保留我的表达。")).status).toBe("failed");
     expect(purposes).toEqual(["response", "response", "compaction", "response", "response"]);
     expect(session.records.filter((record) => record.type === "compaction")).toHaveLength(1);
     expect(agent.state.contextUsage.requests.response.requests).toBe(4);
@@ -285,7 +307,7 @@ describe("Context integration", () => {
       calls += 1;
       yield { type: "finish", finishReason: "stop" };
     });
-    expect((await agent.prompt("中".repeat(100_000))).status).toBe("failed");
+    expect((await promptToCompletion(agent, "中".repeat(100_000))).status).toBe("failed");
     expect(calls).toBe(0);
     expect(session.records.some((record) => record.type === "compaction")).toBe(false);
   });

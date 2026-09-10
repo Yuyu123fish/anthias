@@ -1,17 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { open, readFile, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
-  isNonNegativeInteger,
-  type LegacySessionHeader,
+  hasValidCompactionNavigation,
   type MessageRecord,
   migrateLegacySessionRecords,
-  parseJsonObject,
+  type ParsedSessionHeader,
   parseLegacySessionRecord,
   parseSessionHeader,
   parseSessionRecord,
   type RunFinishedRecord,
-  type Schema2SessionHeader,
   type SessionHeader,
   type SessionRecord,
   type UnfinishedRun,
@@ -22,37 +20,57 @@ import {
 export type SessionFileCheckpoint = Readonly<{
   fileSize: number;
   lastSequence: number;
+  device: bigint;
+  inode: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
 }>;
 
 /** 表示读取期间 Session 文件已变化，调用方不能继续使用旧投影。 */
 export class SessionChangedError extends Error {}
 
-/** 只读校验后的 JSONL 投影，记录偏移始终以 UTF-8 磁盘字节为单位。 */
+/** 只读完整校验得到的 Entry 与同一次读取的文件身份。 */
 export type VerifiedSessionJournal = Readonly<{
-  header: SessionHeader | Schema2SessionHeader | LegacySessionHeader;
+  header: ParsedSessionHeader;
   records: readonly SessionRecord[];
-  recordByteOffsets: readonly number[];
   fileSize: number;
+  contentDigest: string;
+  checkpoint: SessionFileCheckpoint;
 }>;
 
-/** 不修复、不迁移也不刷新 use 记录地读取完整日志，供清理与索引重建使用。 */
-export async function readSessionJournal(sessionFilePath: string): Promise<VerifiedSessionJournal> {
+/** 只读查询与清理共用完整校验，不修复、不迁移、不刷新使用事实。 */
+export async function readSessionJournal(
+  sessionFilePath: string,
+  options: Readonly<{ allowNavigationRepair?: boolean }> = {},
+): Promise<VerifiedSessionJournal> {
+  const before = await readSessionCheckpoint(sessionFilePath);
   const sessionBytes = await readFile(sessionFilePath);
+  await assertSessionCheckpoint(sessionFilePath, before);
+  if (sessionBytes.length !== before.fileSize)
+    throw new SessionChangedError("Session 读取期间大小变化。");
   if (sessionBytes.at(-1) !== 0x0a) {
     throw new Error("Session 文件尾部不完整。");
   }
-  return parseVerifiedSessionJournal(sessionBytes);
+  const parsed = parseVerifiedSessionJournal(sessionBytes, options.allowNavigationRepair ?? false);
+  return Object.freeze({
+    ...parsed,
+    checkpoint: Object.freeze({ ...before, lastSequence: parsed.records.at(-1)?.seq ?? 0 }),
+  });
 }
 
 /** 仅在已经持有写锁的打开路径中修复可证明未完成的尾段后读取日志。 */
 export async function readCompleteSessionJournal(
   sessionFilePath: string,
+  options: Readonly<{ allowNavigationRepair?: boolean }> = {},
 ): Promise<VerifiedSessionJournal> {
-  const sessionText = await readCompleteSessionText(sessionFilePath);
-  return parseVerifiedSessionJournal(Buffer.from(sessionText, "utf8"));
+  await readCompleteSessionText(sessionFilePath);
+  return readSessionJournal(sessionFilePath, options);
 }
 
-function parseVerifiedSessionJournal(sessionBytes: Buffer): VerifiedSessionJournal {
+function parseVerifiedSessionJournal(
+  sessionBytes: Buffer,
+  allowNavigationRepair = false,
+): Omit<VerifiedSessionJournal, "checkpoint"> {
   let sessionText: string;
   try {
     sessionText = new TextDecoder("utf-8", { fatal: true }).decode(sessionBytes);
@@ -64,33 +82,34 @@ function parseVerifiedSessionJournal(sessionBytes: Buffer): VerifiedSessionJourn
   }
   const lines = sessionText.slice(0, -1).split("\n");
   const header = parseSessionHeader(lines[0]);
-  const recordByteOffsets: number[] = [];
-  let byteOffset = Buffer.byteLength(`${lines[0]}\n`, "utf8");
-  if (header.schemaVersion === 2 || header.schemaVersion === 3) {
+  if (header.schemaVersion !== 1) {
     const records = lines.slice(1).map((line, index) => {
-      recordByteOffsets.push(byteOffset);
-      byteOffset += Buffer.byteLength(`${line}\n`, "utf8");
       return parseSessionRecord(line, index + 1, header.schemaVersion);
     });
     validateSessionRecords(records, header);
+    if (
+      header.schemaVersion === 4 &&
+      !allowNavigationRepair &&
+      !hasValidCompactionNavigation(header, records)
+    ) {
+      throw new Error("Session 压缩导航不一致，需要持锁重新打开恢复。");
+    }
     return Object.freeze({
       header,
       records: Object.freeze(records),
-      recordByteOffsets: Object.freeze(recordByteOffsets),
       fileSize: sessionBytes.byteLength,
+      contentDigest: createHash("sha256").update(sessionBytes).digest("hex"),
     });
   }
   const records = lines.slice(1).map((line, index) => {
-    recordByteOffsets.push(byteOffset);
-    byteOffset += Buffer.byteLength(`${line}\n`, "utf8");
     return parseLegacySessionRecord(line, index + 1);
   });
   const migratedRecords = migrateLegacySessionRecords(records);
   return Object.freeze({
     header,
     records: migratedRecords,
-    recordByteOffsets: Object.freeze(recordByteOffsets),
     fileSize: sessionBytes.byteLength,
+    contentDigest: createHash("sha256").update(sessionBytes).digest("hex"),
   });
 }
 
@@ -118,54 +137,66 @@ export async function ensureSessionGitignore(sessionDirectory: string): Promise<
   }
 }
 
-/** 读取当前文件大小与最后 seq，作为下一次 Run 的并发检查点。 */
+/** 持锁写入只核对文件身份和元数据，不重新读取历史正文。 */
 export async function readSessionCheckpoint(
   sessionFilePath: string,
+  lastSequence = 0,
 ): Promise<SessionFileCheckpoint> {
-  const fileStatsBeforeRead = await stat(sessionFilePath);
-  const sessionBytes = await readFile(sessionFilePath);
-  const fileStatsAfterRead = await stat(sessionFilePath);
-  if (
-    fileStatsBeforeRead.size !== fileStatsAfterRead.size ||
-    sessionBytes.byteLength !== fileStatsAfterRead.size
-  ) {
-    throw new SessionChangedError("Session checkpoint 读取期间发生变化。");
+  const fileStats = await lstat(sessionFilePath, { bigint: true });
+  if (!fileStats.isFile() || fileStats.isSymbolicLink() || fileStats.nlink !== 1n) {
+    throw new SessionChangedError("Session 日志不是独占普通文件。");
   }
-  if (sessionBytes.at(-1) !== 0x0a) {
-    throw new Error("Session checkpoint 尾部不完整。");
-  }
-  let sessionText: string;
-  try {
-    sessionText = new TextDecoder("utf-8", { fatal: true }).decode(sessionBytes);
-  } catch {
-    throw new Error("Session checkpoint 不是合法 UTF-8。");
-  }
-  const lines = sessionText.slice(0, -1).split("\n");
-  let lastSequence = 0;
-  if (lines.length > 1) {
-    const lastRecord = parseJsonObject(lines.at(-1));
-    if (!isNonNegativeInteger(lastRecord.seq) || lastRecord.seq === 0) {
-      throw new Error("Session checkpoint 的最后 seq 无效。");
-    }
-    lastSequence = lastRecord.seq;
-  }
-  return Object.freeze({ fileSize: fileStatsAfterRead.size, lastSequence });
+  return checkpointFromStats(fileStats, lastSequence);
 }
 
-/** 判断磁盘 checkpoint 是否仍与 Session 内存投影完全一致。 */
+function checkpointFromStats(
+  fileStats: Readonly<{ size: bigint; dev: bigint; ino: bigint; mtimeNs: bigint; ctimeNs: bigint }>,
+  lastSequence: number,
+): SessionFileCheckpoint {
+  return Object.freeze({
+    fileSize: Number(fileStats.size),
+    lastSequence,
+    device: fileStats.dev,
+    inode: fileStats.ino,
+    mtimeNs: fileStats.mtimeNs,
+    ctimeNs: fileStats.ctimeNs,
+  });
+}
+
 export function areSameCheckpoint(
-  expectedCheckpoint: SessionFileCheckpoint,
-  actualCheckpoint: SessionFileCheckpoint,
+  expected: SessionFileCheckpoint,
+  actual: SessionFileCheckpoint,
 ): boolean {
   return (
-    expectedCheckpoint.fileSize === actualCheckpoint.fileSize &&
-    expectedCheckpoint.lastSequence === actualCheckpoint.lastSequence
+    expected.fileSize === actual.fileSize &&
+    expected.device === actual.device &&
+    expected.inode === actual.inode &&
+    expected.mtimeNs === actual.mtimeNs &&
+    expected.ctimeNs === actual.ctimeNs
   );
+}
+
+export async function assertSessionCheckpoint(
+  sessionFilePath: string,
+  expected: SessionFileCheckpoint,
+): Promise<void> {
+  if (
+    !areSameCheckpoint(
+      expected,
+      await readSessionCheckpoint(sessionFilePath, expected.lastSequence),
+    )
+  ) {
+    throw new SessionChangedError("Session 文件已被外部改写，必须关闭后重新打开。");
+  }
 }
 
 /** 严格解码 Session，并只精确截断无换行的未完成 JSON 尾段。 */
 export async function readCompleteSessionText(sessionFilePath: string): Promise<string> {
+  const checkpoint = await readSessionCheckpoint(sessionFilePath);
   const sessionBytes = await readFile(sessionFilePath);
+  await assertSessionCheckpoint(sessionFilePath, checkpoint);
+  if (sessionBytes.length !== checkpoint.fileSize)
+    throw new SessionChangedError("Session 恢复读取期间大小变化。");
   if (sessionBytes.at(-1) === 0x0a) {
     return decodeUtf8Strict(sessionBytes, "Session 文件不是合法 UTF-8。");
   }
@@ -189,10 +220,25 @@ export async function readCompleteSessionText(sessionFilePath: string): Promise<
     throw new Error("Session 文件包含完整或无效的未换行尾段。");
   }
 
+  parseVerifiedSessionJournal(completePrefix, true);
   const sessionFileHandle = await open(sessionFilePath, "r+");
   try {
+    if (
+      !areSameCheckpoint(
+        checkpoint,
+        checkpointFromStats(
+          await sessionFileHandle.stat({ bigint: true }),
+          checkpoint.lastSequence,
+        ),
+      )
+    )
+      throw new SessionChangedError("Session 恢复句柄身份已变化。");
     await sessionFileHandle.truncate(finalNewlineByteIndex + 1);
     await sessionFileHandle.sync();
+    await assertSessionCheckpoint(
+      sessionFilePath,
+      checkpointFromStats(await sessionFileHandle.stat({ bigint: true }), checkpoint.lastSequence),
+    );
   } finally {
     await sessionFileHandle.close();
   }
@@ -304,7 +350,9 @@ export async function appendRecoveryRecords(
   sessionFilePath: string,
   records: SessionRecord[],
   unfinishedRun: UnfinishedRun,
-): Promise<void> {
+  expectedCheckpoint: SessionFileCheckpoint,
+): Promise<SessionFileCheckpoint> {
+  let checkpoint = expectedCheckpoint;
   let nextSequence = (records.at(-1)?.seq ?? 0) + 1;
   let parentEntryId = records.at(-1)?.entryId ?? null;
   for (const toolCall of unfinishedRun.toolCalls) {
@@ -320,7 +368,7 @@ export async function appendRecoveryRecords(
       parentEntryId,
       runId: unfinishedRun.runId,
       message: Object.freeze({
-        type: "tool_result",
+        role: "tool",
         toolCallId: toolCall.toolCallId,
         toolName: toolCall.toolName,
         status,
@@ -331,7 +379,7 @@ export async function appendRecoveryRecords(
         truncated: false,
       }),
     });
-    await appendJsonLine(sessionFilePath, recoveryRecord);
+    checkpoint = await appendJsonLine(sessionFilePath, recoveryRecord, checkpoint);
     records.push(recoveryRecord);
     parentEntryId = recoveryRecord.entryId;
     nextSequence += 1;
@@ -346,8 +394,9 @@ export async function appendRecoveryRecords(
     runId: unfinishedRun.runId,
     status: "interrupted",
   });
-  await appendJsonLine(sessionFilePath, runFinishedRecord);
+  checkpoint = await appendJsonLine(sessionFilePath, runFinishedRecord, checkpoint);
   records.push(runFinishedRecord);
+  return checkpoint;
 }
 /** 区分完整、语法未完成与已经无效的单个 JSON 值。 */
 function classifyJsonText(text: string): "complete" | "incomplete" | "invalid" {
@@ -597,26 +646,111 @@ function classifyJsonText(text: string): "complete" | "incomplete" | "invalid" {
 export async function writeNewSessionHeader(
   sessionFilePath: string,
   sessionHeader: SessionHeader,
-): Promise<void> {
+): Promise<SessionFileCheckpoint> {
   const sessionFileHandle = await open(sessionFilePath, "wx");
   try {
     await sessionFileHandle.writeFile(`${JSON.stringify(sessionHeader)}\n`, "utf8");
     await sessionFileHandle.sync();
+    const checkpoint = checkpointFromStats(await sessionFileHandle.stat({ bigint: true }), 0);
+    await assertSessionCheckpoint(sessionFilePath, checkpoint);
+    return checkpoint;
   } finally {
     await sessionFileHandle.close();
   }
 }
 
-/** 追加、刷新并关闭单条换行终止的 JSONL 记录。 */
+/** 先验证打开句柄仍指向持有的文件，再写入与刷新单条记录。 */
 export async function appendJsonLine(
   sessionFilePath: string,
   record: SessionRecord,
-): Promise<void> {
-  const sessionFileHandle = await open(sessionFilePath, "a");
+  expected: SessionFileCheckpoint,
+): Promise<SessionFileCheckpoint> {
+  if (record.seq !== expected.lastSequence + 1) throw new Error("Session 追加序号不连续。");
+  await assertSessionCheckpoint(sessionFilePath, expected);
+  const sessionFileHandle = await open(sessionFilePath, "r+");
   try {
-    await sessionFileHandle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+    if (
+      !areSameCheckpoint(
+        expected,
+        checkpointFromStats(await sessionFileHandle.stat({ bigint: true }), expected.lastSequence),
+      )
+    ) {
+      throw new SessionChangedError("Session 写入句柄身份已变化。");
+    }
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+    let written = 0;
+    while (written < bytes.length) {
+      const result = await sessionFileHandle.write(
+        bytes,
+        written,
+        bytes.length - written,
+        expected.fileSize + written,
+      );
+      if (result.bytesWritten === 0) throw new Error("Session 追加未能推进。");
+      written += result.bytesWritten;
+    }
     await sessionFileHandle.sync();
+    const committed = checkpointFromStats(
+      await sessionFileHandle.stat({ bigint: true }),
+      record.seq,
+    );
+    if (committed.fileSize !== expected.fileSize + bytes.length)
+      throw new SessionChangedError("Session 追加期间文件大小异常。");
+    await assertSessionCheckpoint(sessionFilePath, committed);
+    return committed;
   } finally {
     await sessionFileHandle.close();
   }
+}
+
+/** 孤立候选从未成为主日志事实；仅在主日志已完整核验且持锁时移除。 */
+export async function discardSessionCandidate(sessionFilePath: string): Promise<void> {
+  const candidatePath = join(sessionFilePath, "..", "session.publish.tmp");
+  try {
+    const candidateStats = await lstat(candidatePath);
+    if (!candidateStats.isFile() || candidateStats.isSymbolicLink() || candidateStats.nlink !== 1)
+      throw new Error("Session 发布候选不是独占普通文件。");
+    await unlink(candidatePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+/** 完整新内容刷盘后，以一次同目录替换发布；绝不先移走仍可恢复的旧主文件。 */
+export async function publishSessionJournal(
+  sessionFilePath: string,
+  header: SessionHeader,
+  records: readonly SessionRecord[],
+  expectedCheckpoint: SessionFileCheckpoint,
+): Promise<SessionFileCheckpoint> {
+  await assertSessionCheckpoint(sessionFilePath, expectedCheckpoint);
+  await discardSessionCandidate(sessionFilePath);
+  const candidatePath = join(sessionFilePath, "..", "session.publish.tmp");
+  const candidateBytes = Buffer.from(
+    `${[header, ...records].map((record) => JSON.stringify(record)).join("\n")}\n`,
+    "utf8",
+  );
+  const candidateHandle = await open(candidatePath, "wx");
+  try {
+    await candidateHandle.writeFile(candidateBytes);
+    await candidateHandle.sync();
+  } finally {
+    await candidateHandle.close();
+  }
+  const candidate = await readSessionJournal(candidatePath);
+  if (
+    candidate.header.schemaVersion !== 4 ||
+    candidate.header.sessionId !== header.sessionId ||
+    candidate.fileSize !== candidateBytes.length ||
+    candidate.contentDigest !== createHash("sha256").update(candidateBytes).digest("hex")
+  )
+    throw new Error("Session 发布候选校验失败。");
+  await assertSessionCheckpoint(sessionFilePath, expectedCheckpoint);
+  await assertSessionCheckpoint(candidatePath, candidate.checkpoint);
+  // rename 之前失败时旧主文件完整；之后主文件已经同时包含新节点、前后引用和入口。
+  await rename(candidatePath, sessionFilePath);
+  const committed = await readSessionJournal(sessionFilePath);
+  if (committed.contentDigest !== candidate.contentDigest)
+    throw new SessionChangedError("Session 发布后内容已被外部改写。");
+  return committed.checkpoint;
 }

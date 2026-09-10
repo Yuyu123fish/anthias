@@ -79,6 +79,114 @@ function assistant(
 }
 
 describe("Anthias TUI", () => {
+  it.each([false, true])(
+    "submits both input modes while a receipt is pending (interactive=%s)",
+    async (interactive) => {
+      const harness = createHarness(interactive);
+      harness.setState({ running: true });
+      const firstReceipt = Promise.withResolvers<PromptResult>();
+      vi.mocked(harness.agent.prompt).mockReturnValueOnce(firstReceipt.promise);
+      const send = (text: string) => {
+        if (interactive) {
+          harness.terminal.send(text);
+          harness.terminal.send("\r");
+        } else harness.input.write(text + "\n");
+      };
+      send("先检查错误");
+      await vi.waitFor(() => expect(harness.agent.prompt).toHaveBeenCalledWith("先检查错误"));
+      send("/followup 再补文档");
+      await vi.waitFor(() =>
+        expect(harness.agent.prompt).toHaveBeenCalledWith("再补文档", { mode: "followUp" }),
+      );
+      send("/steer 先停止后续修改");
+      await vi.waitFor(() =>
+        expect(harness.agent.prompt).toHaveBeenCalledWith("先停止后续修改", { mode: "steer" }),
+      );
+      firstReceipt.resolve({
+        status: "accepted",
+        inputId: "first-input",
+        mode: "steer",
+        durable: false,
+      });
+      expect(harness.agent.abort).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "shows queued and consumed input and resumes a paused queue (interactive=%s)",
+    async (interactive) => {
+      const harness = createHarness(interactive);
+      const queuedInput = {
+        inputId: "queued-input",
+        content: "等待插入的要求",
+        mode: "followUp" as const,
+        source: { kind: "user" as const },
+      };
+      harness.setState({ inputQueue: { steer: [], followUp: [queuedInput], paused: true } });
+      harness.emit({ type: "input_queued", input: queuedInput });
+      if (interactive) await screenContains(harness.terminal, "尚未保存");
+      else expect(harness.plain()).toContain("尚未保存");
+      if (interactive) {
+        harness.terminal.send("/continue");
+        harness.terminal.send("\r");
+      } else harness.input.write("/continue\n");
+      await vi.waitFor(() =>
+        expect(harness.agent.prompt).toHaveBeenCalledWith("", { resume: true }),
+      );
+      harness.setState({ inputQueue: { steer: [], followUp: [], paused: false } });
+      harness.emit({
+        type: "input_consumed",
+        inputId: queuedInput.inputId,
+        mode: "followUp",
+        runId: "queued-run",
+        entryId: "queued-entry",
+      });
+      if (interactive) await screenContains(harness.terminal, "输入已插入");
+      else expect(harness.plain()).toContain("输入已插入");
+    },
+  );
+
+  it("distinguishes discarded user input from retained member delivery after closing", async () => {
+    const harness = createHarness();
+    harness.setState({
+      inputQueue: {
+        steer: [
+          {
+            inputId: "unsaved-input",
+            content: "尚未消费",
+            mode: "steer",
+            source: { kind: "user" },
+          },
+        ],
+        followUp: [],
+        paused: true,
+      },
+    });
+    vi.mocked(harness.agent.close).mockImplementationOnce(async () => {
+      harness.emit({
+        type: "input_discarded",
+        inputId: "unsaved-input",
+        reason: "closed",
+        source: { kind: "user" },
+      });
+      harness.emit({
+        type: "input_discarded",
+        inputId: "member-delivery",
+        reason: "closed",
+        source: {
+          kind: "agent",
+          messageId: "member-delivery",
+          rootSessionId: harness.agent.state.sessionId,
+          fromSessionId: "member-session",
+        },
+      });
+    });
+    harness.input.end();
+    await expect(harness.result).resolves.toBe(0);
+    expect(harness.plain()).toContain("1 条排队输入未保存");
+    expect(harness.plain()).toContain("1 条成员投递仍保存在协作历史");
+  });
+
   it("keeps plain output free of controls and routes local commands without model calls", async () => {
     const harness = createHarness(false);
     harness.input.write("/help\n");
@@ -961,7 +1069,10 @@ describe("daily usage interactions", () => {
     harness.terminal.send("/continue 保留完成的文件");
     harness.terminal.send("\r");
     await vi.waitFor(() =>
-      expect(harness.agent.prompt).toHaveBeenCalledWith("继续上一任务。补充要求：\n保留完成的文件"),
+      expect(harness.agent.prompt).toHaveBeenCalledWith(
+        "继续上一任务。补充要求：\n保留完成的文件",
+        { resume: true },
+      ),
     );
   });
 });

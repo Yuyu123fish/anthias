@@ -60,7 +60,7 @@ export function createContextSources(options: {
     const lastAssistant = options.session.records.findLast(
       (record) =>
         record.type === "message" &&
-        record.message.type === "assistant" &&
+        record.message.role === "assistant" &&
         record.message.content.some((part) => part.type === "tool_call"),
     );
     const details: ContextSourceDetails = {
@@ -235,12 +235,10 @@ export function createContextSources(options: {
       });
       if (initial) {
         const user = options.session.records.findLast(
-          (record) => record.type === "message" && record.message.type === "user",
+          (record) => record.type === "message" && record.message.role === "user",
         );
         const text =
-          user?.type === "message" && user.message.type === "user"
-            ? user.message.content.map((part) => part.text).join("")
-            : "";
+          user?.type === "message" && user.message.role === "user" ? user.message.content : "";
         const words = text.match(/[a-zA-Z0-9_./-]{3,}|[\u4e00-\u9fff]{2,}/gu) ?? [];
         let selectedBytes = 0;
         let selectedCount = 0;
@@ -320,25 +318,25 @@ export function createContextSources(options: {
       const blocked =
         suppressedRecordIds.has(record.entryId) ||
         (noSend.length > 0 &&
-          ((record.message.type !== "user" &&
+          ((record.message.role !== "user" &&
             record.seq >= originSequence &&
             record.seq <= lastAffectedSequence) ||
             forbiddenText.some((text) => body.includes(JSON.stringify(text).slice(1, -1)))));
       if (!blocked) continue;
       suppressedRecordIds.add(record.entryId);
-      if (record.message.type === "assistant")
+      if (record.message.role === "assistant")
         for (const part of record.message.content)
           if (part.type === "tool_call") blockedCalls.add(part.toolCallId);
     }
     // 任一结果需要排除时，整个调用组一起排除，不能产生悬空 ToolResult。
     for (const record of options.session.records) {
-      if (record.type !== "message" || record.message.type !== "assistant") continue;
+      if (record.type !== "message" || record.message.role !== "assistant") continue;
       const calls = record.message.content.filter((part) => part.type === "tool_call");
       const callIds = new Set(calls.map((call) => call.toolCallId));
       const results = options.session.records.filter(
         (result) =>
           result.type === "message" &&
-          result.message.type === "tool_result" &&
+          result.message.role === "tool" &&
           callIds.has(result.message.toolCallId),
       );
       if (
@@ -354,7 +352,7 @@ export function createContextSources(options: {
         return false;
       if (
         record.type === "message" &&
-        record.message.type === "tool_result" &&
+        record.message.role === "tool" &&
         blockedCalls.has(record.message.toolCallId)
       )
         return false;

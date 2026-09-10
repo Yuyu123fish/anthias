@@ -2,16 +2,20 @@ import { mkdir, mkdtemp, readdir, rm, symlink, truncate, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { type AgentLoopEvent, runAgentLoop } from "../src/agent-loop.js";
+import { runAgentLoop } from "../src/agent-loop.js";
 import { estimateTextTokens } from "../src/context/budget.js";
-import type { AssistantToolCallPart, ToolArtifactReference } from "../src/message.js";
+import type {
+  AssistantToolCallPart,
+  CompletedMessage,
+  ToolArtifactReference,
+} from "../src/message.js";
 import type { ModelStream } from "../src/model/model-stream.js";
 import { decideToolPolicy } from "../src/permission/tool-policy.js";
 import {
   createSessionArtifactStore,
   SESSION_ARTIFACT_BYTE_LIMIT,
   type SessionArtifactStore,
-} from "../src/session/artifacts.js";
+} from "../src/tool/artifacts.js";
 import { finalizeToolResult } from "../src/tool/tool-result.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
 
@@ -500,31 +504,29 @@ describe("Session Tool artifacts", () => {
       yield Object.freeze({ type: "text_delta" as const, delta: "done" });
       yield Object.freeze({ type: "finish" as const, finishReason: "stop" as const });
     };
-    const events: AgentLoopEvent[] = [];
+    const messages: CompletedMessage[] = [];
     await expect(
       runAgentLoop({
-        messages: [],
+        readMessages: () => messages,
+        async recordMessage(message) {
+          messages.push(message);
+          return toolCallId(1000 + messages.length);
+        },
+        consumeSteer: async () => false,
         modelStream,
         systemPrompt: "",
         toolDefinitions: [],
         permissionMode: "plan",
         toolRunner,
         abortController: new AbortController(),
-        emit: async (event) => {
-          events.push(event);
-        },
+        emit: async () => {},
         updatePhase: () => undefined,
         requestToolApproval: async () => {
           throw new Error("approval is not expected");
         },
       }),
     ).resolves.toMatchObject({ status: "completed", diagnostic: { category: "completed" } });
-    const results = events
-      .filter(
-        (event): event is Extract<AgentLoopEvent, { type: "tool_result" }> =>
-          event.type === "tool_result",
-      )
-      .map((event) => event.message);
+    const results = messages.filter((message) => message.role === "tool");
     expect(results).toHaveLength(2);
     expect(results.every((result) => estimateTextTokens(result.content) <= 4_000)).toBe(true);
     expect(

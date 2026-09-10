@@ -3,8 +3,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createSessionArtifactStore } from "../src/session/artifacts.js";
-import { locateSessionGroup } from "../src/session/groups.js";
+import { cleanupExpiredSessions } from "../src/session/cleanup.js";
 import { openSession } from "../src/session/index.js";
 import {
   createSessionStorageDirectory,
@@ -14,6 +13,7 @@ import {
 } from "../src/session/locations.js";
 import { listSessions, readSessionHistory } from "../src/session/query.js";
 import type { SessionHeader } from "../src/session/schema.js";
+import { createSessionArtifactStore } from "../src/tool/artifacts.js";
 
 const roots: string[] = [];
 const shell = { kind: "posix" as const, executable: "/bin/sh", arguments: ["-lc"] };
@@ -29,7 +29,8 @@ function header(workspaceRoot: string, overrides: Partial<SessionHeader> = {}): 
   const sessionId = randomUUID();
   return {
     type: "session_header",
-    schemaVersion: 3,
+    schemaVersion: 4,
+    latestCompactionEntryId: null,
     sessionId,
     rootSessionId: sessionId,
     sessionKind: "primary",
@@ -140,7 +141,7 @@ describe("Session storage ownership", () => {
       });
       const member = header(root, { rootSessionId: primary.sessionId, sessionKind: "subagent" });
       try {
-        await opened.appendCoordination({
+        await opened.appendCoordination(null, {
           kind: "member",
           key: member.sessionId,
           payload: { sessionId: member.sessionId, kind: "subagent", status: "preparing" },
@@ -150,7 +151,7 @@ describe("Session storage ownership", () => {
         expect(
           (await readSessionHistory({ sessionDirectory: root, sessionId: primary.sessionId }))
             .header.schemaVersion,
-        ).toBe(3);
+        ).toBe(4);
       } finally {
         await opened.close();
       }
@@ -180,9 +181,10 @@ describe("Session storage ownership", () => {
     } finally {
       await reopened.close();
     }
-    const group = await locateSessionGroup(root, primary.sessionId);
-    expect(group.complete).toBe(true);
-    expect(new Set(group.sessions.map((session) => session.sessionId))).toEqual(
+    const inventory = await enumerateSessionStorage(root);
+    expect(inventory.complete).toBe(true);
+    expect(inventory.diagnostics).toEqual([]);
+    expect(new Set(inventory.entries.map(({ location }) => location.sessionId))).toEqual(
       new Set([primary.sessionId, oldMember.sessionId, newMember.sessionId]),
     );
     expect(newDirectory).toBe(join(primaryDirectory, "members", newMember.sessionId));
@@ -197,7 +199,10 @@ describe("Session storage ownership", () => {
     await locateSessionStorage(root, member.sessionId);
     await publish(root, member, true);
     await expect(locateSessionStorage(root, member.sessionId)).rejects.toThrow("多个");
-    expect((await locateSessionGroup(root, primary.sessionId)).complete).toBe(false);
+    expect(
+      (await cleanupExpiredSessions({ sessionDirectory: root, now: Date.now() + 15 * 86_400_000 }))
+        .deleted,
+    ).toBe(0);
   });
 
   it("keeps the root readable while a damaged member is diagnosed and protects the group", async () => {
@@ -214,7 +219,10 @@ describe("Session storage ownership", () => {
     await expect(
       readSessionHistory({ sessionDirectory: root, sessionId: member.sessionId }),
     ).rejects.toThrow("损坏");
-    expect((await locateSessionGroup(root, primary.sessionId)).complete).toBe(false);
+    expect(
+      (await cleanupExpiredSessions({ sessionDirectory: root, now: Date.now() + 15 * 86_400_000 }))
+        .deleted,
+    ).toBe(0);
     expect((await enumerateSessionStorage(root)).diagnostics).toContainEqual(
       expect.objectContaining({ sessionId: member.sessionId }),
     );
@@ -248,7 +256,6 @@ describe("Session storage ownership", () => {
     const scan = await enumerateSessionStorage(root, { maximumCandidates: 1 });
     expect(scan.complete).toBe(false);
     expect(scan.diagnostics.length).toBeGreaterThan(0);
-    expect((await locateSessionGroup(root, primary.sessionId, scan)).complete).toBe(false);
   });
 
   it("refuses a members junction and preserves its outside contents", async () => {

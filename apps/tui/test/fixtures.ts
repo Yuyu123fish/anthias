@@ -33,6 +33,7 @@ export function createFakeAgent() {
       requests: { response: emptyUsage, compaction: emptyUsage, approval: emptyUsage },
     },
     messageHistory: [],
+    inputQueue: { steer: [], followUp: [], paused: false },
     activeAssistantMessage: null,
     activeRun: null,
     pendingToolApproval: null,
@@ -45,7 +46,14 @@ export function createFakeAgent() {
     get state() {
       return state;
     },
-    prompt: vi.fn<Agent["prompt"]>(async (): Promise<PromptResult> => ({ status: "completed" })),
+    prompt: vi.fn<Agent["prompt"]>(
+      async (): Promise<PromptResult> => ({
+        status: "accepted",
+        inputId: "test-input",
+        mode: "steer",
+        durable: false,
+      }),
+    ),
     close: vi.fn<Agent["close"]>(async () => {}),
     abort: vi.fn(),
     subscribe(listener) {

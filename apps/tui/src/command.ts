@@ -192,9 +192,23 @@ export async function executeCommand(
       if (args.length) return invalid();
       else notice(formatRunDiagnostic(agent.state.lastRunDiagnostic));
       break;
-    case "continue":
+    case "steer":
+    case "followup":
+      if (!argumentsText) return invalid();
       return {
         kind: "prompt",
+        text: command.argumentsText,
+        options: { mode: command.name === "steer" ? "steer" : "followUp" },
+      };
+    case "continue":
+      if (
+        !argumentsText &&
+        (agent.state.inputQueue.steer.length || agent.state.inputQueue.followUp.length)
+      )
+        return { kind: "prompt", text: "", options: { resume: true } };
+      return {
+        kind: "prompt",
+        options: { resume: true },
         text: argumentsText
           ? `继续上一任务。补充要求：\n${command.argumentsText}`
           : "继续上一任务。先依据已保存消息、工具结果和当前工作区核对剩余工作，保留已经完成的成果，不重复已成功的副作用。",
@@ -220,6 +234,12 @@ export async function executeCommand(
       }
       const identity = args[0];
       if (identity) {
+        if (identity === agent.state.sessionId) {
+          notice(
+            `当前已是此会话，没有重新加载。若需恢复失效的写入器，请 /exit 后用 --session ${identity} 重新启动。`,
+          );
+          return { kind: "handled" };
+        }
         return report(await agent.sessions.open(identity), "会话已恢复。");
       }
       const result = await agent.sessions.list();

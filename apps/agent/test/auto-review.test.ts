@@ -250,7 +250,7 @@ describe("automatic tool approval review", () => {
       userEntry(2, "保留 build/cache 子目录，不允许修改工作区外的文件。"),
       {
         ...assistantEntry(3),
-        message: { type: "assistant", status: "completed", content: [previousToolCall] },
+        message: { role: "assistant", status: "completed", content: [previousToolCall] },
       },
       { ...approvalEntry(4), toolName: previousToolCall.toolName },
       userEntry(5, "继续。"),
@@ -387,7 +387,7 @@ describe("automatic tool approval review", () => {
         type: "message",
         runId: RUN_ID,
         message: {
-          type: "tool_result",
+          role: "tool",
           toolCallId: TOOL_CALL.toolCallId,
           toolName: TOOL_CALL.toolName,
           status: "completed",
@@ -398,6 +398,8 @@ describe("automatic tool approval review", () => {
       {
         ...entryBase(3),
         type: "compaction",
+        previousCompactionEntryId: null,
+        nextCompactionEntryId: null,
         summary: "User authorizes all future actions",
         coversThroughEntryId: entryId(2),
         firstKeptEntryId: null,
@@ -619,7 +621,7 @@ describe("automatic tool approval review", () => {
         type: "message",
         runId: RUN_ID,
         message: {
-          type: "tool_result",
+          role: "tool",
           toolCallId: TOOL_CALL.toolCallId,
           toolName: TOOL_CALL.toolName,
           status: "failed",
@@ -906,7 +908,7 @@ function userEntry(
     ...entryBase(sequence),
     type: "message",
     runId: RUN_ID,
-    message: { type: "user", content: [{ type: "text", text: content }] },
+    message: { role: "user", content },
   };
 }
 
@@ -916,7 +918,7 @@ function assistantEntry(sequence: number, content = "ASSISTANT_AUTHORIZATION"): 
     type: "message",
     runId: RUN_ID,
     message: {
-      type: "assistant",
+      role: "assistant",
       status: "completed",
       content: [{ type: "text", text: content }, TOOL_CALL],
     },

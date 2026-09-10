@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
+  assertSessionCheckpoint,
   hasRecoverableIncompleteSessionTail,
+  publishSessionJournal,
   readCompleteSessionText,
   readSessionJournal,
+  type VerifiedSessionJournal,
 } from "./journal.js";
 import {
   createMigrationStagingDirectory,
@@ -14,13 +17,18 @@ import {
 } from "./locations.js";
 import { SessionBusyError } from "./lock.js";
 import {
+  encodeLegacySessionRecord,
+  getSessionOwnership,
   hasExactKeys,
+  hasValidCompactionNavigation,
   isUuid,
   type LegacySessionHeader,
   migrateLegacySessionRecords,
   parseLegacySessionRecord,
   parseSessionHeader,
+  rebuildCompactionNavigation,
   type Schema2SessionHeader,
+  type Schema3SessionHeader,
   type SessionHeader,
   type SessionKind,
   type SessionRecord,
@@ -174,81 +182,38 @@ type SchemaUpgradeState = Readonly<{
   state: "prepared";
 }>;
 
-/** 仅在调用方持有 Session 写锁时，将目录日志的 Header 原路径提升到 Schema 3。 */
-export async function upgradeSessionToSchema3(
-  storageDirectory: string,
-  target: Readonly<{
-    sessionId: string;
-    rootSessionId: string;
-    sessionKind: SessionKind;
-  }>,
-): Promise<SessionHeader> {
-  await completeSessionSchemaUpgrade(storageDirectory);
-  const sessionFilePath = join(storageDirectory, "session.jsonl");
-  const currentJournal = await readSessionJournal(sessionFilePath);
-  if (currentJournal.header.schemaVersion === 3) {
-    assertSchemaUpgradeTarget(currentJournal.header, target);
-    return currentJournal.header;
-  }
-  if (
-    currentJournal.header.schemaVersion !== 2 ||
-    currentJournal.header.sessionId !== target.sessionId
-  ) {
-    throw new Error("只有 Schema 2 目录日志可以升级到 Schema 3。");
-  }
-  const upgradedHeader: SessionHeader = Object.freeze({
+/** 执行打开持锁后才升级当前 Session；旧格式与导航修复共用完整候选发布。 */
+export async function upgradeSessionToSchema4(
+  sessionFilePath: string,
+  journal: VerifiedSessionJournal,
+) {
+  const checkpoint = journal.checkpoint;
+  await assertSessionCheckpoint(sessionFilePath, checkpoint);
+  if (checkpoint.fileSize !== journal.fileSize) throw new Error("Session 升级前日志已变化。");
+  const navigation = rebuildCompactionNavigation(journal.records);
+  const header: SessionHeader = Object.freeze({
     type: "session_header",
-    schemaVersion: 3,
-    sessionId: currentJournal.header.sessionId,
-    rootSessionId: target.rootSessionId,
-    sessionKind: target.sessionKind,
-    createdAt: currentJournal.header.createdAt,
-    workspaceRoot: currentJournal.header.workspaceRoot,
-    shell: currentJournal.header.shell,
+    schemaVersion: 4,
+    sessionId: journal.header.sessionId,
+    ...getSessionOwnership(journal.header),
+    createdAt: journal.header.createdAt,
+    workspaceRoot: journal.header.workspaceRoot,
+    shell: journal.header.shell,
+    latestCompactionEntryId: navigation.latestCompactionEntryId,
   });
-  assertSchemaUpgradeTarget(upgradedHeader, target);
-  const sessionText = await readFile(sessionFilePath, "utf8");
-  const firstNewlineIndex = sessionText.indexOf("\n");
-  if (firstNewlineIndex < 0 || !sessionText.endsWith("\n")) {
-    throw new Error("Schema 2 Session 日志不完整。");
+  if (
+    journal.header.schemaVersion === 4 &&
+    hasValidCompactionNavigation(journal.header, journal.records)
+  ) {
+    return Object.freeze({ header, records: journal.records, checkpoint });
   }
-  const temporaryPath = join(storageDirectory, SCHEMA_UPGRADE_TEMP_FILE_NAME);
-  const backupPath = join(storageDirectory, SCHEMA_UPGRADE_BACKUP_FILE_NAME);
-  if (await pathExists(backupPath)) {
-    throw new Error("Schema 3 升级备份状态不明。");
-  }
-  await unlinkIfExists(temporaryPath);
-  let upgradeStateWritten = false;
-  try {
-    await writeSyncedFile(
-      temporaryPath,
-      Buffer.from(JSON.stringify(upgradedHeader) + sessionText.slice(firstNewlineIndex), "utf8"),
-    );
-    const stagedJournal = await readSessionJournal(temporaryPath);
-    if (stagedJournal.header.schemaVersion !== 3) {
-      throw new Error("Schema 3 升级暂存日志校验失败。");
-    }
-    await writeSchemaUpgradeState(storageDirectory, {
-      schemaVersion: 2,
-      sessionId: target.sessionId,
-      rootSessionId: target.rootSessionId,
-      sessionKind: target.sessionKind,
-      state: "prepared",
-    });
-    upgradeStateWritten = true;
-    await completeSessionSchemaUpgrade(storageDirectory);
-  } catch (error) {
-    if (!upgradeStateWritten) {
-      await unlinkIfExists(temporaryPath).catch(() => undefined);
-    }
-    throw error;
-  }
-  const upgradedJournal = await readSessionJournal(sessionFilePath);
-  if (upgradedJournal.header.schemaVersion !== 3) {
-    throw new Error("Session Schema 3 升级未完成。");
-  }
-  assertSchemaUpgradeTarget(upgradedJournal.header, target);
-  return upgradedJournal.header;
+  const committedCheckpoint = await publishSessionJournal(
+    sessionFilePath,
+    header,
+    navigation.records,
+    checkpoint,
+  );
+  return Object.freeze({ header, records: navigation.records, checkpoint: committedCheckpoint });
 }
 
 /** 恢复已经刷新升级意图但尚未完成的同目录 Header 替换。 */
@@ -347,7 +312,7 @@ async function writeMigratedJournal(
   records: readonly SessionRecord[],
 ): Promise<void> {
   validateSessionRecords(records);
-  const journalText = `${JSON.stringify(header)}\n${records.map((record) => JSON.stringify(record)).join("\n")}${records.length === 0 ? "" : "\n"}`;
+  const journalText = `${JSON.stringify(header)}\n${records.map((record) => JSON.stringify(encodeLegacySessionRecord(record))).join("\n")}${records.length === 0 ? "" : "\n"}`;
   const normalizedJournalText = journalText.endsWith("\n") ? journalText : `${journalText}\n`;
   const temporaryJournalPath = join(stagingDirectory, `.session.${randomUUID()}.tmp`);
   const finalJournalPath = join(stagingDirectory, "session.jsonl");
@@ -404,16 +369,6 @@ async function readMigrationState(storageDirectory: string): Promise<MigrationSt
   }
 }
 
-async function writeSchemaUpgradeState(
-  storageDirectory: string,
-  state: SchemaUpgradeState,
-): Promise<void> {
-  await writeSyncedFile(
-    join(storageDirectory, SCHEMA_UPGRADE_STATE_FILE_NAME),
-    Buffer.from(JSON.stringify(state) + "\n", "utf8"),
-  );
-}
-
 async function readSchemaUpgradeState(
   storageDirectory: string,
 ): Promise<SchemaUpgradeState | null> {
@@ -458,7 +413,7 @@ async function readSchemaUpgradeState(
 }
 
 function assertSchemaUpgradeTarget(
-  header: SessionHeader,
+  header: Schema3SessionHeader,
   target: Readonly<{
     sessionId: string;
     rootSessionId: string;
@@ -480,18 +435,6 @@ async function readJournalIfExists(path: string) {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
-    }
-    throw error;
-  }
-}
-
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return false;
     }
     throw error;
   }

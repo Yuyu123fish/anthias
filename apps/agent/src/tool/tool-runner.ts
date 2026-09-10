@@ -1,7 +1,7 @@
 import type { AssistantToolCallPart, ToolResultMessage } from "../message.js";
 import type { PermissionMode } from "../permission/permission-mode.js";
-import type { SessionArtifactStore } from "../session/artifacts.js";
 import type { SessionShell } from "../session/index.js";
+import type { SessionArtifactStore } from "./artifacts.js";
 import {
   BASE_TOOLS,
   isReadOnlyToolName,

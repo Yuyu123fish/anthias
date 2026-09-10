@@ -11,6 +11,7 @@ import { createSession } from "../src/session/index.js";
 import type { AgentToolExtension } from "../src/tool/managed-tool.js";
 import { createToolRunnerFromTools } from "../src/tool/tool-runner.js";
 import { createWebSearchTools } from "../src/tool/web-search.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const syntheticKey = "synthetic-searchapi-key-49281";
 const cleanups: (() => Promise<void>)[] = [];
@@ -239,7 +240,9 @@ describe("web_search", () => {
     cleanups.push(() => agent.close());
     const events: AgentEvent[] = [];
     agent.subscribe((event) => events.push(event));
-    expect(await agent.prompt("查找公开参考资料")).toMatchObject({ status: "completed" });
+    expect(await promptToCompletion(agent, "查找公开参考资料")).toMatchObject({
+      status: "completed",
+    });
     expect(requests[0]?.tools.some((definition) => definition.name === "web_search")).toBe(true);
     expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(1);
     expect(events.filter((event) => event.type === "tool_execution_end")).toHaveLength(1);

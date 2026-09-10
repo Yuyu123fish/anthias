@@ -111,6 +111,21 @@ describe("slash commands", () => {
     expect(notice.mock.calls.flat().join("\n")).toContain("外部上下文 200 · 工具定义 600");
   });
 
+  it("does not claim to reload the current session", async () => {
+    const { agent } = createFakeAgent();
+    const notice = vi.fn();
+    const command = parseInput(`/resume ${agent.state.sessionId}`);
+    if (command.type !== "command") throw new Error("Expected a local command");
+    await expect(
+      executeCommand(command, { agent, notice, details() {}, exit() {} }),
+    ).resolves.toEqual({ kind: "handled" });
+    expect(agent.sessions.open).not.toHaveBeenCalled();
+    expect(notice).toHaveBeenCalledWith(
+      expect.stringContaining(`请 /exit 后用 --session ${agent.state.sessionId} 重新启动`),
+    );
+    expect(notice.mock.calls.flat().join("\n")).not.toContain("会话已恢复");
+  });
+
   it("rejects unknown commands and malformed arguments locally", async () => {
     const { agent } = createFakeAgent();
     const notice = vi.fn();

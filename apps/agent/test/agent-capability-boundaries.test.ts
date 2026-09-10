@@ -9,6 +9,7 @@ import type { ModelStream } from "../src/model/model-stream.js";
 import { COMPACTION_SECTION_TITLES } from "../src/prompts/compaction-prompt.js";
 import { createSession, type Session } from "../src/session/index.js";
 import { createSkillLibrary } from "../src/skill/index.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -33,8 +34,8 @@ function own(agent: Agent): Agent {
 }
 
 async function seedHistory(agent: Agent) {
-  expect((await agent.prompt("第一轮原始输入")).status).toBe("completed");
-  expect((await agent.prompt("第二轮原始输入")).status).toBe("completed");
+  expect((await promptToCompletion(agent, "第一轮原始输入")).status).toBe("completed");
+  expect((await promptToCompletion(agent, "第二轮原始输入")).status).toBe("completed");
 }
 
 async function waitForAbort(signal: AbortSignal) {
@@ -95,7 +96,7 @@ describe("Agent capability failure boundaries", () => {
       expect(session.records.some((record) => record.type === "compaction")).toBe(false);
       expect(operations).toEqual(["compacting", "idle"]);
       await agent.close();
-      expect(await agent.prompt("关闭后不可运行")).toEqual({
+      expect(await promptToCompletion(agent, "关闭后不可运行")).toEqual({
         status: "rejected",
         reason: "closed",
       });
@@ -145,9 +146,6 @@ describe("Agent capability failure boundaries", () => {
     let modelRequests = 0;
     const failingSession: Session = {
       ...session,
-      get messageHistory() {
-        return session.messageHistory;
-      },
       get records() {
         return session.records;
       },
@@ -175,13 +173,13 @@ describe("Agent capability failure boundaries", () => {
     expect(compactionWrites).toBe(1);
     expect(agent.state.operation).toBeNull();
     expect(agent.state.messageHistory).toEqual(messageHistory);
-    expect((await agent.prompt("写入失败后不要继续")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "写入失败后不要继续")).status).toBe("failed");
     expect(modelRequests).toBe(3);
     expect(agent.state.messageHistory).toEqual(messageHistory);
     expect(session.records.some((record) => record.type === "compaction")).toBe(false);
   });
 
-  it("seals a Run after load_skill cannot persist its context source through the lease", async () => {
+  it("seals a Run after load_skill cannot persist its context source through the Session writer", async () => {
     const { root, session } = await setupSession();
     const directory = join(root, "skills", "sample");
     await mkdir(directory, { recursive: true });
@@ -194,31 +192,16 @@ describe("Agent capability failure boundaries", () => {
       directories: [{ path: join(root, "skills"), source: "test" }],
     });
     let sourceWrites = 0;
-    let runAcquisitions = 0;
     let modelRequests = 0;
     const failingSession: Session = {
       ...session,
-      get messageHistory() {
-        return session.messageHistory;
-      },
       get records() {
         return session.records;
       },
-      async acquireRun(runId) {
-        runAcquisitions += 1;
-        const acquisition = await session.acquireRun(runId);
-        if (acquisition.status !== "acquired") return acquisition;
-        return {
-          status: "acquired",
-          lease: {
-            ...acquisition.lease,
-            async appendContextSource(details) {
-              if (details.kind !== "skill") return acquisition.lease.appendContextSource(details);
-              sourceWrites += 1;
-              throw new Error("synthetic context source write failure");
-            },
-          },
-        };
+      async appendContextSource(runId, details) {
+        if (details.kind !== "skill") return session.appendContextSource(runId, details);
+        sourceWrites += 1;
+        throw new Error("synthetic context source write failure");
       },
     };
     const events: AgentEvent[] = [];
@@ -240,19 +223,18 @@ describe("Agent capability failure boundaries", () => {
       }),
     );
     agent.subscribe((event) => events.push(event));
-    expect((await agent.prompt("读取外部指令")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "读取外部指令")).status).toBe("failed");
     expect(sourceWrites).toBe(1);
     expect(agent.state.running).toBe(false);
     expect(agent.state.activeRun).toBeNull();
-    expect(events.filter((event) => event.type === "run_end")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "session_unavailable")).toHaveLength(1);
     expect(
       session.records.some((record) => record.type === "context_source" && record.kind === "skill"),
     ).toBe(false);
     const messageHistory = agent.state.messageHistory;
     const toolEvents = events.filter((event) => event.type === "tool_execution_start").length;
-    expect((await agent.prompt("不要再调用模型或工具")).status).toBe("failed");
+    expect((await promptToCompletion(agent, "不要再调用模型或工具")).status).toBe("failed");
     expect(modelRequests).toBe(1);
-    expect(runAcquisitions).toBe(1);
     expect(sourceWrites).toBe(1);
     expect(events.filter((event) => event.type === "tool_execution_start")).toHaveLength(
       toolEvents,
@@ -336,11 +318,15 @@ describe("Agent capability failure boundaries", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
       }
     });
-    expect((await agent.prompt("只进行规划")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "只进行规划")).status).toBe("completed");
     expect(called).toBe(0);
     expect(approvals).toBe(0);
     expect(modelRequests).toBe(2);
-    expect(session.messageHistory.find((message) => message.role === "tool")).toMatchObject({
+    expect(
+      session.records
+        .flatMap((entry) => (entry.type === "message" ? [entry.message] : []))
+        .find((message) => message.role === "tool"),
+    ).toMatchObject({
       status: "denied",
       toolName: tool.name,
     });

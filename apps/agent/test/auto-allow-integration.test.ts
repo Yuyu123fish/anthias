@@ -12,6 +12,8 @@ import {
 } from "../src/model/model-stream.js";
 import { createSession, openSession, type Session } from "../src/session/index.js";
 
+import { promptToCompletion } from "./prompt-helper.js";
+
 const cleanup: Array<() => Promise<void>> = [];
 const shell = {
   kind: "powershell" as const,
@@ -47,7 +49,7 @@ function toolCall(
 }
 function reviewJson(session: Session, decision = "allow") {
   const authorizationEntryId = session.records.findLast(
-    (record) => record.type === "message" && record.message.type === "user",
+    (record) => record.type === "message" && record.message.role === "user",
   )?.entryId;
   return JSON.stringify({
     decision,
@@ -124,7 +126,7 @@ it("skips both approval paths in Full Access despite workspace revocation and re
       revocation = agent.permissions.revoke();
     }
   });
-  expect((await agent.prompt("写入 full.txt。")).status).toBe("completed");
+  expect((await promptToCompletion(agent, "写入 full.txt。")).status).toBe("completed");
   await revocation;
   expect(approvalRequests).toBe(0);
   expect(manualApprovals).toBe(0);
@@ -193,7 +195,8 @@ describe("AutoAllow Agent integration", () => {
       }
     });
     expect(
-      (await agent.prompt("只执行两次 Write-Output 'diagnostic-ok'，不要执行第三次。")).status,
+      (await promptToCompletion(agent, "只执行两次 Write-Output 'diagnostic-ok'，不要执行第三次。"))
+        .status,
     ).toBe("completed");
     expect(executionHistories).toEqual([
       expect.objectContaining({ startedCount: 0, latestExecution: null }),
@@ -250,7 +253,7 @@ describe("AutoAllow Agent integration", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
       }
     });
-    expect((await agent.prompt("准备临时文件操作。")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "准备临时文件操作。")).status).toBe("completed");
     expect(reviewRequests).toBe(1);
     expect(manualRequests).toBe(1);
     expect(
@@ -303,7 +306,7 @@ describe("AutoAllow Agent integration", () => {
       }
     });
     const task = "请在当前工作区创建 large.txt 和 note.txt，不要写入工作区外。";
-    expect((await agent.prompt(task)).status).toBe("completed");
+    expect((await promptToCompletion(agent, task)).status).toBe("completed");
     expect(manualCount).toBe(1);
     expect(requests).toHaveLength(1);
     const request = requests[0];
@@ -342,7 +345,9 @@ describe("AutoAllow Agent integration", () => {
       if (event.type === "tool_auto_review_start")
         expect(agent.setPermissionMode("plan").status).toBe("rejected");
     });
-    expect(await agent.prompt("请在当前临时工作区创建 note.txt，内容 approved。")).toEqual({
+    expect(
+      await promptToCompletion(agent, "请在当前临时工作区创建 note.txt，内容 approved。"),
+    ).toEqual({
       status: "completed",
     });
     expect(await readFile(join(session.workspaceRoot, "note.txt"), "utf8")).toBe("approved");
@@ -396,7 +401,7 @@ describe("AutoAllow Agent integration", () => {
           agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
         }
       });
-      expect((await agent.prompt("请修改临时文件。")).status).toBe("completed");
+      expect((await promptToCompletion(agent, "请修改临时文件。")).status).toBe("completed");
       expect(manualCount).toBe(1);
       expect(purposes.filter((purpose) => purpose === "approval")).toHaveLength(1);
       expect(session.records.filter((record) => record.type === "approval_decision")).toMatchObject(
@@ -419,7 +424,7 @@ describe("AutoAllow Agent integration", () => {
       toolCall({ command: "rm -rf /" }, "execute_command"),
       allowed(session),
     );
-    expect((await agent.prompt("允许执行这个命令。")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "允许执行这个命令。")).status).toBe("completed");
     expect(purposes).toEqual(["response", "response"]);
     expect(session.records.some((record) => record.type === "tool_execution_started")).toBe(false);
     expect(session.records.find((record) => record.type === "approval_decision")).toMatchObject({
@@ -443,7 +448,7 @@ describe("AutoAllow Agent integration", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "deny");
       }
     });
-    expect(await agent.prompt("请创建 review-failed.txt。")).toMatchObject({
+    expect(await promptToCompletion(agent, "请创建 review-failed.txt。")).toMatchObject({
       status: "failed",
       error: expect.stringContaining("自动审核"),
     });
@@ -485,7 +490,7 @@ describe("AutoAllow Agent integration", () => {
         yield { type: "finish", finishReason: "stop", usage };
       },
     );
-    const result = agent.prompt("请创建临时文件。");
+    const result = promptToCompletion(agent, "请创建临时文件。");
     await started.promise;
     agent.abort();
     expect(await result).toEqual({ status: "aborted" });
@@ -506,7 +511,7 @@ describe("AutoAllow Agent integration", () => {
         yield { type: "finish", finishReason: "stop", usage };
       },
     );
-    expect((await agent.prompt("请更新 note.txt。")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "请更新 note.txt。")).status).toBe("completed");
     expect(await readFile(path, "utf8")).toBe("external update");
     expect(agent.state.messageHistory.find((message) => message.role === "tool")).toMatchObject({
       status: "failed",
@@ -521,18 +526,8 @@ describe("AutoAllow Agent integration", () => {
       get records() {
         return session.records;
       },
-      async acquireRun(runId) {
-        const acquired = await session.acquireRun(runId);
-        if (acquired.status !== "acquired") return acquired;
-        return {
-          status: "acquired",
-          lease: {
-            ...acquired.lease,
-            async appendApprovalDecision() {
-              throw new Error("forced disk failure");
-            },
-          },
-        };
+      async appendApprovalDecision() {
+        throw new Error("forced disk failure");
       },
     };
     const { agent } = makeAgent(
@@ -540,7 +535,7 @@ describe("AutoAllow Agent integration", () => {
       toolCall({ path: "note.txt", content: "approved" }),
       allowed(session),
     );
-    expect(await agent.prompt("请创建 note.txt。")).toMatchObject({
+    expect(await promptToCompletion(agent, "请创建 note.txt。")).toMatchObject({
       status: "failed",
       error: expect.stringContaining("Session"),
     });

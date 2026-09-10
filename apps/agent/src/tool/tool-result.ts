@@ -4,7 +4,7 @@ import {
   estimateTextTokens,
   TOOL_RESULT_TOKEN_LIMIT,
 } from "../context/budget.js";
-import type { ArtifactSourceStatus, SessionArtifactStore } from "../session/artifacts.js";
+import type { ArtifactSourceStatus, SessionArtifactStore } from "./artifacts.js";
 
 /** 文件页范围只在结果收敛前存在，最终范围按实际可见完整行生成。 */
 export type ToolFilePage = Readonly<{

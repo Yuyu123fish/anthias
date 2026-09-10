@@ -12,6 +12,7 @@ import type { MemberSummary } from "../src/multi-agent/index.js";
 import { createSession, openSession } from "../src/session/index.js";
 import { locateSessionStorage } from "../src/session/locations.js";
 import { readSessionHistory } from "../src/session/query.js";
+import { promptToCompletion } from "./prompt-helper.js";
 
 const execute = promisify(execFile);
 const roots: string[] = [];
@@ -219,7 +220,7 @@ describe("MultiAgent through the Agent interface", () => {
       ),
     ).toBe(true);
     expect(
-      history.records.some((record) => record.type === "message" && record.message.type === "user"),
+      history.records.some((record) => record.type === "message" && record.message.role === "user"),
     ).toBe(false);
     expect(
       value(await agent.collaboration.execute({ action: "result", memberId: member.sessionId })),
@@ -336,7 +337,7 @@ describe("MultiAgent through the Agent interface", () => {
     });
     const member = await spawn(agent, "member budget");
     await entered.promise;
-    expect((await agent.prompt("root budget")).status).toBe("completed");
+    expect((await promptToCompletion(agent, "root budget")).status).toBe("completed");
     await wait(agent, member.sessionId);
     expect(counts).toEqual({ root: 33, member: 33 });
   }, 60_000);
@@ -561,7 +562,8 @@ describe("MultiAgent through the Agent interface", () => {
       }
     });
     expect(
-      (await agent.prompt("请创建隔离成员，将 shared.txt 写为 root approved result。")).status,
+      (await promptToCompletion(agent, "请创建隔离成员，将 shared.txt 写为 root approved result。"))
+        .status,
     ).toBe("completed");
     const member = agent.collaboration.snapshot().members[0];
     if (!member) throw new Error("member was not created");
@@ -574,7 +576,7 @@ describe("MultiAgent through the Agent interface", () => {
       );
     }
     const actualUserEntry = session.records.find(
-      (record) => record.type === "message" && record.message.type === "user",
+      (record) => record.type === "message" && record.message.role === "user",
     );
     const history = await readSessionHistory({
       sessionDirectory,

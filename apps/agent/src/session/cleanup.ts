@@ -7,13 +7,12 @@ import {
   openSessionCleanupState,
   type SessionCleanupState,
 } from "./cleanup-state.js";
-import {
-  type LocatedGroupSession,
-  type LocatedSessionGroup,
-  locateSessionGroup,
-} from "./groups.js";
 import { readSessionJournal } from "./journal.js";
-import { enumerateSessionStorage, locateSessionStorage } from "./locations.js";
+import {
+  enumerateSessionStorage,
+  locateSessionStorage,
+  type SessionStorageScan,
+} from "./locations.js";
 import {
   acquireSessionLock,
   DEFAULT_SESSION_LOCK_SYSTEM,
@@ -27,7 +26,10 @@ import { hasPendingSessionMigration } from "./migration.js";
 import {
   type CoordinationRecord,
   deriveLastActivityAt,
+  getSessionOwnership,
+  isUuid,
   type Schema2SessionHeader,
+  type Schema3SessionHeader,
   type SessionHeader,
   type SessionRecord,
   validateSessionRecords,
@@ -38,7 +40,7 @@ const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 
 type VerifiedManagedSession = Readonly<{
   located: LocatedGroupSession;
-  header: SessionHeader;
+  header: SessionHeader | Schema3SessionHeader;
   records: readonly SessionRecord[];
 }>;
 
@@ -294,7 +296,7 @@ async function cleanSchema3Group(
     for (const located of sortedSessions) {
       const journal = await verifyManagedJournal(root, located);
       if (
-        journal.header.schemaVersion !== 3 ||
+        (journal.header.schemaVersion !== 3 && journal.header.schemaVersion !== 4) ||
         journal.header.rootSessionId !== group.rootSessionId
       ) {
         throw new Error("group ownership incomplete");
@@ -384,7 +386,7 @@ async function verifyManagedJournal(root: string, located: LocatedGroupSession) 
 
 function assertCompletedRecords(
   records: readonly SessionRecord[],
-  header: SessionHeader | Schema2SessionHeader,
+  header: SessionHeader | Schema3SessionHeader | Schema2SessionHeader,
 ): void {
   if (validateSessionRecords(records, header) !== null) {
     throw new Error("Session has unfinished Run");
@@ -393,7 +395,7 @@ function assertCompletedRecords(
 
 function assertExpiredGroup(
   sessions: readonly Readonly<{
-    header: SessionHeader | Schema2SessionHeader;
+    header: SessionHeader | Schema3SessionHeader | Schema2SessionHeader;
     records: readonly SessionRecord[];
   }>[],
   now: number,
@@ -645,4 +647,95 @@ function safeCleanupSkipReason(error: unknown): string {
     return "正在写入或锁状态不明";
   }
   return "日志或存储状态无法核验";
+}
+
+type LocatedGroupSession = Readonly<{
+  sessionId: string;
+  storageDirectory: string;
+  sessionFilePath: string;
+  relativeStorageDirectory: string;
+  header: SessionHeader | Schema3SessionHeader | Schema2SessionHeader;
+  records: readonly SessionRecord[];
+}>;
+
+type LocatedSessionGroup = Readonly<{
+  rootSessionId: string;
+  sessions: readonly LocatedGroupSession[];
+  complete: boolean;
+  diagnostics: readonly string[];
+}>;
+
+/** 已知物理根的损坏成员只影响该组；归属未知的候选可能属于任一组，必须保守保留。 */
+async function locateSessionGroup(
+  sessionDirectory: string,
+  sessionId: string,
+  scannedStorage?: SessionStorageScan,
+): Promise<LocatedSessionGroup> {
+  if (!isUuid(sessionId)) throw new Error("Session group 身份无效。");
+  const scan = scannedStorage ?? (await enumerateSessionStorage(sessionDirectory));
+  const requestedCandidates = scan.entries.filter(
+    ({ location }) => location.source === "directory" && location.sessionId === sessionId,
+  );
+  if (requestedCandidates.length !== 1) throw new Error("Session group 的请求身份不存在或重复。");
+  const requested = requestedCandidates[0];
+  if (requested === undefined) throw new Error("Session group 身份不存在。");
+  const rootSessionId = getSessionOwnership(requested.header).rootSessionId;
+  const candidates = scan.entries.filter(
+    ({ location, header }) =>
+      location.source === "directory" &&
+      getSessionOwnership(header).rootSessionId === rootSessionId,
+  );
+  const diagnostics = scan.diagnostics
+    .filter(
+      (diagnostic) =>
+        diagnostic.rootSessionId === undefined || diagnostic.rootSessionId === rootSessionId,
+    )
+    .map((diagnostic) => diagnostic.message);
+  const sessions: LocatedGroupSession[] = [];
+  for (const { location, header } of candidates) {
+    try {
+      if (
+        header.schemaVersion === 1 ||
+        location.relativeStorageDirectory === null ||
+        (await lstat(location.sessionFilePath)).size > 64 * 1024 * 1024
+      ) {
+        throw new Error("Session journal exceeds group read budget");
+      }
+      const journal = await readSessionJournal(location.sessionFilePath);
+      if (JSON.stringify(journal.header) !== JSON.stringify(header)) {
+        throw new Error("Session Header changed during enumeration");
+      }
+      sessions.push(
+        Object.freeze({
+          sessionId: location.sessionId,
+          storageDirectory: location.storageDirectory,
+          sessionFilePath: location.sessionFilePath,
+          relativeStorageDirectory: location.relativeStorageDirectory.replaceAll("\\", "/"),
+          header,
+          records: journal.records,
+        }),
+      );
+    } catch {
+      diagnostics.push("组成员日志无法核验");
+    }
+  }
+  const identities = new Set(sessions.map((session) => session.sessionId));
+  const roots = sessions.filter(
+    (session) =>
+      session.sessionId === rootSessionId &&
+      getSessionOwnership(session.header).sessionKind === "primary",
+  );
+  return Object.freeze({
+    rootSessionId,
+    sessions: Object.freeze(
+      sessions.sort((left, right) => left.sessionId.localeCompare(right.sessionId)),
+    ),
+    complete:
+      scan.complete &&
+      diagnostics.length === 0 &&
+      roots.length === 1 &&
+      identities.size === sessions.length &&
+      sessions.length === candidates.length,
+    diagnostics: Object.freeze(diagnostics),
+  });
 }

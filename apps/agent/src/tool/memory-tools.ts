@@ -138,7 +138,7 @@ export function createMemoryTools(options: {
             const trigger = options.session.records.findLast(
               (record) =>
                 record.type === "message" &&
-                record.message.type === "assistant" &&
+                record.message.role === "assistant" &&
                 record.message.content.some(
                   (part) => part.type === "tool_call" && part.toolCallId === call.toolCallId,
                 ),
@@ -146,12 +146,13 @@ export function createMemoryTools(options: {
             const userRecord = options.session.records.findLast(
               (record) =>
                 record.type === "message" &&
-                record.message.type === "user" &&
+                record.message.role === "user" &&
+                record.message.source?.kind !== "agent" &&
                 record.runId === (trigger?.type === "message" ? trigger.runId : undefined),
             );
             const userText =
-              userRecord?.type === "message" && userRecord.message.type === "user"
-                ? userRecord.message.content.map((part) => part.text).join("")
+              userRecord?.type === "message" && userRecord.message.role === "user"
+                ? userRecord.message.content
                 : "";
             const userQuote = quote.length > 0 && userText.includes(quote);
             let explicit =
@@ -214,13 +215,13 @@ export function createMemoryTools(options: {
               const evidence = options.session.records.findLast(
                 (record) =>
                   record.type === "message" &&
-                  record.message.type === "tool_result" &&
+                  record.message.role === "tool" &&
                   record.message.toolCallId === input.toolCallId &&
                   record.message.status === "completed",
               );
               if (
                 evidence?.type !== "message" ||
-                evidence.message.type !== "tool_result" ||
+                evidence.message.role !== "tool" ||
                 !quote ||
                 !evidence.message.content.includes(quote) ||
                 ["memory", "agent_result", "team"].includes(evidence.message.toolName)
@@ -229,13 +230,13 @@ export function createMemoryTools(options: {
               const callRecord = options.session.records.find(
                 (record) =>
                   record.type === "message" &&
-                  record.message.type === "assistant" &&
+                  record.message.role === "assistant" &&
                   record.message.content.some(
                     (part) => part.type === "tool_call" && part.toolCallId === input.toolCallId,
                   ),
               );
               const evidenceCall =
-                callRecord?.type === "message" && callRecord.message.type === "assistant"
+                callRecord?.type === "message" && callRecord.message.role === "assistant"
                   ? callRecord.message.content.find(
                       (part) => part.type === "tool_call" && part.toolCallId === input.toolCallId,
                     )

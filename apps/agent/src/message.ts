@@ -2,6 +2,12 @@
 export type UserMessage = Readonly<{
   role: "user";
   content: string;
+  source?: Readonly<{
+    kind: "agent";
+    messageId: string;
+    rootSessionId: string;
+    fromSessionId: string;
+  }>;
 }>;
 
 /** 枚举 Assistant ToolCall 可以安全持久化并回传模型的 JSON 值。 */
@@ -166,6 +172,12 @@ export type ToolResultMessage = Readonly<{
 
 /** 枚举 Agent 对外可见的线性消息。 */
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+
+/** 只有完成态消息能进入 Session；活动 partial 与临时 reasoning 不属于持久历史。 */
+export type CompletedMessage =
+  | UserMessage
+  | (AssistantMessage & Readonly<{ status: "completed" | "aborted" | "failed" }>)
+  | ToolResultMessage;
 
 /** 判断 Assistant 内容 part 是否为 ToolCall。 */
 export function isToolCallPart(part: AssistantContentPart): part is AssistantToolCallPart {

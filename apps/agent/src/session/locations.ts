@@ -8,6 +8,7 @@ import {
   type ParsedSessionHeader,
   parseJsonObject,
   parseSessionHeader,
+  type Schema3SessionHeader,
   type SessionHeader,
 } from "./schema.js";
 
@@ -48,7 +49,7 @@ export function getSessionStorageRelativeDirectory(header: ParsedSessionHeader):
 /** 成员在根位置确认后创建；跨日执行不改变归属目录或 Header 的真实时间。 */
 export async function createSessionStorageDirectory(
   sessionDirectory: string,
-  header: SessionHeader,
+  header: SessionHeader | Schema3SessionHeader,
 ): Promise<SessionStorageLocation> {
   const normalizedSessionDirectory = await realpath(sessionDirectory);
   const existing = await enumerateSessionStorage(normalizedSessionDirectory);
@@ -81,7 +82,7 @@ export async function createSessionStorageDirectory(
       rootLocation.sessionFilePath,
     );
     if (
-      rootHeader.schemaVersion !== 3 ||
+      (rootHeader.schemaVersion !== 3 && rootHeader.schemaVersion !== 4) ||
       rootHeader.sessionKind !== "primary" ||
       rootHeader.sessionId !== header.rootSessionId ||
       rootHeader.rootSessionId !== header.rootSessionId
@@ -344,10 +345,10 @@ async function inspectDirectoryLocation(
     if (rootId === undefined) throw new Error("Session 根目录身份无效。");
     const root = await inspectDirectoryLocation(sessionDirectory, rootId, rootRelativeDirectory);
     if (
-      root.header.schemaVersion !== 3 ||
+      (root.header.schemaVersion !== 3 && root.header.schemaVersion !== 4) ||
       root.header.sessionKind !== "primary" ||
       root.header.rootSessionId !== rootId ||
-      header.schemaVersion !== 3 ||
+      (header.schemaVersion !== 3 && header.schemaVersion !== 4) ||
       header.sessionKind === "primary" ||
       header.rootSessionId !== rootId
     ) {
@@ -522,7 +523,8 @@ export async function enumerateSessionStorage(
           (entry) => entry.location.relativeStorageDirectory === relativeDirectory,
         )?.header;
         const knownRoot =
-          containingHeader?.schemaVersion === 3 && containingHeader.sessionKind === "primary"
+          (containingHeader?.schemaVersion === 3 || containingHeader?.schemaVersion === 4) &&
+          containingHeader.sessionKind === "primary"
             ? { rootSessionId: containingHeader.sessionId }
             : {};
         for (const memberId of await readNames(membersDirectory)) {
