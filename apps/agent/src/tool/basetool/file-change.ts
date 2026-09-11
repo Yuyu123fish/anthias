@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import {
   basename,
@@ -18,6 +18,7 @@ import {
   type ToolExecutionResult,
   type ToolFailedResult,
 } from "../tool-result.js";
+import { sharedWorkspaceAccess } from "../workspace-access.js";
 import {
   arePathsEqual,
   isPathSameOrInside,
@@ -25,7 +26,12 @@ import {
   type ToolWorkspace,
   validateWorkspaceRelativePath,
 } from "../workspace-path.js";
-import { decodeStrictUtf8, splitTextLines } from "./text-file.js";
+import {
+  decodeStrictUtf8,
+  type ExpectedFileVersion,
+  fileContentVersion,
+  splitTextLines,
+} from "./text-file.js";
 
 /** 枚举两个需要人工确认的文件副作用 Tool。 */
 type FileToolName = "edit_file" | "write_file";
@@ -42,6 +48,8 @@ type FileChangeCalculator = (
 /** 保存一个已经展示、仍未写入磁盘的准确文件变更。 */
 export type PreparedFileTool = Readonly<{
   toolName: FileToolName;
+  toolCallId: string;
+  expectedVersion: ExpectedFileVersion;
   target: string;
   preview: string;
   operation: "edit" | "create" | "overwrite";
@@ -96,10 +104,19 @@ export async function prepareFileChange(
   toolName: FileToolName,
   requestedPath: string,
   workspace: ToolWorkspace,
+  expectedVersion: ExpectedFileVersion,
+  toolCallId: string,
   calculateChange: FileChangeCalculator,
 ): Promise<PreparedFileResult> {
   try {
     const target = await resolveFileTarget(requestedPath, workspace);
+    const currentVersion =
+      target.fingerprint.kind === "missing" ? "missing" : "sha256:" + target.fingerprint.sha256;
+    if (currentVersion !== expectedVersion) {
+      return failedFilePreparation(
+        "stale version：文件与 expectedVersion 不符，请重新 read_file 后调整修改。",
+      );
+    }
     const calculatedChange = calculateChange(
       Object.freeze({ exists: target.exists, originalContent: target.originalContent }),
     );
@@ -131,6 +148,8 @@ export async function prepareFileChange(
       ok: true,
       preparedTool: Object.freeze({
         toolName,
+        toolCallId,
+        expectedVersion,
         target: target.displayPath,
         preview: previewResult.content,
         operation: calculatedChange.operation,
@@ -157,6 +176,34 @@ export async function executePreparedFileTool(
   if (abortSignal.aborted) {
     return failedToolResult("Run 已停止，文件未写入。");
   }
+  const workspace = preparedTool.workspace;
+  const workspaceAccess = workspace.workspaceAccess ?? sharedWorkspaceAccess;
+  let releaseWrite: (() => void) | undefined;
+  workspace.resourceState?.(preparedTool.toolCallId, "waiting");
+  try {
+    releaseWrite = await workspaceAccess.acquireFileWrite(
+      workspace.workspaceRoot,
+      preparedTool.absolutePath,
+      abortSignal,
+    );
+    workspace.resourceState?.(preparedTool.toolCallId, "acquired");
+    workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+    return await applyPreparedFileChange(preparedTool, abortSignal);
+  } catch (error) {
+    return failedToolResult(
+      abortSignal.aborted ? "Run 已停止，文件未写入。" : toSafeFileError(error),
+    );
+  } finally {
+    releaseWrite?.();
+    workspace.resourceState?.(preparedTool.toolCallId, "released");
+  }
+}
+
+/** 锁覆盖身份与版本复核到原子替换，批准等待与模型生成不占用写入资源。 */
+async function applyPreparedFileChange(
+  preparedTool: PreparedFileTool,
+  abortSignal: AbortSignal,
+): Promise<ToolExecutionResult> {
   const fingerprintMatches = await matchesPreparedTarget(preparedTool).catch(() => false);
   if (!fingerprintMatches) {
     return failedToolResult("stale target：目标在确认后发生变化，文件未写入。");
@@ -193,6 +240,8 @@ export async function executePreparedFileTool(
       temporaryFileCreated = false;
       return failedToolResult("stale target：目标在确认后发生变化，文件未写入。");
     }
+    preparedTool.workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+    if (abortSignal.aborted) return failedToolResult("Run 已停止，文件未写入。");
     await rename(temporaryFilePath, preparedTool.absolutePath);
     temporaryFileCreated = false;
     return Object.freeze({
@@ -201,10 +250,9 @@ export async function executePreparedFileTool(
       truncated: false,
     });
   } catch (error) {
-    if (temporaryFileCreated) {
-      await unlink(temporaryFilePath).catch(() => undefined);
-    }
     return failedToolResult(toSafeFileError(error));
+  } finally {
+    if (temporaryFileCreated) await unlink(temporaryFilePath).catch(() => undefined);
   }
 }
 
@@ -456,7 +504,7 @@ function fingerprintBytes(
 ): Extract<TargetFingerprint, { kind: "file" }> {
   return Object.freeze({
     kind: "file",
-    sha256: createHash("sha256").update(bytes).digest("hex"),
+    sha256: fileContentVersion(bytes).slice("sha256:".length),
     device: stats.dev,
     inode: stats.ino,
   });

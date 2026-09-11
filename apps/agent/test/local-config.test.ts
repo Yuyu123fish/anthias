@@ -38,7 +38,7 @@ describe("Anthias local configuration", () => {
     const workspaceRoot = join(anthiasRoot, "task-workspace");
     await mkdir(workspaceRoot);
     const configuration =
-      "ANTHIAS_MODEL_API_KEY='synthetic-root-key' # local\nANTHIAS_PERMISSION_MODE=plan\n";
+      "ANTHIAS_MODEL_API_KEY='synthetic-root-key' # local\nANTHIAS_PERMISSION_MODE=agent\n";
     await writeFile(join(anthiasRoot, ".env"), configuration);
     await writeFile(
       join(workspaceRoot, ".env"),
@@ -48,7 +48,7 @@ describe("Anthias local configuration", () => {
       const result = await loadLocalConfiguration({ anthiasRoot, environment: {} });
       expect(result).toMatchObject({
         ok: true,
-        permissionMode: "plan",
+        permissionMode: "agent",
         environment: { ANTHIAS_MODEL_API_KEY: "synthetic-root-key" },
       });
     }
@@ -66,7 +66,7 @@ describe("Anthias local configuration", () => {
       environment: {
         ANTHIAS_MODEL_API_KEY: "",
         SEARCHAPI_API_KEY: undefined,
-        ANTHIAS_PERMISSION_MODE: "plan",
+        ANTHIAS_PERMISSION_MODE: "agent",
       },
       permissionMode: "agent",
     });
@@ -79,9 +79,9 @@ describe("Anthias local configuration", () => {
     expect(
       await loadLocalConfiguration({
         anthiasRoot,
-        environment: { ANTHIAS_PERMISSION_MODE: "plan" },
+        environment: { ANTHIAS_PERMISSION_MODE: "agent" },
       }),
-    ).toMatchObject({ ok: true, permissionMode: "plan" });
+    ).toMatchObject({ ok: true, permissionMode: "agent" });
     expect(
       await loadLocalConfiguration({ anthiasRoot, environment: { ANTHIAS_PERMISSION_MODE: "" } }),
     ).toMatchObject({ ok: false, error: expect.stringContaining("ANTHIAS_PERMISSION_MODE") });
@@ -101,13 +101,13 @@ describe("Anthias local configuration", () => {
     expect(
       await loadLocalConfiguration({
         anthiasRoot,
-        environment: { ANTHIAS_PERMISSION_MODE: "plan" },
+        environment: { ANTHIAS_PERMISSION_MODE: "agent" },
       }),
-    ).toMatchObject({ ok: true, permissionMode: "plan" });
+    ).toMatchObject({ ok: true, permissionMode: "agent" });
     expect(
       await loadLocalConfiguration({
         anthiasRoot,
-        environment: { ANTHIAS_PERMISSION_MODE: "plan" },
+        environment: { ANTHIAS_PERMISSION_MODE: "agent" },
         permissionMode: "full_access",
       }),
     ).toMatchObject({ ok: true, permissionMode: "full_access" });

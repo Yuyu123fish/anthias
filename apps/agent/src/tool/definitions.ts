@@ -55,14 +55,16 @@ export const FIXED_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.fre
   BASE_TOOLS.map((tool) => tool.definition),
 );
 
-/** Plan 模式只向模型暴露工作区和当前 Session 产物只读 Tool。 */
+/** 工作区和当前 Session 产物的只读 Tool definitions。 */
 export const READ_ONLY_TOOL_DEFINITIONS: readonly ModelToolDefinition[] = Object.freeze(
   FIXED_TOOL_DEFINITIONS.filter((definition) => isReadOnlyToolName(definition.name)),
 );
 
 /** 按 Run 的权限快照返回不可变 Tool definitions。 */
-export function getToolDefinitions(permissionMode: PermissionMode): readonly ModelToolDefinition[] {
-  return permissionMode === "plan" ? READ_ONLY_TOOL_DEFINITIONS : FIXED_TOOL_DEFINITIONS;
+export function getToolDefinitions(
+  _permissionMode: PermissionMode,
+): readonly ModelToolDefinition[] {
+  return FIXED_TOOL_DEFINITIONS;
 }
 
 /** 判断名称是否属于无需人工确认的只读 Tool。 */

@@ -15,6 +15,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { promptToCompletion } from "./prompt-helper.js";
 
 const temporaryDirectories = new Set<string>();
@@ -35,19 +36,25 @@ describe("file Agent Tool Loop", () => {
       if (modelRequests.length === 1) {
         yield toolCallEvent(1, "edit_file", {
           path: "existing.txt",
+          expectedVersion: fixture.expectedVersion,
           replacements: [{ oldText: "alpha", newText: "beta" }],
         });
         yield finishEvent("tool_calls");
         return;
       }
       if (modelRequests.length === 2) {
-        yield toolCallEvent(2, "write_file", { path: "created.txt", content: "created\n" });
+        yield toolCallEvent(2, "write_file", {
+          path: "created.txt",
+          expectedVersion: "missing",
+          content: "created\n",
+        });
         yield finishEvent("tool_calls");
         return;
       }
       if (modelRequests.length === 3) {
         yield toolCallEvent(3, "write_file", {
           path: "existing.txt",
+          expectedVersion: fileContentVersion(Buffer.from("beta\n")),
           content: "overwritten\n",
         });
         yield finishEvent("tool_calls");
@@ -119,6 +126,7 @@ describe("file Agent Tool Loop", () => {
       if (modelRequestCount === 1) {
         yield toolCallEvent(10, "edit_file", {
           path: "existing.txt",
+          expectedVersion: fixture.expectedVersion,
           replacements: [{ oldText: "before", newText: "agent" }],
         });
         yield finishEvent("tool_calls");
@@ -150,7 +158,11 @@ describe("file Agent Tool Loop", () => {
     const modelStream: ModelStream = async function* () {
       modelRequestCount += 1;
       if (modelRequestCount === 1) {
-        yield toolCallEvent(20, "write_file", { path: "denied.txt", content: "no\n" });
+        yield toolCallEvent(20, "write_file", {
+          path: "denied.txt",
+          expectedVersion: "missing",
+          content: "no\n",
+        });
         yield finishEvent("tool_calls");
         return;
       }
@@ -184,6 +196,7 @@ describe("file Agent Tool Loop", () => {
     const modelStream: ModelStream = async function* () {
       yield toolCallEvent(30, "edit_file", {
         path: "existing.txt",
+        expectedVersion: fixture.expectedVersion,
         replacements: [{ oldText: "unchanged", newText: "changed" }],
       });
       yield finishEvent("tool_calls");
@@ -232,14 +245,17 @@ describe("file Agent Tool Loop", () => {
       if (modelRequestCount === 1) {
         yield toolCallEvent(40, "edit_file", {
           path: "existing.txt",
+          expectedVersion: fixture.expectedVersion,
           replacements: [{ oldText: "same", newText: "different" }],
         });
         yield toolCallEvent(41, "write_file", {
           path: "data/conversation/forbidden.txt",
+          expectedVersion: "missing",
           content: "forbidden",
         });
         yield toolCallEvent(42, "write_file", {
           path: "oversized.txt",
+          expectedVersion: "missing",
           content: "x".repeat(70 * 1024),
         });
         yield finishEvent("tool_calls");
@@ -280,6 +296,7 @@ async function createFileToolFixture(existingContent: string) {
   return Object.freeze({
     workspaceRoot,
     existingFilePath,
+    expectedVersion: fileContentVersion(Buffer.from(existingContent)),
     session,
     sessionDirectory,
     shell,

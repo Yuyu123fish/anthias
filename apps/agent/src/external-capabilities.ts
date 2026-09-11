@@ -24,6 +24,7 @@ export function createExternalCapabilities(options: {
   sources: ContextSources;
   skills: SkillLibrary | undefined;
   mcp: McpConnections | undefined;
+  writable?: boolean;
 }) {
   const activeSources = options.sources.active;
   const skillDiagnostics = new Map<string, string>();
@@ -194,6 +195,7 @@ export function createExternalCapabilities(options: {
       tools: options.mcp?.tools() ?? [],
       reservedDefinitions: extraTools,
       permissionMode,
+      writable: options.writable !== false,
     });
     lastPreparedMcpDiagnostics = mcpSnapshot.omittedToolCount
       ? [`${mcpSnapshot.omittedToolCount} 个工具定义超出当前请求预算，未提供给模型。`]
@@ -246,7 +248,7 @@ export function createExternalCapabilities(options: {
 
   function createExternalToolPlan(
     call: AssistantToolCallPart,
-    permissionMode: PermissionMode,
+    _permissionMode: PermissionMode,
     mcpSnapshot: McpToolSnapshot,
   ): ToolCallPlan {
     const managed = ["load_skill", "read_skill", "read_mcp_resource"].includes(call.toolName);
@@ -270,8 +272,8 @@ export function createExternalCapabilities(options: {
       )
         return rejected("外部 Tool 参数不符合 Schema。");
     }
-    if (mcpTool && permissionMode === "plan")
-      return rejected("Plan 模式不允许执行未知副作用的 MCP Tool。", true);
+    if (mcpTool && options.writable === false)
+      return rejected("只读成员不允许执行未知副作用的 MCP Tool。", true);
     if (mcpTool && !snapshotTool?.visible) return rejected("MCP Tool 定义未进入当前请求预算。");
     if (mcpTool) {
       const validation = options.mcp?.validateToolCall(mcpTool.name, input, mcpTool.generation);
@@ -398,14 +400,14 @@ export function createExternalCapabilities(options: {
   /** 只补充未提供给模型的 MCP 拒绝原因，绝不把当前连接集合变成执行后门。 */
   function rejectUnavailableTool(
     call: AssistantToolCallPart,
-    permissionMode: PermissionMode,
+    _permissionMode: PermissionMode,
     mcpSnapshot?: McpToolSnapshot,
   ): ToolCallPlan | null {
     const snapshotTool = resolveMcpTool(mcpSnapshot, call.toolName);
     if (!snapshotTool) return null;
     if (call.invalid || !isRecord(call.input)) return rejected("外部 Tool 输入必须是有效对象。");
-    if (permissionMode === "plan")
-      return rejected("Plan 模式不允许执行未知副作用的 MCP Tool。", true);
+    if (options.writable === false)
+      return rejected("只读成员不允许执行未知副作用的 MCP Tool。", true);
     return snapshotTool.visible ? null : rejected("MCP Tool 定义未进入当前请求预算。");
   }
 

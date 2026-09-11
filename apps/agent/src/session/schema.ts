@@ -152,7 +152,7 @@ export type SessionUseDetails = Readonly<{
 
 /** 根 Session 保存的成员、任务、交付与 Git 协调事实。 */
 export type CoordinationDetails = Readonly<{
-  kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation";
+  kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation" | "user_request";
   key: string;
   payload: JsonValue;
 }>;
@@ -1144,9 +1144,28 @@ function validateFactReferences(
     }
   }
 }
+/** 只有真实用户消息及交互入口记录的明确派工可以成为新动作授权；成员内容不能提升来源。 */
+export function userAuthorizationText(record: SessionRecord): string | null {
+  if (
+    record.type === "message" &&
+    record.message.role === "user" &&
+    record.message.source?.kind !== "agent"
+  )
+    return record.message.content;
+  if (
+    record.type !== "coordination" ||
+    record.kind !== "user_request" ||
+    !isPlainObject(record.payload)
+  )
+    return null;
+  return record.payload.source === "user" && typeof record.payload.content === "string"
+    ? record.payload.content
+    : null;
+}
+
 function isTrustedAuthorizationSource(record: SessionRecord): boolean {
   return (
-    (record.type === "message" && record.message.role === "user") ||
+    userAuthorizationText(record) !== null ||
     (record.type === "approval_decision" &&
       record.decisionSource === "user" &&
       record.decision === "allowed")
@@ -1527,7 +1546,8 @@ function isCoordinationKind(value: unknown): value is CoordinationDetails["kind"
     value === "task" ||
     value === "delivery" ||
     value === "worktree" ||
-    value === "git_operation"
+    value === "git_operation" ||
+    value === "user_request"
   );
 }
 

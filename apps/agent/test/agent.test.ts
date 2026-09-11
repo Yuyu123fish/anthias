@@ -119,7 +119,7 @@ describe("Agent", () => {
     await expect(promptResult).resolves.toEqual({ status: "aborted" });
     expect(events.at(-1)).toMatchObject({ type: "run_end", result: { status: "aborted" } });
     expect(agent.state.running).toBe(false);
-    expect(agent.setPermissionMode("plan")).toEqual({ status: "rejected", reason: "closed" });
+    expect(agent.setPermissionMode("auto_allow")).toEqual({ status: "rejected", reason: "closed" });
   });
 
   it("normalizes visible reasoning spans without changing the durable AssistantMessage", async () => {
@@ -289,7 +289,12 @@ describe("Agent", () => {
     expect(promptResult).toEqual({ status: "completed" });
     expect(agent.state).toMatchObject({
       operation: null,
-      collaboration: { rootSessionId: agent.state.sessionId, members: [], team: null, tasks: [] },
+      collaboration: {
+        rootSessionId: agent.state.sessionId,
+        members: [],
+        team: { id: agent.state.sessionId, name: "协作群组" },
+        tasks: [],
+      },
       messageHistory: [
         { role: "user", content: "你好" },
         {

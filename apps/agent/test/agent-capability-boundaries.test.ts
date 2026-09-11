@@ -242,7 +242,7 @@ describe("Agent capability failure boundaries", () => {
     expect(agent.state.messageHistory).toEqual(messageHistory);
   });
 
-  it("denies a forced MCP tool in Plan mode without invoking it or asking for approval", async () => {
+  it("denies a forced MCP tool for a read-only agent without invoking it or asking for approval", async () => {
     const { session } = await setupSession();
     let called = 0;
     let approvals = 0;
@@ -292,7 +292,8 @@ describe("Agent capability failure boundaries", () => {
       createAgentWithModelStream({
         session,
         mcp,
-        permissionMode: "plan",
+        permissionMode: "full_access",
+        writable: false,
         modelStream: async function* (request) {
           modelRequests += 1;
           expect(request.tools.some((definition) => definition.name === tool.name)).toBe(false);

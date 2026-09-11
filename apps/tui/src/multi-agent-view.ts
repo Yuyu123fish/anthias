@@ -8,15 +8,27 @@ import type {
 import type { CommandResult } from "./command-result.js";
 import { sanitizeTerminalText } from "./content-renderer.js";
 
+const phaseNames: Record<string, string> = {
+  requesting_model: "请求模型",
+  retrying_model: "等待模型重试",
+  compacting: "压缩上下文",
+  reviewing_tool: "自动审核",
+  awaiting_tool_approval: "等待批准",
+  awaiting_workspace: "等待工作区资源",
+  executing_tool: "执行工具",
+};
 const statusNames: Record<MemberSummary["status"], string> = {
   preparing: "准备中",
+  queued: "等待执行位置",
+  paused: "已暂停",
+  closing: "关闭中",
   running: "运行中",
   idle: "空闲",
   completed: "完成",
   failed: "失败",
   aborted: "已停止",
   interrupted: "已中断",
-  closed: "已释放",
+  closed: "已关闭",
 };
 export function memberStatusName(status: MemberSummary["status"]): string {
   return statusNames[status];
@@ -28,21 +40,18 @@ export function formatCollaboration(
   const lines = [
     "主 Agent · 根 Session：" + (snapshot.rootSessionId ?? fallbackRootSessionId ?? "归属信息缺失"),
     ...(snapshot.notice ? [snapshot.notice] : []),
-    snapshot.team
-      ? "Team · " +
-        snapshot.team.name +
-        " · " +
-        (snapshot.team.status === "active" ? "活动" : "已结束")
-      : "当前没有 Team。",
+    "协作群组 · " +
+      (snapshot.members.length ? snapshot.members.length + " 名成员" : "尚未创建成员"),
     ...snapshot.members.map((member) =>
       [
-        (member.name.trim() || member.sessionId) +
-          " · " +
-          member.kind +
-          " · " +
-          memberStatusName(member.status),
+        (member.name.trim() || member.sessionId) + " · " + memberStatusName(member.status),
         "  " + member.sessionId,
         "  Workspace: " + member.workspaceRoot,
+        "  能力: " + (member.writable ? "可写" : "只读"),
+        member.phase ? "  阶段: " + (phaseNames[member.phase] ?? member.phase) : "",
+        member.pausedBy ? "  暂停来源: " + (member.pausedBy === "user" ? "用户" : "根 Agent") : "",
+        member.lastActivityAt ? "  最近活动: " + member.lastActivityAt : "",
+        member.workspaceNotice ? "  工作区说明: " + member.workspaceNotice : "",
         "  任务: " + (member.task.trim() || "任务信息缺失"),
         member.result?.trim() ? "  结果: " + member.result : "  尚无结果摘要。",
         member.error ? "  原因: " + member.error : "",
@@ -72,7 +81,21 @@ export function collaborationStatus(snapshot: CollaborationSnapshot | undefined)
   const active = snapshot.members.filter(
     (member) => member.status === "running" || member.status === "preparing",
   ).length;
-  return " · 成员 " + active + " 运行 / " + snapshot.members.length + " 总计 · /agents";
+  const waiting = snapshot.members.filter(
+    (member) =>
+      member.status === "queued" ||
+      member.phase === "awaiting_tool_approval" ||
+      member.phase === "awaiting_workspace",
+  ).length;
+  return (
+    " · 成员 " +
+    active +
+    " 运行 / " +
+    snapshot.members.length +
+    " 总计" +
+    (waiting ? " · " + waiting + " 等待" : "") +
+    " · /agents"
+  );
 }
 
 /** 命令只构造 Agent 语义操作；权限、成员身份和目录归属由 Agent 复核。 */
@@ -124,7 +147,7 @@ export async function runCollaborationCommand(
       return { kind: "rejected" };
     }
   }
-  if (name === "agents" || (name === "team" && (!operation || operation === "tasks"))) {
+  if (name === "agents" || (name === "agent" && operation === "tasks")) {
     if (name === "agents" && tokens.length) {
       notice("用法：/agents");
       return { kind: "rejected" };
@@ -175,15 +198,26 @@ export async function runCollaborationCommand(
       notice(result.ok ? renderResult(result.value) : result.error);
       return { kind: result.ok ? "handled" : "rejected" };
     }
-    if ((name === "agent" && operation === "spawn") || (name === "team" && operation === "add")) {
-      const writable = tokens[1] === "--write";
-      const task = after(writable ? 2 : 1);
+    if (name === "agent" && operation === "spawn") {
+      let writable = true;
+      let worktreeId: string | undefined;
+      let index = 1;
+      while (tokens[index]?.startsWith("--")) {
+        const flag = tokens[index++];
+        if (flag === "--read-only") writable = false;
+        else if (flag === "--write") writable = true;
+        else if (flag === "--worktree" && tokens[index] && !tokens[index]?.startsWith("--"))
+          worktreeId = tokens[index++];
+        else throw new Error("成员选项只支持 --read-only 和 --worktree <id>。");
+      }
+      const task = after(index);
       if (!task) throw new Error("请给出成员任务。");
       return await dispatch({
-        action: name === "agent" ? "spawn" : "team_add",
+        action: "spawn",
         task,
         writable,
         name: task.slice(0, 32),
+        ...(worktreeId ? { worktreeId } : {}),
       });
     } else if (name === "agent" && operation === "result" && tokens[1] && tokens.length <= 3) {
       const offset = tokens[2] === undefined ? undefined : Number(tokens[2]);
@@ -218,7 +252,7 @@ export async function runCollaborationCommand(
         memberId: tokens[1],
         release: operation === "release",
       });
-    } else if (name === "agent" && operation === "wait" && tokens[1] && tokens.length <= 4) {
+    } else if (name === "agent" && operation === "wait" && tokens[1] && tokens.length <= 10) {
       return await dispatch({ action: "wait", memberIds: tokens.slice(1) });
     } else if (name === "agent" && operation === "resume" && tokens[1]) {
       return await dispatch({
@@ -226,15 +260,48 @@ export async function runCollaborationCommand(
         memberId: tokens[1],
         ...(after(2) ? { task: after(2) } : {}),
       });
-    } else if (name === "team" && operation === "create" && after(1)) {
-      return await dispatch({ action: "team_create", name: after(1) });
-    } else if (name === "team" && operation === "close" && tokens.length === 1) {
-      return await dispatch({ action: "team_close" });
-    } else if (name === "team" && operation === "assign" && tokens[1] && after(2)) {
+    } else if (name === "agent" && operation === "reopen" && tokens[1] && tokens.length === 2) {
+      return await dispatch({ action: "reopen", memberId: tokens[1] });
+    } else if (name === "agent" && operation === "assign" && tokens[1] && after(2)) {
       return await dispatch({ action: "task_assign", memberId: tokens[1], task: after(2) });
-    } else if (name === "team" && operation === "message" && tokens[1] && after(2)) {
+    } else if (
+      name === "agent" &&
+      operation === "update" &&
+      tokens[1] &&
+      (tokens[2] === "completed" || tokens[2] === "blocked") &&
+      after(3)
+    ) {
+      return await dispatch({
+        action: "task_update",
+        taskId: tokens[1],
+        status: tokens[2],
+        result: after(3),
+      });
+    } else if (name === "agent" && operation === "message" && tokens[1] && after(2)) {
       return await dispatch({ action: "message", memberId: tokens[1], content: after(2) });
-    } else throw new Error("使用 /help 查看成员和 Team 命令。");
+    } else if (name === "agent" && operation === "workspace" && tokens[1] && tokens.length <= 3) {
+      return await dispatch({
+        action: "workspace_bind",
+        memberId: tokens[1],
+        ...(tokens[2] && tokens[2] !== "root" ? { worktreeId: tokens[2] } : {}),
+      });
+    } else if (name === "agent" && operation === "group" && tokens.length === 2) {
+      if (tokens[1] === "stop") return await dispatch({ action: "group_stop" });
+      if (tokens[1] === "continue") return await dispatch({ action: "group_continue" });
+      throw new Error("用法：/agent group stop|continue");
+    } else if (name === "agent" && operation === "notes") {
+      if (tokens.length === 1 || (tokens[1] === "read" && tokens.length === 2))
+        return await dispatch({ action: "notes_read" });
+      if (tokens[1] === "append" && after(2))
+        return await dispatch({ action: "notes_append", content: after(2) });
+      if (tokens[1] === "replace" && tokens[2])
+        return await dispatch({
+          action: "notes_replace",
+          expectedVersion: tokens[2],
+          content: after(3),
+        });
+      throw new Error("用法：/agent notes [read|append <正文>|replace <版本> <正文>]");
+    } else throw new Error("使用 /help 查看成员与群组命令。");
   } catch (error) {
     notice(error instanceof Error ? error.message : "命令参数无效。");
     return { kind: "rejected" };
@@ -253,7 +320,7 @@ function resultOwnerTitle(owner: ResultOwner): string {
   return [
     "根 Session：" + owner.rootSessionId,
     "成员 " + (member?.name.trim() || owner.memberId) + " [" + owner.memberId + "]",
-    "种类：" + (member?.kind ?? "身份信息缺失"),
+    "角色：普通成员",
     "状态：" + (member ? memberStatusName(member.status) : "状态信息缺失"),
     "任务：" + (member?.task.trim() || "任务信息缺失"),
     ...(owner.artifactId ? ["产物：" + owner.artifactId] : []),

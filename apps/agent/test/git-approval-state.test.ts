@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import type { JsonValue } from "../src/message.js";
 import { createGitWorkspace } from "../src/tool/basetool/git/index.js";
+import { createGitTools } from "../src/tool/basetool/git/tool.js";
+import { createWorkspaceAccess } from "../src/tool/workspace-access.js";
 
 const execFileAsync = promisify(execFile);
 const fixtureRoots = new Set<string>();
@@ -27,6 +29,71 @@ afterEach(async () => {
 });
 
 describe("Git approval state", { timeout: 60_000 }, () => {
+  it("rechecks an approved commit after a queued file writer finishes", async () => {
+    const fixture = await createFixture();
+    const path = join(fixture.repositoryRoot, "base.txt");
+    await writeFile(path, "approved change\n");
+    const resourceStates: string[] = [];
+    const tool = createGitTools({
+      git: fixture.workspace,
+      primary: true,
+      assertIdle: () => {},
+      resourceState: (_id, state) => resourceStates.push(state),
+    }).tools("agent")[0];
+    if (tool === undefined) throw new Error("missing Git tool");
+    const prepared = await tool
+      .createPlan(
+        {
+          type: "tool_call",
+          toolCallId: "queued-commit",
+          toolName: "git",
+          input: { action: "commit", paths: ["base.txt"], message: "approved" },
+          invalid: false,
+        },
+        "agent",
+      )
+      .prepare();
+    if (!prepared.ok) throw new Error(prepared.result.content);
+    const releaseWriter = await fixture.workspaceAccess.acquireFileWrite(
+      fixture.repositoryRoot,
+      path,
+    );
+    const resultPromise = prepared.preparedExecution.execute(
+      new AbortController().signal,
+      () => {},
+    );
+    await writeFile(path, "changed by the preceding writer\n");
+    expect(resourceStates).toEqual(["waiting"]);
+    releaseWriter();
+    expect(await resultPromise).toMatchObject({
+      status: "failed",
+      content: expect.stringContaining("Git 状态已经变化"),
+    });
+    expect(resourceStates).toEqual(["waiting", "acquired", "released"]);
+    expect((await git(fixture.repositoryRoot, "log", "-1", "--format=%s")).trim()).toBe("base");
+    expect((await git(fixture.repositoryRoot, "diff", "--cached", "--name-only")).trim()).toBe("");
+  });
+
+  it("cancels a queued Git mutation without holding or changing the workspace", async () => {
+    const fixture = await createFixture();
+    const path = join(fixture.repositoryRoot, "base.txt");
+    await writeFile(path, "uncommitted\n");
+    const releaseWriter = await fixture.workspaceAccess.acquireFileWrite(
+      fixture.repositoryRoot,
+      path,
+    );
+    const controller = new AbortController();
+    const resultPromise = fixture.workspace.commit(
+      { paths: ["base.txt"], message: "never" },
+      controller.signal,
+    );
+    controller.abort();
+    await expect(resultPromise).rejects.toThrow();
+    releaseWriter();
+    expect((await git(fixture.repositoryRoot, "log", "-1", "--format=%s")).trim()).toBe("base");
+    expect((await git(fixture.repositoryRoot, "diff", "--cached", "--name-only")).trim()).toBe("");
+  });
+
   it("changes when an untracked file keeps its status but changes content", async () => {
     const fixture = await createFixture();
     await writeFile(join(fixture.repositoryRoot, "untracked.txt"), "first-value\n");
@@ -74,7 +141,9 @@ async function createFixture(largeContent?: string) {
   await git(repositoryRoot, "add", ".");
   await git(repositoryRoot, "commit", "-m", "base");
   const records: { kind: string; key: string; payload: JsonValue }[] = [];
+  const workspaceAccess = createWorkspaceAccess();
   const workspace = createGitWorkspace({
+    workspaceAccess,
     workspaceRoot: repositoryRoot,
     worktreeDirectory: join(fixtureRoot, "worktrees"),
     rootSessionId: "root-session",
@@ -83,7 +152,7 @@ async function createFixture(largeContent?: string) {
       records.push(record);
     },
   });
-  return { repositoryRoot, workspace };
+  return { repositoryRoot, workspace, workspaceAccess };
 }
 
 async function git(cwd: string, ...arguments_: string[]): Promise<string> {

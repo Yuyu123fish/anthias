@@ -17,6 +17,7 @@ export type CreateToolRunnerOptions = Readonly<{
   workspace: ToolWorkspace;
   shell: SessionShell;
   artifactStore?: SessionArtifactStore;
+  writable?: boolean;
 }>;
 
 /** 隐藏 Tool 分派细节，只向 Agent Loop 提供统一计划入口。 */
@@ -109,22 +110,23 @@ export type BaseTool = Readonly<{
 /** 每次请求选取同一组工具；Full Access 的路径能力仍由调用时的权限决定。 */
 export function createBaseTools(
   options: CreateToolRunnerOptions,
-  mode: PermissionMode,
+  _mode: PermissionMode,
 ): readonly AgentTool[] {
   return Object.freeze(
-    BASE_TOOLS.filter((tool) => mode !== "plan" || isReadOnlyToolName(tool.definition.name)).map(
-      (tool) =>
-        Object.freeze({
-          definition: tool.definition,
-          createPlan: (toolCall: AssistantToolCallPart, permissionMode: PermissionMode) =>
-            tool.createPlan(toolCall, permissionMode, {
-              ...options,
-              workspace: {
-                ...options.workspace,
-                allowExternalPaths: permissionMode === "full_access",
-              },
-            }),
-        }),
+    BASE_TOOLS.filter(
+      (tool) => options.writable !== false || isReadOnlyToolName(tool.definition.name),
+    ).map((tool) =>
+      Object.freeze({
+        definition: tool.definition,
+        createPlan: (toolCall: AssistantToolCallPart, permissionMode: PermissionMode) =>
+          tool.createPlan(toolCall, permissionMode, {
+            ...options,
+            workspace: {
+              ...options.workspace,
+              allowExternalPaths: permissionMode === "full_access",
+            },
+          }),
+      }),
     ),
   );
 }
@@ -159,15 +161,9 @@ export function createToolRunner(options: CreateToolRunnerOptions): ToolRunner {
 /** 隐藏的副作用工具仍先校验参数再拒绝；复用同一计划入口，不能另开执行路径。 */
 export function rejectUnavailableBaseTool(
   toolCall: AssistantToolCallPart,
-  permissionMode: PermissionMode,
+  _permissionMode: PermissionMode,
   options: CreateToolRunnerOptions,
 ): ToolCallPlan | null {
-  if (permissionMode !== "plan" || !isSideEffectToolName(toolCall.toolName)) return null;
-  return (
-    BASE_TOOLS.find((tool) => tool.definition.name === toolCall.toolName)?.createPlan(
-      toolCall,
-      permissionMode,
-      options,
-    ) ?? null
-  );
+  if (options.writable !== false || !isSideEffectToolName(toolCall.toolName)) return null;
+  return createRejectedToolCallPlan("当前成员只能读取工作区。");
 }

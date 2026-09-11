@@ -16,6 +16,7 @@ import {
   SESSION_ARTIFACT_BYTE_LIMIT,
   type SessionArtifactStore,
 } from "../src/tool/artifacts.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { finalizeToolResult } from "../src/tool/tool-result.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
 
@@ -32,13 +33,15 @@ afterEach(async () => {
 });
 
 describe("Session Tool artifacts", () => {
-  it("allows read_artifact in Plan mode without changing write permissions", () => {
-    expect(decideToolPolicy({ permissionMode: "plan", toolName: "read_artifact" }).kind).toBe(
-      "allow",
-    );
-    expect(decideToolPolicy({ permissionMode: "plan", toolName: "execute_command" }).kind).toBe(
-      "deny",
-    );
+  it("allows read_artifact for a read-only member without changing write permissions", () => {
+    expect(
+      decideToolPolicy({ permissionMode: "agent", writable: false, toolName: "read_artifact" })
+        .kind,
+    ).toBe("allow");
+    expect(
+      decideToolPolicy({ permissionMode: "agent", writable: false, toolName: "execute_command" })
+        .kind,
+    ).toBe("deny");
   });
 
   it("keeps incomplete-source evidence visible for short results without an artifact", async () => {
@@ -277,7 +280,7 @@ describe("Session Tool artifacts", () => {
       invalid: false,
     });
 
-    const preparation = await toolRunner.createPlan(toolCall, "plan").prepare();
+    const preparation = await toolRunner.createPlan(toolCall, "agent").prepare();
     if (!preparation.ok) {
       throw new Error("expected read_file preparation to succeed");
     }
@@ -352,7 +355,7 @@ describe("Session Tool artifacts", () => {
       input: { path: "page.txt", startLine: 2, lineCount: 4 },
       invalid: false,
     });
-    const preparation = await toolRunner.createPlan(toolCall, "plan").prepare();
+    const preparation = await toolRunner.createPlan(toolCall, "agent").prepare();
     if (!preparation.ok) {
       throw new Error("expected ranged read_file preparation to succeed");
     }
@@ -362,6 +365,7 @@ describe("Session Tool artifacts", () => {
     );
     const expectedPageText = [
       "path: page.txt",
+      "version: " + fileContentVersion(Buffer.from(sourceText)),
       "lines: 2-5 of 6",
       "nextStartLine: 6",
       "---",
@@ -416,7 +420,7 @@ describe("Session Tool artifacts", () => {
       input: { path: "long-line.txt", startLine: 1, lineCount: 1 },
       invalid: false,
     });
-    const preparation = await toolRunner.createPlan(toolCall, "plan").prepare();
+    const preparation = await toolRunner.createPlan(toolCall, "agent").prepare();
     if (!preparation.ok) {
       throw new Error("expected long-line read_file preparation to succeed");
     }
@@ -445,9 +449,9 @@ describe("Session Tool artifacts", () => {
       });
       expect(page.status).toBe("completed");
       expect(page.content).not.toContain("�");
-      const storedLineSegment = page.content.split("\n").find((line) => line.startsWith("5| "));
+      const storedLineSegment = page.content.split("\n").find((line) => line.startsWith("6| "));
       if (storedLineSegment !== undefined) {
-        let segment = storedLineSegment.slice("5| ".length);
+        let segment = storedLineSegment.slice("6| ".length);
         if (reconstructedLine.length === 0) {
           expect(segment.startsWith("1| ")).toBe(true);
           segment = segment.slice("1| ".length);
@@ -516,7 +520,7 @@ describe("Session Tool artifacts", () => {
         modelStream,
         systemPrompt: "",
         toolDefinitions: [],
-        permissionMode: "plan",
+        permissionMode: "agent",
         toolRunner,
         abortController: new AbortController(),
         emit: async () => {},

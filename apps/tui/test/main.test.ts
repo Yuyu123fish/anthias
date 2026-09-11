@@ -139,21 +139,21 @@ describe("Anthias CLI", () => {
         "ANTHIAS_PERMISSION_MODE=invalid-workspace-mode\n",
       );
       const environment = createTestProcessEnvironment();
-      const fromFile = spawnCli([], environment, workspaceRoot, "/mode plan\n/exit\n");
+      const fromFile = spawnCli([], environment, workspaceRoot, "/mode agent\n/exit\n");
       expect(fromFile.status).toBe(0);
       expect(fromFile.stdout).toContain("Mode: AutoAllow\n");
       expect(fromFile.stderr).toBe("");
       const fromProcess = spawnCli(
         [],
-        { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+        { ...environment, ANTHIAS_PERMISSION_MODE: "full_access" },
         workspaceRoot,
         "/exit\n",
       );
       expect(fromProcess.status).toBe(0);
-      expect(fromProcess.stdout).toContain("Mode: Plan\n");
+      expect(fromProcess.stdout).toContain("Mode: FullAccess\n");
       const fromCli = spawnCli(
         ["--mode", "agent"],
-        { ...environment, ANTHIAS_PERMISSION_MODE: "plan" },
+        { ...environment, ANTHIAS_PERMISSION_MODE: "full_access" },
         workspaceRoot,
         "/exit\n",
       );
@@ -337,7 +337,7 @@ describe("Anthias CLI", () => {
   });
 
   it(
-    "accepts Plan, AutoAllow and FullAccess modes and rejects an unknown mode before startup",
+    "accepts current modes and rejects retired Plan or unknown modes before startup",
     async () => {
       const workspaceRoot = await createTemporaryDirectory("anthias-cli-mode-");
       const sessionDirectory = join(workspaceRoot, "sessions");
@@ -353,8 +353,8 @@ describe("Anthias CLI", () => {
       };
 
       const planResult = spawnCli(["--mode", "plan"], environment, workspaceRoot, "/exit\n");
-      expect(planResult.status).toBe(0);
-      expect(planResult.stdout).toContain("Mode: Plan\n");
+      expect(planResult.status).toBe(1);
+      expect(planResult.stderr).toContain("--mode <agent|auto_allow|full_access>");
 
       const autoResult = spawnCli(["--mode", "auto_allow"], environment, workspaceRoot, "/exit\n");
       expect(autoResult.status).toBe(0);
@@ -365,7 +365,7 @@ describe("Anthias CLI", () => {
       expect(fullResult.stdout).toContain("访问能力不等于任务授权");
       const invalidResult = spawnCli(["--mode", "unsafe"], environment, workspaceRoot);
       expect(invalidResult.status).toBe(1);
-      expect(invalidResult.stderr).toContain("--mode <agent|plan|auto_allow|full_access>");
+      expect(invalidResult.stderr).toContain("--mode <agent|auto_allow|full_access>");
     },
     4 * cliProcessTimeoutMs,
   );

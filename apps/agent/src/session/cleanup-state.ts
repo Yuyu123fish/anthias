@@ -469,6 +469,7 @@ export async function isSafeSessionContents(
     if (entry.isFile()) {
       if (
         entry.name !== "session.jsonl" &&
+        !(allowMembers && entry.name === "shared-notes.md") &&
         entry.name !== "session.publish.tmp" &&
         entry.name !== "session.index.json" &&
         !(

@@ -71,12 +71,18 @@ describe("read-only Agent Tool Loop", () => {
 
     expect(modelRequests).toHaveLength(4);
     expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "agent_group",
       "agent_list",
+      "agent_message",
+      "agent_notes",
+      "agent_reopen",
       "agent_result",
       "agent_resume",
       "agent_spawn",
       "agent_stop",
+      "agent_task",
       "agent_wait",
+      "agent_workspace",
       "edit_file",
       "execute_command",
       "git",
@@ -85,7 +91,6 @@ describe("read-only Agent Tool Loop", () => {
       "memory",
       "read_artifact",
       "read_file",
-      "team",
       "write_file",
     ]);
     expect(JSON.stringify(modelRequests[0]?.messages)).toContain(

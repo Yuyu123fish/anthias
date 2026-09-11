@@ -18,7 +18,7 @@
 - 执行分叉已退出核心产品路线；Git worktree 等隔离机制按具体任务需要选择。为验证任务编写脚本不构成 Agent 自我进化的产品授权。
 - Java/JVM/Maven/JLine 路线，以及旧的 Electron Desktop、独立 Host、JSON-RPC 和 Feature 001 实现均已撤销。
 - Feature 001–003 已累计形成 Agent Loop、线性 Session、六个固定 Tool、权限与安全策略和只读有界并发；Feature 003 已由开发者验收。Feature 005 已于 2026-09-05 验收，补齐上下文压缩、产物与会话清理、AutoAllow，并完成其 Report 所列的限量 DeepSeek V4 Flash 冒烟；后续真实 Provider 验证继续单独授权，当前没有 OS 沙箱。
-- Feature 007 已实现，待开发者验收；涉及成员权限、Git 成果交付或协作历史恢复时读取 [Spec](specs/feature007-multi-agent/spec.md) 与 [Report](specs/feature007-multi-agent/report.md)。
+- 当前协作合同以 Feature 014 为准：统一持续成员，默认共享根工作区，含根最多十个执行并发，工作树由根显式选择；成员只读能力独立于三种权限模式。涉及邮箱、共享笔记、成员控制、并发写入、Git 或恢复时读取 [Spec](specs/feature014-unified-multi-agent/spec.md) 与 [Report](specs/feature014-unified-multi-agent/report.md)，状态以 Report 为准。
 - 当前优先补齐 Coding Agent 剩余基本功能；工程验证方向已确认，留待后续 Feature，不提前建设专用验证框架、数据平台或证据存储接口。下一项基础功能按当前代码与实际使用缺口单独确认。
 
 ## 代码与运行时

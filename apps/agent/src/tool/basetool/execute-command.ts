@@ -14,7 +14,6 @@ import {
 } from "../input-validation.js";
 import {
   createApprovalPlan,
-  createPolicyDeniedPlan,
   createRejectedToolCallPlan,
   createToolActivitySummary,
   failedExecution,
@@ -26,6 +25,7 @@ import {
   type ToolFailedResult,
 } from "../tool-result.js";
 import type { BaseTool, CreateToolRunnerOptions, ToolCallPlan } from "../tool-runner.js";
+import { sharedWorkspaceAccess } from "../workspace-access.js";
 import {
   arePathsEqual,
   resolveExistingWorkspacePath,
@@ -57,10 +57,7 @@ export const executeCommandTool: BaseTool = Object.freeze({
   createPlan(toolCall, permissionMode, options) {
     const validationError = validateCommandToolCallInput(toolCall);
     if (validationError !== null) return createRejectedToolCallPlan(validationError);
-    if (permissionMode === "plan")
-      return createPolicyDeniedPlan(
-        decideToolPolicy({ permissionMode, toolName: "execute_command" }),
-      );
+    if (options.writable === false) return createRejectedToolCallPlan("当前成员只能读取工作区。");
     return createCommandToolCallPlan(toolCall, permissionMode, options);
   },
 });
@@ -68,6 +65,8 @@ export const executeCommandTool: BaseTool = Object.freeze({
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
   toolName: "execute_command";
+  toolCallId: string;
+  workspace: ToolWorkspace;
   target: string;
   preview: string;
   command: string;
@@ -148,6 +147,8 @@ export async function prepareCommandTool(
       ok: true,
       preparedTool: Object.freeze({
         toolName: "execute_command",
+        toolCallId: toolCall.toolCallId,
+        workspace,
         target,
         preview: previewResult.content,
         command: inputResult.input.command,
@@ -172,6 +173,44 @@ export async function executePreparedCommand(
     return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
   }
 
+  const workspace = preparedTool.workspace;
+  const workspaceAccess = workspace.workspaceAccess ?? sharedWorkspaceAccess;
+  let releaseWrite: (() => void) | undefined;
+  let retainWriteLease = false;
+  workspace.resourceState?.(preparedTool.toolCallId, "waiting");
+  try {
+    releaseWrite = await workspaceAccess.acquireExclusiveWrite(
+      [workspace.workspaceRoot, preparedTool.cwd],
+      abortSignal,
+    );
+    workspace.resourceState?.(preparedTool.toolCallId, "acquired");
+    workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+    const result = await executeCommandWithWriteAccess(preparedTool, abortSignal, publishUpdate);
+    // 进程树清理不明时保留独占权，不能让后续写入与可能仍存活的命令竞争。
+    retainWriteLease = result.cleanupUncertain;
+    return result;
+  } catch (error) {
+    return abortSignal.aborted
+      ? createCommandResult("aborted", null, 0, createCommandOutputCollector(), false)
+      : {
+          status: "failed",
+          content: toSafeCommandError(error),
+          truncated: false,
+          cleanupUncertain: false,
+        };
+  } finally {
+    if (!retainWriteLease) {
+      releaseWrite?.();
+      workspace.resourceState?.(preparedTool.toolCallId, "released");
+    }
+  }
+}
+
+async function executeCommandWithWriteAccess(
+  preparedTool: PreparedCommandTool,
+  abortSignal: AbortSignal,
+  publishUpdate: (update: CommandExecutionUpdate) => void,
+): Promise<CommandExecutionResult> {
   // 批准只绑定准备时的真实目录；同路径目录被替换或转成链接后不得复用旧批准。
   let cwdUnchanged = false;
   try {
@@ -197,6 +236,10 @@ export async function executePreparedCommand(
     });
   }
 
+  preparedTool.workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+  if (abortSignal.aborted) {
+    return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
+  }
   const startedAtMilliseconds = Date.now();
   const outputCollector = createCommandOutputCollector();
   const outputCapture = createCommandOutputCapture();

@@ -450,9 +450,7 @@ export function createConversationPresentation(options: {
           : member.expanded
             ? "v"
             : ">";
-        const heading = theme.lagoon(
-          `${marker} ${sanitizeTerminalText(source)} · ${summary?.kind ?? "身份信息缺失"} · ${status}`,
-        );
+        const heading = theme.lagoon(`${marker} ${sanitizeTerminalText(source)} · ${status}`);
         const headingLines = wrapTextWithAnsi(heading, Math.max(1, width - 2));
         const lines = ["", ...headingLines.map((line) => " " + line)];
         member.controls = headingLines.map((line, index) => ({

@@ -56,12 +56,12 @@ describe("editor autocomplete", () => {
     await vi.waitFor(() => expect(editor.isShowingAutocomplete()).toBe(true));
     terminal.send("\t");
     expect(editor.getText()).toBe("/mode ");
-    editor.setText("/mode p");
+    editor.setText("/mode au");
     expect(editor.isShowingAutocomplete()).toBe(false);
     terminal.send("\t");
-    await vi.waitFor(() => expect(editor.getText()).toBe("/mode plan"));
+    await vi.waitFor(() => expect(editor.getText()).toBe("/mode auto_allow"));
     terminal.send("\t");
-    await vi.waitFor(() => expect(editor.getText()).toBe("/mode plan"));
+    await vi.waitFor(() => expect(editor.getText()).toBe("/mode auto_allow"));
     editor.setText("/mode f");
     terminal.send("\t");
     await vi.waitFor(() => expect(editor.getText()).toBe("/mode full_access"));
@@ -85,7 +85,7 @@ describe("editor autocomplete", () => {
     await vi.waitFor(() => expect(editor.isShowingAutocomplete()).toBe(true));
     terminal.send("\u001b[B");
     terminal.send("\t");
-    expect(editor.getText()).toBe("/mode plan");
+    expect(editor.getText()).toBe("/mode auto_allow");
     editor.setText("/permissions grant --r");
     terminal.send("\t");
     await vi.waitFor(() => expect(editor.isShowingAutocomplete()).toBe(true));

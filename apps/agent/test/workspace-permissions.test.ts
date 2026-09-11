@@ -37,7 +37,8 @@ function approval(toolName: string, target: string, ruleId: string): ToolApprova
 }
 async function createAgentFixture(
   modelStream: ModelStream,
-  mode: "agent" | "plan" | "auto_allow" = "auto_allow",
+  mode: "agent" | "auto_allow" | "full_access" = "auto_allow",
+  writable = true,
 ) {
   const location = await fixture();
   const session = await createSession({
@@ -53,6 +54,7 @@ async function createAgentFixture(
     session,
     modelStream,
     permissionMode: mode,
+    writable,
     permissionDirectory: location.directory,
     protectedPaths: [join(location.workspaceRoot, ".env")],
   });
@@ -77,7 +79,7 @@ function writeSequence(
         type: "tool_call",
         toolCallId: `write-${requestCount}`,
         toolName: "write_file",
-        input: { path, content: "saved" },
+        input: { path, expectedVersion: "missing", content: "saved" },
         invalid: false,
       };
       yield { type: "finish", finishReason: "tool_calls" };
@@ -234,12 +236,16 @@ describe("Workspace authorization", () => {
     expect(agent.permissions.snapshot().revoked).toBe(true);
   });
 
-  it.each(["agent", "plan"] as const)(
-    "does not use a workspace grant to bypass %s mode",
-    async (mode) => {
+  it.each([
+    { mode: "agent", writable: true },
+    { mode: "auto_allow", writable: false },
+  ] as const)(
+    "does not use a workspace grant to bypass $mode with writable=$writable",
+    async ({ mode, writable }) => {
       const { agent, workspaceRoot } = await createAgentFixture(
         writeSequence(["denied.txt"]),
         mode,
+        writable,
       );
       let manualRequests = 0;
       agent.subscribe((event) => {
@@ -279,7 +285,7 @@ describe("Workspace authorization", () => {
           call("read_file", { path: ".env" }),
           call("read_file", { path: "alias.env" }),
           call("grep", { pattern: "API_KEY", path: ".", filePattern: "*.env" }),
-          call("write_file", { path: ".env", content: "corruption" }),
+          call("write_file", { path: ".env", expectedVersion: "missing", content: "corruption" }),
         ].entries())
           yield { ...toolCall, type: "tool_call", toolCallId: String(index) };
         yield { type: "finish", finishReason: "tool_calls" };

@@ -10,6 +10,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { prepareWriteFileTool } from "../src/tool/basetool/write-file.js";
 import { promptToCompletion } from "./prompt-helper.js";
 
@@ -30,7 +31,11 @@ describe("external single-file approval", () => {
     const modelStream: ModelStream = async function* () {
       modelRequestCount += 1;
       if (modelRequestCount === 1) {
-        yield toolCallEvent(1, "write_file", { path: externalPath, content: "approved\n" });
+        yield toolCallEvent(1, "write_file", {
+          path: externalPath,
+          expectedVersion: "missing",
+          content: "approved\n",
+        });
         yield finishEvent("tool_calls");
         return;
       }
@@ -65,6 +70,7 @@ describe("external single-file approval", () => {
       if (modelRequestCount === 1) {
         yield toolCallEvent(2, "edit_file", {
           path: externalPath,
+          expectedVersion: fileContentVersion(Buffer.from("before\n")),
           replacements: [{ oldText: "before", newText: "agent" }],
         });
         yield finishEvent("tool_calls");
@@ -116,7 +122,11 @@ describe("external single-file approval", () => {
 
     for (const [index, rejectedPath] of rejectedPaths.entries()) {
       const result = await prepareWriteFileTool(
-        fileToolCall(index + 10, "write_file", { path: rejectedPath, content: "blocked" }),
+        fileToolCall(index + 10, "write_file", {
+          path: rejectedPath,
+          expectedVersion: "missing",
+          content: "blocked",
+        }),
         {
           workspaceRoot: fixture.workspaceRoot,
           sessionDirectory: fixture.sessionDirectory,
@@ -131,7 +141,11 @@ describe("external single-file approval", () => {
     const workspacePath = join(fixture.workspaceRoot, "report[1].txt");
 
     const result = await prepareWriteFileTool(
-      fileToolCall(30, "write_file", { path: workspacePath, content: "workspace" }),
+      fileToolCall(30, "write_file", {
+        path: workspacePath,
+        expectedVersion: "missing",
+        content: "workspace",
+      }),
       {
         workspaceRoot: fixture.workspaceRoot,
         sessionDirectory: fixture.sessionDirectory,

@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type { ActionResult, AgentControls, AgentOperation } from "./agent-controls.js";
-import { type CollaborationAction, isDirectCollaborationControl } from "./multi-agent/index.js";
+import type { CollaborationAction } from "./multi-agent/index.js";
 import { createAgentRuntime } from "./runtime.js";
 import type { Session } from "./session/index.js";
 import { createSession, openSession } from "./session/index.js";
@@ -14,7 +14,6 @@ import type {
   ToolApprovalRequest,
 } from "./session-agent.js";
 import { executeGitAction, type GitAction, isGitQuery } from "./tool/basetool/git/tool.js";
-import { collaborationToolCall } from "./tool/multi-agent-tools.js";
 
 export type {
   ActiveRun,
@@ -36,7 +35,14 @@ export type {
 } from "./session-agent.js";
 export type Agent = Omit<
   SessionAgent,
-  "external" | "compact" | "promptInternal" | "queueInternal" | "runTool" | "abort" | "close"
+  | "external"
+  | "compact"
+  | "promptInternal"
+  | "queueInternal"
+  | "runTool"
+  | "abort"
+  | "close"
+  | "toolAccess"
 > &
   AgentControls &
   Readonly<{ abort(): void; close(): Promise<void> }>;
@@ -201,6 +207,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
 
   async function switchSession(id: string | undefined, signal: AbortSignal) {
     if (id === currentSession.sessionId) return;
+    if (
+      id &&
+      currentRuntime.coordinator.snapshot().members.some((member) => member.sessionId === id)
+    )
+      fail("成员 Session 必须从根 Session 查看或继续，不能作为主 Agent 打开。");
     const settings = {
       workspaceRoot: currentSession.workspaceRoot,
       sessionDirectory: currentSession.sessionDirectory,
@@ -252,7 +263,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
     prompt(text, promptOptions) {
       if (closed) return Promise.resolve({ status: "rejected", reason: "closed" });
       if (operation !== null) return Promise.resolve({ status: "rejected", reason: "busy" });
-      if (!currentAgent.state.running) currentRuntime.coordinator.beginTask();
+      if (
+        !currentAgent.state.running &&
+        (!currentAgent.state.inputQueue.paused || promptOptions?.resume)
+      )
+        currentRuntime.coordinator.beginTask();
       return currentAgent.prompt(text, promptOptions);
     },
     setPermissionMode(mode) {
@@ -364,16 +379,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
       async execute(action: CollaborationAction) {
         try {
           if (closed) return { ok: false, error: "Agent 已关闭。" };
-          if (isDirectCollaborationControl(action)) {
-            return {
-              ok: true,
-              value: await runDirectControl((signal) =>
-                currentRuntime.coordinator.execute(currentSession.sessionId, action, signal),
-              ),
-            };
-          }
-          const call = collaborationToolCall(action);
-          return invokeTool(call.toolName, call.input);
+          const value = await runDirectControl((signal) =>
+            currentRuntime.coordinator.execute(currentSession.sessionId, action, signal, "user"),
+          );
+          if (action.action === "group_continue") await currentAgent.prompt("", { resume: true });
+          return { ok: true, value };
         } catch (error) {
           return { ok: false, error: error instanceof Error ? error.message : "协作操作失败。" };
         }

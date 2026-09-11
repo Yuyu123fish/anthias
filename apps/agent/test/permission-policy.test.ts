@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AgentEvent, createAgentWithModelStream, type PermissionMode } from "../src/agent.js";
-import type { AssistantToolCallPart } from "../src/message.js";
+import type { AssistantToolCallPart, JsonValue } from "../src/message.js";
 import type { ModelRequest, ModelStream, ModelStreamEvent } from "../src/model/model-stream.js";
 import { classifyCommandSafety } from "../src/permission/tool-policy.js";
 import {
@@ -23,8 +23,10 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { createSessionAgent } from "../src/session-agent.js";
 import { prepareEditFileTool } from "../src/tool/basetool/edit-file.js";
 import { executePreparedFileTool } from "../src/tool/basetool/file-change.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { prepareWriteFileTool } from "../src/tool/basetool/write-file.js";
 import { resolveExistingWorkspacePath } from "../src/tool/workspace-path.js";
 import { promptToCompletion } from "./prompt-helper.js";
@@ -40,60 +42,57 @@ afterEach(async () => {
 });
 
 describe("Permission Mode", () => {
-  it("keeps workspace access read-only in Plan while exposing managed memory and denying forged writes", async () => {
-    const outsideRoot = await createTemporaryDirectory("anthias-plan-outside-");
-    const outsidePath = join(outsideRoot, "blocked.txt");
-    const modelRequests: ModelRequest[] = [];
-    const modelStream: ModelStream = async function* (modelRequest) {
-      modelRequests.push(modelRequest);
-      if (modelRequests.length === 1) {
-        yield toolCallEvent(1, "write_file", { path: outsidePath, content: "blocked" });
-        yield finishEvent("tool_calls");
-        return;
+  it.each(["agent", "auto_allow", "full_access"] as const)(
+    "keeps read-only capability independent of %s and rejects forged writes",
+    async (permissionMode) => {
+      const workspaceRoot = await createTemporaryDirectory("anthias-readonly-");
+      const sessionDirectory = resolveSessionDirectory(workspaceRoot, {});
+      const shell = await resolveSessionShell(process.env);
+      const session = await createSession({ workspaceRoot, sessionDirectory, shell });
+      const blockedPath = join(workspaceRoot, "blocked.txt");
+      const modelRequests: ModelRequest[] = [];
+      const modelStream: ModelStream = async function* (modelRequest) {
+        modelRequests.push(modelRequest);
+        if (modelRequests.length === 1) {
+          yield toolCallEvent(1, "write_file", {
+            path: "blocked.txt",
+            content: "blocked",
+            expectedVersion: "missing",
+          });
+          yield finishEvent("tool_calls");
+          return;
+        }
+        yield { type: "text_delta", delta: "已保持只读。" };
+        yield finishEvent("stop");
+      };
+      const agent = createSessionAgent({ modelStream, session, permissionMode, writable: false });
+      const events: AgentEvent[] = [];
+      agent.subscribe((event) => events.push(event));
+      try {
+        await expect(promptToCompletion(agent, "只做分析")).resolves.toEqual({
+          status: "completed",
+        });
+        expect(agent.state.permissionMode).toBe(permissionMode);
+        const toolNames = modelRequests[0]?.tools.map((tool) => tool.name) ?? [];
+        expect(toolNames).toEqual(expect.arrayContaining(["read_file", "glob", "grep"]));
+        expect(toolNames).not.toEqual(expect.arrayContaining(["write_file"]));
+        expect(toolNames).not.toEqual(expect.arrayContaining(["edit_file"]));
+        expect(toolNames).not.toEqual(expect.arrayContaining(["execute_command"]));
+        expect(JSON.stringify(modelRequests[0]?.messages)).toContain("当前成员只读");
+        expect(modelRequests[1]?.messages.at(-1)).toMatchObject({
+          role: "tool",
+          toolName: "write_file",
+          status: "failed",
+          content: expect.stringContaining("只能读取"),
+        });
+        expect(events.some((event) => event.type === "tool_approval_requested")).toBe(false);
+        expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
+        await expect(access(blockedPath)).rejects.toThrow();
+      } finally {
+        await agent.close();
       }
-      yield { type: "text_delta", delta: "已保持只读。" };
-      yield finishEvent("stop");
-    };
-    const { agent } = await createTestAgent(modelStream, "plan");
-    const events: AgentEvent[] = [];
-    agent.subscribe((event) => events.push(event));
-
-    await expect(promptToCompletion(agent, "只做分析")).resolves.toEqual({ status: "completed" });
-
-    expect(agent.state.permissionMode).toBe("plan");
-    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "agent_list",
-      "agent_result",
-      "agent_resume",
-      "agent_spawn",
-      "agent_stop",
-      "agent_wait",
-      "git",
-      "glob",
-      "grep",
-      "memory",
-      "read_artifact",
-      "read_file",
-      "team",
-    ]);
-    const gitDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "git");
-    expect(gitDefinition?.inputSchema.properties?.action).toMatchObject({
-      enum: expect.not.arrayContaining(["commit", "create", "integrate"]),
-    });
-    const spawnDefinition = modelRequests[0]?.tools.find((tool) => tool.name === "agent_spawn");
-    expect(spawnDefinition?.inputSchema.properties?.writable).toMatchObject({ const: false });
-    expect(JSON.stringify(modelRequests[0]?.messages)).toContain("当前权限模式：Plan 模式");
-    expect(JSON.stringify(modelRequests[0]?.messages)).toContain("任务工作区仅允许检查与分析");
-    expect(modelRequests[0]?.systemPrompt).toContain("允许受管的应用记忆维护");
-    expect(modelRequests[1]?.messages.at(-1)).toMatchObject({
-      role: "tool",
-      toolName: "write_file",
-      status: "denied",
-    });
-    expect(events.some((event) => event.type === "tool_approval_requested")).toBe(false);
-    expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
-    await expect(access(outsidePath)).rejects.toThrow();
-  });
+    },
+  );
 
   it("changes mode only while idle and snapshots it for a Run", async () => {
     const modelEntered = Promise.withResolvers<void>();
@@ -111,30 +110,25 @@ describe("Permission Mode", () => {
     agent.subscribe((event) => events.push(event));
 
     expect(agent.state.permissionMode).toBe("agent");
-    expect(agent.setPermissionMode("plan")).toEqual({
+    expect(agent.setPermissionMode("auto_allow")).toEqual({
       status: "accepted",
-      permissionMode: "plan",
+      permissionMode: "auto_allow",
     });
     const promptResultPromise = promptToCompletion(agent, "inspect");
     await modelEntered.promise;
 
     expect(agent.setPermissionMode("agent")).toEqual({ status: "rejected", reason: "busy" });
-    expect(agent.state.permissionMode).toBe("plan");
-    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "agent_list",
-      "agent_result",
-      "agent_resume",
-      "agent_spawn",
-      "agent_stop",
-      "agent_wait",
-      "git",
-      "glob",
-      "grep",
-      "memory",
-      "read_artifact",
-      "read_file",
-      "team",
-    ]);
+    expect(agent.state.permissionMode).toBe("auto_allow");
+    expect(modelRequests[0]?.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "read_file",
+        "write_file",
+        "agent_spawn",
+        "agent_message",
+        "agent_notes",
+      ]),
+    );
+    expect(modelRequests[0]?.tools.some((tool) => tool.name === "team")).toBe(false);
 
     releaseModel.resolve();
     await expect(promptResultPromise).resolves.toEqual({ status: "completed" });
@@ -146,7 +140,7 @@ describe("Permission Mode", () => {
       events
         .filter((event) => event.type === "permission_mode_changed")
         .map((event) => event.permissionMode),
-    ).toEqual(["plan", "agent"]);
+    ).toEqual(["auto_allow", "agent"]);
   });
 });
 
@@ -373,6 +367,7 @@ describe("Full Access file changes", () => {
     const preparedEdit = await prepareEditFileTool(
       fileToolCall("edit_file", {
         path: externalPath,
+        expectedVersion: fileContentVersion(Buffer.from("before")),
         replacements: [{ oldText: "before", newText: "after" }],
       }),
       fixture.workspace,
@@ -428,6 +423,7 @@ describe("Full Access file changes", () => {
     const preparedEdit = await prepareEditFileTool(
       fileToolCall("edit_file", {
         path: fileAlias,
+        expectedVersion: fileContentVersion(Buffer.from("before")),
         replacements: [{ oldText: "before", newText: "after" }],
       }),
       fixture.workspace,
@@ -470,6 +466,7 @@ describe("Full Access file changes", () => {
       const preparedEdit = await prepareEditFileTool(
         fileToolCall("edit_file", {
           path: fileAlias,
+          expectedVersion: fileContentVersion(Buffer.from("before")),
           replacements: [{ oldText: "before", newText: "after" }],
         }),
         fixture.workspace,
@@ -541,7 +538,11 @@ describe("Full Access file changes", () => {
       );
       const fileAlias = join(directoryAlias, "existing.txt");
       const preparedWrite = await prepareWriteFileTool(
-        fileToolCall("write_file", { path: fileAlias, content: "agent" }),
+        fileToolCall("write_file", {
+          path: fileAlias,
+          content: "agent",
+          expectedVersion: fileContentVersion(Buffer.from("before")),
+        }),
         fixture.workspace,
       );
       expect(preparedWrite.ok).toBe(true);
@@ -624,7 +625,7 @@ function fileToolCall(
     type: "tool_call",
     toolCallId: "00000000-0000-4000-8000-000000000050",
     toolName,
-    input,
+    input: { expectedVersion: "missing", ...(input as Record<string, JsonValue>) },
     invalid: false,
   };
 }

@@ -14,6 +14,7 @@ type ToolPolicyInput = Readonly<{
   toolName: FixedToolName;
   command?: string;
   externalFile?: boolean;
+  writable?: boolean;
 }>;
 
 type HardDanger = Readonly<{
@@ -43,11 +44,11 @@ export function decideToolPolicy(input: ToolPolicyInput): ToolPolicyDecision {
         : "路径解析和真实路径校验均限制在当前工作区。",
     );
   }
-  if (input.permissionMode === "plan") {
+  if (input.writable === false) {
     return freezeDecision(
       "deny",
-      "permission.plan_read_only",
-      `Plan 模式不允许执行 ${input.toolName}。`,
+      "permission.member_read_only",
+      `只读成员不允许执行 ${input.toolName}。`,
       "调用不会请求批准，也不会启动文件写入或命令。",
     );
   }

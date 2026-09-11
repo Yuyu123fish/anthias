@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readlink, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { JsonValue } from "../../../message.js";
+import { sharedWorkspaceAccess, type WorkspaceAccess } from "../../workspace-access.js";
 import { GitCommandAbortedError, GitCommandError, runGit } from "./command.js";
 import {
   createGitIntegration,
@@ -17,6 +18,7 @@ const MAXIMUM_APPROVAL_TOTAL_BYTES = 64 * 1024 * 1024;
 
 export type GitWorkspaceOptions = Readonly<{
   workspaceRoot: string;
+  workspaceAccess?: WorkspaceAccess;
   worktreeDirectory: string;
   rootSessionId: string;
   readRecords: () => readonly { kind: string; key: string; payload: JsonValue }[];
@@ -111,17 +113,37 @@ export type GitIntegrationResolution = Readonly<{
   integrationCommit?: string;
 }>;
 
+export type BeforeGitMutation = () => void | Promise<void>;
+
 export type GitWorkspace = Readonly<{
   query(input: GitQueryInput, signal?: AbortSignal): Promise<string>;
   captureApprovalState(input: GitApprovalStateInput, signal?: AbortSignal): Promise<string>;
-  createWorktree(input: CreateWorktreeInput, signal?: AbortSignal): Promise<ManagedWorktree>;
+  createWorktree(
+    input: CreateWorktreeInput,
+    signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
+  ): Promise<ManagedWorktree>;
   inspectWorktree(id: string, signal?: AbortSignal): Promise<ManagedWorktree>;
-  removeWorktree(id: string, signal?: AbortSignal, discard?: boolean): Promise<ManagedWorktree>;
-  commit(input: GitCommitInput, signal?: AbortSignal): Promise<GitCommitResult>;
-  integrate(input: GitIntegrateInput, signal?: AbortSignal): Promise<GitIntegrationResult>;
+  removeWorktree(
+    id: string,
+    signal?: AbortSignal,
+    discard?: boolean,
+    beforeMutation?: BeforeGitMutation,
+  ): Promise<ManagedWorktree>;
+  commit(
+    input: GitCommitInput,
+    signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
+  ): Promise<GitCommitResult>;
+  integrate(
+    input: GitIntegrateInput,
+    signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
+  ): Promise<GitIntegrationResult>;
   resolveIntegration(
     input: ResolveGitIntegrationInput,
     signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
   ): Promise<GitIntegrationResolution>;
   listWorktrees(): readonly ManagedWorktree[];
 }>;
@@ -163,12 +185,12 @@ type ApprovalRepositorySnapshot = Readonly<{
   control: ApprovalControlSnapshot;
   files: readonly ApprovalFileSnapshot[];
 }>;
-let gitMutationTail: Promise<void> = Promise.resolve();
 
 /** 创建一个持有受管 worktree 与本地集成状态的内部 Git Module。 */
 export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
   assertSafeIdentifier(options.rootSessionId, "rootSessionId");
   const workspaceRoot = resolve(options.workspaceRoot);
+  const workspaceAccess = options.workspaceAccess ?? sharedWorkspaceAccess;
   const worktreeDirectory = resolve(options.worktreeDirectory);
   const managedDirectory = resolve(worktreeDirectory, options.rootSessionId);
   assertPathWithin(worktreeDirectory, managedDirectory, false);
@@ -200,6 +222,24 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
     assertNoUntrackedIntegrationCollisions,
     isCoveredByRequests,
   });
+
+  // 一次受管 Git 变更只在最外层取锁；内部命令与回滚沿用同一租约，不能嵌套等待自己。
+  async function serializeWorkspaceMutation<T>(
+    workspaceRoots: () => readonly string[],
+    signal: AbortSignal | undefined,
+    beforeMutation: BeforeGitMutation | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const releaseWrite = await workspaceAccess.acquireExclusiveWrite(workspaceRoots(), signal);
+    try {
+      if (signal?.aborted) throw new GitCommandAbortedError();
+      await beforeMutation?.();
+      if (signal?.aborted) throw new GitCommandAbortedError();
+      return await operation();
+    } finally {
+      releaseWrite();
+    }
+  }
 
   const findWorktree = (id: string): ManagedWorktree => {
     const worktree = managedWorktrees.get(id);
@@ -366,117 +406,111 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
   const createWorktree = (
     input: CreateWorktreeInput,
     signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
   ): Promise<ManagedWorktree> =>
-    serializeGitMutation(signal, async () => {
-      if (input.memberSessionId !== undefined) {
-        assertNonEmptyText(input.memberSessionId, "memberSessionId", 256);
-      }
-      await ensureManagedDirectory(worktreeDirectory, managedDirectory);
-      const repository = await loadRepository(workspaceRoot, signal);
-      await rejectSubmoduleRepository(repository.root, signal);
-      const baseCommit = await resolveCommit(repository.root, input.ref ?? "HEAD", signal);
-      const dirty = !(await isClean(repository.root, signal));
-      const worktreeId = randomUUID();
-      const worktreePath = resolve(managedDirectory, worktreeId);
-      assertPathWithin(managedDirectory, worktreePath, false);
-      await assertPathMissing(worktreePath);
-      const rootName = options.rootSessionId.replace(/[^a-zA-Z0-9._-]/gu, "-").slice(0, 48);
-      const branch = `anthias/${rootName}/${worktreeId}`;
-      await assertBranchMissing(repository.root, branch, signal);
-      const creatingWorktree = freezeWorktree({
-        id: worktreeId,
-        rootSessionId: options.rootSessionId,
-        ...(input.memberSessionId === undefined ? {} : { memberSessionId: input.memberSessionId }),
-        path: worktreePath,
-        repositoryRoot: repository.root,
-        commonGitDirectory: repository.commonGitDirectory,
-        branch,
-        baseCommit,
-        status: "creating",
-        integrated: false,
-        ...(dirty
-          ? {
-              notice: `主工作区存在未提交修改；worktree 从提交 ${baseCommit} 创建，这些修改不会带入。`,
-            }
-          : {}),
-      });
-      await appendWorktree(creatingWorktree);
-      try {
-        await runGit({
-          cwd: repository.root,
-          arguments: ["worktree", "add", "-b", branch, worktreePath, baseCommit],
-          ...(signal === undefined ? {} : { signal }),
-        });
-        const actualRepository = await loadRepository(worktreePath, signal);
-        if (
-          !samePath(actualRepository.commonGitDirectory, repository.commonGitDirectory) ||
-          actualRepository.branch !== branch ||
-          actualRepository.head !== baseCommit
-        ) {
-          throw new Error("新 worktree 的仓库身份、分支或基线与创建意图不一致。");
+    serializeWorkspaceMutation(
+      () => [workspaceRoot],
+      signal,
+      beforeMutation,
+      async () => {
+        if (input.memberSessionId !== undefined) {
+          assertNonEmptyText(input.memberSessionId, "memberSessionId", 256);
         }
-        const readyWorktree = freezeWorktree({ ...creatingWorktree, status: "ready" });
-        await appendWorktree(readyWorktree);
-        return readyWorktree;
-      } catch (error) {
-        const failedWorktree = freezeWorktree({
-          ...creatingWorktree,
-          status: "error",
-          error: safeErrorMessage(error),
+        await ensureManagedDirectory(worktreeDirectory, managedDirectory);
+        const repository = await loadRepository(workspaceRoot, signal);
+        await rejectSubmoduleRepository(repository.root, signal);
+        const baseCommit = await resolveCommit(repository.root, input.ref ?? "HEAD", signal);
+        const dirty = !(await isClean(repository.root, signal));
+        const worktreeId = randomUUID();
+        const worktreePath = resolve(managedDirectory, worktreeId);
+        assertPathWithin(managedDirectory, worktreePath, false);
+        await assertPathMissing(worktreePath);
+        const rootName = options.rootSessionId.replace(/[^a-zA-Z0-9._-]/gu, "-").slice(0, 48);
+        const branch = `anthias/${rootName}/${worktreeId}`;
+        await assertBranchMissing(repository.root, branch, signal);
+        const creatingWorktree = freezeWorktree({
+          id: worktreeId,
+          rootSessionId: options.rootSessionId,
+          ...(input.memberSessionId === undefined
+            ? {}
+            : { memberSessionId: input.memberSessionId }),
+          path: worktreePath,
+          repositoryRoot: repository.root,
+          commonGitDirectory: repository.commonGitDirectory,
+          branch,
+          baseCommit,
+          status: "creating",
+          integrated: false,
+          ...(dirty
+            ? {
+                notice: `主工作区存在未提交修改；worktree 从提交 ${baseCommit} 创建，这些修改不会带入。`,
+              }
+            : {}),
         });
+        await appendWorktree(creatingWorktree);
         try {
-          await appendWorktree(failedWorktree);
-        } catch {
-          // 创建意图已持久化；记录失败时保留实际 Git 状态供下次检查。
+          await runGit({
+            cwd: repository.root,
+            arguments: ["worktree", "add", "-b", branch, worktreePath, baseCommit],
+            ...(signal === undefined ? {} : { signal }),
+          });
+          const actualRepository = await loadRepository(worktreePath, signal);
+          if (
+            !samePath(actualRepository.commonGitDirectory, repository.commonGitDirectory) ||
+            actualRepository.branch !== branch ||
+            actualRepository.head !== baseCommit
+          ) {
+            throw new Error("新 worktree 的仓库身份、分支或基线与创建意图不一致。");
+          }
+          const readyWorktree = freezeWorktree({ ...creatingWorktree, status: "ready" });
+          await appendWorktree(readyWorktree);
+          return readyWorktree;
+        } catch (error) {
+          const failedWorktree = freezeWorktree({
+            ...creatingWorktree,
+            status: "error",
+            error: safeErrorMessage(error),
+          });
+          try {
+            await appendWorktree(failedWorktree);
+          } catch {
+            // 创建意图已持久化；记录失败时保留实际 Git 状态供下次检查。
+          }
+          throw error;
         }
-        throw error;
-      }
-    });
+      },
+    );
 
   const inspectWorktree = (id: string, signal?: AbortSignal): Promise<ManagedWorktree> =>
-    serializeGitMutation(signal, async () =>
-      inspectManagedWorktree(findWorktree(id), signal, appendWorktree),
+    serializeWorkspaceMutation(
+      () => [findWorktree(id).path],
+      signal,
+      undefined,
+      async () => inspectManagedWorktree(findWorktree(id), signal, appendWorktree),
     );
 
   const removeWorktree = (
     id: string,
     signal?: AbortSignal,
     discard = false,
+    beforeMutation?: BeforeGitMutation,
   ): Promise<ManagedWorktree> =>
-    serializeGitMutation(signal, async () => {
-      const inspected = await inspectManagedWorktree(findWorktree(id), signal, appendWorktree);
-      if (inspected.status !== "ready") {
-        throw new Error("只有状态正常的受管 worktree 可以移除。");
-      }
-      if (!(await isCleanForRemoval(inspected.path, signal))) {
-        throw new Error("worktree 含有未提交或未跟踪修改，不能移除。");
-      }
-      if (inspected.resultCommit !== undefined && !inspected.integrated && !discard) {
-        throw new Error("worktree 成果尚未集成；需要明确 discard 才能放弃。");
-      }
-      const operationId = randomUUID();
-      await appendOperation(
-        operationId,
-        toJsonValue({
-          operationType: "remove_worktree",
-          operationId,
-          rootSessionId: options.rootSessionId,
-          worktreeId: inspected.id,
-          phase: "intent",
-          discard,
-        }),
-      );
-      let removeCommandCompleted = false;
-      try {
-        await runGit({
-          cwd: inspected.repositoryRoot,
-          arguments: ["worktree", "remove", "--", inspected.path],
-          ...(signal === undefined ? {} : { signal }),
-        });
-        removeCommandCompleted = true;
-        if (await pathExists(inspected.path)) {
-          throw new Error("Git 已返回成功，但 worktree 目录仍然存在。");
+    serializeWorkspaceMutation(
+      () => [workspaceRoot, findWorktree(id).path],
+      signal,
+      beforeMutation,
+      async () => {
+        const inspected = await inspectManagedWorktree(findWorktree(id), signal, appendWorktree);
+        if (inspected.status !== "ready") {
+          throw new Error("只有状态正常的受管 worktree 可以移除。");
         }
+        if (!(await isCleanForRemoval(inspected.path, signal))) {
+          throw new Error("worktree 含有未提交或未跟踪修改，不能移除。");
+        }
+        if (inspected.resultCommit !== undefined && !inspected.integrated && !discard) {
+          throw new Error("worktree 成果尚未集成；需要明确 discard 才能放弃。");
+        }
+        const operationId = randomUUID();
         await appendOperation(
           operationId,
           toJsonValue({
@@ -484,87 +518,73 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
             operationId,
             rootSessionId: options.rootSessionId,
             worktreeId: inspected.id,
-            phase: "removed",
+            phase: "intent",
             discard,
           }),
         );
-        const removed = freezeWorktree({ ...inspected, status: "removed" });
-        await appendWorktree(removed);
-        return removed;
-      } catch (error) {
-        await appendOperation(
-          operationId,
-          toJsonValue({
-            operationType: "remove_worktree",
+        let removeCommandCompleted = false;
+        try {
+          await runGit({
+            cwd: inspected.repositoryRoot,
+            arguments: ["worktree", "remove", "--", inspected.path],
+            ...(signal === undefined ? {} : { signal }),
+          });
+          removeCommandCompleted = true;
+          if (await pathExists(inspected.path)) {
+            throw new Error("Git 已返回成功，但 worktree 目录仍然存在。");
+          }
+          await appendOperation(
             operationId,
-            rootSessionId: options.rootSessionId,
-            worktreeId: inspected.id,
-            phase: removeCommandCompleted ? "intent" : "failed",
-            discard,
-            error: safeErrorMessage(error),
-          }),
-        );
-        throw error;
-      }
-    });
+            toJsonValue({
+              operationType: "remove_worktree",
+              operationId,
+              rootSessionId: options.rootSessionId,
+              worktreeId: inspected.id,
+              phase: "removed",
+              discard,
+            }),
+          );
+          const removed = freezeWorktree({ ...inspected, status: "removed" });
+          await appendWorktree(removed);
+          return removed;
+        } catch (error) {
+          await appendOperation(
+            operationId,
+            toJsonValue({
+              operationType: "remove_worktree",
+              operationId,
+              rootSessionId: options.rootSessionId,
+              worktreeId: inspected.id,
+              phase: removeCommandCompleted ? "intent" : "failed",
+              discard,
+              error: safeErrorMessage(error),
+            }),
+          );
+          throw error;
+        }
+      },
+    );
 
-  const commit = (input: GitCommitInput, signal?: AbortSignal): Promise<GitCommitResult> =>
-    serializeGitMutation(signal, async () => {
-      assertNonEmptyText(input.message, "message", 16 * 1024);
-      const target = await resolveCommitTarget(input.worktreeId, signal);
-      const requestedPaths = await normalizeRequestedPaths(target.root, input.paths, signal);
-      if (input.worktreeId === undefined && integration.pendingOperation() !== undefined) {
-        throw new Error("根工作区存在待处理的集成，不能执行普通提交。");
-      }
-      if (await hasStagedChanges(target.root, signal)) {
-        throw new Error("目标工作区已经含有暂存内容，拒绝夹带到本次提交。");
-      }
-      const operationId = randomUUID();
-      await appendOperation(
-        operationId,
-        toJsonValue({
-          operationType: "commit",
-          operationId,
-          rootSessionId: options.rootSessionId,
-          ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
-          phase: "intent",
-          targetHead: target.head,
-          paths: requestedPaths,
-        }),
-      );
-      let staged = false;
-      let commitCommandCompleted = false;
-      try {
-        await runGit({
-          cwd: target.root,
-          arguments: ["add", "--all", "--", ...literalPathspecs(requestedPaths)],
-          ...(signal === undefined ? {} : { signal }),
-        });
-        staged = true;
-        const stagedPaths = await listGitPaths(
-          target.root,
-          ["diff", "--cached", "--name-only", "-z", "--"],
-          signal,
-        );
-        if (stagedPaths.length === 0) throw new Error("指定路径没有可提交的修改。");
-        if (stagedPaths.some((path) => !isCoveredByRequests(path, requestedPaths))) {
-          throw new Error("Git 暂存内容超出了明确路径范围。");
+  const commit = (
+    input: GitCommitInput,
+    signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
+  ): Promise<GitCommitResult> =>
+    serializeWorkspaceMutation(
+      () => [input.worktreeId === undefined ? workspaceRoot : findWorktree(input.worktreeId).path],
+      signal,
+      beforeMutation,
+      async () => {
+        assertNonEmptyText(input.message, "message", 16 * 1024);
+        const target = await resolveCommitTarget(input.worktreeId, signal);
+        const requestedPaths = await normalizeRequestedPaths(target.root, input.paths, signal);
+        if (input.worktreeId === undefined && integration.pendingOperation() !== undefined) {
+          throw new Error("根工作区存在待处理的集成，不能执行普通提交。");
         }
-        if ((await resolveCommit(target.root, "HEAD", signal)) !== target.head) {
-          throw new Error("目标 HEAD 在暂存后发生变化，拒绝提交。");
+        if (await hasStagedChanges(target.root, signal)) {
+          throw new Error("目标工作区已经含有暂存内容，拒绝夹带到本次提交。");
         }
-        await runGit({
-          cwd: target.root,
-          arguments: ["-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", input.message],
-          ...(signal === undefined ? {} : { signal }),
-        });
-        commitCommandCompleted = true;
-        staged = false;
-        const commitId = await resolveCommit(target.root, "HEAD", signal);
-        const commitParent = await resolveCommit(target.root, `${commitId}^`, signal);
-        if (commitParent !== target.head) {
-          throw new Error("提交结果不再直接基于审批时的 HEAD，结果需要人工核对。");
-        }
+        const operationId = randomUUID();
         await appendOperation(
           operationId,
           toJsonValue({
@@ -572,32 +592,44 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
             operationId,
             rootSessionId: options.rootSessionId,
             ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
-            phase: "committed",
+            phase: "intent",
+            targetHead: target.head,
             paths: requestedPaths,
-            commit: commitId,
           }),
         );
-        if (input.worktreeId !== undefined) {
-          const worktree = findWorktree(input.worktreeId);
-          await appendWorktree(
-            freezeWorktree({
-              ...worktree,
-              status: "ready",
-              resultCommit: commitId,
-              integrated: false,
-              integrationCommit: undefined,
-              error: undefined,
-            }),
-          );
-        }
-        return Object.freeze({
-          commit: commitId,
-          ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
-          paths: Object.freeze([...requestedPaths]),
-        });
-      } catch (error) {
-        if (staged) await unstageRequestedPaths(target.root, requestedPaths);
+        let staged = false;
+        let commitCommandCompleted = false;
         try {
+          await runGit({
+            cwd: target.root,
+            arguments: ["add", "--all", "--", ...literalPathspecs(requestedPaths)],
+            ...(signal === undefined ? {} : { signal }),
+          });
+          staged = true;
+          const stagedPaths = await listGitPaths(
+            target.root,
+            ["diff", "--cached", "--name-only", "-z", "--"],
+            signal,
+          );
+          if (stagedPaths.length === 0) throw new Error("指定路径没有可提交的修改。");
+          if (stagedPaths.some((path) => !isCoveredByRequests(path, requestedPaths))) {
+            throw new Error("Git 暂存内容超出了明确路径范围。");
+          }
+          if ((await resolveCommit(target.root, "HEAD", signal)) !== target.head) {
+            throw new Error("目标 HEAD 在暂存后发生变化，拒绝提交。");
+          }
+          await runGit({
+            cwd: target.root,
+            arguments: ["-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", input.message],
+            ...(signal === undefined ? {} : { signal }),
+          });
+          commitCommandCompleted = true;
+          staged = false;
+          const commitId = await resolveCommit(target.root, "HEAD", signal);
+          const commitParent = await resolveCommit(target.root, `${commitId}^`, signal);
+          if (commitParent !== target.head) {
+            throw new Error("提交结果不再直接基于审批时的 HEAD，结果需要人工核对。");
+          }
           await appendOperation(
             operationId,
             toJsonValue({
@@ -605,105 +637,152 @@ export function createGitWorkspace(options: GitWorkspaceOptions): GitWorkspace {
               operationId,
               rootSessionId: options.rootSessionId,
               ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
-              phase: commitCommandCompleted ? "intent" : "failed",
+              phase: "committed",
               paths: requestedPaths,
-              error: safeErrorMessage(error),
+              commit: commitId,
             }),
           );
-        } catch {
-          // 原始失败优先返回；已有 intent 足以在恢复时阻止盲目重放。
+          if (input.worktreeId !== undefined) {
+            const worktree = findWorktree(input.worktreeId);
+            await appendWorktree(
+              freezeWorktree({
+                ...worktree,
+                status: "ready",
+                resultCommit: commitId,
+                integrated: false,
+                integrationCommit: undefined,
+                error: undefined,
+              }),
+            );
+          }
+          return Object.freeze({
+            commit: commitId,
+            ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
+            paths: Object.freeze([...requestedPaths]),
+          });
+        } catch (error) {
+          if (staged) await unstageRequestedPaths(target.root, requestedPaths);
+          try {
+            await appendOperation(
+              operationId,
+              toJsonValue({
+                operationType: "commit",
+                operationId,
+                rootSessionId: options.rootSessionId,
+                ...(input.worktreeId === undefined ? {} : { worktreeId: input.worktreeId }),
+                phase: commitCommandCompleted ? "intent" : "failed",
+                paths: requestedPaths,
+                error: safeErrorMessage(error),
+              }),
+            );
+          } catch {
+            // 原始失败优先返回；已有 intent 足以在恢复时阻止盲目重放。
+          }
+          throw error;
         }
-        throw error;
-      }
-    });
+      },
+    );
 
   const integrate = (
     input: GitIntegrateInput,
     signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
   ): Promise<GitIntegrationResult> =>
-    serializeGitMutation(signal, async () => {
-      if (integration.pendingOperation() !== undefined) {
-        throw new Error("已有待处理的 Git 集成，请先继续或中止。");
-      }
-      const worktree = await inspectManagedWorktree(
-        findWorktree(input.worktreeId),
-        signal,
-        appendWorktree,
-      );
-      if (worktree.status !== "ready" || worktree.resultCommit === undefined) {
-        throw new Error("该 worktree 没有可集成的已提交成果。");
-      }
-      if (worktree.integrated) throw new Error("该 worktree 的当前成果已经集成。");
-      const sourceCommit = await resolveCommit(worktree.path, input.commit, signal);
-      if (sourceCommit !== worktree.resultCommit) {
-        throw new Error("只能集成该受管 worktree 实际记录的结果提交。");
-      }
-      const containsResult = await runGit({
-        cwd: worktree.path,
-        arguments: ["merge-base", "--is-ancestor", sourceCommit, "HEAD"],
-        ...(signal === undefined ? {} : { signal }),
-        allowedExitCodes: [0, 1],
-        readOnly: true,
-      });
-      if (containsResult.exitCode !== 0) throw new Error("结果提交不属于受管 worktree 当前分支。");
+    serializeWorkspaceMutation(
+      () => [workspaceRoot, findWorktree(input.worktreeId).path],
+      signal,
+      beforeMutation,
+      async () => {
+        if (integration.pendingOperation() !== undefined) {
+          throw new Error("已有待处理的 Git 集成，请先继续或中止。");
+        }
+        const worktree = await inspectManagedWorktree(
+          findWorktree(input.worktreeId),
+          signal,
+          appendWorktree,
+        );
+        if (worktree.status !== "ready" || worktree.resultCommit === undefined) {
+          throw new Error("该 worktree 没有可集成的已提交成果。");
+        }
+        if (worktree.integrated) throw new Error("该 worktree 的当前成果已经集成。");
+        const sourceCommit = await resolveCommit(worktree.path, input.commit, signal);
+        if (sourceCommit !== worktree.resultCommit) {
+          throw new Error("只能集成该受管 worktree 实际记录的结果提交。");
+        }
+        const containsResult = await runGit({
+          cwd: worktree.path,
+          arguments: ["merge-base", "--is-ancestor", sourceCommit, "HEAD"],
+          ...(signal === undefined ? {} : { signal }),
+          allowedExitCodes: [0, 1],
+          readOnly: true,
+        });
+        if (containsResult.exitCode !== 0)
+          throw new Error("结果提交不属于受管 worktree 当前分支。");
 
-      const target = await loadRepository(workspaceRoot, signal);
-      await rejectSubmoduleRepository(target.root, signal);
-      if (
-        !samePath(target.root, worktree.repositoryRoot) ||
-        !samePath(target.commonGitDirectory, worktree.commonGitDirectory)
-      ) {
-        throw new Error("根工作区与受管 worktree 不属于同一仓库。");
-      }
-      if (!(await isClean(target.root, signal))) {
-        throw new Error("根工作区必须保持 clean 才能开始集成。");
-      }
-      const allowedPaths = await changedPathsForCommit(target.root, sourceCommit, signal);
-      if (allowedPaths.length === 0) throw new Error("结果提交没有可集成的文件变化。");
-      return integration.stage(
-        {
-          root: target.root,
-          targetHead: target.head,
-          worktreeId: worktree.id,
-          sourceCommit,
-          allowedPaths,
-        },
-        signal,
-      );
-    });
+        const target = await loadRepository(workspaceRoot, signal);
+        await rejectSubmoduleRepository(target.root, signal);
+        if (
+          !samePath(target.root, worktree.repositoryRoot) ||
+          !samePath(target.commonGitDirectory, worktree.commonGitDirectory)
+        ) {
+          throw new Error("根工作区与受管 worktree 不属于同一仓库。");
+        }
+        if (!(await isClean(target.root, signal))) {
+          throw new Error("根工作区必须保持 clean 才能开始集成。");
+        }
+        const allowedPaths = await changedPathsForCommit(target.root, sourceCommit, signal);
+        if (allowedPaths.length === 0) throw new Error("结果提交没有可集成的文件变化。");
+        return integration.stage(
+          {
+            root: target.root,
+            targetHead: target.head,
+            worktreeId: worktree.id,
+            sourceCommit,
+            allowedPaths,
+          },
+          signal,
+        );
+      },
+    );
 
   const resolveIntegration = (
     input: ResolveGitIntegrationInput,
     signal?: AbortSignal,
+    beforeMutation?: BeforeGitMutation,
   ): Promise<GitIntegrationResolution> =>
-    serializeGitMutation(signal, async () => {
-      const operation = integration.pendingOperation();
-      if (operation === undefined) throw new Error("当前没有待处理的 Git 集成。");
-      const worktree = findWorktree(operation.worktreeId);
-      const target = await loadRepository(workspaceRoot, signal);
-      await rejectSubmoduleRepository(target.root, signal);
-      if (
-        target.head !== operation.targetHead ||
-        !samePath(target.root, worktree.repositoryRoot) ||
-        !samePath(target.commonGitDirectory, worktree.commonGitDirectory)
-      ) {
-        throw new Error("集成目标的 HEAD 或仓库身份已经变化，拒绝继续修改。");
-      }
-      const resolution = await integration.resolve(target.root, operation, input.action, signal);
-      if (resolution.status === "committed") {
-        // 集成事实先落盘，worktree 摘要写入失败时仍可在重开后恢复交付状态。
-        await appendWorktree(
-          freezeWorktree({
-            ...worktree,
-            status: "ready",
-            integrated: true,
-            integrationCommit: resolution.integrationCommit,
-            error: undefined,
-          }),
-        );
-      }
-      return resolution;
-    });
+    serializeWorkspaceMutation(
+      () => [workspaceRoot],
+      signal,
+      beforeMutation,
+      async () => {
+        const operation = integration.pendingOperation();
+        if (operation === undefined) throw new Error("当前没有待处理的 Git 集成。");
+        const worktree = findWorktree(operation.worktreeId);
+        const target = await loadRepository(workspaceRoot, signal);
+        await rejectSubmoduleRepository(target.root, signal);
+        if (
+          target.head !== operation.targetHead ||
+          !samePath(target.root, worktree.repositoryRoot) ||
+          !samePath(target.commonGitDirectory, worktree.commonGitDirectory)
+        ) {
+          throw new Error("集成目标的 HEAD 或仓库身份已经变化，拒绝继续修改。");
+        }
+        const resolution = await integration.resolve(target.root, operation, input.action, signal);
+        if (resolution.status === "committed") {
+          // 集成事实先落盘，worktree 摘要写入失败时仍可在重开后恢复交付状态。
+          await appendWorktree(
+            freezeWorktree({
+              ...worktree,
+              status: "ready",
+              integrated: true,
+              integrationCommit: resolution.integrationCommit,
+              error: undefined,
+            }),
+          );
+        }
+        return resolution;
+      },
+    );
 
   async function resolveQueryTarget(
     worktreeId: string | undefined,
@@ -1519,19 +1598,4 @@ function safeErrorMessage(error: unknown): string {
     return error.message;
   }
   return error instanceof Error ? error.message : "Git 操作失败。";
-}
-
-function serializeGitMutation<T>(
-  signal: AbortSignal | undefined,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const result = gitMutationTail.then(async () => {
-    if (signal?.aborted) throw new GitCommandAbortedError();
-    return operation();
-  });
-  gitMutationTail = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
 }

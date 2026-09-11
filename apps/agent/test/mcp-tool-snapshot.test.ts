@@ -7,7 +7,7 @@ import type { AssistantToolCallPart } from "../src/message.js";
 import type { ModelRequest } from "../src/model/model-stream.js";
 import { createToolRunnerFromTools } from "../src/tool/tool-runner.js";
 
-function fixture(toolCount = 1) {
+function fixture(toolCount = 1, writable = true) {
   let generation = 1;
   let tools: McpToolInfo[] = Array.from({ length: toolCount }, (_, index) => ({
     name: "mcp_" + String(index).padStart(3, "0"),
@@ -71,7 +71,7 @@ function fixture(toolCount = 1) {
     checkExecution: async () => undefined,
   };
   return {
-    external: createExternalCapabilities({ sources, mcp, skills: undefined }),
+    external: createExternalCapabilities({ sources, mcp, skills: undefined, writable }),
     calls: () => calls,
     reconnect() {
       generation++;
@@ -92,8 +92,8 @@ describe("MCP request snapshot", () => {
   it("keeps one request executable after another projection and rejects a later connection generation", async () => {
     const { external, reconnect, calls } = fixture();
     const first = external.prepareRequest(request, "agent");
-    const other = external.prepareRequest(request, "plan");
-    expect(other.request.tools.some((tool) => tool.name === "mcp_000")).toBe(false);
+    const other = external.prepareRequest(request, "full_access");
+    expect(other.request.tools.some((tool) => tool.name === "mcp_000")).toBe(true);
     expect(external.rejectUnavailableTool(toolCall("mcp_000"), "agent")).toBeNull();
     const planned = createToolRunnerFromTools(first.tools).createPlan(toolCall("mcp_000"), "agent");
     const preparation = await planned?.prepare();
@@ -116,9 +116,12 @@ describe("MCP request snapshot", () => {
         .createPlan(toolCall("mcp_000"), "agent")
         ?.prepare(),
     ).toMatchObject({ ok: false, result: { content: expect.stringContaining("失效") } });
+    const readOnly = fixture(1, false).external;
+    const readOnlyRequest = readOnly.prepareRequest(request, "full_access");
+    expect(readOnlyRequest.request.tools.some((tool) => tool.name === "mcp_000")).toBe(false);
     expect(
-      await createToolRunnerFromTools(reconnected.tools)
-        .createPlan(toolCall("mcp_000"), "plan")
+      await readOnly
+        .rejectUnavailableTool(toolCall("mcp_000"), "full_access", readOnlyRequest.mcpSnapshot)
         ?.prepare(),
     ).toMatchObject({ ok: false, result: { status: "denied" } });
     expect(calls()).toBe(1);

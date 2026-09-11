@@ -45,12 +45,16 @@ const memoryCommand: CommandDefinition = {
 
 // 声明只负责发现信息；参数校验、审批与执行仍由各命令的显式分支持有。
 export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
-  { name: "agents", description: "成员、Team 与任务状态" },
+  { name: "agents", description: "协作群组、成员与任务状态" },
   {
     name: "agent",
-    description: "委派与成员历史",
+    description: "持续成员协作与历史",
     subcommands: [
-      { name: "spawn", argumentHint: "[--write] <任务>", description: "委派成员" },
+      {
+        name: "spawn",
+        argumentHint: "[--read-only] [--worktree <id>] <任务>",
+        description: "创建持续成员",
+      },
       {
         name: "result",
         argumentHint: "<id> [offset]",
@@ -65,36 +69,63 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       },
       {
         name: "wait",
-        argumentHint: "<id> [id2] [id3]",
+        argumentHint: "<id> [其他成员，最多九个]",
         description: "等待成员结束",
         argumentCompletion: "member",
       },
-      { name: "stop", argumentHint: "<id>", description: "停止成员", argumentCompletion: "member" },
+      { name: "stop", argumentHint: "<id>", description: "暂停成员", argumentCompletion: "member" },
       {
         name: "release",
         argumentHint: "<id>",
-        description: "释放成员",
+        description: "关闭成员",
         argumentCompletion: "member",
       },
       {
         name: "resume",
         argumentHint: "<id> [任务]",
-        description: "显式继续成员",
+        description: "继续暂停成员",
         argumentCompletion: "member",
       },
+      {
+        name: "reopen",
+        argumentHint: "<id>",
+        description: "重新打开已关闭成员",
+        argumentCompletion: "member",
+      },
+      {
+        name: "assign",
+        argumentHint: "<id> <任务>",
+        description: "分配正式任务",
+        argumentCompletion: "member",
+      },
+      {
+        name: "update",
+        argumentHint: "<taskId> completed|blocked <结果>",
+        description: "更新任务",
+      },
+      {
+        name: "message",
+        argumentHint: "<id> <消息>",
+        description: "发送持续对话",
+        argumentCompletion: "member",
+      },
+      {
+        name: "workspace",
+        argumentHint: "<id> [worktreeId|root]",
+        description: "绑定停止成员的工作区",
+        argumentCompletion: "member",
+      },
+      { name: "tasks", description: "查看群组任务与成员状态" },
+      {
+        name: "notes",
+        argumentHint: "[read|append <正文>|replace <版本> <正文>]",
+        description: "受管共享笔记",
+      },
+      { name: "group", argumentHint: "stop|continue", description: "暂停或继续协作群组" },
     ],
-    helpNotes: ["可写成员从已提交版本创建；主目录未提交修改不会带入。"],
-  },
-  {
-    name: "team",
-    description: "持续团队协作",
-    subcommands: [
-      { name: "create", argumentHint: "<名称>" },
-      { name: "add", argumentHint: "[--write] <任务>" },
-      { name: "assign", argumentHint: "<id> <任务>", argumentCompletion: "member" },
-      { name: "message", argumentHint: "<id> <消息>", argumentCompletion: "member" },
-      { name: "tasks", description: "查看 Team 与任务状态" },
-      { name: "close", description: "关闭当前 Team" },
+    helpNotes: [
+      "成员默认可写并共享根工作区；--read-only 创建只读成员，--worktree 选择已创建的受管工作树。",
+      "共享笔记通过受管入口访问，修改不自动通知全组；暂停与关闭后的恢复必须明确操作。",
     ],
   },
   {
@@ -160,12 +191,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   {
     name: "mode",
     description: "查看或切换权限模式",
-    subcommands: [
-      { name: "agent" },
-      { name: "plan" },
-      { name: "auto_allow" },
-      { name: "full_access" },
-    ],
+    subcommands: [{ name: "agent" }, { name: "auto_allow" }, { name: "full_access" }],
     helpNotes: ["FullAccess 跳过人工与自动审核，可访问工作区外文件；当前没有 OS 沙箱。"],
   },
   {

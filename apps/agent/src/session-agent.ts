@@ -43,8 +43,10 @@ import type { AgentInputDetails, Session } from "./session/index.js";
 import { isSideEffectToolName, type SessionRecord } from "./session/schema.js";
 import type { SkillLibrary } from "./skill/index.js";
 import { createSessionArtifactStore } from "./tool/artifacts.js";
+import { isSideEffectToolName as isWorkspaceSideEffectToolName } from "./tool/definitions.js";
 import type { AgentToolExtension } from "./tool/managed-tool.js";
 import { createMemoryTools, type MaintainMemory } from "./tool/memory-tools.js";
+import { createRejectedToolCallPlan } from "./tool/tool-plan.js";
 import {
   type AgentTool,
   type CreateToolRunnerOptions,
@@ -54,6 +56,7 @@ import {
   type ToolApprovalPlan,
   type ToolRunner,
 } from "./tool/tool-runner.js";
+import { sharedWorkspaceAccess } from "./tool/workspace-access.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
 export type RunPhase =
@@ -62,6 +65,7 @@ export type RunPhase =
   | "compacting"
   | "reviewing_tool"
   | "awaiting_tool_approval"
+  | "awaiting_workspace"
   | "executing_tool";
 export type ActiveRun = Readonly<{
   runId: string;
@@ -243,6 +247,10 @@ export type AgentEvent = Readonly<{ memberSessionId?: string; memberName?: strin
 export type AgentListener = (event: AgentEvent) => void;
 export type SessionAgent = Readonly<{
   readonly state: AgentState;
+  toolAccess: Readonly<{
+    assertWriteAllowed(toolCallId: string): void;
+    resourceState(toolCallId: string, resourceState: "waiting" | "acquired" | "released"): void;
+  }>;
   prompt(promptText: string, options?: PromptOptions): Promise<PromptResult>;
   promptInternal(input: AgentInputDetails): Promise<InternalPromptResult>;
   queueInternal(input: AgentInputDetails): void;
@@ -274,9 +282,11 @@ export type SessionAgentOptions = Readonly<{
   protectedPaths?: readonly string[];
   workspacePermissions?: WorkspacePermissions;
   permissionMember?: boolean;
+  writable?: boolean;
   remainingTaskTimeMs?: () => number;
   pendingInputs?: () => readonly AgentInputDetails[];
   acknowledgeInput?: (input: AgentInputDetails) => Promise<void>;
+  onRunSettled?: (result: FinishedPromptResult) => void;
   authorizationRecords?: () => readonly SessionRecord[];
   modelContext?: Readonly<{ modelId: string; budget: ContextBudget }>;
   session: Session;
@@ -305,6 +315,7 @@ type ActiveRunOwnership = {
   deniedToolActionFingerprints: Set<string>;
   terminalResultPromise: Promise<FinishedPromptResult> | null;
   requestToolRunners: WeakMap<ModelRequest, ToolRunner>;
+  waitingWorkspaceToolCallIds: Set<string>;
   inputCompletions: Set<NonNullable<QueuedInput["completion"]>>;
   resumeAfterTermination: boolean;
 };
@@ -363,9 +374,11 @@ export function createSessionAgent({
   managedTools,
   pendingInputs,
   acknowledgeInput,
+  onRunSettled,
   authorizationRecords,
   workspacePermissions,
   permissionMember = false,
+  writable = true,
   protectedPaths = [],
   remainingTaskTimeMs,
   memory,
@@ -417,7 +430,12 @@ export function createSessionAgent({
     session,
     ...(memory ? { memory } : {}),
     environment: () =>
-      createCodingEnvironmentPrompt(session.workspaceRoot, session.shell, state.permissionMode),
+      createCodingEnvironmentPrompt(
+        session.workspaceRoot,
+        session.shell,
+        state.permissionMode,
+        writable,
+      ),
     skillDirectory: () => external.directory(),
     appendSource: async (details) => {
       try {
@@ -432,7 +450,7 @@ export function createSessionAgent({
       }
     },
   });
-  const external = createExternalCapabilities({ sources, skills, mcp });
+  const external = createExternalCapabilities({ sources, skills, mcp, writable });
   const contextController = createContextController({
     session,
     modelStream,
@@ -440,16 +458,40 @@ export function createSessionAgent({
     modelId: modelContext?.modelId ?? "deterministic-local",
     budget: contextBudget,
   });
+  const toolAccess = {
+    assertWriteAllowed(toolCallId: string) {
+      if (!writable) throw new Error("当前成员只能读取工作区。");
+      const currentRun = state.activeRun;
+      if (!currentRun || state.closeRequested) throw new Error("当前执行已结束。");
+      currentRun.abortController.signal.throwIfAborted();
+      const approvedRevision = currentRun.toolAuthorizationRevisions.get(toolCallId);
+      if (approvedRevision && workspacePermissions?.revision() !== approvedRevision)
+        throw new Error("等待工作区期间授权已变化，请重新请求批准。");
+    },
+    resourceState(toolCallId: string, resourceState: "waiting" | "acquired" | "released") {
+      const currentRun = state.activeRun;
+      if (!currentRun || currentRun.abortController.signal.aborted) return;
+      if (resourceState === "waiting") currentRun.waitingWorkspaceToolCallIds.add(toolCallId);
+      else currentRun.waitingWorkspaceToolCallIds.delete(toolCallId);
+      updateRunPhase(
+        currentRun,
+        currentRun.waitingWorkspaceToolCallIds.size > 0 ? "awaiting_workspace" : "executing_tool",
+      );
+    },
+  };
   const baseToolOptions: CreateToolRunnerOptions = {
     workspace: Object.freeze({
       workspaceRoot: session.workspaceRoot,
       sessionDirectory: session.sessionDirectory,
+      workspaceAccess: sharedWorkspaceAccess,
+      ...toolAccess,
       protectedPaths: [
         ...protectedPaths,
         ...(workspacePermissions ? [workspacePermissions.directory] : []),
       ],
     }),
     shell: session.shell,
+    writable,
     artifactStore,
   };
   const memoryTools = memory
@@ -512,11 +554,13 @@ export function createSessionAgent({
       request: prepared.request,
       toolRunner: {
         createPlan: (call, mode) =>
-          rejectUnavailableBaseTool(call, mode, runtime.tools.baseOptions) ??
-          runtime.tools.managed?.rejectUnavailableTool?.(call, mode) ??
-          runtime.tools.memory?.rejectUnavailableTool?.(call, mode) ??
-          runtime.tools.external.rejectUnavailableTool(call, mode, prepared.mcpSnapshot) ??
-          toolRunner.createPlan(call, mode),
+          !writable && isWorkspaceSideEffectToolName(call.toolName)
+            ? createRejectedToolCallPlan("当前成员只能读取工作区。")
+            : (rejectUnavailableBaseTool(call, mode, runtime.tools.baseOptions) ??
+              runtime.tools.managed?.rejectUnavailableTool?.(call, mode) ??
+              runtime.tools.memory?.rejectUnavailableTool?.(call, mode) ??
+              runtime.tools.external.rejectUnavailableTool(call, mode, prepared.mcpSnapshot) ??
+              toolRunner.createPlan(call, mode)),
       } satisfies ToolRunner,
     };
   }
@@ -613,10 +657,10 @@ export function createSessionAgent({
   function abortActiveRun(source: NonNullable<RunDiagnostic["abortSource"]> = "user"): void {
     state.inputsPaused = true;
     const currentRun = state.activeRun;
-    if (currentRun === null || currentRun.abortController.signal.aborted) {
-      return;
-    }
+    if (currentRun === null) return;
+    // 旧 Run 尚在清理时也要撤销后来登记的继续；重复停止不能因已 abort 而失效。
     currentRun.resumeAfterTermination = false;
+    if (currentRun.abortController.signal.aborted) return;
     currentRun.abortSource = source;
     currentRun.abortController.abort(source);
     resolvePendingToolApproval(currentRun, "aborted");
@@ -970,8 +1014,8 @@ export function createSessionAgent({
       if (!options.resume) return Promise.resolve(EMPTY_PROMPT_RESULT);
       for (const input of runtime.pendingInputs?.() ?? []) queueInternal(input);
       const nextInput = state.steerQueue[0] ?? state.followUpQueue[0];
-      if (!nextInput) return Promise.resolve(EMPTY_PROMPT_RESULT);
       resumeInputs();
+      if (!nextInput) return Promise.resolve(EMPTY_PROMPT_RESULT);
       const accepted = state.ownedRunResultPromise === null;
       startQueuedRun(true);
       return Promise.resolve({
@@ -1025,8 +1069,23 @@ export function createSessionAgent({
       ...(controlCall ? { controlCall } : {}),
       completion,
     };
-    if (internalInput) state.inputsPaused = false;
+    if (internalInput) {
+      state.inputsPaused = false;
+      // 邮箱可能已将同一条消息放入内存队列；显式调度只接管其完成通知，不能再次消费。
+      state.steerQueue = state.steerQueue.filter(
+        (queued) => queued.inputId !== internalInput.messageId,
+      );
+      if (state.committedInputIds.has(internalInput.messageId)) {
+        void runtime
+          .acknowledgeInput?.(internalInput)
+          .then(() => completion.resolve({ status: "completed" }), completion.reject);
+        return completion.promise;
+      }
+    }
     queueInput(input);
+    if (internalInput?.kind === "task") {
+      state.steerQueue = [input, ...state.steerQueue.filter((queued) => queued !== input)];
+    }
     startQueuedRun(true);
     return completion.promise;
   }
@@ -1057,6 +1116,7 @@ export function createSessionAgent({
       deniedToolActionFingerprints: new Set(),
       terminalResultPromise: null,
       requestToolRunners: new WeakMap(),
+      waitingWorkspaceToolCallIds: new Set(),
       resumeAfterTermination: false,
       inputCompletions: new Set(
         [...state.steerQueue, ...state.followUpQueue].flatMap((queued) =>
@@ -1071,6 +1131,12 @@ export function createSessionAgent({
       for (const inputCompletion of currentRun.inputCompletions) inputCompletion.resolve(result);
       completion.resolve(result);
       startQueuedRun();
+      // 整轮所有权释放后才通知群组，避免终态事件与迟到邮箱争用仍未清理的执行者。
+      try {
+        onRunSettled?.(result);
+      } catch {
+        /* 观察者不能破坏已经完成的 Run。 */
+      }
     });
   }
 
@@ -1535,6 +1601,7 @@ export function createSessionAgent({
       return createStateSnapshot();
     },
     prompt,
+    toolAccess,
     queueInternal,
     promptInternal(input) {
       if (input.rootSessionId !== runtime.session.rootSessionId)

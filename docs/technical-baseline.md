@@ -42,7 +42,7 @@ Agent 持有消息 transcript、当前流式消息、是否正在运行以及取
 - 通过生产启动工厂从 Anthias 根 `.env` 与进程环境创建 Agent，并返回安全的配置结果；
 - 读取当前只读 state；
 - 提交一条 prompt；
-- 在空闲时查看或切换 Agent / Plan / AutoAllow 权限模式；
+- 在空闲时查看或切换 请求批准 / AutoAllow / Full Access 权限模式；
 - 响应当前待决的 Tool approval；
 - 通过 `permissions.snapshot/grant/revoke` 查看、明确授予或撤销工作区授权；
 - 取消当前运行，或关闭 Agent 并等待资源释放；
@@ -118,25 +118,25 @@ AutoAllow 对相同动作的新 ToolCall 重新核验授权，同时向审核模
 
 精确匹配使用字面参数边界；只有显式 `--prefix` 才允许后续参数，cwd 必须为工作区内确切的现存目录，执行前重新核对真实路径。组合命令逐段匹配，CR、LF、CRLF 都作为命令边界；不确定语法、动态展开、重定向及可直接识别的 Git、清理或发布入口交回审核。解释器前缀可运行后续字面脚本，不限制脚本运行时的系统用户能力。授权预览与工具待批准不能并存，撤销或范围变化使旧预览失效。
 
-只有 `auto_allow` 消费授权：先应用硬禁止和当前限制，再核对最终文件路径、命令和有效授权，未命中时独立审核。`agent` 保留逐动作确认，`plan` 保持只读。命中来源随审批事实保存，但历史事实不能恢复旧权限。文件与命令仍以当前系统用户权限运行，cwd 和 worktree 不构成 OS 隔离。
+只有 `auto_allow` 消费授权：先应用硬禁止和当前限制，再核对最终文件路径、命令和有效授权，未命中时独立审核。`agent` 保留逐动作确认，`full_access` 跳过人工与模型批准；成员只读限制独立生效。命中来源随审批事实保存，但历史事实不能恢复旧权限。文件与命令仍以当前系统用户权限运行，cwd 和 worktree 不构成 OS 隔离。
 
-仅本次会话的 `--members` 包含当前任务创建并登记的成员 worktree；同时记住时，包含以后从同一根工作区发起任务所创建并登记的成员 worktree。不选择则不继承。`/permissions revoke` 先使根与成员尚未开始的动作和待审批失效，再保存撤销；已开始动作需要停止，已产生副作用不能回滚。授权或撤销保存失败时分别呈现当前会话与跨启动的实际结果，不宣称已经记住。
+`--members` 明确包含同根工作区的成员，以及从该根登记的成员工作树；记住后可用于后续从同一根工作区发起的成员任务。不选择则不继承。`/permissions revoke` 先使根与成员尚未开始的动作和待审批失效，再保存撤销；已开始动作需要停止，已产生副作用不能回滚。授权或撤销保存失败时分别呈现当前会话与跨启动的实际结果，不宣称已经记住。
 
 ## 外部能力
 
-内建 `web_search` 固定使用 SearchAPI Google 的 `https://www.searchapi.io/api/v1/search`，凭据来自可选 `SEARCHAPI_API_KEY`，仅通过 Bearer Header 发送，模型不能替换端点。它以内部工具扩展接入根与成员，Plan 可用，并沿用只读有界并发、生命周期事件和取消。缺少搜索配置仅使此工具不可用，不阻断其他 Coding 能力启动。
+内建 `web_search` 固定使用 SearchAPI Google 的 `https://www.searchapi.io/api/v1/search`，凭据来自可选 `SEARCHAPI_API_KEY`，仅通过 Bearer Header 发送，模型不能替换端点。它以内部工具扩展接入根与成员，只读成员可用，并沿用只读有界并发、生命周期事件和取消。缺少搜索配置仅使此工具不可用，不阻断其他 Coding 能力启动。
 
 输入为最多 2000 字符的非空 query 和可选正整数 page；不自动翻页或读取全文。响应最多 1 MiB，保留最多 20 条、总计 60 KiB 的标题、URL、摘要和来源，单次请求超时 15 秒。服务错误只映射为安全结果，响应中的凭据回显被移除；结果作为带来源的不可信摘要进入上下文，不提升权限，最终主张需引用相应链接。
 
 Skill 使用用户和项目 `.agents/skills`，扩展路径通过 `ANTHIAS_SKILL_DIRS` 传入。目录只保留有界元数据，正文与引用分别按需读取；实际内容作为 Session 来源事实保存，恢复保留已保存版本，文件变化给出诊断。外部指令和参考资料始终计入后续请求预算，压缩不把它们变为真实用户授权。
 
-MCP 使用官方 TypeScript 客户端。配置发现与连接分开，`/mcp connect` 才启动 stdio 进程或 HTTP 连接。工具经 schema 与连接版本校验、现有权限/AutoAllow、开始事实和产物链执行；Plan 拒绝未知外部工具。资源按 URI 读取，模板由用户选择，其内容保持外部来源。配置格式及环境变量引用见 [Quick Start](../quick-start.md)，协议验证范围见 [Feature 006 Report](../specs/feature006-command-skill-mcp-tui/report.md)。
+MCP 使用官方 TypeScript 客户端。配置发现与连接分开，`/mcp connect` 才启动 stdio 进程或 HTTP 连接。工具经 schema 与连接版本校验、现有权限/AutoAllow、开始事实和产物链执行；只读成员拒绝未知外部工具。资源按 URI 读取，模板由用户选择，其内容保持外部来源。配置格式及环境变量引用见 [Quick Start](../quick-start.md)，协议验证范围见 [Feature 006 Report](../specs/feature006-command-skill-mcp-tui/report.md)。
 
 ## 记忆与提示词编排
 
 Feature 008 已实现主动记忆和 `/memory` 管理。应用根目录的 `memory/user/`、`memory/experience/<project-id>/` 与 `memory/state/` 分别保存用户条目、项目经验及本地设置。当前 Workspace 与应用数据根分别装配；同仓库工作树按共同 Git 目录归组，各自读取自己的项目根 AGENTS.md，未提交仓库与非 Git Workspace 也可使用记忆。
 
-`memory/` Module 持有存储、修订校验、范围和时效；`tool/memory-tools.ts` 绑定真实用户或已完成 Tool 证据，根校验成员候选，成员条件以自己的工作树取证。人工确认保留原证据来源，后续自动维护不能覆盖用户确认的内容。候选不默认采用，文件或分支条件变化进入待复核，读取不会刷新确认时间。自动开关控制自动维护，Plan 仍允许受管应用记忆维护，Workspace 权限独立检查。
+`memory/` Module 持有存储、修订校验、范围和时效；`tool/memory-tools.ts` 绑定真实用户或已完成 Tool 证据，根校验成员候选，成员条件以自己的工作树取证。人工确认保留原证据来源，后续自动维护不能覆盖用户确认的内容。候选不默认采用，文件或分支条件变化进入待复核，读取不会刷新确认时间。自动开关控制自动维护，受管应用记忆维护不授予工作区写入权，Workspace 权限独立检查。
 
 请求文本按固定基础规则、少量通用用户记忆、初始环境、项目规则、Skill 目录、经验索引与少量正文、会话历史及动态来源排列。`tools` 保持独立字段并按名称稳定排序；系统模板不重新拼入变化的正文。来源首次采用形成有界快照，后续真实变化追加新版本；按需正文位于对应完整 Tool 组后，Tool 结果只确认采用或引用，不重复携带正文。语义优先级为真实用户要求、项目规则、有效经验、用户记忆，传输角色不会改变来源身份或授予权限。
 
@@ -144,7 +144,7 @@ Session 保存实际消息与采用事实，memory 保存当前跨会话状态�
 
 遗忘保留不含正文的抑制标记，后续采用移除相关记忆与受影响摘要；明确停止发送时还过滤相关原始消息的模型投影。已经发送的请求无法撤回，执行未开始的 Tool 前会重新核对撤销状态。存储提交与 Session 采用分别处理，采用失败会如实说明“记忆已保存”，封口当前 Run，恢复时重新对齐。取消不能将已经提交的写入报告为未保存。
 
-来源正文继续计入请求预算，缓存用量只使用 Provider 返回值，未知保持未知。已移除每 Run 12 次和整组 60 次调用截止；30 分钟共享任务时限、32 个 ToolCall / 批、只读四并发和三个成员的限制保持。实现与本地验证范围见 [Feature 008 Report](../specs/feature008-memory-and-prompt-orchestration/report.md)。
+来源正文继续计入请求预算，缓存用量只使用 Provider 返回值，未知保持未知。已移除每 Run 12 次和整组 60 次调用截止；30 分钟共享任务时限、32 个 ToolCall / 批、只读四并发保持，成员执行限制已由 Feature 014 调整为九个（加根共十个）。实现与本地验证范围见 [Feature 008 Report](../specs/feature008-memory-and-prompt-orchestration/report.md)。
 
 ## 设计约束
 
@@ -169,10 +169,16 @@ Session 保存实际消息与采用事实，memory 保存当前跨会话状态�
 
 ## 多 Agent 协作
 
-Feature 007 已完成实现与本地验证，待开发者验收。在现有 Agent Module 内复用 SessionAgent，每个成员持有独立线性 Session 和取消资源；根持有三个成员名额、一个活动 Team、任务和消息队列。公开入口增加 `collaboration.snapshot/execute` 与 `git.execute`，TUI 只构造语义操作；没有新增 package、Host 或数据库。
+[Feature 014](../specs/feature014-unified-multi-agent/spec.md) 将 SubAgent 与 Team 合并为根 Session 的一个隐式群组；实现与验证状态见 [Report](../specs/feature014-unified-multi-agent/report.md)。每名成员持有独立 Session、上下文和 Run，完成后保留为 idle。总执行并发十个，其中根保留一个位置，九个成员位置饱和时排队；空闲、暂停、关闭不占执行位置。
 
-`multi-agent/` 负责成员运行、Team 与投递；`git/` 负责固定 argv 的本地仓库操作、受管 worktree、成果提交及集成。Tool 层承接参数、权限和审批，Session 层继续负责记录、兼容、只读历史和组清理。成员不能继续创建 Agent，内部委派和消息不成为用户授权，AutoAllow 核对真实根 Session 记录。
+`multi-agent/members.ts` 持有成员、执行位置和取消，`tasks.ts` 持有正式任务，`mailbox.ts` 持有稳定 ID 投递与消费确认，`shared-notes.ts` 串行维护根目录下唯一笔记。`index.ts` 绑定根权力、群组暂停来源和三十分钟共享时限。SessionAgent 继续持有模型和输入安全点，协调器不复制 Agent Loop。TUI 统一使用 `/agent` 与 `collaboration.snapshot/execute`；旧 Team 动作仅在内部兼容，不再暴露两套模型工具。
 
-Schema 3 Header 明确 `sessionKind`、`rootSessionId`；根和成员分别在原日期平铺目录保存 JSONL。根的 `coordination` 记录保存成员、任务、消息和 Git 事实，成员的 `agent_input` 保存带发送方与稳定消息 ID 的内部输入。旧 Schema 1/2 可读，显式执行采用兼容升级；只读历史不会触发迁移或要求 Workspace 存在。索引是可重建缓存，不承担跨 Session 事务。
+用户高于根，根高于成员。根可以创建、分派、停止、重开和绑定成员工作区；成员可以通信、更新自身任务、查看公开快照和追加笔记。根可读成员完整历史，普通成员只能查看同伴公开结果。组内内容保留来源，不能变成真实用户授权。用户直接通过协作入口提交正式任务时，先保存根 `coordination/user_request` 事实；AutoAllow 与压缩校验使用该真实用户原文，模型发消息不能产生这种授权。用户暂停群组同时停止根和成员，根不能借新建成员解除；用户明确继续后才恢复调度。
 
-创建和 Git 写入先记录意图，再保存结果；跨日志投递先持久化收件输入，再确认送达，依靠稳定 ID 去重。重开只恢复历史状态，显式继续才创建新 Run。清理按根关系成组保护未交付资源，永远不删除 Git 目录或分支。`ANTHIAS_WORKTREE_DIR` 与 `ANTHIAS_SESSION_DIR` 分别配置代码和历史路径。具体限制与验证见 [Feature 007 Report](../specs/feature007-multi-agent/report.md)。
+消息先写根 `coordination`，在成员 `agent_input` 持久化后确认消费。运行中在整个工具批次完成后的安全点插入，空闲成员由调度唤醒；暂停保持队列，关闭拒绝新消息，重开需要根明确调用。每个收件者最多三十二条待处理消息，每条十六 KiB。根正常完成关闭新唤醒，已启动 Run 在原期限内收尾，迟到消息保留历史；根失败或取消收束成员。重启只恢复状态，用户明确继续群组后才执行，消息不能重置时限。
+
+成员默认共享根工作区且可写，根可独立限制为只读；可写不创建工作树。需要隔离时先显式创建或选取受管 worktree，再绑定停止中的成员。绑定事实保存在根日志，执行打开核对成员所属根与当前绑定，保留原 Header。工作树只带入明确提交，不复制未提交文件、依赖或凭据。
+
+文件工具读取返回完整原始字节 SHA-256，编辑和覆盖携带 `expectedVersion`，新建使用 `missing`。批准期间不持锁，取得写入权后再次核对内容、文件/父目录身份、授权与取消，然后原子替换。同一真实路径或文件身份串行，不同文件可以并行；命令独占所属工作区写入阶段，Git 变更在同一协调器内对相关工作区排他并重新核对批准指纹。等待可取消；命令清理无法确认时保留该工作区租约，不能假装资源已释放。以上只协调本进程的受管操作，不约束外部编辑器或其他进程，不构成 OS 沙箱。
+
+当前 Session 仍使用 Schema 4，根位于 `data/conversation/<UTC日期>/<时间戳>-<根ID>/`，成员位于根目录下 `members/<成员ID>/`，唯一笔记为根目录的 `shared-notes.md`。历史 `plan`、`subagent`、`teammate` 记录继续可读；存储标签不决定运行时两套行为。未消费消息、未完成任务和受管工作树等阻止整组清理，关闭成员不删除源码或历史。

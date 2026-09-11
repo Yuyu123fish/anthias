@@ -451,12 +451,13 @@ function assertGroupCoordinationIsSafe(
     if (
       memberSession === undefined ||
       payload?.sessionId !== record.key ||
-      payload.kind !== memberSession.header.sessionKind ||
-      payload.workspaceRoot !== memberSession.header.workspaceRoot
+      !["subagent", "teammate"].includes(String(payload.kind)) ||
+      typeof payload.workspaceRoot !== "string"
     ) {
       throw new Error("group ownership incomplete");
     }
     if (
+      payload.status !== "idle" &&
       payload.status !== "completed" &&
       payload.status !== "failed" &&
       payload.status !== "aborted" &&
@@ -465,12 +466,25 @@ function assertGroupCoordinationIsSafe(
     ) {
       throw new Error("group has active member");
     }
-    if (payload.writable === true) {
-      if (typeof payload.worktreeId !== "string") {
-        throw new Error("group ownership incomplete");
-      }
+    // 工作区切换以根的绑定记录为准；不同于原 Header 时仍须属于根或受管工作树。
+    if (
+      payload.workspaceRoot !== rootSession.header.workspaceRoot &&
+      payload.worktreeId === undefined
+    )
+      throw new Error("group workspace ownership incomplete");
+    if (payload.worktreeId !== undefined) {
+      if (typeof payload.worktreeId !== "string") throw new Error("group ownership incomplete");
       const worktreeRecord = latestRecords.get(`worktree\0${payload.worktreeId}`);
-      if (worktreeRecord === undefined) {
+      const worktree = worktreeRecord ? asJsonObject(worktreeRecord.payload) : null;
+      if (
+        !worktree ||
+        (worktree.path !== payload.workspaceRoot &&
+          !(
+            worktree.path === undefined &&
+            payload.workspaceRoot === memberSession.header.workspaceRoot
+          )) ||
+        worktree.rootSessionId !== rootSession.header.sessionId
+      ) {
         throw new Error("group ownership incomplete");
       }
     }
@@ -487,7 +501,11 @@ function assertGroupCoordinationIsSafe(
     if (record.kind === "task" && payload.status !== "completed") {
       throw new Error("group has unfinished task");
     }
-    if (record.kind === "delivery" && payload.status !== "delivered") {
+    if (
+      record.kind === "delivery" &&
+      payload.status !== "delivered" &&
+      payload.status !== "retained"
+    ) {
       throw new Error("group has unfinished task");
     }
     if (record.kind === "worktree") {

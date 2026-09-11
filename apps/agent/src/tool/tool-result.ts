@@ -9,6 +9,7 @@ import type { ArtifactSourceStatus, SessionArtifactStore } from "./artifacts.js"
 /** 文件页范围只在结果收敛前存在，最终范围按实际可见完整行生成。 */
 export type ToolFilePage = Readonly<{
   path: string;
+  version: string;
   startLine: number;
   totalLines: number;
   lines: readonly string[];
@@ -136,6 +137,7 @@ export function renderToolFilePage(page: ToolFilePage, lineCount = page.lines.le
   const endLine = page.startLine - 1 + lineCount;
   return [
     "path: " + page.path,
+    "version: " + page.version,
     "lines: " +
       (lineCount === 0 ? "none" : page.startLine + "-" + endLine) +
       " of " +
@@ -162,7 +164,11 @@ function boundFilePage(page: ToolFilePage, tokenBudget: number, marker: string) 
   return fitsToolOutput(content, tokenBudget)
     ? { content, truncated: true }
     : {
-        content: "文件页元数据超过预算；请缩小请求范围。\nnextStartLine: " + page.startLine,
+        content:
+          "version: " +
+          page.version +
+          "\n文件页元数据超过预算；请缩小请求范围。\nnextStartLine: " +
+          page.startLine,
         truncated: true,
       };
 }

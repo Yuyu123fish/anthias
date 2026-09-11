@@ -190,7 +190,7 @@ describe("Anthias TUI", () => {
   it("keeps plain output free of controls and routes local commands without model calls", async () => {
     const harness = createHarness(false);
     harness.input.write("/help\n");
-    harness.input.write("/mode plan\n");
+    harness.input.write("/mode auto_allow\n");
     harness.input.write("/context\n");
     await vi.waitFor(() => expect(harness.plain()).toContain("外部上下文 200"));
     expect(harness.plain()).toContain(harness.agent.state.workspaceRoot);
@@ -1240,12 +1240,10 @@ it("restores root and member summaries without opening member sessions", async (
   });
   await screenContains(harness.terminal, "主 Agent · 根 Session " + rootSessionId);
   expect(harness.terminal.text()).toContain("Saved root answer");
-  expect(harness.terminal.text()).toContain("成员 Reviewer [closed-member] · teammate · 已释放");
+  expect(harness.terminal.text()).toContain("成员 Reviewer [closed-member] · 已关闭");
   expect(harness.terminal.text()).toContain("Review existing changes");
   expect(harness.terminal.text()).toContain("Saved review result");
-  expect(harness.terminal.text()).toContain(
-    "成员 missing-member [missing-member] · subagent · 失败",
-  );
+  expect(harness.terminal.text()).toContain("成员 missing-member [missing-member] · 失败");
   expect(harness.terminal.text()).toContain("尚无结果摘要。");
   expect(harness.terminal.text()).toContain("Member log is missing");
   clickText(harness.terminal, "成员 Reviewer");

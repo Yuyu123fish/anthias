@@ -278,15 +278,17 @@ export function createConversationView(options: {
                   ? "思考中"
                   : state.activeAssistantMessage
                     ? "正在回答"
-                    : state.activeRun?.phase === "reviewing_tool"
-                      ? "自动审批"
-                      : state.activeRun?.phase === "executing_tool"
-                        ? "Tool 运行中"
-                        : state.activeRun?.phase === "retrying_model"
-                          ? "等待模型重试 · Ctrl+C 停止"
-                          : state.running
-                            ? "请求模型中"
-                            : "等待输入";
+                    : state.activeRun?.phase === "awaiting_workspace"
+                      ? "等待工作区资源"
+                      : state.activeRun?.phase === "reviewing_tool"
+                        ? "自动审批"
+                        : state.activeRun?.phase === "executing_tool"
+                          ? "Tool 运行中"
+                          : state.activeRun?.phase === "retrying_model"
+                            ? "等待模型重试 · Ctrl+C 停止"
+                            : state.running
+                              ? "请求模型中"
+                              : "等待输入";
       const usage = state.contextUsage;
       const contextText =
         usage.inputTokens === null

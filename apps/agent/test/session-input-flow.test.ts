@@ -30,7 +30,7 @@ async function setup(modelStream: ModelStream, configure?: (session: Session) =>
     session,
     modelStream,
     ...(configure ? { toolRunner: configure(session) } : {}),
-    permissionMode: "plan",
+    permissionMode: "agent",
   });
   agents.push(agent);
   const events: AgentEvent[] = [];
@@ -406,3 +406,65 @@ it.each(["aborted", "failed"] as const)(
     expect(agent.state.inputQueue).toEqual({ steer: [], followUp: [], paused: false });
   },
 );
+
+it("lets the last stop cancel continuation while the aborted Run is sealing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anthias-last-stop-"));
+  directories.push(directory);
+  const session = await createSession({
+    workspaceRoot: directory,
+    sessionDirectory: join(directory, "sessions"),
+    shell: { kind: "powershell", executable: "pwsh", arguments: [] },
+  });
+  const sealing = Promise.withResolvers<void>();
+  const releaseSeal = Promise.withResolvers<void>();
+  const delayedSession: Session = {
+    ...session,
+    get records() {
+      return session.records;
+    },
+    get header() {
+      return session.header;
+    },
+    async appendRunFinished(runId, details) {
+      if (details.status === "aborted") {
+        sealing.resolve();
+        await releaseSeal.promise;
+      }
+      return session.appendRunFinished(runId, details);
+    },
+  };
+  let requestCount = 0;
+  const agent = createSessionAgent({
+    session: delayedSession,
+    modelStream: async function* (_request, signal) {
+      requestCount += 1;
+      if (requestCount === 1) {
+        yield { type: "text_delta", delta: "working" };
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        return;
+      }
+      yield { type: "text_delta", delta: "done" };
+      yield { type: "finish", finishReason: "stop" };
+    },
+  });
+  agents.push(agent);
+  const initialResult = promptToCompletion(agent, "initial");
+  await vi.waitFor(() => expect(requestCount).toBe(1));
+  await agent.prompt("queued continuation");
+  agent.abort();
+  await sealing.promise;
+  await agent.prompt("", { resume: true });
+  agent.abort();
+  releaseSeal.resolve();
+  expect((await initialResult).status).toBe("aborted");
+  await vi.waitFor(() => expect(agent.state.running).toBe(false));
+  expect(agent.state.inputQueue.paused).toBe(true);
+  expect(agent.state.inputQueue.steer.map((input) => input.content)).toEqual([
+    "queued continuation",
+  ]);
+  expect(requestCount).toBe(1);
+  expect((await promptToCompletion(agent, "", { resume: true })).status).toBe("completed");
+  expect(requestCount).toBe(2);
+});

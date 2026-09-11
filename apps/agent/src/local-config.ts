@@ -27,7 +27,7 @@ ANTHIAS_MODEL_API_KEY=
 # 可选；缺少此 Key 只影响 web_search。
 SEARCHAPI_API_KEY=
 
-# agent / plan / auto_allow / full_access；AutoAllow 按工作区授权或真实用户要求审核。
+# agent / auto_allow / full_access；AutoAllow 按工作区授权或真实用户要求审核。
 # Full Access 跳过人工和模型审批，可访问系统用户权限内的工作区外文件；没有 OS 沙箱。
 # --mode 优先于此默认值；运行中的 /mode 不改写本文件。
 ANTHIAS_PERMISSION_MODE=agent
@@ -104,7 +104,7 @@ function resolveConfiguration(
   if (!isPermissionMode(permissionMode)) {
     return {
       ok: false,
-      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、plan、auto_allow 或 full_access。",
+      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、auto_allow 或 full_access。",
     };
   }
   return { ok: true, environment, permissionMode };

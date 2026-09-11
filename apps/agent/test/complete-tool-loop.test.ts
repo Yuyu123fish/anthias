@@ -46,6 +46,7 @@ describe("complete Coding Agent Tool Loop", { timeout: 20_000 }, () => {
         case 2:
           yield toolCallEvent(3, "edit_file", {
             path: "src/value.txt",
+            expectedVersion: readVersion(modelRequest),
             replacements: [{ oldText: "old", newText: "new" }],
           });
           yield finishEvent("tool_calls");
@@ -116,4 +117,14 @@ function finishEvent(finishReason: "stop" | "tool_calls") {
     type: "finish" as const,
     finishReason,
   });
+}
+
+function readVersion(request: ModelRequest): string {
+  const readResult = request.messages.findLast(
+    (message) => message.role === "tool" && message.toolName === "read_file",
+  );
+  if (readResult?.role !== "tool") throw new Error("missing read_file result");
+  const version = readResult.content.match(/^version: (sha256:[a-f0-9]{64})$/mu)?.[1];
+  if (version === undefined) throw new Error("missing file version");
+  return version;
 }
