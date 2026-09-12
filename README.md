@@ -42,6 +42,7 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 - [Feature 006](specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏固定面板与应用内滚动、流式 Markdown、统一 `/` 命令、会话切换与手动压缩、按需加载外部 Skill、显式连接 MCP。当前全屏交互替代 Feature 004 的 scrollback 方案；[实施报告](specs/feature006-command-skill-mcp-tui/report.md) 记录本地验证，等待开发者终端体验验收。
 - [Feature 007](specs/feature007-multi-agent/spec.md) 建立了本地 Git 成果交付与协作历史；其三成员、SubAgent/Team 和自动工作树行为已由 Feature 014 替代，历史 Report 保留当时证据。
 - [Feature 014](specs/feature014-unified-multi-agent/spec.md) 实施统一持续成员、持久邮箱、共享笔记、含根十个执行并发、三种权限模式，以及默认共享工作区与显式工作树。文件使用内容版本和受管写入协调；暂停/关闭与恢复边界见 [Report](specs/feature014-unified-multi-agent/report.md)。已通过完整本地门禁，待开发者验收。
+- [Feature 015](specs/feature015-execution-recovery/spec.md) 已实现工作区显式阻塞与恢复、Enter 排队和 Esc 中断处理、紧凑故障反馈、编辑新版本及安全预算诊断。已完成本地验证，待验收；本地浏览器仍能复现输出完成而命令不退出，现已转为可诊断阻塞，具体边界见 [Report](specs/feature015-execution-recovery/report.md)。
 - [Feature 008](specs/feature008-memory-and-prompt-orchestration/spec.md) 已实现主动记忆、`/memory` 管理、项目 `AGENTS.md` 自动加载、稳定提示词顺序与来源增量，以及历史身份和压缩恢复映射。已移除 12/60 次模型调用截止，保留 30 分钟时限和资源边界；本地验证与真实缓存收益的证据边界见 [实施报告](specs/feature008-memory-and-prompt-orchestration/report.md)，待开发者验收。
 - [Feature 009](specs/feature009-usage-stability/spec.md) 已实现根 `.env` 配置、SearchAPI 网页搜索、可记住与撤销的工作区授权，以及命令顺序、工具过程和输入草稿修复；`/diagnostics` 查看安全停止原因，`/continue` 明确继续，`/draft` 恢复未接受输入。普通模型恢复行为已由 Feature 010 后续增量扩展，见下一项。本地验证见 [实施报告](specs/feature009-usage-stability/report.md)，当前待开发者验收；本 Feature 未进行真实模型、SearchAPI 调用或 Windows Terminal 主观体验验收。
 - [Feature 010](specs/feature010-agent-execution-reliability/spec.md) 已实现模型续轮、工具保存与并发、审批和 Tab 补全修复；[后续增量](specs/feature010-agent-execution-reliability/increment.md) 补齐相同动作重新审核、任务持续执行提示词与有界自动恢复。主模型重试和续跑共用最多两次预算，审核技术故障最多恢复一次；保持原 Run、授权和任务时限，不重放已完成工具。当前为已实现、待验收，验证边界见 [Report](specs/feature010-agent-execution-reliability/report.md)。
@@ -54,4 +55,5 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 - [技术基线](docs/technical-baseline.md)：当前 TypeScript、Agent、TUI、事件和模型方向。
 - [开发流程](docs/development-workflow.md)：讨论、Spec、Plan、实施与验收的协作方式。
 - [Feature 文档约定](specs/README.md)：编号 Feature 的目录、文档结构和状态。
+- [故障记录](docs/incident/README.md)：真实使用中的问题、原因、修复方案与验证状态。
 - [Research](research/README.md)：项目级或跨 Feature 的调查规则和历史归档；Feature 专属 Research 见对应 Feature 目录。

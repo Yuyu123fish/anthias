@@ -75,6 +75,7 @@ describe("read-only Agent Tool Loop", () => {
       "agent_list",
       "agent_message",
       "agent_notes",
+      "agent_recover_workspace",
       "agent_reopen",
       "agent_result",
       "agent_resume",

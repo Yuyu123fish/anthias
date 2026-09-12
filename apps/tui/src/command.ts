@@ -190,7 +190,13 @@ export async function executeCommand(
     }
     case "diagnostics":
       if (args.length) return invalid();
-      else notice(formatRunDiagnostic(agent.state.lastRunDiagnostic));
+      else
+        notice(
+          [
+            ...(agent.state.configurationSummary ?? []),
+            formatRunDiagnostic(agent.state.lastRunDiagnostic),
+          ].join("\n"),
+        );
       break;
     case "steer":
     case "followup":

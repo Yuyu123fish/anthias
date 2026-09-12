@@ -96,6 +96,8 @@ export function createMembers(options: {
   started?(member: MemberSummary): Promise<void>;
   finished(member: MemberSummary): Promise<void>;
 }) {
+  const deliveredFaults = new Map<string, number>();
+  const faultRevisions = new Map<string, number>();
   const members = new Map<string, MemberOwnership>();
   const waiters = new Set<() => void>();
   let closing = false;
@@ -305,6 +307,26 @@ export function createMembers(options: {
           phase: event.phase,
           lastActivityAt: new Date().toISOString(),
         };
+        notify();
+      }
+      if (
+        (event.type === "model_retry" &&
+          event.phase === "waiting" &&
+          event.diagnostic.category === "output_limit") ||
+        (event.type === "tool_execution_end" &&
+          (event.cleanupUncertain || event.result.content.includes("workspace_blocked")))
+      ) {
+        member.summary = {
+          ...member.summary,
+          error:
+            event.type === "model_retry"
+              ? "输出超限，重试 " + event.retryCount + "；需要缩小单次输出并检查预算。"
+              : event.result.content.slice(0, 800),
+        };
+        faultRevisions.set(
+          member.summary.sessionId,
+          (faultRevisions.get(member.summary.sessionId) ?? 0) + 1,
+        );
         notify();
       }
       options.event(member.summary, event);
@@ -854,10 +876,39 @@ export function createMembers(options: {
       });
       return closeCompletion;
     },
+    reportWorkspaceBlock(sessionId: string, error: string) {
+      const member = members.get(sessionId);
+      if (!member || member.summary.error === error) return;
+      member.summary = { ...member.summary, error };
+      faultRevisions.set(sessionId, (faultRevisions.get(sessionId) ?? 0) + 1);
+      notify();
+    },
+    clearWorkspaceBlock(blockId: string) {
+      for (const member of members.values()) {
+        if (member.summary.error?.includes(blockId))
+          member.summary = { ...member.summary, error: "" };
+      }
+      notify();
+    },
     async wait(ids: readonly string[], timeoutMs: number, signal: AbortSignal) {
       const selected = ids.map(get);
-      const snapshot = () => selected.map((member) => ({ ...member.summary }));
-      const settled = () => selected.some((member) => !busy(member.summary.sessionId));
+      const snapshot = () =>
+        selected.map((member) => {
+          if (member.summary.error)
+            deliveredFaults.set(
+              member.summary.sessionId,
+              faultRevisions.get(member.summary.sessionId) ?? 0,
+            );
+          return { ...member.summary };
+        });
+      const settled = () =>
+        selected.some(
+          (member) =>
+            !busy(member.summary.sessionId) ||
+            (Boolean(member.summary.error) &&
+              deliveredFaults.get(member.summary.sessionId) !==
+                (faultRevisions.get(member.summary.sessionId) ?? 0)),
+        );
       if (settled()) return snapshot();
       signal.throwIfAborted();
       await new Promise<void>((resolve, reject) => {

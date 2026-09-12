@@ -7,6 +7,7 @@ import type { WorkspaceAccess } from "./workspace-access.js";
 export type ToolWorkspace = Readonly<{
   workspaceRoot: string;
   sessionDirectory: string;
+  sessionId?: string;
   protectedPaths?: readonly string[];
   allowExternalPaths?: boolean;
   workspaceAccess?: WorkspaceAccess;

@@ -37,6 +37,14 @@ export function toolResultStatus(status: ToolResultMessage["status"]): string {
 /** 两种入口共用事件含义；流式状态、折叠和插入位置仍由各自呈现层决定。 */
 export function eventNotice(event: AgentEvent): Readonly<{ title: string; text: string }> | null {
   switch (event.type) {
+    case "input_interruption_changed":
+      return {
+        title: "插入用户消息",
+        text:
+          event.status === "blocked"
+            ? "清理受阻，消息已保留；/agents 查看来源，/agent recover <blockId> 检查。"
+            : "正在打断并清理，完成后处理排队消息。",
+      };
     case "input_queued":
       return {
         title:
@@ -44,8 +52,8 @@ export function eventNotice(event: AgentEvent): Readonly<{ title: string; text: 
             ? "成员输入 · 已排队"
             : event.input.mode === "steer"
               ? "优先插入 · 已排队"
-              : "等待插入 · 已排队",
-        text: `[${event.input.inputId.slice(-8)}] ${event.input.content}\n${event.input.source.kind === "agent" ? "成员投递已保存在协作历史，等待安全点插入。" : "尚未保存；停止后用 /continue 恢复，关闭会丢弃。"}`,
+              : "后续消息 · 已排队",
+        text: `[${event.input.inputId.slice(-8)}] ${event.input.content}\n${event.input.source.kind === "agent" ? "成员投递已保存在协作历史，等待安全点插入。" : "尚未保存；当前任务结束后处理，Esc 立即打断并处理。停止后用 /continue 恢复，关闭前尚未消费的消息会丢弃。"}`,
       };
     case "input_consumed":
       return {

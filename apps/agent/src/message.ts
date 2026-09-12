@@ -1,3 +1,10 @@
+/** 实际交给 Provider 的安全请求参数，不含端点、凭据或消息正文。 */
+export type RequestConfiguration = Readonly<{
+  modelId: string;
+  maxOutputTokens: number;
+  reasoningEffort?: "low" | "medium" | "high";
+}>;
+
 /** 表示一条已经被 Agent 接受的用户文本消息。 */
 export type UserMessage = Readonly<{
   role: "user";
@@ -90,7 +97,15 @@ export type RunDiagnostic = Readonly<{
     cacheWriteInputTokens: number | null;
   }> | null;
   retryCount: number | null;
-  abortSource: "user" | "task_deadline" | "shutdown" | "parent" | "internal" | "unknown" | null;
+  abortSource:
+    | "user"
+    | "task_deadline"
+    | "shutdown"
+    | "parent"
+    | "internal"
+    | "input"
+    | "unknown"
+    | null;
   httpStatus: number | null;
   providerErrorCode?:
     | "context_length_exceeded"

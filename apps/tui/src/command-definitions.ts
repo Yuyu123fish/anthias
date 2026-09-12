@@ -73,6 +73,11 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         description: "等待成员结束",
         argumentCompletion: "member",
       },
+      {
+        name: "recover",
+        argumentHint: "<blockId> [confirm-cleanup]",
+        description: "检查工作区阻塞；外部清理后可明确确认",
+      },
       { name: "stop", argumentHint: "<id>", description: "暂停成员", argumentCompletion: "member" },
       {
         name: "release",
@@ -265,7 +270,7 @@ export function commandHelp(): string {
     "PageUp / PageDown 滚动 · Ctrl+Home / Ctrl+End 顶部/末尾",
     "Ctrl+T 详情 · Ctrl+C 停止运行，空闲时退出 · Ctrl+D 空输入时退出",
     "审批时输入 approve 或 deny；先完整浏览审批详情，再确认。/approval 返回当前审批。",
-    "正文默认优先插入；/steer <消息> 优先插入，/followup <消息> 等待当前任务完成。",
+    "正文默认排入后续消息；Esc 立即打断并处理最早排队消息；/steer <消息> 在安全点插入，/followup <消息> 等待当前任务完成。",
     "排队输入尚未保存；停止或失败后用 /continue 恢复，关闭后不会保留。",
     "拒绝的输入可用 /draft 恢复；/continue 明确继续上一任务。",
     "// 开头会将一个 / 作为普通文本发送。",

@@ -6,6 +6,7 @@ import {
   isToolCallPart,
   type JsonValue,
   type Message,
+  type RequestConfiguration,
   type RunDiagnostic,
   type ToolResultMessage,
 } from "../message.js";
@@ -67,6 +68,7 @@ export class ModelRequestError extends Error {
 
 /** 描述一次 Model Adapter 调用需要的完整 Agent 自有输入。 */
 export type ModelRequest = Readonly<{
+  onConfiguration?: (configuration: RequestConfiguration) => void;
   systemPrompt: string;
   messages: readonly ModelInputMessage[];
   tools: readonly ModelToolDefinition[];

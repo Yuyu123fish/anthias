@@ -5,6 +5,8 @@ import { locateSessionStorage } from "../session/locations.js";
 import type { AgentEvent, PermissionMode } from "../session-agent.js";
 import { createSessionArtifactStore } from "../tool/artifacts.js";
 import type { GitWorkspace } from "../tool/basetool/git/index.js";
+import type { WorkspaceAccess, WorkspaceBlock } from "../tool/workspace-access.js";
+import { isPathSameOrInside } from "../tool/workspace-path.js";
 import { createMailbox } from "./mailbox.js";
 import { createMembers, type MemberFactory, type MemberSummary, validateText } from "./members.js";
 import { createSharedNotes } from "./shared-notes.js";
@@ -13,6 +15,7 @@ import { createTasks, type TeamSummary, type TeamTask } from "./tasks.js";
 export type { MemberSummary, TeamSummary, TeamTask };
 export type CollaborationSnapshot = Readonly<{
   rootSessionId?: string;
+  workspaceBlocks?: readonly WorkspaceBlock[];
   notice?: string;
   schedulingEnabled?: boolean;
   members: readonly MemberSummary[];
@@ -21,6 +24,7 @@ export type CollaborationSnapshot = Readonly<{
 }>;
 
 export type CollaborationAction =
+  | Readonly<{ action: "workspace_recover"; blockId: string; confirmCleanup?: boolean }>
   | Readonly<{
       action: "spawn" | "team_add";
       task: string;
@@ -57,6 +61,7 @@ export type CollaborationAction =
 /** 根持有群组调度和权力；单 Session 执行器继续独占模型、输入安全点与 Run。 */
 export function createMultiAgent(options: {
   root: Session;
+  workspaceAccess?: WorkspaceAccess;
   git: GitWorkspace;
   modelStream: ModelStream;
   createMember: MemberFactory;
@@ -109,17 +114,58 @@ export function createMultiAgent(options: {
   });
   members.setSchedulingEnabled(false);
 
+  function workspaceBlocks() {
+    const roots = [
+      options.root.workspaceRoot,
+      ...members.list().map((member) => member.workspaceRoot),
+    ];
+    return (
+      options.workspaceAccess
+        ?.snapshot()
+        .filter((block) =>
+          block.workspaceRoots.some((blockedRoot) =>
+            roots.some(
+              (root) =>
+                isPathSameOrInside(root, blockedRoot) || isPathSameOrInside(blockedRoot, root),
+            ),
+          ),
+        ) ?? []
+    );
+  }
+  function compactMember(member: MemberSummary) {
+    return {
+      sessionId: member.sessionId,
+      name: member.name,
+      status: member.status,
+      phase: member.phase,
+      workspaceRoot: member.workspaceRoot,
+      taskId: member.taskId,
+      pausedBy: member.pausedBy,
+      error: member.error,
+      result: member.result?.slice(0, 1200),
+    };
+  }
+  const unsubscribeWorkspace = options.workspaceAccess?.subscribe(() => {
+    for (const block of workspaceBlocks())
+      members.reportWorkspaceBlock(
+        block.sessionId,
+        "workspace_blocked: " + block.blockId + "; " + block.reason,
+      );
+    changed(true);
+  });
   function snapshot(): CollaborationSnapshot {
     return {
       rootSessionId: options.root.sessionId,
+      workspaceBlocks: workspaceBlocks(),
       ...(limitNotice ? { notice: limitNotice } : {}),
       schedulingEnabled: taskState === "active",
       members: members.list(),
       ...tasks.snapshot(),
     };
   }
-  function changed() {
-    if (members.list().length > 0) options.changed(snapshot());
+  function changed(force = false) {
+    if (force || members.list().length > 0 || workspaceBlocks().length > 0)
+      options.changed(snapshot());
     if (!wakeScheduled && taskState === "active" && !closed) {
       wakeScheduled = true;
       queueMicrotask(() => {
@@ -351,7 +397,31 @@ export function createMultiAgent(options: {
       const member = members.get(caller);
       if (["closing", "closed"].includes(member.status)) throw new Error("当前成员已经关闭。");
     }
-    if (action.action === "list") return JSON.stringify(snapshot());
+    if (action.action === "list") {
+      const current = snapshot();
+      return JSON.stringify({
+        rootSessionId: current.rootSessionId,
+        schedulingEnabled: current.schedulingEnabled,
+        notice: current.notice,
+        members: current.members.map(compactMember),
+        workspaceBlocks: current.workspaceBlocks,
+      });
+    }
+    if (action.action === "workspace_recover") {
+      assertRoot(caller);
+      if (action.confirmCleanup && source !== "user")
+        throw new Error("外部清理确认只能由用户直接提交。");
+      if (!workspaceBlocks().some((block) => block.blockId === action.blockId))
+        throw new Error("阻塞不属于当前群组工作区，或已经解除。");
+      if (!options.workspaceAccess) throw new Error("当前工作区未装配恢复入口。");
+      const recovery = await options.workspaceAccess.recover(
+        action.blockId,
+        signal,
+        action.confirmCleanup,
+      );
+      if (recovery.status === "recovered") members.clearWorkspaceBlock(action.blockId);
+      return JSON.stringify(recovery);
+    }
     if (action.action === "result") return readResult(caller, action);
     if (action.action === "message") return JSON.stringify(await send(caller, action));
     if (action.action === "notes_read") return JSON.stringify(await notes.read());
@@ -386,11 +456,13 @@ export function createMultiAgent(options: {
       if (!action.memberIds.length || action.memberIds.length > 9)
         throw new Error("等待需要一至九个成员 ID。");
       return JSON.stringify(
-        await members.wait(
-          action.memberIds,
-          Math.max(1, Math.min(action.timeoutMs ?? 30_000, 60_000)),
-          signal,
-        ),
+        (
+          await members.wait(
+            action.memberIds,
+            Math.max(1, Math.min(action.timeoutMs ?? 30_000, 60_000)),
+            signal,
+          )
+        ).map(compactMember),
       );
     }
     if (action.action === "stop") {
@@ -526,6 +598,7 @@ export function createMultiAgent(options: {
     abort,
     async close() {
       closed = true;
+      unsubscribeWorkspace?.();
       groupControlRevision += 1;
       members.setSchedulingEnabled(false);
       clearTimeout(budgetTimer);

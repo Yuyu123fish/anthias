@@ -144,6 +144,47 @@ export async function createAgentFromEnvironment({
         ...(worktreeDirectory ? { worktreeDirectory: resolve(worktreeDirectory) } : {}),
         skills,
         mcp,
+        configurationSummary: [
+          "model: " +
+            modelConfigResult.config.modelId +
+            " (" +
+            localConfiguration.sources.ANTHIAS_MODEL_ID +
+            ")",
+          "contextWindow: " +
+            modelConfigResult.config.contextBudget.contextWindow +
+            " (" +
+            (localConfiguration.sources.ANTHIAS_MODEL_CONTEXT_WINDOW === "默认"
+              ? "已核验能力"
+              : localConfiguration.sources.ANTHIAS_MODEL_CONTEXT_WINDOW) +
+            ")",
+          "modelMaxOutputTokens: " +
+            (modelConfigResult.config.capabilities.maxOutputTokens ?? "未声明") +
+            " (" +
+            (localConfiguration.sources.ANTHIAS_MODEL_MAX_OUTPUT_TOKENS === "默认"
+              ? "已核验能力"
+              : localConfiguration.sources.ANTHIAS_MODEL_MAX_OUTPUT_TOKENS) +
+            ")",
+          "responseOutputTokens: " +
+            modelConfigResult.config.contextBudget.responseOutputTokens +
+            " (" +
+            localConfiguration.sources.ANTHIAS_RESPONSE_MAX_TOKENS +
+            ")",
+          "summaryOutputTokens: " +
+            modelConfigResult.config.contextBudget.summaryOutputTokens +
+            " (" +
+            localConfiguration.sources.ANTHIAS_COMPACTION_MAX_TOKENS +
+            ")",
+          "responseReasoningEffort: " +
+            (modelConfigResult.config.responseReasoningEffort ?? "未发送") +
+            " (" +
+            localConfiguration.sources.ANTHIAS_RESPONSE_REASONING_EFFORT +
+            ")",
+          "approvalReasoningEffort: " +
+            (modelConfigResult.config.approvalReasoningEffort ?? "未发送") +
+            " (" +
+            localConfiguration.sources.ANTHIAS_APPROVAL_REASONING_EFFORT +
+            ")",
+        ],
         modelContext: {
           modelId: modelConfigResult.config.modelId,
           budget: modelConfigResult.config.contextBudget,

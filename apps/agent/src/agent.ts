@@ -270,6 +270,11 @@ export function createAgentWithModelStream(options: CreateAgentWithModelStreamOp
         currentRuntime.coordinator.beginTask();
       return currentAgent.prompt(text, promptOptions);
     },
+    interruptForInput(inputId) {
+      if (closed || operation !== null)
+        return { status: "ignored", reason: "Agent 已关闭或正在切换会话。" };
+      return currentAgent.interruptForInput(inputId);
+    },
     setPermissionMode(mode) {
       if (closed) return { status: "rejected", reason: "closed" };
       if (operation !== null || directControls.size > 0 || currentRuntime.coordinator.busy())

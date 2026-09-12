@@ -425,7 +425,7 @@ describe("Agent", () => {
     expect(agent.state.messageHistory).toEqual([{ role: "user", content: "first" }]);
     responseGate.resolve();
     expect((await first).status).toBe("completed");
-    expect(modelCallCount).toBe(2);
+    await vi.waitFor(() => expect(modelCallCount).toBe(2));
     expect(agent.state.messageHistory.filter((message) => message.role === "user")).toEqual([
       { role: "user", content: "first" },
       { role: "user", content: "second" },

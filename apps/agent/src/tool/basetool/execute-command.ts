@@ -25,7 +25,7 @@ import {
   type ToolFailedResult,
 } from "../tool-result.js";
 import type { BaseTool, CreateToolRunnerOptions, ToolCallPlan } from "../tool-runner.js";
-import { sharedWorkspaceAccess } from "../workspace-access.js";
+import { type ExclusiveWriteLease, sharedWorkspaceAccess } from "../workspace-access.js";
 import {
   arePathsEqual,
   resolveExistingWorkspacePath,
@@ -42,7 +42,7 @@ export const executeCommandTool: BaseTool = Object.freeze({
   definition: Object.freeze({
     name: "execute_command",
     description:
-      "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。",
+      "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。timeoutMs 限制执行时间，取锁等待另以上述数值为上限。清理不明需先处理 workspace_blocked，不能重复提交命令。",
     inputSchema: Object.freeze({
       type: "object",
       additionalProperties: false,
@@ -91,6 +91,8 @@ export type CommandExecutionUpdate = Readonly<{
 export type CommandExecutionResult = ToolExecutionResult &
   Readonly<{
     cleanupUncertain: boolean;
+    processStarted: boolean;
+    executionDurationMs: number;
   }>;
 
 /** 枚举一次命令可以进入的明确终止原因。 */
@@ -175,34 +177,82 @@ export async function executePreparedCommand(
 
   const workspace = preparedTool.workspace;
   const workspaceAccess = workspace.workspaceAccess ?? sharedWorkspaceAccess;
-  let releaseWrite: (() => void) | undefined;
-  let retainWriteLease = false;
+  let releaseWrite: ExclusiveWriteLease | undefined;
+  const waitingStartedAt = Date.now();
+  const waitingController = new AbortController();
+  const waitingTimer = setTimeout(
+    () => waitingController.abort(),
+    preparedTool.timeoutMilliseconds,
+  );
+  let waitDurationMs = 0;
+  let checkCleanup: (() => Promise<boolean>) | undefined;
   workspace.resourceState?.(preparedTool.toolCallId, "waiting");
   try {
     releaseWrite = await workspaceAccess.acquireExclusiveWrite(
       [workspace.workspaceRoot, preparedTool.cwd],
-      abortSignal,
+      AbortSignal.any([abortSignal, waitingController.signal]),
     );
+    clearTimeout(waitingTimer);
+    waitDurationMs = Date.now() - waitingStartedAt;
     workspace.resourceState?.(preparedTool.toolCallId, "acquired");
     workspace.assertWriteAllowed?.(preparedTool.toolCallId);
-    const result = await executeCommandWithWriteAccess(preparedTool, abortSignal, publishUpdate);
-    // 进程树清理不明时保留独占权，不能让后续写入与可能仍存活的命令竞争。
-    retainWriteLease = result.cleanupUncertain;
-    return result;
-  } catch (error) {
-    return abortSignal.aborted
-      ? createCommandResult("aborted", null, 0, createCommandOutputCollector(), false)
-      : {
-          status: "failed",
-          content: toSafeCommandError(error),
-          truncated: false,
-          cleanupUncertain: false,
-        };
-  } finally {
-    if (!retainWriteLease) {
-      releaseWrite?.();
-      workspace.resourceState?.(preparedTool.toolCallId, "released");
+    const result = await executeCommandWithWriteAccess(
+      preparedTool,
+      abortSignal,
+      publishUpdate,
+      (check) => {
+        checkCleanup = check;
+      },
+    );
+    let blockDescription = "";
+    if (result.cleanupUncertain) {
+      const block = await workspaceAccess.block(
+        {
+          workspaceRoots: releaseWrite.workspaceRoots,
+          sessionId: workspace.sessionId ?? "unknown",
+          toolCallId: preparedTool.toolCallId,
+          reason: "命令超时或取消后，无法确认进程树和输出管道已清理。",
+        },
+        checkCleanup,
+      );
+      blockDescription = "\nworkspace_blocked: " + block.blockId + "; " + block.reason;
     }
+    return {
+      ...result,
+      content:
+        "waitDurationMs: " +
+        waitDurationMs +
+        "\nexecutionDurationMs: " +
+        result.executionDurationMs +
+        "\nprocessStarted: " +
+        result.processStarted +
+        blockDescription +
+        "\n" +
+        result.content,
+    };
+  } catch (error) {
+    const aborted = abortSignal.aborted;
+    return {
+      status: "failed",
+      content:
+        (aborted
+          ? "termination: aborted；等待工作区已取消，命令未启动。"
+          : waitingController.signal.aborted
+            ? "workspace_timeout：等待工作区超时，命令未启动。"
+            : toSafeCommandError(error)) +
+        "\nwaitDurationMs: " +
+        (Date.now() - waitingStartedAt) +
+        "\nexecutionDurationMs: 0\nprocessStarted: false",
+      truncated: false,
+      cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
+    };
+  } finally {
+    clearTimeout(waitingTimer);
+    // 清理不明已由阻塞记录接管保护，普通租约始终结束，避免匿名残留。
+    releaseWrite?.();
+    workspace.resourceState?.(preparedTool.toolCallId, "released");
   }
 }
 
@@ -210,6 +260,7 @@ async function executeCommandWithWriteAccess(
   preparedTool: PreparedCommandTool,
   abortSignal: AbortSignal,
   publishUpdate: (update: CommandExecutionUpdate) => void,
+  registerCleanupCheck: (check: () => Promise<boolean>) => void,
 ): Promise<CommandExecutionResult> {
   // 批准只绑定准备时的真实目录；同路径目录被替换或转成链接后不得复用旧批准。
   let cwdUnchanged = false;
@@ -233,6 +284,8 @@ async function executeCommandWithWriteAccess(
       content: "execute_command cwd 已变化，命令未启动。",
       truncated: false,
       cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
     });
   }
 
@@ -274,6 +327,10 @@ async function executeCommandWithWriteAccess(
     let terminationReason: "timeout" | "aborted" | null = null;
     let terminationPromise: Promise<boolean> | null = null;
     let cleanupUncertain = false;
+    let processClosed = false;
+    registerCleanupCheck(
+      async () => processClosed && (terminationPromise === null || !(await terminationPromise)),
+    );
     let shutdownFallbackTimer: NodeJS.Timeout | null = null;
 
     /** 只交付一次命令终态，并移除所有由本次执行持有的资源。 */
@@ -294,6 +351,11 @@ async function executeCommandWithWriteAccess(
       childProcess.stdout?.removeAllListeners();
       childProcess.stderr?.removeAllListeners();
       childProcess.removeAllListeners();
+      // 只保留原命令的关闭事实供恢复核查，不使用可能复用的 PID 再发起终止。
+      if (cleanupUncertain && !processClosed)
+        childProcess.once("close", () => {
+          processClosed = true;
+        });
       childProcess.stdout?.destroy();
       childProcess.stderr?.destroy();
       const reason: CommandTerminationReason = spawnFailed
@@ -306,6 +368,7 @@ async function executeCommandWithWriteAccess(
           Date.now() - startedAtMilliseconds,
           outputCollector,
           cleanupUncertain,
+          !spawnFailed,
         ),
         ...outputCapture.finish(),
       });
@@ -353,6 +416,7 @@ async function executeCommandWithWriteAccess(
     });
     childProcess.once("error", () => settle(null, true));
     childProcess.once("close", (exitCode) => {
+      processClosed = true;
       if (terminationPromise === null) {
         settle(exitCode);
         return;

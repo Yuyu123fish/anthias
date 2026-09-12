@@ -776,6 +776,9 @@ function createRequestUsageRecord(
     parentEntryId,
     ...(runId === undefined ? {} : { runId }),
     purpose: details.purpose,
+    ...(details.configuration
+      ? { configuration: Object.freeze({ ...details.configuration }) }
+      : {}),
     requestEntryId: details.requestEntryId,
     contextVersion: details.contextVersion,
     usage: snapshotUsage(details.usage),

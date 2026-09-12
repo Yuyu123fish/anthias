@@ -881,9 +881,11 @@ describe("prepared approval action binding", () => {
     );
     expect(result).toEqual({
       status: "failed",
-      content: "execute_command cwd 已变化，命令未启动。",
+      content: expect.stringContaining("execute_command cwd 已变化，命令未启动。"),
       truncated: false,
       cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
     });
     await expect(access(join(cwdPath, "spawned.txt"))).rejects.toThrow();
   });

@@ -8,6 +8,7 @@ import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
 import { createSession, type Session } from "../src/session/index.js";
 import { createSessionAgent, type SessionAgent } from "../src/session-agent.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
+import { getWorkspaceAccess } from "../src/tool/workspace-access.js";
 import { promptToCompletion } from "./prompt-helper.js";
 
 const agents: Array<Agent | SessionAgent> = [];
@@ -62,8 +63,8 @@ it("consumes one steer at each final response and starts FIFO follow-ups only af
   const initial = promptToCompletion(agent, "initial");
   await vi.waitFor(() => expect(requests).toHaveLength(1));
   const followOne = await agent.prompt("follow one", { mode: "followUp" });
-  const steerOne = await agent.prompt("steer one");
-  const steerTwo = await agent.prompt("steer two");
+  const steerOne = await agent.prompt("steer one", { mode: "steer" });
+  const steerTwo = await agent.prompt("steer two", { mode: "steer" });
   const followTwo = await agent.prompt("follow two", { mode: "followUp" });
   expect(
     [followOne, steerOne, steerTwo, followTwo].every(
@@ -155,7 +156,7 @@ it("waits for the entire parallel tool batch before inserting queued steering", 
   await writeFile(join(directory, "1.txt"), "second");
   const initial = promptToCompletion(agent, "read both");
   await vi.waitFor(() => expect(started.size).toBe(2));
-  await agent.prompt("after the batch");
+  await agent.prompt("after the batch", { mode: "steer" });
   gates[0]?.resolve();
   await vi.waitFor(() =>
     expect(events.filter((event) => event.type === "tool_execution_end")).toHaveLength(1),
@@ -461,10 +462,237 @@ it("lets the last stop cancel continuation while the aborted Run is sealing", as
   expect((await initialResult).status).toBe("aborted");
   await vi.waitFor(() => expect(agent.state.running).toBe(false));
   expect(agent.state.inputQueue.paused).toBe(true);
-  expect(agent.state.inputQueue.steer.map((input) => input.content)).toEqual([
+  expect(agent.state.inputQueue.followUp.map((input) => input.content)).toEqual([
     "queued continuation",
   ]);
   expect(requestCount).toBe(1);
   expect((await promptToCompletion(agent, "", { resume: true })).status).toBe("completed");
   expect(requestCount).toBe(2);
+});
+
+it("queues follow-ups by default and interrupts once before consuming the same input", async () => {
+  const cleanup = Promise.withResolvers<void>();
+  const requests: ModelRequest[] = [];
+  const { agent, events } = await setup(async function* (request, signal) {
+    requests.push(request);
+    if (requests.length === 1) {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      await cleanup.promise;
+      return;
+    }
+    yield { type: "text_delta", delta: "done" };
+    yield { type: "finish", finishReason: "stop" };
+  });
+  await agent.prompt("initial");
+  await vi.waitFor(() => expect(requests).toHaveLength(1));
+  const first = await agent.prompt("first follow-up");
+  const second = await agent.prompt("second follow-up", { mode: "steer" });
+  if (first.status === "rejected" || second.status === "rejected")
+    throw new Error("input rejected");
+  expect(first.mode).toBe("followUp");
+  expect(agent.interruptForInput()).toMatchObject({
+    status: "accepted",
+    inputId: first.inputId,
+  });
+  expect(agent.interruptForInput(second.inputId)).toMatchObject({
+    status: "accepted",
+    inputId: first.inputId,
+  });
+  expect(requests).toHaveLength(1);
+  cleanup.resolve();
+  await vi.waitFor(() => expect(agent.state.running).toBe(false));
+  expect(requests.map(userTexts)).toEqual([
+    ["initial"],
+    ["initial", "first follow-up"],
+    ["initial", "first follow-up", "second follow-up"],
+  ]);
+  const consumed = events.filter((event) => event.type === "input_consumed");
+  expect(consumed.filter((event) => event.inputId === first.inputId)).toHaveLength(1);
+  expect(consumed.filter((event) => event.inputId === second.inputId)).toHaveLength(1);
+});
+
+it("keeps a follow-up paused when the user stops during input interruption cleanup", async () => {
+  const cleanup = Promise.withResolvers<void>();
+  let requests = 0;
+  const { agent } = await setup(async function* (_request, signal) {
+    requests++;
+    if (requests === 1) {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      await cleanup.promise;
+      return;
+    }
+    yield { type: "text_delta", delta: "continued" };
+    yield { type: "finish", finishReason: "stop" };
+  });
+  await agent.prompt("initial");
+  await vi.waitFor(() => expect(requests).toBe(1));
+  await agent.prompt("retained follow-up");
+  agent.interruptForInput();
+  agent.abort();
+  cleanup.resolve();
+  await vi.waitFor(() => expect(agent.state.running).toBe(false));
+  expect(requests).toBe(1);
+  expect(agent.state.inputQueue.paused).toBe(true);
+  expect(agent.state.inputQueue.followUp.map((input) => input.content)).toEqual([
+    "retained follow-up",
+  ]);
+  await agent.prompt("", { resume: true });
+  await vi.waitFor(() => expect(requests).toBe(2));
+});
+
+it("retains the interrupted input through uncertain cleanup and resumes only after recovery", async () => {
+  let requests = 0;
+  const toolStarted = Promise.withResolvers<void>();
+  const { agent } = await setup(
+    async function* () {
+      requests++;
+      if (requests === 1) {
+        yield {
+          type: "tool_call",
+          toolCallId: "uncertain",
+          toolName: "execute_command",
+          input: { command: "fixture" },
+          invalid: false,
+        };
+        yield { type: "finish", finishReason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", delta: "recovered" };
+      yield { type: "finish", finishReason: "stop" };
+    },
+    (session) => ({
+      createPlan(call) {
+        return {
+          scheduling: "serial",
+          abortedPreparationContent: "cancelled",
+          async prepare() {
+            return {
+              ok: true,
+              preparedExecution: {
+                approval: null,
+                activitySummary: "fixture command",
+                executionUnavailableContent: "unavailable",
+                async execute(signal) {
+                  toolStarted.resolve();
+                  await new Promise<void>((resolve) =>
+                    signal.addEventListener("abort", () => resolve(), { once: true }),
+                  );
+                  await getWorkspaceAccess(
+                    join(session.sessionDirectory, "workspace-blocks"),
+                  ).block({
+                    workspaceRoots: [session.workspaceRoot],
+                    sessionId: session.sessionId,
+                    toolCallId: call.toolCallId,
+                    reason: "fixture cleanup remains uncertain",
+                  });
+                  return {
+                    status: "failed",
+                    content: "cleanupUncertain: true",
+                    truncated: false,
+                    cleanupUncertain: true,
+                  };
+                },
+              },
+            };
+          },
+        };
+      },
+    }),
+  );
+  await agent.prompt("initial");
+  await toolStarted.promise;
+  const input = await agent.prompt("after cleanup");
+  if (input.status === "rejected") throw new Error("input rejected");
+  agent.interruptForInput();
+  await vi.waitFor(() => expect(agent.state.inputQueue.interruption?.status).toBe("blocked"));
+  expect(requests).toBe(1);
+  expect(agent.state.inputQueue.followUp[0]?.inputId).toBe(input.inputId);
+  const block = agent.collaboration.snapshot().workspaceBlocks?.[0];
+  if (!block) throw new Error("missing block");
+  const inspection = await agent.collaboration.execute({
+    action: "workspace_recover",
+    blockId: block.blockId,
+  });
+  expect(inspection.ok && JSON.parse(inspection.value).status).toBe("blocked");
+  const recovery = await agent.collaboration.execute({
+    action: "workspace_recover",
+    blockId: block.blockId,
+    confirmCleanup: true,
+  });
+  expect(recovery.ok && JSON.parse(recovery.value).status).toBe("recovered");
+  await vi.waitFor(() => expect(requests).toBe(2));
+  await vi.waitFor(() => expect(agent.state.running).toBe(false));
+  expect(
+    agent.state.messageHistory.filter(
+      (message) => message.role === "user" && message.content === "after cleanup",
+    ),
+  ).toHaveLength(1);
+});
+
+it("does not let a previous Run's workspace block hold a model-only input interruption", async () => {
+  let requests = 0;
+  const { agent, session } = await setup(async function* (_request, signal) {
+    requests++;
+    if (requests === 1) {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+      return;
+    }
+    yield { type: "text_delta", delta: "continued" };
+    yield { type: "finish", finishReason: "stop" };
+  });
+  const access = getWorkspaceAccess(join(session.sessionDirectory, "workspace-blocks"));
+  await access.block({
+    workspaceRoots: [session.workspaceRoot],
+    sessionId: session.sessionId,
+    toolCallId: "old-call",
+    reason: "old uncertainty",
+  });
+  await agent.prompt("inspect the old fault");
+  await vi.waitFor(() => expect(requests).toBe(1));
+  await agent.prompt("new model-only question");
+  expect(agent.interruptForInput().status).toBe("accepted");
+  await vi.waitFor(() => expect(requests).toBe(2));
+  expect(agent.state.inputQueue.interruption).toBeUndefined();
+  expect(access.snapshot()).toHaveLength(1);
+});
+
+it("saves actual request configuration and reloads it without credentials", async () => {
+  const { agent, session } = await setup(async function* (request) {
+    request.onConfiguration?.({
+      modelId: "fixture-model",
+      maxOutputTokens: 64000,
+      reasoningEffort: "low",
+    });
+    yield { type: "text_delta", delta: "done" };
+    yield { type: "finish", finishReason: "stop" };
+  });
+  await promptToCompletion(agent, "check budget");
+  const record = session.records.find((entry) => entry.type === "request_usage");
+  expect(record?.type === "request_usage" && record.configuration).toEqual({
+    modelId: "fixture-model",
+    maxOutputTokens: 64000,
+    reasoningEffort: "low",
+  });
+  await agent.close();
+  const restored = await import("../src/session/index.js").then(({ openSession }) =>
+    openSession({
+      sessionId: session.sessionId,
+      workspaceRoot: session.workspaceRoot,
+      sessionDirectory: session.sessionDirectory,
+      shell: session.shell,
+    }),
+  );
+  try {
+    expect(restored.records.find((entry) => entry.type === "request_usage")).toMatchObject({
+      configuration: { maxOutputTokens: 64000 },
+    });
+  } finally {
+    await restored.close();
+  }
 });

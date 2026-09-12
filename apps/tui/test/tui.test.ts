@@ -1316,3 +1316,25 @@ it("keeps plain member process in sourced details and relabels interrupted root 
   expect(harness.agent.sessions.open).not.toHaveBeenCalled();
   expect(harness.agent.collaboration.execute).not.toHaveBeenCalled();
 });
+
+it("uses Esc for a queued input and keeps Ctrl+C as group stop", async () => {
+  const harness = await createHarness(true, 110, 28, undefined, {
+    running: true,
+    activeRun: { runId: "active", phase: "requesting_model" },
+    inputQueue: {
+      steer: [],
+      followUp: [
+        { inputId: "queued", content: "new direction", mode: "followUp", source: { kind: "user" } },
+      ],
+      paused: false,
+    },
+  });
+  await screenContains(harness.terminal, "Esc 立即处理");
+  harness.terminal.send("\u001b");
+  await vi.waitFor(() => expect(harness.agent.interruptForInput).toHaveBeenCalledTimes(1));
+  expect(harness.agent.abort).not.toHaveBeenCalled();
+  harness.emit({ type: "input_interruption_changed", inputId: "queued", status: "cancelling" });
+  await screenContains(harness.terminal, "正在打断并清理");
+  harness.terminal.send("\u0003");
+  expect(harness.agent.abort).toHaveBeenCalledTimes(1);
+});

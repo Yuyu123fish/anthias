@@ -256,6 +256,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<AgentL
     generationRetryCount = 0;
     recoveryInstruction = null;
 
+    // 执行工具调用
     const toolCalls = assistantResponseResult.message.content.filter(isToolCallPart);
     if (toolCalls.length === 0) {
       if (assistantResponseResult.finishReason === "stop" && (await options.consumeSteer()))

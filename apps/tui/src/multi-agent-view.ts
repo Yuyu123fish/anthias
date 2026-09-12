@@ -40,6 +40,20 @@ export function formatCollaboration(
   const lines = [
     "主 Agent · 根 Session：" + (snapshot.rootSessionId ?? fallbackRootSessionId ?? "归属信息缺失"),
     ...(snapshot.notice ? [snapshot.notice] : []),
+    ...(snapshot.workspaceBlocks ?? []).map(
+      (block) =>
+        "工作区阻塞 " +
+        block.blockId +
+        "\n  来源: " +
+        block.sessionId +
+        " / " +
+        block.toolCallId +
+        "\n  " +
+        block.reason +
+        "\n  /agent recover " +
+        block.blockId +
+        " 检查清理；外部清理后由用户使用同命令追加 confirm-cleanup 确认。",
+    ),
     "协作群组 · " +
       (snapshot.members.length ? snapshot.members.length + " 名成员" : "尚未创建成员"),
     ...snapshot.members.map((member) =>
@@ -155,6 +169,21 @@ export async function runCollaborationCommand(
     return { kind: "handled" };
   }
   try {
+    if (name === "agent" && operation === "recover") {
+      if (
+        !tokens[1] ||
+        tokens.length > 3 ||
+        (tokens[2] !== undefined && tokens[2] !== "confirm-cleanup")
+      )
+        throw new Error(
+          "用法：/agent recover <blockId> [confirm-cleanup]；确认前必须在外部完成原命令资源清理。",
+        );
+      return dispatch({
+        action: "workspace_recover",
+        blockId: tokens[1],
+        ...(tokens[2] === "confirm-cleanup" ? { confirmCleanup: true } : {}),
+      });
+    }
     if (name === "git") {
       let action: GitAction;
       if (

@@ -62,9 +62,11 @@ export function createRunDiagnostic(
           ? "程序关闭已停止 Run；已完成的消息与工具结果仍然保留。"
           : diagnostic.abortSource === "parent"
             ? "父任务取消已停止 Run；已完成的消息与工具结果仍然保留。"
-            : diagnostic.abortSource === "internal"
-              ? "内部中止已停止 Run；已完成的消息与工具结果仍然保留。"
-              : SUMMARIES[category]
+            : diagnostic.abortSource === "input"
+              ? "为处理排队用户消息中断 Run；已完成结果保留，必要清理后继续。"
+              : diagnostic.abortSource === "internal"
+                ? "内部中止已停止 Run；已完成的消息与工具结果仍然保留。"
+                : SUMMARIES[category]
       : SUMMARIES[category];
   return Object.freeze({ ...diagnostic, summary: abortSummary + retrySummary });
 }

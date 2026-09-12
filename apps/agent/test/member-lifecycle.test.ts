@@ -496,3 +496,42 @@ describe("Persistent member lifecycle", () => {
     expect(direct.workspaceRoot).toBe(worktree.path);
   }, 20_000);
 });
+
+it("reports a repeated output fault in a new Run without repeatedly waking on one fault", async () => {
+  const releaseFirst = gate();
+  const releaseSecond = gate();
+  let requests = 0;
+  const { members } = await setup(async function* () {
+    requests++;
+    if (requests % 2 === 1) {
+      yield { type: "text_delta", delta: "partial output" };
+      yield { type: "finish", finishReason: "length" };
+      return;
+    }
+    await (requests === 2 ? releaseFirst.promise : releaseSecond.promise);
+    yield { type: "text_delta", delta: "done" };
+    yield { type: "finish", finishReason: "stop" };
+  });
+  const member = await members.spawn({ task: "first task" }, signal());
+  const firstReport = await members.wait([member.sessionId], 5000, signal());
+  expect(firstReport[0]?.error).toContain("输出超限");
+  let repeatedWaitResolved = false;
+  const repeatedWait = members.wait([member.sessionId], 5000, signal()).then(() => {
+    repeatedWaitResolved = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(repeatedWaitResolved).toBe(false);
+  releaseFirst.resolve();
+  await repeatedWait;
+  await settled(members, member.sessionId);
+  await members.resume(member.sessionId, "second task", undefined, signal());
+  await vi.waitFor(() => expect(members.get(member.sessionId).error).toContain("输出超限"));
+  const nextReport = await Promise.race([
+    members.wait([member.sessionId], 5000, signal()),
+    new Promise<string>((resolve) => setTimeout(() => resolve("new fault was swallowed"), 200)),
+  ]);
+  expect(nextReport).toEqual(
+    expect.arrayContaining([expect.objectContaining({ error: firstReport[0]?.error })]),
+  );
+  releaseSecond.resolve();
+});

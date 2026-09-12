@@ -576,6 +576,7 @@ export function createConversationPresentation(options: {
       )
         retryStatusText = null;
       switch (event.type) {
+        case "input_interruption_changed":
         case "input_queued":
         case "input_consumed":
         case "input_discarded": {

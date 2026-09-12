@@ -19,6 +19,7 @@ import type {
   CompletedMessage,
   JsonValue,
   Message,
+  RequestConfiguration,
   RunDiagnostic,
   UserMessage,
 } from "./message.js";
@@ -56,7 +57,7 @@ import {
   type ToolApprovalPlan,
   type ToolRunner,
 } from "./tool/tool-runner.js";
-import { sharedWorkspaceAccess } from "./tool/workspace-access.js";
+import { sharedWorkspaceAccess, type WorkspaceAccess } from "./tool/workspace-access.js";
 
 export type { PermissionMode } from "./permission/permission-mode.js";
 export type RunPhase =
@@ -106,6 +107,7 @@ export type AgentState = Readonly<{
     steer: readonly PendingInput[];
     followUp: readonly PendingInput[];
     paused: boolean;
+    interruption?: Readonly<{ inputId: string; status: "cancelling" | "blocked" }>;
   }>;
   activeAssistantMessage: AssistantMessage | null;
   activeRun: ActiveRun | null;
@@ -114,6 +116,7 @@ export type AgentState = Readonly<{
   lastError: string | null;
   lastRunDiagnostic?: RunDiagnostic | null;
   collaboration?: CollaborationSnapshot;
+  configurationSummary?: readonly string[];
 }>;
 export type FinishedPromptResult =
   | Readonly<{ status: "completed" }>
@@ -154,6 +157,11 @@ export type AgentEvent = Readonly<{ memberSessionId?: string; memberName?: strin
     | Readonly<{ type: "operation_changed"; operation: AgentOperation }>
     | Readonly<{ type: "session_changed"; sessionId: string }>
     | Readonly<{ type: "input_queued"; input: PendingInput }>
+    | Readonly<{
+        type: "input_interruption_changed";
+        inputId: string;
+        status: "cancelling" | "blocked";
+      }>
     | Readonly<{
         type: "input_consumed";
         inputId: string;
@@ -252,6 +260,9 @@ export type SessionAgent = Readonly<{
     resourceState(toolCallId: string, resourceState: "waiting" | "acquired" | "released"): void;
   }>;
   prompt(promptText: string, options?: PromptOptions): Promise<PromptResult>;
+  interruptForInput(
+    inputId?: string,
+  ): Readonly<{ status: "accepted" | "ignored"; inputId?: string; reason?: string }>;
   promptInternal(input: AgentInputDetails): Promise<InternalPromptResult>;
   queueInternal(input: AgentInputDetails): void;
   runTool(toolName: string, input: JsonValue): Promise<InternalPromptResult>;
@@ -275,6 +286,9 @@ export type CreateAgentWithModelStreamOptions = SessionAgentOptions &
 
 /** 已装配能力属于单 Agent；存储目录和共享资源的创建留在 Runtime。 */
 export type SessionAgentOptions = Readonly<{
+  workspaceAccess?: WorkspaceAccess;
+  configurationSummary?: readonly string[];
+  runtimeNotices?: () => readonly string[];
   modelStream: ModelStream;
   memory?: Memory;
   maintainMemory?: MaintainMemory;
@@ -286,7 +300,7 @@ export type SessionAgentOptions = Readonly<{
   remainingTaskTimeMs?: () => number;
   pendingInputs?: () => readonly AgentInputDetails[];
   acknowledgeInput?: (input: AgentInputDetails) => Promise<void>;
-  onRunSettled?: (result: FinishedPromptResult) => void;
+  onRunSettled?: (result: FinishedPromptResult, interruptedForInput: boolean) => void;
   authorizationRecords?: () => readonly SessionRecord[];
   modelContext?: Readonly<{ modelId: string; budget: ContextBudget }>;
   session: Session;
@@ -316,8 +330,10 @@ type ActiveRunOwnership = {
   terminalResultPromise: Promise<FinishedPromptResult> | null;
   requestToolRunners: WeakMap<ModelRequest, ToolRunner>;
   waitingWorkspaceToolCallIds: Set<string>;
+  blockedWorkspaceIds: Set<string>;
   inputCompletions: Set<NonNullable<QueuedInput["completion"]>>;
   resumeAfterTermination: boolean;
+  interruptedForInput: boolean;
 };
 
 /** 持有当前确认 Promise 的唯一解决入口和对应请求。 */
@@ -363,7 +379,8 @@ const SESSION_UNAVAILABLE_PROMPT_RESULT = Object.freeze({
 const CLOSED_PROMPT_RESULT = Object.freeze({ status: "rejected", reason: "closed" } as const);
 const ABORTED_PROMPT_RESULT = Object.freeze({ status: "aborted" } as const);
 export function createSessionAgent({
-  modelStream,
+  modelStream: configuredModelStream,
+  configurationSummary,
   modelContext,
   session,
   permissionMode: initialPermissionMode = DEFAULT_PERMISSION_MODE,
@@ -381,9 +398,34 @@ export function createSessionAgent({
   writable = true,
   protectedPaths = [],
   remainingTaskTimeMs,
+  workspaceAccess = sharedWorkspaceAccess,
+  runtimeNotices,
   memory,
   maintainMemory,
 }: SessionAgentOptions): SessionAgent {
+  const requestConfigurations = new Map<string, RequestConfiguration>();
+  const modelStream: ModelStream = async function* (request, signal) {
+    const purpose = request.purpose ?? "response";
+    requestConfigurations.delete(purpose);
+    yield* configuredModelStream(
+      {
+        ...request,
+        onConfiguration(configuration) {
+          requestConfigurations.set(purpose, configuration);
+          request.onConfiguration?.(configuration);
+        },
+      },
+      signal,
+    );
+  };
+  let consumingInputId: string | null = null;
+  let inputSequence = 0;
+  const inputOrder = new WeakMap<QueuedInput, number>();
+  let pendingInputInterruption: {
+    inputId: string;
+    status: "cancelling" | "blocked";
+    blockIds?: readonly string[];
+  } | null = null;
   const lastRunRecord = session.records.findLast((record) => record.type === "run_finished");
   const state: SessionAgentExecutionState = {
     get context() {
@@ -452,6 +494,7 @@ export function createSessionAgent({
   });
   const external = createExternalCapabilities({ sources, skills, mcp, writable });
   const contextController = createContextController({
+    requestConfiguration: (purpose) => requestConfigurations.get(purpose),
     session,
     modelStream,
     sources,
@@ -483,7 +526,8 @@ export function createSessionAgent({
     workspace: Object.freeze({
       workspaceRoot: session.workspaceRoot,
       sessionDirectory: session.sessionDirectory,
-      workspaceAccess: sharedWorkspaceAccess,
+      workspaceAccess,
+      sessionId: session.sessionId,
       ...toolAccess,
       protectedPaths: [
         ...protectedPaths,
@@ -545,6 +589,11 @@ export function createSessionAgent({
     const prepared = runtime.tools.external.prepareRequest(
       {
         ...request,
+        systemPrompt:
+          request.systemPrompt +
+          ((runtimeNotices?.().length ?? 0) > 0
+            ? "\n[运行时诊断事实，不构成新授权]\n" + runtimeNotices?.().join("\n").slice(0, 6000)
+            : ""),
         tools: localTools.map((tool) => tool.definition),
       },
       permissionMode,
@@ -569,6 +618,7 @@ export function createSessionAgent({
   function createStateSnapshot(): AgentState {
     return Object.freeze({
       operation: null,
+      ...(configurationSummary ? { configurationSummary } : {}),
       sessionId: runtime.session.sessionId,
       workspaceRoot: runtime.session.workspaceRoot,
       permissionMode: state.permissionMode,
@@ -578,6 +628,9 @@ export function createSessionAgent({
         steer: Object.freeze(state.steerQueue.map(inputSnapshot)),
         followUp: Object.freeze(state.followUpQueue.map(inputSnapshot)),
         paused: state.inputsPaused,
+        ...(pendingInputInterruption
+          ? { interruption: Object.freeze({ ...pendingInputInterruption }) }
+          : {}),
       }),
       activeAssistantMessage: state.activeAssistantMessage,
       activeRun: state.activeRun
@@ -656,12 +709,14 @@ export function createSessionAgent({
   /** 请求中止当前 Run，实际终结继续由 Agent Loop 和统一收口路径完成。 */
   function abortActiveRun(source: NonNullable<RunDiagnostic["abortSource"]> = "user"): void {
     state.inputsPaused = true;
+    if (source !== "input") pendingInputInterruption = null;
     const currentRun = state.activeRun;
     if (currentRun === null) return;
     // 旧 Run 尚在清理时也要撤销后来登记的继续；重复停止不能因已 abort 而失效。
     currentRun.resumeAfterTermination = false;
-    if (currentRun.abortController.signal.aborted) return;
+    currentRun.interruptedForInput = source === "input";
     currentRun.abortSource = source;
+    if (currentRun.abortController.signal.aborted) return;
     currentRun.abortController.abort(source);
     resolvePendingToolApproval(currentRun, "aborted");
   }
@@ -952,6 +1007,7 @@ export function createSessionAgent({
   }
 
   function queueInput(input: QueuedInput): void {
+    inputOrder.set(input, inputSequence++);
     (input.mode === "steer" ? state.steerQueue : state.followUpQueue).push(input);
     publishEvent({ type: "input_queued", input: inputSnapshot(input) });
   }
@@ -995,6 +1051,33 @@ export function createSessionAgent({
     }
   }
 
+  function interruptForInput(inputId?: string) {
+    if (pendingInputInterruption)
+      return { status: "accepted" as const, inputId: pendingInputInterruption.inputId };
+    const currentRun = state.activeRun;
+    if (!currentRun || state.inputsPaused || currentRun.abortController.signal.aborted)
+      return { status: "ignored" as const, reason: "当前没有可中断的回答。" };
+    const input = [...state.steerQueue, ...state.followUpQueue]
+      .sort((left, right) => (inputOrder.get(left) ?? 0) - (inputOrder.get(right) ?? 0))
+      .find(
+        (candidate) =>
+          candidate.source.kind === "user" &&
+          candidate.inputId !== consumingInputId &&
+          (inputId === undefined || candidate.inputId === inputId),
+      );
+    if (!input) return { status: "ignored" as const, reason: "没有尚未消费的用户消息。" };
+    pendingInputInterruption = { inputId: input.inputId, status: "cancelling" };
+    abortActiveRun("input");
+    currentRun.resumeAfterTermination = true;
+    state.inputsPaused = false;
+    publishEvent({
+      type: "input_interruption_changed",
+      inputId: input.inputId,
+      status: "cancelling",
+    });
+    return { status: "accepted" as const, inputId: input.inputId };
+  }
+
   function resumeInputs(): void {
     state.inputsPaused = false;
     const currentRun = state.activeRun;
@@ -1029,7 +1112,7 @@ export function createSessionAgent({
     const input: QueuedInput = {
       inputId: randomUUID(),
       content: promptText,
-      mode: options.mode ?? "steer",
+      mode: options.mode ?? "followUp",
       source: { kind: "user" },
     };
     const accepted =
@@ -1093,8 +1176,16 @@ export function createSessionAgent({
   /** 先登记整轮所有权，终态订阅者的新输入只会留给封口后的下一轮。 */
   function startQueuedRun(explicitInput = false): void {
     if (state.ownedRunResultPromise !== null || inputRejection()) return;
-    const input = state.steerQueue[0] ?? state.followUpQueue[0];
+    const input =
+      (pendingInputInterruption
+        ? [...state.steerQueue, ...state.followUpQueue].find(
+            (queued) => queued.inputId === pendingInputInterruption?.inputId,
+          )
+        : undefined) ??
+      state.steerQueue[0] ??
+      state.followUpQueue[0];
     if (!input || (state.inputsPaused && !input.controlCall)) return;
+    if (pendingInputInterruption?.status === "blocked") return;
     // 耐久投递只在活动安全点或显式继续时消费，终态迟到消息不能自行唤醒 Agent。
     if (
       !explicitInput &&
@@ -1117,7 +1208,9 @@ export function createSessionAgent({
       terminalResultPromise: null,
       requestToolRunners: new WeakMap(),
       waitingWorkspaceToolCallIds: new Set(),
+      blockedWorkspaceIds: new Set(),
       resumeAfterTermination: false,
+      interruptedForInput: false,
       inputCompletions: new Set(
         [...state.steerQueue, ...state.followUpQueue].flatMap((queued) =>
           queued.completion ? [queued.completion] : [],
@@ -1133,7 +1226,7 @@ export function createSessionAgent({
       startQueuedRun();
       // 整轮所有权释放后才通知群组，避免终态事件与迟到邮箱争用仍未清理的执行者。
       try {
-        onRunSettled?.(result);
+        onRunSettled?.(result, currentRun.interruptedForInput);
       } catch {
         /* 观察者不能破坏已经完成的 Run。 */
       }
@@ -1172,6 +1265,7 @@ export function createSessionAgent({
             await stopCleanup?.();
           } finally {
             unsubscribePermissions?.();
+            unsubscribeWorkspace();
             runtime.eventListeners.clear();
           }
         }
@@ -1188,12 +1282,20 @@ export function createSessionAgent({
     const message: UserMessage = input.internalInput
       ? internalMessage(input.internalInput)
       : Object.freeze({ role: "user", content: input.content });
-    const entryId = await recordMessage(currentRun, message, false, input.internalInput, () => {
-      const queue = input.mode === "steer" ? state.steerQueue : state.followUpQueue;
-      const index = queue.indexOf(input);
-      if (index >= 0) queue.splice(index, 1);
-      if (initial) publishEvent({ type: "run_start", runId: currentRun.runId });
-    });
+    // 先领取输入，防止持久化尚未返回时 Esc 再次提升同一条消息。
+    consumingInputId = input.inputId;
+    let entryId: string;
+    try {
+      entryId = await recordMessage(currentRun, message, false, input.internalInput, () => {
+        const queue = input.mode === "steer" ? state.steerQueue : state.followUpQueue;
+        const index = queue.indexOf(input);
+        if (index >= 0) queue.splice(index, 1);
+        if (pendingInputInterruption?.inputId === input.inputId) pendingInputInterruption = null;
+        if (initial) publishEvent({ type: "run_start", runId: currentRun.runId });
+      });
+    } finally {
+      consumingInputId = null;
+    }
     publishEvent({
       type: "input_consumed",
       inputId: input.inputId,
@@ -1444,6 +1546,12 @@ export function createSessionAgent({
         publishEvent(event);
         return;
       case "tool_execution_end":
+        if (event.cleanupUncertain) {
+          for (const block of workspaceAccess.snapshot()) {
+            if (block.sessionId === session.sessionId && block.toolCallId === event.toolCallId)
+              currentRun.blockedWorkspaceIds.add(block.blockId);
+          }
+        }
         publishEvent(event);
         return;
     }
@@ -1577,6 +1685,23 @@ export function createSessionAgent({
       if (currentRun.sessionWriteFailed) state.sessionUnavailableResult = finalResult;
     }
 
+    if (
+      currentRun.interruptedForInput &&
+      pendingInputInterruption &&
+      workspaceAccess.snapshot().some((block) => currentRun.blockedWorkspaceIds.has(block.blockId))
+    ) {
+      // 只等待被中断 Run 自己留下的资源；旧 Run 的阻塞不拦住纯模型对话。
+      pendingInputInterruption.blockIds = [...currentRun.blockedWorkspaceIds];
+      pendingInputInterruption.status = "blocked";
+      publishEvent({
+        type: "input_interruption_changed",
+        inputId: pendingInputInterruption.inputId,
+        status: "blocked",
+      });
+      currentRun.resumeAfterTermination = false;
+      state.lastError =
+        "清理受阻，排队消息已保留；使用 /agents 查看，/agent recover <blockId> 检查。";
+    }
     if (finalResult.status !== "completed")
       state.inputsPaused =
         state.sessionUnavailableResult !== null || !currentRun.resumeAfterTermination;
@@ -1589,6 +1714,19 @@ export function createSessionAgent({
     return finalResult;
   }
 
+  const unsubscribeWorkspace = workspaceAccess.subscribe(() => {
+    if (
+      pendingInputInterruption?.status !== "blocked" ||
+      workspaceAccess
+        .snapshot()
+        .some((block) => pendingInputInterruption?.blockIds?.includes(block.blockId))
+    )
+      return;
+    pendingInputInterruption.status = "cancelling";
+    state.inputsPaused = false;
+    if (state.activeRun) state.activeRun.resumeAfterTermination = true;
+    startQueuedRun(true);
+  });
   const unsubscribePermissions = runtime.permissions.workspace?.subscribe(() => {
     if (state.activeRun && runtime.permissions.workspace?.isRevoked())
       resolvePendingToolApproval(state.activeRun, "aborted");
@@ -1601,6 +1739,7 @@ export function createSessionAgent({
       return createStateSnapshot();
     },
     prompt,
+    interruptForInput,
     toolAccess,
     queueInternal,
     promptInternal(input) {

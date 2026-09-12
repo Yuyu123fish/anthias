@@ -21,6 +21,12 @@ function define(
 }
 const definitions: readonly ModelToolDefinition[] = [
   define(
+    "agent_recover_workspace",
+    "根检查原命令清理结果并尝试解除对应工作区阻塞；不重放工具，不提供外部清理确认。",
+    { blockId: identity },
+    ["blockId"],
+  ),
+  define(
     "agent_spawn",
     "创建持续成员并分配任务，立即返回成员 ID。默认可写并共享根工作区；可写与工作树独立，需要隔离时根显式提供已创建的 worktreeId。只有根可创建成员。",
     { task: text, name: identity, writable: { type: "boolean" }, worktreeId: identity },
@@ -219,6 +225,7 @@ export function collaborationToolCall(
     reopen: "agent_reopen",
     message: "agent_message",
     workspace_bind: "agent_workspace",
+    workspace_recover: "agent_recover_workspace",
   };
   const simpleName = simpleNames[operation];
   if (simpleName) return { toolName: simpleName, input };
@@ -267,6 +274,9 @@ function parseCollaborationCall(call: AssistantToolCallPart): CollaborationActio
     return value;
   }
   switch (call.toolName) {
+    case "agent_recover_workspace":
+      keys(["blockId"]);
+      return { action: "workspace_recover", blockId: required("blockId") };
     case "agent_spawn": {
       keys(["task", "name", "writable", "worktreeId"]);
       const name = string("name", true);

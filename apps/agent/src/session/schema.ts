@@ -125,6 +125,7 @@ export type CompactionDetails = Readonly<{
 
 /** 后续 Model Context 可写入的校准用量事实。 */
 export type RequestUsageDetails = Readonly<{
+  configuration?: import("../message.js").RequestConfiguration;
   purpose: "response" | "compaction" | "approval";
   requestEntryId: string | null;
   contextVersion: string;
@@ -259,6 +260,7 @@ export type CompactionRecord = SessionEntryBase &
 export type RequestUsageRecord = SessionEntryBase &
   Readonly<{
     type: "request_usage";
+    configuration?: import("../message.js").RequestConfiguration;
     runId?: string;
     purpose: RequestUsageDetails["purpose"];
     requestEntryId: string | null;
@@ -630,17 +632,22 @@ export function validateSessionRecord(
   }
   if (value.type === "request_usage") {
     if (
-      !hasExactKeysWithOptionalRunId(value, [
-        "type",
-        "entryId",
-        "seq",
-        "timestamp",
-        "parentEntryId",
-        "purpose",
-        "requestEntryId",
-        "contextVersion",
-        "usage",
-      ]) ||
+      !hasExactKeysWithOptionalRunId(
+        value,
+        [
+          "type",
+          "entryId",
+          "seq",
+          "timestamp",
+          "parentEntryId",
+          "purpose",
+          "requestEntryId",
+          "contextVersion",
+          "usage",
+        ],
+        ["configuration"],
+      ) ||
+      !(value.configuration === undefined || isRequestConfiguration(value.configuration)) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
       !isRequestUsagePurpose(value.purpose) ||
       !(value.requestEntryId === null || isUuid(value.requestEntryId)) ||
@@ -1802,7 +1809,7 @@ export function isRunDiagnostic(value: unknown): value is RunDiagnostic {
         Object.hasOwn(diagnostic.usage, "cacheWriteInputTokens"))) &&
     (diagnostic.retryCount === null || isNonNegativeSafeInteger(diagnostic.retryCount)) &&
     (diagnostic.abortSource === null ||
-      ["user", "task_deadline", "shutdown", "parent", "internal", "unknown"].includes(
+      ["user", "task_deadline", "shutdown", "parent", "internal", "input", "unknown"].includes(
         String(diagnostic.abortSource),
       )) &&
     (diagnostic.httpStatus === null ||
@@ -1849,5 +1856,21 @@ function isRequestSummary(value: unknown): boolean {
     countKeys.every(
       (key) => isNonNegativeSafeInteger(summary[key]) && Number(summary[key]) <= 1_000_000,
     )
+  );
+}
+
+/** 可选请求配置只接受安全字段，旧记录无需迁移。 */
+function isRequestConfiguration(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    Object.keys(value).every((key) =>
+      ["modelId", "maxOutputTokens", "reasoningEffort"].includes(key),
+    ) &&
+    isNonEmptyString(value.modelId) &&
+    Number.isSafeInteger(value.maxOutputTokens) &&
+    typeof value.maxOutputTokens === "number" &&
+    value.maxOutputTokens > 0 &&
+    (value.reasoningEffort === undefined ||
+      ["low", "medium", "high"].includes(String(value.reasoningEffort)))
   );
 }

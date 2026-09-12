@@ -54,6 +54,11 @@ export function createOpenAICompatibleModelStream({
         : purpose === "response"
           ? responseReasoningEffort
           : undefined;
+    modelRequest.onConfiguration?.({
+      modelId,
+      maxOutputTokens,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    });
     try {
       const modelTools: ToolSet = Object.fromEntries(
         modelRequest.tools.map((definition) => [

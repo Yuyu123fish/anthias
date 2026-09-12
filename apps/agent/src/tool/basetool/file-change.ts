@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import {
   basename,
@@ -246,7 +246,7 @@ async function applyPreparedFileChange(
     temporaryFileCreated = false;
     return Object.freeze({
       status: "completed",
-      content: `${preparedTool.operation} completed: ${preparedTool.target}`,
+      content: `${preparedTool.operation} completed: ${preparedTool.target}\nnewVersion: sha256:${createHash("sha256").update(preparedTool.newContent, "utf8").digest("hex")}`,
       truncated: false,
     });
   } catch (error) {

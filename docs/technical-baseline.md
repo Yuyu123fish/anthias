@@ -2,6 +2,8 @@
 
 状态：Feature 003、005 已验收；Feature 006–008 已实现并完成本地验证；Feature 009 已实现，待开发者验收。本 Feature 未进行真实模型、SearchAPI 调用或 Windows Terminal 主观体验验收；历史真实外部调用证据仍按各 Feature Report 区分。
 
+2026-09-12，[Feature 015](../specs/feature015-execution-recovery/report.md) 已实现执行阻塞恢复、输入中断与预算诊断，并完成本地验证，等待开发者验收；浏览器命令未正常结束的上游原因仍保留为已知问题。
+
 2026-09-06，产品方向调整为在 Coding Agent 基础上，围绕工程问题构造验证并交付证据。当前仍优先补齐 Coding Agent 基本功能；工程验证工具、数据准备与证据交付的具体机制留待后续 Feature。现有两个 package、Agent Interface、模型与 Tool 权限边界继续作为技术基线。
 
 2026-08-31，开发者撤销了此前实现的 Electron Desktop、独立 Utility Process Host、JSON-RPC 协议和跨层状态投影。问题不是 Electron 本身不可用，而是这些选择被过早设为所有运行方式的产品前提，并让基础 Agent Loop 承担了尚未出现的跨进程需求。
@@ -75,7 +77,7 @@ Feature 001 不创建 Desktop 目录、进程或协议。未来 Desktop 需要�
 
 AgentEvent 只表达 Agent 已经发生的生命周期、消息、权限和 Tool 变化。当前事件包含 Run 开始与结束、真实 phase 变化、消息开始/更新/结束、Visible Reasoning、权限模式变化、Tool approval 请求与结果，以及带 ToolActivity 与 ToolCall 归属的执行开始、输出和结束。事件按产生顺序同步交给当前订阅者；TUI 按事件顺序维护呈现状态，再合并绘制，不通过事件反向控制 Agent。会话切换和手动能力操作另外发布 session_changed、operation_changed、skills_changed、mcp_changed、memory_changed、permissions_changed；工具参数阶段和 model_retry 表达正在发生的准备及等待，TUI 只呈现这些事件，不自行发起执行。
 
-Session 使用 Schema 3 JSONL（兼容 Schema 1/2），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和带可选安全诊断的 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
+Session 使用 Schema 4 JSONL（兼容历史 Schema 1/2/3），持久化完整消息、压缩、调用用量、审批、副作用开始事实、context_source 外部来源、使用活动和带可选安全诊断的 Run 终态；流式 delta 与瞬时 AgentEvent 不写入 JSONL。会话按 UTC 创建时间归档，索引为可重建旁路文件。TUI 可以保存输入缓冲、折叠和焦点等呈现状态，但不能成为 Agent 生命周期、Tool Policy 或 Session 事实的权威。
 
 ## 模型配置方向
 
@@ -92,9 +94,9 @@ Model Adapter 的必需配置为：
 三项只供 Agent Module 内部的模型 Adapter 使用，TUI 只接收启动成功后的 Agent 或安全错误文本。缺失或无效配置必须在发起请求前给出可理解提示，API Key 不进入事件、TUI 输出、错误详情、测试快照或仓库文件。应用不为 DeepSeek V4 Flash 增加模型枚举或专用条件分支。
 
 
-已知 deepseek-v4-flash 使用内置模型能力数据。自定义模型需声明 `ANTHIAS_MODEL_CONTEXT_WINDOW`，可用 `ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 声明输出能力。普通输出默认 64,000；上下文窗口不超过 84,000 时沿用 16,000，再按模型输出能力收窄。摘要和保留原文目标为 8,000 / 32,000，安全余量为 20,000；`ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS` 可覆盖，显式超限仍在启动时拒绝。
+已知 deepseek-flash 与兼容调用名使用内置模型能力数据，核验日期与来源见 [Feature 015 Research](../specs/feature015-execution-recovery/research.md)。自定义模型需声明 `ANTHIAS_MODEL_CONTEXT_WINDOW`，可用 `ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 声明输出能力。普通输出默认 64,000；上下文窗口不超过 84,000 时沿用 16,000，再按模型输出能力收窄。摘要和保留原文目标为 8,000 / 32,000，安全余量为 20,000；`ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS` 可覆盖，显式超限仍在启动时拒绝。
 
-`ANTHIAS_RESPONSE_REASONING_EFFORT` 与 `ANTHIAS_APPROVAL_REASONING_EFFORT` 分别控制普通生成和审核的可选 `reasoning_effort`，支持 `low` / `medium` / `high`；未配置不传，压缩不采用这两个覆盖值。配置和 Provider 参数装配仍属于 Agent，TUI 不读取。
+`ANTHIAS_RESPONSE_REASONING_EFFORT` 与 `ANTHIAS_APPROVAL_REASONING_EFFORT` 分别控制普通生成和审核的可选 `reasoning_effort`，支持 `low` / `medium` / `high`；未配置不传，压缩不采用这两个覆盖值。配置和 Provider 参数装配仍属于 Agent，TUI 不读取。Agent 提供不含凭据与 Endpoint 的最终配置和来源摘要，`/diagnostics` 呈现；Schema 4 的 request_usage 可选保存生产 Adapter 实际采用的 modelId、maxOutputTokens 与 reasoningEffort，旧记录缺少时保持未知。
 
 上下文检查位于每次普通请求发送前。有效 usage 对完全相同的请求前缀进行校准，否则保守估算；摘要不修改完整对话历史，JSONL 是事实源。摘要成功刷盘后自动继续，失败或取消不丢原文。AutoAllow 审核为同一模型的独立请求，最多 8,000 输入 / 2,000 输出。授权来源按顺序保留全部真实用户消息，历史单次批准只留作审计，不携带整份工具输入占据新审核预算；摘要、工具结果和外部内容不成为用户授权。动作或完整用户来源超预算时明确转人工，不静默丢弃原始任务或后续约束。
 
@@ -175,10 +177,12 @@ Session 保存实际消息与采用事实，memory 保存当前跨会话状态�
 
 用户高于根，根高于成员。根可以创建、分派、停止、重开和绑定成员工作区；成员可以通信、更新自身任务、查看公开快照和追加笔记。根可读成员完整历史，普通成员只能查看同伴公开结果。组内内容保留来源，不能变成真实用户授权。用户直接通过协作入口提交正式任务时，先保存根 `coordination/user_request` 事实；AutoAllow 与压缩校验使用该真实用户原文，模型发消息不能产生这种授权。用户暂停群组同时停止根和成员，根不能借新建成员解除；用户明确继续后才恢复调度。
 
-消息先写根 `coordination`，在成员 `agent_input` 持久化后确认消费。运行中在整个工具批次完成后的安全点插入，空闲成员由调度唤醒；暂停保持队列，关闭拒绝新消息，重开需要根明确调用。每个收件者最多三十二条待处理消息，每条十六 KiB。根正常完成关闭新唤醒，已启动 Run 在原期限内收尾，迟到消息保留历史；根失败或取消收束成员。重启只恢复状态，用户明确继续群组后才执行，消息不能重置时限。
+消息先写根 `coordination`，在成员 `agent_input` 持久化后确认消费。运行中在整个工具批次完成后的安全点插入，空闲成员由调度唤醒；暂停保持队列，关闭拒绝新消息，重开需要根明确调用。每个收件者最多三十二条待处理消息，每条十六 KiB。根正常完成关闭新唤醒，已启动 Run 在原期限内收尾，迟到消息保留历史；根失败或用户停止收束成员；Esc 输入中断只取消根当前 Run，后续存储失败仍收束成员。重启只恢复状态，用户明确继续群组后才执行，消息不能重置时限。
 
 成员默认共享根工作区且可写，根可独立限制为只读；可写不创建工作树。需要隔离时先显式创建或选取受管 worktree，再绑定停止中的成员。绑定事实保存在根日志，执行打开核对成员所属根与当前绑定，保留原 Header。工作树只带入明确提交，不复制未提交文件、依赖或凭据。
 
-文件工具读取返回完整原始字节 SHA-256，编辑和覆盖携带 `expectedVersion`，新建使用 `missing`。批准期间不持锁，取得写入权后再次核对内容、文件/父目录身份、授权与取消，然后原子替换。同一真实路径或文件身份串行，不同文件可以并行；命令独占所属工作区写入阶段，Git 变更在同一协调器内对相关工作区排他并重新核对批准指纹。等待可取消；命令清理无法确认时保留该工作区租约，不能假装资源已释放。以上只协调本进程的受管操作，不约束外部编辑器或其他进程，不构成 OS 沙箱。
+文件工具读取返回完整原始字节 SHA-256，编辑和覆盖携带 `expectedVersion`，新建使用 `missing`，成功原子替换返回实际提交字节的 `newVersion`。批准期间不持锁，取得写入权后再次核对内容、文件/父目录身份、授权与取消，然后原子替换。同一真实路径或文件身份串行，不同文件可以并行；命令独占所属工作区写入阶段，Git 变更在同一协调器内对相关工作区排他并重新核对批准指纹。取锁等待可取消，并独立使用命令 timeoutMs 作为上限；执行另行计时。清理不明时，用取锁时冻结的真实资源键建立显式阻塞，拒绝受影响的排队与后续写入，再结束普通租约。阻塞保存到 Session 数据目录的 workspace-blocks；仅根可请求检查，外部清理确认只从直接用户入口接受。保存或恢复失败保留保护，恢复不重放命令，也不凭裸 PID 接管资源。以上只协调本进程的受管操作，不约束外部编辑器或其他进程，不构成 OS 沙箱。
+
+运行中 Enter 默认 followUp；Esc 提升两个队列中最早、尚未领取的用户输入，沿用 inputId，立即取消并等待旧 Run 自己的必要清理。清理不明时输入绑定该 Run 的具体 blockId；旧 Run 的阻塞不拦住纯模型对话。停止撤销后续自动继续，迟到清理不能覆盖新的停止。成员状态保留简短故障，agent_wait 按新故障序号提前返回；模型列表与等待不再携带完整任务。
 
 当前 Session 仍使用 Schema 4，根位于 `data/conversation/<UTC日期>/<时间戳>-<根ID>/`，成员位于根目录下 `members/<成员ID>/`，唯一笔记为根目录的 `shared-notes.md`。历史 `plan`、`subagent`、`teammate` 记录继续可读；存储标签不决定运行时两套行为。未消费消息、未完成任务和受管工作树等阻止整组清理，关闭成员不删除源码或历史。
