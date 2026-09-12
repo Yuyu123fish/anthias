@@ -293,7 +293,7 @@ description: 检查项目的接口兼容性与错误处理
 | 分派任务、发送邮箱消息 | `/agent assign <成员ID> 下一任务`、`/agent message <成员ID> 补充信息` |
 | 共享笔记 | `/agent notes read`、`/agent notes append 协作内容`、`/agent notes replace <读取版本> 整理后的内容` |
 | 暂停 / 继续群组 | `/agent group stop`、`/agent group continue` |
-| 查看 / 检查工作区阻塞 | `/agents` 查看来源，`/agent recover <blockId>` 检查原命令清理结果 |
+| 查看 / 检查工作区阻塞 | `/agents` 查看来源，`/agent recover <blockId>` 请求原资源清理并检查结果 |
 | 查看仓库与工作树 | `/git status [worktreeID]`、`/git diff [worktreeID]`、`/git worktrees` |
 | 显式创建与绑定工作树 | `/git create [已提交ref]`、`/agent workspace <成员ID> <worktreeID>` |
 | 返回根工作区 | `/agent workspace <成员ID> root` |
@@ -308,11 +308,13 @@ description: 检查项目的接口兼容性与错误处理
 
 命令可能仍在运行或持有管道时，Anthias 保留写入保护，并显示 `workspace_blocked`、blockId、成员与工具来源。相关排队和新写入会明确失败；命令 timeoutMs 仍限制执行时间，取锁另以同一数值为上限，结果分别给出等待/执行时长与是否启动。
 
-1. 用 `/agents` 查看阻塞来源；`/agent recover <blockId>` 只核查原命令资源，不重新执行工具。
-2. 仍无法确认时，在外部检查并关闭该命令留下的进程或资源。确认已清理后，由用户输入 `/agent recover <blockId> confirm-cleanup`；这会记录用户确认，模型不能使用这项绕过检查的确认。
+1. 用 `/agents` 查看来源；`/agent recover <blockId>` 请求重新检查原执行器持有的命令进程和输出流，必要时重试通用清理。根也可用 `agent_recover_workspace`，不经过被阻塞的写入队列，不重放原工具。
+2. 本次限时清理未完成时，可以稍后再次请求恢复，不要重试普通 Shell 或文件写入。若重启丢失句柄、无法核验归属或持续失败，再外部清理对应资源；确认后由用户直接输入 `/agent recover <blockId> confirm-cleanup`。普通对话中的“已清理”无效，模型不能代替直接确认。
 3. Esc 对应输入会在自己的阻塞解除后继续；若后来按过 Ctrl+C，输入仍暂停，需要明确 `/continue`。重复 Esc 不复制消息，未发送草稿不会被提交。
 
-已保存的阻塞位于 Session 数据目录的 `workspace-blocks/`，重启会重新加载；没有原句柄时需要用户核查。仅保存已发生的阻塞，无法保证进程崩溃前尚未落盘的状态。阻塞目录损坏时写入保持关闭，修复目录后重新启动。浏览器命令仍可能输出 Done 后超时，详见 [事故记录](docs/incident/2026-09-11-multi-agent-workspace-blocking.md)。
+已保存的阻塞位于 Session 数据目录的 `workspace-blocks/`，重启会重新加载；没有原句柄时需要用户核查。仅保存已发生的阻塞，无法保证进程崩溃前尚未落盘的状态。阻塞目录损坏时写入保持关闭，修复目录后重新启动。外部程序持续持有输出或清理失败时仍可能阻塞，详见 [事故记录](docs/incident/2026-09-11-multi-agent-workspace-blocking.md)。
+
+浏览器能力通过外部 CLI 或 MCP 使用，可按相应 Skill 操作。Anthias 执行通用权限与取消规则；浏览器会话、配置和关闭由外部工具负责，Anthias 不会自动配置或关闭浏览器。外部资源持续占用时，需要先通过对应工具或人工完成清理。完成构建后重新启动 Anthias 才会加载新代码。
 
 需要隔离时，先 `/git create`，再 `/agent spawn --worktree <ID> 任务`，或停止已有成员后绑定。工作树只含创建时指定提交，根工作区的未提交修改保留原地，不自动带入依赖、凭据或服务。默认代码目录为 `data/worktrees/<根SessionID>/`，可通过绝对路径 `ANTHIAS_WORKTREE_DIR` 覆盖；它独立于 Session 历史目录。
 

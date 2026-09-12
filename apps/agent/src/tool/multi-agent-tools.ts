@@ -22,7 +22,7 @@ function define(
 const definitions: readonly ModelToolDefinition[] = [
   define(
     "agent_recover_workspace",
-    "根检查原命令清理结果并尝试解除对应工作区阻塞；不重放工具，不提供外部清理确认。",
+    "根对本执行器持有的原命令进程与输出流做有界清理和重新检查，成功后解除对应工作区阻塞；不重放工具。限时清理未完成可稍后重试本工具，不要重试普通命令。无法核验归属或持续失败时，由用户外部清理后直接输入 /agent recover <blockId> confirm-cleanup；普通对话不能代替确认。",
     { blockId: identity },
     ["blockId"],
   ),

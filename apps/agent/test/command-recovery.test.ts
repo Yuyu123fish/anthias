@@ -207,3 +207,114 @@ it("keeps protection when saving or removing a block fails", async () => {
     "recovered",
   );
 });
+
+it.skipIf(process.platform !== "win32")(
+  "recovers when real output handles close after an unsuccessful cancellation",
+  async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-late-cleanup-"));
+    directories.push(workspaceRoot);
+    const workspaceAccess = createWorkspaceAccess();
+    const preparation = await prepareCommandTool(
+      {
+        type: "tool_call",
+        toolName: "execute_command",
+        toolCallId: "late-cleanup",
+        input: { command: "setTimeout(() => {}, 6000)", timeoutMs: 15000 },
+        invalid: false,
+      },
+      { workspaceRoot, workspaceAccess, sessionDirectory: join(workspaceRoot, ".sessions") },
+      { kind: "powershell", executable: process.execPath, arguments: ["-e"] },
+    );
+    if (!preparation.ok) throw new Error("preparation failed");
+    const actualChildProcess =
+      await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let observedProcess: ChildProcess | undefined;
+    vi.mocked(spawn).mockImplementation((...argumentsList) => {
+      if (argumentsList[0] === process.execPath) {
+        observedProcess = actualChildProcess.spawn(...argumentsList);
+        vi.spyOn(observedProcess, "kill").mockReturnValue(false);
+        return observedProcess;
+      }
+      const failedTermination = new ChildProcess();
+      queueMicrotask(() => failedTermination.emit("close", 1));
+      return failedTermination;
+    });
+    const controller = new AbortController();
+    const completion = executePreparedCommand(
+      preparation.preparedTool,
+      controller.signal,
+      () => {},
+    );
+    await vi.waitFor(() => expect(observedProcess).toBeDefined());
+    controller.abort();
+    expect((await completion).cleanupUncertain).toBe(true);
+    const block = workspaceAccess.snapshot()[0];
+    if (!block) throw new Error("expected a block");
+    expect(
+      (await workspaceAccess.recover(block.blockId, new AbortController().signal)).status,
+    ).toBe("blocked");
+    // Node 自己从真实管道 EOF 推进 close；手动 emit(close) 会掩盖内部监听被删的缺陷。
+    await vi.waitFor(
+      () => {
+        expect(observedProcess?.stdout?.readableEnded).toBe(true);
+        expect(observedProcess?.stderr?.readableEnded).toBe(true);
+      },
+      { timeout: 8000, interval: 25 },
+    );
+    expect(
+      (await workspaceAccess.recover(block.blockId, new AbortController().signal)).status,
+    ).toBe("recovered");
+    const release = await workspaceAccess.acquireExclusiveWrite([workspaceRoot]);
+    release();
+  },
+  15000,
+);
+
+it("reports output held after exit without terminating an expired process identity", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "anthias-output-pending-"));
+  directories.push(workspaceRoot);
+  const workspaceAccess = createWorkspaceAccess();
+  const preparation = await prepareCommandTool(
+    {
+      type: "tool_call",
+      toolName: "execute_command",
+      toolCallId: "exited-command",
+      input: { command: "one-shot command", timeoutMs: 30000 },
+      invalid: false,
+    },
+    { workspaceRoot, workspaceAccess, sessionDirectory: join(workspaceRoot, ".sessions") },
+    { kind: "powershell", executable: "pwsh", arguments: ["-Command"] },
+  );
+  if (!preparation.ok) throw new Error("preparation failed");
+  const commandProcess = new ChildProcess();
+  const killProcess = vi.spyOn(commandProcess, "kill").mockReturnValue(true);
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  Object.defineProperties(commandProcess, { stdout: { value: stdout }, stderr: { value: stderr } });
+  vi.mocked(spawn).mockClear().mockReturnValue(commandProcess);
+  const completion = executePreparedCommand(
+    preparation.preparedTool,
+    new AbortController().signal,
+    () => {},
+  );
+  await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1));
+  stdout.write("client finished\n");
+  commandProcess.emit("exit", 0);
+  try {
+    const result = await completion;
+    expect(result.status).toBe("failed");
+    expect(result.content).toContain("termination: output_pending");
+    expect(result.content).toContain("client finished");
+    expect(result.cleanupUncertain).toBe(true);
+    expect(killProcess).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const block = workspaceAccess.snapshot()[0];
+    if (!block) throw new Error("expected output ownership to remain blocked");
+    await expect(workspaceAccess.acquireExclusiveWrite([workspaceRoot])).rejects.toThrow(
+      block.blockId,
+    );
+  } finally {
+    stdout.end();
+    stderr.end();
+  }
+}, 6000);

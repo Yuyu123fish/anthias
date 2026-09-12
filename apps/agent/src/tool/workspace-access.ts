@@ -51,7 +51,7 @@ export type WorkspaceAccess = Readonly<{
   ): Promise<ExclusiveWriteLease>;
   block(
     details: Omit<WorkspaceBlock, "blockId" | "createdAt" | "persisted">,
-    checkCleanup?: () => Promise<boolean>,
+    checkCleanup?: (signal: AbortSignal) => Promise<boolean>,
   ): Promise<WorkspaceBlock>;
   snapshot(): readonly WorkspaceBlock[];
   recover(
@@ -67,7 +67,7 @@ export function createWorkspaceAccess(options: { directory?: string } = {}): Wor
   const activeWrites = new Set<WriteRequest>();
   const pendingWrites: PendingWrite[] = [];
   const blocks = new Map<string, WorkspaceBlock>();
-  const cleanupChecks = new Map<string, () => Promise<boolean>>();
+  const cleanupChecks = new Map<string, (signal: AbortSignal) => Promise<boolean>>();
   const pendingSaves = new Map<string, Promise<void>>();
   const listeners = new Set<() => void>();
   const recovering = new Map<string, Promise<WorkspaceRecoveryResult>>();
@@ -275,7 +275,9 @@ export function createWorkspaceAccess(options: { directory?: string } = {}): Wor
             signal.addEventListener("abort", onAbort, { once: true });
             try {
               cleanupConfirmed = await Promise.race([
-                checkCleanup().catch(() => false),
+                checkCleanup(AbortSignal.any([signal, AbortSignal.timeout(2000)])).catch(
+                  () => false,
+                ),
                 new Promise<boolean>((resolveTimeout) => {
                   timeout = setTimeout(() => resolveTimeout(false), 2000);
                 }),
@@ -291,7 +293,13 @@ export function createWorkspaceAccess(options: { directory?: string } = {}): Wor
         if (!cleanupConfirmed)
           return {
             status: "blocked",
-            message: "仍无法确认原命令资源已清理；请检查原命令资源，外部清理后由用户明确确认。",
+            message:
+              (cleanupChecks.has(blockId)
+                ? "本次有界清理尚未确认完成。根可稍后重试 agent_recover_workspace，不要重试普通命令；持续失败再由用户外部清理。"
+                : "当前进程没有原资源句柄，需要用户核验并清理外部资源。") +
+              "外部清理后，请用户直接输入 /agent recover " +
+              blockId +
+              " confirm-cleanup；普通对话中的‘已清理’不能代替该确认。",
           };
         if (blocks.get(blockId) !== block)
           return { status: "blocked", message: "阻塞记录已变化，请重新检查。" };
