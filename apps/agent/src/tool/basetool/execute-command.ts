@@ -14,7 +14,6 @@ import {
 } from "../input-validation.js";
 import {
   createApprovalPlan,
-  createPolicyDeniedPlan,
   createRejectedToolCallPlan,
   createToolActivitySummary,
   failedExecution,
@@ -26,6 +25,7 @@ import {
   type ToolFailedResult,
 } from "../tool-result.js";
 import type { BaseTool, CreateToolRunnerOptions, ToolCallPlan } from "../tool-runner.js";
+import { type ExclusiveWriteLease, sharedWorkspaceAccess } from "../workspace-access.js";
 import {
   arePathsEqual,
   resolveExistingWorkspacePath,
@@ -42,7 +42,7 @@ export const executeCommandTool: BaseTool = Object.freeze({
   definition: Object.freeze({
     name: "execute_command",
     description:
-      "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。",
+      "在 Session 固定 Shell 中执行一次性非交互命令。cwd 是工作区相对目录，省略时为根目录；不要传绝对路径。timeoutMs 限制执行时间，取锁等待另以上述数值为上限。清理不明需先处理 workspace_blocked，不能重复提交命令。",
     inputSchema: Object.freeze({
       type: "object",
       additionalProperties: false,
@@ -57,10 +57,7 @@ export const executeCommandTool: BaseTool = Object.freeze({
   createPlan(toolCall, permissionMode, options) {
     const validationError = validateCommandToolCallInput(toolCall);
     if (validationError !== null) return createRejectedToolCallPlan(validationError);
-    if (permissionMode === "plan")
-      return createPolicyDeniedPlan(
-        decideToolPolicy({ permissionMode, toolName: "execute_command" }),
-      );
+    if (options.writable === false) return createRejectedToolCallPlan("当前成员只能读取工作区。");
     return createCommandToolCallPlan(toolCall, permissionMode, options);
   },
 });
@@ -68,6 +65,8 @@ export const executeCommandTool: BaseTool = Object.freeze({
 /** 保存一次已经完成预检、仍未启动子进程的命令调用。 */
 export type PreparedCommandTool = Readonly<{
   toolName: "execute_command";
+  toolCallId: string;
+  workspace: ToolWorkspace;
   target: string;
   preview: string;
   command: string;
@@ -92,6 +91,8 @@ export type CommandExecutionUpdate = Readonly<{
 export type CommandExecutionResult = ToolExecutionResult &
   Readonly<{
     cleanupUncertain: boolean;
+    processStarted: boolean;
+    executionDurationMs: number;
   }>;
 
 /** 枚举一次命令可以进入的明确终止原因。 */
@@ -99,6 +100,7 @@ export type CommandTerminationReason =
   | "completed"
   | "non_zero_exit"
   | "spawn_failed"
+  | "output_pending"
   | "timeout"
   | "aborted";
 
@@ -148,6 +150,8 @@ export async function prepareCommandTool(
       ok: true,
       preparedTool: Object.freeze({
         toolName: "execute_command",
+        toolCallId: toolCall.toolCallId,
+        workspace,
         target,
         preview: previewResult.content,
         command: inputResult.input.command,
@@ -172,6 +176,93 @@ export async function executePreparedCommand(
     return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
   }
 
+  const workspace = preparedTool.workspace;
+  const workspaceAccess = workspace.workspaceAccess ?? sharedWorkspaceAccess;
+  let releaseWrite: ExclusiveWriteLease | undefined;
+  const waitingStartedAt = Date.now();
+  const waitingController = new AbortController();
+  const waitingTimer = setTimeout(
+    () => waitingController.abort(),
+    preparedTool.timeoutMilliseconds,
+  );
+  let waitDurationMs = 0;
+  let checkCleanup: ((signal: AbortSignal) => Promise<boolean>) | undefined;
+  workspace.resourceState?.(preparedTool.toolCallId, "waiting");
+  try {
+    releaseWrite = await workspaceAccess.acquireExclusiveWrite(
+      [workspace.workspaceRoot, preparedTool.cwd],
+      AbortSignal.any([abortSignal, waitingController.signal]),
+    );
+    clearTimeout(waitingTimer);
+    waitDurationMs = Date.now() - waitingStartedAt;
+    workspace.resourceState?.(preparedTool.toolCallId, "acquired");
+    workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+    const result = await executeCommandWithWriteAccess(
+      preparedTool,
+      abortSignal,
+      publishUpdate,
+      (check) => {
+        checkCleanup = check;
+      },
+    );
+    let blockDescription = "";
+    if (result.cleanupUncertain) {
+      const block = await workspaceAccess.block(
+        {
+          workspaceRoots: releaseWrite.workspaceRoots,
+          sessionId: workspace.sessionId ?? "unknown",
+          toolCallId: preparedTool.toolCallId,
+          reason: "命令收尾时无法确认进程树和输出管道已清理。",
+        },
+        checkCleanup,
+      );
+      blockDescription = `\nworkspace_blocked: ${block.blockId}; ${block.reason}`;
+    }
+    return {
+      ...result,
+      content:
+        "waitDurationMs: " +
+        waitDurationMs +
+        "\nexecutionDurationMs: " +
+        result.executionDurationMs +
+        "\nprocessStarted: " +
+        result.processStarted +
+        blockDescription +
+        "\n" +
+        result.content,
+    };
+  } catch (error) {
+    const aborted = abortSignal.aborted;
+    return {
+      status: "failed",
+      content:
+        (aborted
+          ? "termination: aborted；等待工作区已取消，命令未启动。"
+          : waitingController.signal.aborted
+            ? "workspace_timeout：等待工作区超时，命令未启动。"
+            : toSafeCommandError(error)) +
+        "\nwaitDurationMs: " +
+        (Date.now() - waitingStartedAt) +
+        "\nexecutionDurationMs: 0\nprocessStarted: false",
+      truncated: false,
+      cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
+    };
+  } finally {
+    clearTimeout(waitingTimer);
+    // 清理不明已由阻塞记录接管保护，普通租约始终结束，避免匿名残留。
+    releaseWrite?.();
+    workspace.resourceState?.(preparedTool.toolCallId, "released");
+  }
+}
+
+async function executeCommandWithWriteAccess(
+  preparedTool: PreparedCommandTool,
+  abortSignal: AbortSignal,
+  publishUpdate: (update: CommandExecutionUpdate) => void,
+  registerCleanupCheck: (check: (signal: AbortSignal) => Promise<boolean>) => void,
+): Promise<CommandExecutionResult> {
   // 批准只绑定准备时的真实目录；同路径目录被替换或转成链接后不得复用旧批准。
   let cwdUnchanged = false;
   try {
@@ -194,9 +285,15 @@ export async function executePreparedCommand(
       content: "execute_command cwd 已变化，命令未启动。",
       truncated: false,
       cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
     });
   }
 
+  preparedTool.workspace.assertWriteAllowed?.(preparedTool.toolCallId);
+  if (abortSignal.aborted) {
+    return createCommandResult("aborted", null, 0, createCommandOutputCollector(), false);
+  }
   const startedAtMilliseconds = Date.now();
   const outputCollector = createCommandOutputCollector();
   const outputCapture = createCommandOutputCapture();
@@ -209,7 +306,7 @@ export async function executePreparedCommand(
       [...preparedTool.shell.arguments, preparedTool.command],
       {
         cwd: preparedTool.cwd,
-        env: createSanitizedEnvironment(process.env),
+        env: createCommandEnvironment(process.env),
         shell: false,
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -228,31 +325,67 @@ export async function executePreparedCommand(
 
   return new Promise((resolve) => {
     let settled = false;
-    let terminationReason: "timeout" | "aborted" | null = null;
+    let terminationReason: "timeout" | "aborted" | "output_pending" | null = null;
     let terminationPromise: Promise<boolean> | null = null;
     let cleanupUncertain = false;
+    let processClosed = false;
+    let processExited = false;
+    let observedExitCode: number | null = null;
+    let stdoutEnded = childProcess.stdout === null;
+    let stderrEnded = childProcess.stderr === null;
+    let outputDrainTimer: NodeJS.Timeout | undefined;
+    const resourcesClosed = () => processClosed && stdoutEnded && stderrEnded;
+    registerCleanupCheck(async (signal) => {
+      if (signal.aborted) return false;
+      if (resourcesClosed()) return true;
+      // 只对仍由 ChildProcess 持有的活进程重试终止；主进程退出后不能再使用可能复用的 PID。
+      if (!processExited) {
+        const retry = terminateProcessTree(childProcess);
+        await Promise.race([
+          retry,
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 1000);
+            timer.unref();
+          }),
+        ]);
+      }
+      const deadline = Date.now() + 500;
+      while (!resourcesClosed() && !signal.aborted && Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      }
+      return resourcesClosed() && !signal.aborted;
+    });
     let shutdownFallbackTimer: NodeJS.Timeout | null = null;
 
-    /** 只交付一次命令终态，并移除所有由本次执行持有的资源。 */
+    /** 只交付一次命令终态；清理不明时保留恢复所需的关闭观察。 */
     const settle = (exitCode: number | null, spawnFailed = false) => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(commandTimeout);
+      clearTimeout(outputDrainTimer);
       if (shutdownFallbackTimer !== null) {
         clearTimeout(shutdownFallbackTimer);
       }
       abortSignal.removeEventListener("abort", handleAbort);
       const finalStdout = stdoutDecoder.end();
       const finalStderr = stderrDecoder.end();
-      publishAcceptedOutput("stdout", finalStdout);
-      publishAcceptedOutput("stderr", finalStderr);
-      childProcess.stdout?.removeAllListeners();
-      childProcess.stderr?.removeAllListeners();
-      childProcess.removeAllListeners();
-      childProcess.stdout?.destroy();
-      childProcess.stderr?.destroy();
+      outputCapture.append(finalStdout);
+      outputCapture.append(finalStderr);
+      outputCollector.append("stdout", finalStdout);
+      outputCollector.append("stderr", finalStderr);
+      // Node 自己的 close 监听负责合并进程与管道关闭，不能 removeAllListeners。只撤下本调用的数据收集。
+      childProcess.stdout?.removeListener("data", collectStdout);
+      childProcess.stderr?.removeListener("data", collectStderr);
+      if (cleanupUncertain) {
+        // 保留原有 end/exit/close 观察并继续排空；destroy 读取侧不能证明后台写入者退出。
+        childProcess.stdout?.on("data", () => {});
+        childProcess.stderr?.on("data", () => {});
+      } else {
+        childProcess.stdout?.destroy();
+        childProcess.stderr?.destroy();
+      }
       const reason: CommandTerminationReason = spawnFailed
         ? "spawn_failed"
         : (terminationReason ?? (exitCode === 0 ? "completed" : "non_zero_exit"));
@@ -263,6 +396,7 @@ export async function executePreparedCommand(
           Date.now() - startedAtMilliseconds,
           outputCollector,
           cleanupUncertain,
+          !spawnFailed,
         ),
         ...outputCapture.finish(),
       });
@@ -270,6 +404,7 @@ export async function executePreparedCommand(
 
     /** 保存并发布仍落在统一边界内的输出，订阅者异常不能破坏子进程收口。 */
     const publishAcceptedOutput = (stream: "stdout" | "stderr", text: string) => {
+      if (settled) return;
       outputCapture.append(text);
       const acceptedText = outputCollector.append(stream, text);
       if (acceptedText.length === 0 || settled) {
@@ -283,33 +418,53 @@ export async function executePreparedCommand(
     };
 
     /** 在中止或超时时仅请求一次进程树终止，并为无法确认的情况设置收口上限。 */
-    const requestTermination = (reason: "timeout" | "aborted") => {
+    const requestTermination = (reason: "timeout" | "aborted" | "output_pending") => {
       if (terminationReason !== null || settled) {
         return;
       }
       terminationReason = reason;
-      terminationPromise = terminateProcessTree(childProcess).then((uncertain) => {
+      terminationPromise = (
+        processExited ? Promise.resolve(!resourcesClosed()) : terminateProcessTree(childProcess)
+      ).then((uncertain) => {
         cleanupUncertain ||= uncertain;
         return uncertain;
       });
       shutdownFallbackTimer = setTimeout(() => {
         cleanupUncertain = true;
-        forceTerminateProcessTree(childProcess);
-        settle(null);
+        if (!processExited) forceTerminateProcessTree(childProcess);
+        settle(observedExitCode);
       }, PROCESS_TREE_SHUTDOWN_GRACE_MILLISECONDS);
     };
 
     /** 根 AbortSignal 只请求进程回收，Run 终态由 Agent 统一决定。 */
     const handleAbort = () => requestTermination("aborted");
 
-    childProcess.stdout?.on("data", (chunk: Buffer) => {
+    const collectStdout = (chunk: Buffer) =>
       publishAcceptedOutput("stdout", stdoutDecoder.write(chunk));
-    });
-    childProcess.stderr?.on("data", (chunk: Buffer) => {
+    const collectStderr = (chunk: Buffer) =>
       publishAcceptedOutput("stderr", stderrDecoder.write(chunk));
+    childProcess.stdout?.on("data", collectStdout);
+    childProcess.stderr?.on("data", collectStderr);
+    childProcess.stdout?.once("end", () => {
+      stdoutEnded = true;
+    });
+    childProcess.stderr?.once("end", () => {
+      stderrEnded = true;
+    });
+    childProcess.once("exit", (code) => {
+      processExited = true;
+      observedExitCode = code;
+      if (settled) return;
+      // 一次性命令已退出却仍没有 EOF，尽快报告资源边界，避免耗尽数分钟执行预算。
+      outputDrainTimer = setTimeout(() => {
+        if (!processClosed) requestTermination("output_pending");
+      }, 1000);
     });
     childProcess.once("error", () => settle(null, true));
     childProcess.once("close", (exitCode) => {
+      processClosed = true;
+      processExited = true;
+      observedExitCode = exitCode;
       if (terminationPromise === null) {
         settle(exitCode);
         return;
@@ -443,32 +598,6 @@ function forceTerminateProcessTree(childProcess: ReturnType<typeof spawn>): void
   }
 }
 
-/** 从宿主环境的明确允许列表构造命令环境，避免隐式继承凭据和注入配置。 */
-function createSanitizedEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const allowedNames =
-    process.platform === "win32"
-      ? [
-          "PATH",
-          "PATHEXT",
-          "SYSTEMROOT",
-          "WINDIR",
-          "COMSPEC",
-          "SYSTEMDRIVE",
-          "TEMP",
-          "TMP",
-          "OS",
-          "PROCESSOR_ARCHITECTURE",
-          "NUMBER_OF_PROCESSORS",
-        ]
-      : ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR"];
-  const allowedNameSet = new Set(allowedNames.map((name) => name.toLocaleLowerCase("en-US")));
-  return Object.fromEntries(
-    Object.entries(environment).filter(
-      ([name, value]) => value !== undefined && allowedNameSet.has(name.toLocaleLowerCase("en-US")),
-    ),
-  );
-}
-
 /** 用不会混淆 executable 与参数边界的形式展示固定 Session Shell。 */
 function renderShell(shell: SessionShell): string {
   return [shell.executable, ...shell.arguments].map((part) => JSON.stringify(part)).join(" ");
@@ -536,4 +665,30 @@ function createCommandToolCallPlan(
       });
     },
   });
+}
+
+/** 子进程只继承执行所需的环境变量，避免把模型凭据交给命令。 */
+function createCommandEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const allowedNames =
+    process.platform === "win32"
+      ? [
+          "PATH",
+          "PATHEXT",
+          "SYSTEMROOT",
+          "WINDIR",
+          "COMSPEC",
+          "SYSTEMDRIVE",
+          "TEMP",
+          "TMP",
+          "OS",
+          "PROCESSOR_ARCHITECTURE",
+          "NUMBER_OF_PROCESSORS",
+        ]
+      : ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+  const allowedNameSet = new Set(allowedNames.map((name) => name.toLowerCase()));
+  return Object.fromEntries(
+    Object.entries(environment).filter(
+      ([name, value]) => value !== undefined && allowedNameSet.has(name.toLowerCase()),
+    ),
+  );
 }

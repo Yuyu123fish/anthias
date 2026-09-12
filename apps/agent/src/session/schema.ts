@@ -125,6 +125,7 @@ export type CompactionDetails = Readonly<{
 
 /** 后续 Model Context 可写入的校准用量事实。 */
 export type RequestUsageDetails = Readonly<{
+  configuration?: import("../message.js").RequestConfiguration;
   purpose: "response" | "compaction" | "approval";
   requestEntryId: string | null;
   contextVersion: string;
@@ -152,7 +153,7 @@ export type SessionUseDetails = Readonly<{
 
 /** 根 Session 保存的成员、任务、交付与 Git 协调事实。 */
 export type CoordinationDetails = Readonly<{
-  kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation";
+  kind: "member" | "team" | "task" | "delivery" | "worktree" | "git_operation" | "user_request";
   key: string;
   payload: JsonValue;
 }>;
@@ -259,6 +260,7 @@ export type CompactionRecord = SessionEntryBase &
 export type RequestUsageRecord = SessionEntryBase &
   Readonly<{
     type: "request_usage";
+    configuration?: import("../message.js").RequestConfiguration;
     runId?: string;
     purpose: RequestUsageDetails["purpose"];
     requestEntryId: string | null;
@@ -630,17 +632,22 @@ export function validateSessionRecord(
   }
   if (value.type === "request_usage") {
     if (
-      !hasExactKeysWithOptionalRunId(value, [
-        "type",
-        "entryId",
-        "seq",
-        "timestamp",
-        "parentEntryId",
-        "purpose",
-        "requestEntryId",
-        "contextVersion",
-        "usage",
-      ]) ||
+      !hasExactKeysWithOptionalRunId(
+        value,
+        [
+          "type",
+          "entryId",
+          "seq",
+          "timestamp",
+          "parentEntryId",
+          "purpose",
+          "requestEntryId",
+          "contextVersion",
+          "usage",
+        ],
+        ["configuration"],
+      ) ||
+      !(value.configuration === undefined || isRequestConfiguration(value.configuration)) ||
       !(value.runId === undefined || isUuid(value.runId)) ||
       !isRequestUsagePurpose(value.purpose) ||
       !(value.requestEntryId === null || isUuid(value.requestEntryId)) ||
@@ -1144,9 +1151,28 @@ function validateFactReferences(
     }
   }
 }
+/** 只有真实用户消息及交互入口记录的明确派工可以成为新动作授权；成员内容不能提升来源。 */
+export function userAuthorizationText(record: SessionRecord): string | null {
+  if (
+    record.type === "message" &&
+    record.message.role === "user" &&
+    record.message.source?.kind !== "agent"
+  )
+    return record.message.content;
+  if (
+    record.type !== "coordination" ||
+    record.kind !== "user_request" ||
+    !isPlainObject(record.payload)
+  )
+    return null;
+  return record.payload.source === "user" && typeof record.payload.content === "string"
+    ? record.payload.content
+    : null;
+}
+
 function isTrustedAuthorizationSource(record: SessionRecord): boolean {
   return (
-    (record.type === "message" && record.message.role === "user") ||
+    userAuthorizationText(record) !== null ||
     (record.type === "approval_decision" &&
       record.decisionSource === "user" &&
       record.decision === "allowed")
@@ -1527,7 +1553,8 @@ function isCoordinationKind(value: unknown): value is CoordinationDetails["kind"
     value === "task" ||
     value === "delivery" ||
     value === "worktree" ||
-    value === "git_operation"
+    value === "git_operation" ||
+    value === "user_request"
   );
 }
 
@@ -1782,7 +1809,7 @@ export function isRunDiagnostic(value: unknown): value is RunDiagnostic {
         Object.hasOwn(diagnostic.usage, "cacheWriteInputTokens"))) &&
     (diagnostic.retryCount === null || isNonNegativeSafeInteger(diagnostic.retryCount)) &&
     (diagnostic.abortSource === null ||
-      ["user", "task_deadline", "shutdown", "parent", "internal", "unknown"].includes(
+      ["user", "task_deadline", "shutdown", "parent", "internal", "input", "unknown"].includes(
         String(diagnostic.abortSource),
       )) &&
     (diagnostic.httpStatus === null ||
@@ -1829,5 +1856,21 @@ function isRequestSummary(value: unknown): boolean {
     countKeys.every(
       (key) => isNonNegativeSafeInteger(summary[key]) && Number(summary[key]) <= 1_000_000,
     )
+  );
+}
+
+/** 可选请求配置只接受安全字段，旧记录无需迁移。 */
+function isRequestConfiguration(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    Object.keys(value).every((key) =>
+      ["modelId", "maxOutputTokens", "reasoningEffort"].includes(key),
+    ) &&
+    isNonEmptyString(value.modelId) &&
+    Number.isSafeInteger(value.maxOutputTokens) &&
+    typeof value.maxOutputTokens === "number" &&
+    value.maxOutputTokens > 0 &&
+    (value.reasoningEffort === undefined ||
+      ["low", "medium", "high"].includes(String(value.reasoningEffort)))
   );
 }

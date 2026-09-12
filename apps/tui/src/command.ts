@@ -117,7 +117,7 @@ export async function executeCommand(
   const argumentsText = command.argumentsText.trim();
   const args = argumentsText ? argumentsText.split(/\s+/u) : [];
   if (command.name === "memory") return runMemoryCommand(command.argumentsText, agent, notice);
-  if (["agents", "agent", "team", "git"].includes(command.name))
+  if (["agents", "agent", "git"].includes(command.name))
     return runCollaborationCommand(command.name, argumentsText, agent, notice);
   const report = (result: { ok: boolean; error?: string }, success: string): CommandResult => {
     notice(result.ok ? success : (result.error ?? "操作失败。"));
@@ -147,7 +147,7 @@ export async function executeCommand(
         notice(
           result.ok
             ? agent.state.permissionMode === "full_access"
-              ? "工作区授权已撤销，仅影响 auto_allow。FullAccess 仍然生效；需在空闲时使用 /mode agent、/mode plan 或 /mode auto_allow 退出。已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
+              ? "工作区授权已撤销，仅影响 auto_allow。FullAccess 仍然生效；需在空闲时使用 /mode agent 或 /mode auto_allow 退出。已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
               : "工作区授权已撤销。未开始的动作与待批准请求已失效；已开始动作可用 Ctrl+C 停止，已产生副作用不回滚。"
             : result.error,
         );
@@ -190,7 +190,13 @@ export async function executeCommand(
     }
     case "diagnostics":
       if (args.length) return invalid();
-      else notice(formatRunDiagnostic(agent.state.lastRunDiagnostic));
+      else
+        notice(
+          [
+            ...(agent.state.configurationSummary ?? []),
+            formatRunDiagnostic(agent.state.lastRunDiagnostic),
+          ].join("\n"),
+        );
       break;
     case "steer":
     case "followup":
@@ -430,7 +436,7 @@ export function formatContextUsage(usage: ContextUsage): string {
 }
 
 function isPermissionMode(value: string): value is PermissionMode {
-  return value === "agent" || value === "plan" || value === "auto_allow" || value === "full_access";
+  return value === "agent" || value === "auto_allow" || value === "full_access";
 }
 
 /** 只解析授权入口的选项；分隔符之后的 Shell 文本交给 Agent 校验，保留原始引号。 */

@@ -9,7 +9,7 @@
 
 ## 1. 当前基线与范围
 
-- 当前分支为 `main`，Stage 01 已在 `8c34b78` 完成，Stage 02 已在 `996556e` 完成，Stage 03 已完成整体集成与验收准备。
+- 当前分支为 `main`，Stage 01 已在 `a0f3f8f` 完成，Stage 02 已在 `216a018` 完成，Stage 03 已完成整体集成与验收准备。
 - 当前环境为 Windows、Node.js `v24.13.1`、pnpm `10.33.0`、PowerShell `7.5.4`。
 - `apps/agent` 已实现 Schema 1 Session 的新建、追加、按 UUID 重开与持久投影；一次提示词可以在单 activeRun 内发起多次结构化模型请求，串行处理 ToolCall，并统一支持取消和安全失败。
 - `apps/tui` 仍只依赖 `@anthias/agent`，现已通过同一公开 Interface 呈现 Tool、处理逐次确认、停止当前 Run 并报告最终结果。

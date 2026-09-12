@@ -6,7 +6,7 @@
 - 对应 Spec：[spec.md](spec.md)
 - 对应 Plan：[plan.md](plan.md)
 - 对应 Tasks：[tasks.md](tasks.md)
-- 职责修正基线：`main` / `52726d9`
+- 职责修正基线：`main` / `d3881bd`
 
 ## 1. 已经成立的用户行为
 
@@ -69,7 +69,7 @@ apps/agent/src/index.ts
 
 ## 6. Git 边界
 
-- 当前仍在 `main`，职责修正开始于 `52726d9`；当前修正尚未提交。
+- 当前仍在 `main`，职责修正开始于 `d3881bd`；当前修正尚未提交。
 - 本次变更只涉及 Agent/TUI 职责文档、package 依赖、模型 Adapter 归属、Agent 启动工厂和对应测试，没有改变 Feature 001 的用户行为。
 - 修正前工作区干净，没有重置、覆盖或夹带开发者的其他修改。
 - 未调用真实 Provider，未提交、推送或创建 PR；这些动作仍需开发者分别授权。

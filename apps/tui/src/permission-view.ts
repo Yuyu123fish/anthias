@@ -7,7 +7,7 @@ export type PermissionGrantChoice = Readonly<{
 }>;
 
 export function permissionModeLabel(mode: PermissionMode): string {
-  return { agent: "Agent", plan: "Plan", auto_allow: "AutoAllow", full_access: "FullAccess" }[mode];
+  return { agent: "Agent", auto_allow: "AutoAllow", full_access: "FullAccess" }[mode];
 }
 
 export function permissionModeNotice(
@@ -15,7 +15,7 @@ export function permissionModeNotice(
   snapshot: WorkspacePermissionSnapshot,
 ): string | null {
   if (mode === "full_access")
-    return "FullAccess 跳过人工与自动审核，允许系统用户权限内的工作区外文件访问。当前没有 OS 沙箱，访问能力不等于任务授权。\n撤销工作区授权不会退出 FullAccess；请在空闲时使用 /mode agent、/mode plan 或 /mode auto_allow 切换。";
+    return "FullAccess 跳过人工与自动审核，允许系统用户权限内的工作区外文件访问。当前没有 OS 沙箱，访问能力不等于任务授权。\n撤销工作区授权不会退出 FullAccess；请在空闲时使用 /mode agent 或 /mode auto_allow 切换。";
   return mode === "auto_allow" && snapshot.grant === null
     ? "auto_allow 已启用自动审核，当前没有工作区授权。自动审核不等于工作区授权。\n使用 /permissions grant --remember 查看并授予范围。"
     : null;
@@ -49,7 +49,7 @@ export function formatPermissions(
     choice || grant
       ? `文件：${choice || grant?.files ? "当前工作区内的普通创建与编辑" : "未授权"}`
       : "",
-    `成员：${includeMembers ? (remember ? "包括今后从本工作区发起的任务所创建并登记的成员 worktree" : "仅包括当前任务创建并登记的成员 worktree") : "不包括成员 worktree"}`,
+    `成员：${includeMembers ? (remember ? "包括今后从本工作区发起任务的登记成员" : "仅包括当前任务创建并登记的成员") : "不包括成员"}`,
     "命令按下面列明的匹配方式和工作目录授权；其他命令仍需审核：",
     ...commands.map(
       (command) =>
@@ -60,7 +60,7 @@ export function formatPermissions(
       : "",
     "仅 auto_allow 模式采用此授权；FullAccess 由 /mode 显式选择，不依赖此授权。",
     mode === "full_access"
-      ? "撤销工作区授权不会退出 FullAccess；需在空闲时使用 /mode 切换为 agent、plan 或 auto_allow。"
+      ? "撤销工作区授权不会退出 FullAccess；需在空闲时使用 /mode 切换为 agent 或 auto_allow。"
       : "切换至 auto_allow 不会自动授予工作区权限。",
     "本地命令与项目代码以当前系统用户运行。\n可能访问工作区之外；cwd 与 worktree 不限制其运行时副作用。\n当前没有 OS 沙箱。",
     "此范围不包含外部路径写入、破坏性清理、Git 提交或远端发布。",

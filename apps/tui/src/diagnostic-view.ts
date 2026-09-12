@@ -12,6 +12,7 @@ export function formatRunDiagnostic(
   const tokens = (value: number | null | undefined) =>
     value == null ? "未知" : value.toLocaleString("en-US");
   const abortSources = {
+    input: "插入用户消息",
     user: "用户停止",
     task_deadline: "共享任务时限",
     shutdown: "程序关闭",

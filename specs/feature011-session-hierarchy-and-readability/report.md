@@ -12,7 +12,7 @@
 
 ## Plan 01 的结果
 
-基线为 main @ 865baac。根沿用创建日期/时间戳/ID 目录；新 SubAgent 与 teammate 使用根目录的 members/<memberSessionId>，Header 保留成员真实时间。根与成员各自保存 JSONL、恢复索引与 artifacts；没有共享写入器、额度或新日志 Schema。
+基线为 main @ 75450a0。根沿用创建日期/时间戳/ID 目录；新 SubAgent 与 teammate 使用根目录的 members/<memberSessionId>，Header 保留成员真实时间。根与成员各自保存 JSONL、恢复索引与 artifacts；没有共享写入器、额度或新日志 Schema。
 
 旧 Schema 1/2/3 和旧平铺成员继续兼容。只读历史不迁移日志，旧成员继续原位置；旧根显式打开并开始协作时，经原有协调事实追加路径升级为 Schema 3，新成员随后嵌套。一个根下可以同时保留旧平铺和新嵌套成员。
 
@@ -69,7 +69,7 @@
 
 ## Plan 02 的结果
 
-接续 aea8813。运行核心保持现有公开行为、日志 Schema、权限及并发语义，集中原来散在装配、循环和转换闭包中的协议。Agent package 入口与 AgentControls 改动均为 0，仍为两个生产 package；新文件均为内部实现。
+接续 1da57ba。运行核心保持现有公开行为、日志 Schema、权限及并发语义，集中原来散在装配、循环和转换闭包中的协议。Agent package 入口与 AgentControls 改动均为 0，仍为两个生产 package；新文件均为内部实现。
 
 | 真实调用者 | 之前的阅读负担 | 当前入口与保证 |
 | --- | --- | --- |
@@ -101,11 +101,11 @@ Context 的 assembly.ts 已删除，历史装配实质归入 projection.ts；mcp
 
 A10 的独立写并发、冲突屏障、四并发、逆序完成后源序提交及取消排队专项主要在 tool-scheduling.test.ts，本轮最终全量测试已覆盖；不将全部专项归到上述 163 项分区结果。
 
-Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建期间关闭；既有 refreshAfterUsageOnlyAppend 等待期间仍可能交付 lease，close 随后等待持有者释放。该判断与 aea8813 相同，本次未扩张为新的取消语义，也不宣称测试覆盖获取锁全过程。
+Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建期间关闭；既有 refreshAfterUsageOnlyAppend 等待期间仍可能交付 lease，close 随后等待持有者释放。该判断与 1da57ba 相同，本次未扩张为新的取消语义，也不宣称测试覆盖获取锁全过程。
 
 ## Plan 03 的结果
 
-接续 c94f08f。全屏头部明确当前根 Session；恢复的成员按各自 ID 建立独立卡片，展示名称/ID、种类、任务、状态及已有结果，过程默认收起。成员模型重试和终态进入自己的呈现区域，不拆开根 Assistant 的流式正文。成员详情与根输入的控制权继续分离，展开过程或读取历史不会调用 prompt、open 或 resume。
+接续 b29b558。全屏头部明确当前根 Session；恢复的成员按各自 ID 建立独立卡片，展示名称/ID、种类、任务、状态及已有结果，过程默认收起。成员模型重试和终态进入自己的呈现区域，不拆开根 Assistant 的流式正文。成员详情与根输入的控制权继续分离，展开过程或读取历史不会调用 prompt、open 或 resume。
 
 /agents 显示所属根，/agent result 与 /agent artifact 在发起读取前捕获同一根与成员摘要；成功结果和读取失败均带归属标题。成员已结束、已释放或缺少摘要时仍按实际事实显示，不合成成功或调用模型生成名称。TUI 只使用既有 Agent 控制面，不扫描日志文件。
 
@@ -118,7 +118,7 @@ Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建
 | 帮助、自动补全、记忆帮助 | COMMANDS、嵌套 choices、手写子命令与 MEMORY_HELP 分开维护 | command-definitions 为顶层/子命令名称、参数提示、候选来源与帮助唯一声明；command 保留显式解析、校验与 Agent 调用，memory-view 只消费帮助 |
 | 成员详情命令 | 结果内容或错误与根/成员摘要分开拼装 | multi-agent-view 捕获请求归属并统一渲染标题，失败保留对应 ID；实际授权和产物引用校验仍由 Agent 持有 |
 
-没有新增 package 或 Agent 公开字段。presentation 直接接管原有实质呈现逻辑，旧 View 没有保留第二份可独立修改的 Assistant/Tool/成员状态；command.ts 保留实际解析和执行，并非只转发的旧壳。命令分区逐字核对 parseInput、executeCommand 及权限参数解析主体与 c94f08f 相同。
+没有新增 package 或 Agent 公开字段。presentation 直接接管原有实质呈现逻辑，旧 View 没有保留第二份可独立修改的 Assistant/Tool/成员状态；command.ts 保留实际解析和执行，并非只转发的旧壳。命令分区逐字核对 parseInput、executeCommand 及权限参数解析主体与 b29b558 相同。
 
 ### Plan 03 验证与最终门禁
 
@@ -148,11 +148,11 @@ Session 审查对新增关闭测试作了明确限定：它覆盖锁凭据创建
 
 ## 验收边界与交付
 
-三个 Plan 均已实现并完成各自审查，本 Feature 标为“已实现”，等待开发者验收。Plan 01 提交为 aea8813，Plan 02 提交为 c94f08f；Plan 03 随本次交付提交。按开发者授权逐 Plan 提交，不推送、不创建 PR。
+三个 Plan 均已实现并完成各自审查，本 Feature 标为“已实现”，等待开发者验收。Plan 01 提交为 1da57ba，Plan 02 提交为 b29b558；Plan 03 随本次交付提交。按开发者授权逐 Plan 提交，不推送、不创建 PR。
 
 - 已验证：存储层级、旧布局兼容、产物归属、组清理，核心执行/持久化/快照/恢复，以及 TUI 与命令接线。全部 A01–A15 有上述实现或验证证据。
 - 人工终端主观体验及真实 Provider 未验证；本地模拟终端和确定性流不能替代这些证据。
 - 未改写、迁移或删除实际 data/conversation 历史；未实施 OS 沙箱，没有保留演示后台进程。Research 归档不代表沙箱能力实现。
 - 稳定使用说明与技术基线按 Plan 03 在开发者验收后同步；当前已实现行为、预期目录及证据以本 Feature 的 Spec、Plan、Tasks 和 Report 为准。
 
-最终文档核对：6 份 Feature 文档均为已实现，11 个本地链接有效；Agent/TUI package 入口与 AgentControls 相对 865baac 均无差异，git diff --check 通过。
+最终文档核对：6 份 Feature 文档均为已实现，11 个本地链接有效；Agent/TUI package 入口与 AgentControls 相对 75450a0 均无差异，git diff --check 通过。

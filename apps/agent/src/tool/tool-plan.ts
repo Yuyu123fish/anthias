@@ -159,11 +159,11 @@ export function createApprovalPlan(
   preparedTool: PreparedFileTool | PreparedCommandTool,
   policyDecision: ToolPolicyDecision,
 ): ToolApprovalPlan {
-  // 指纹覆盖完整准备快照，不能只绑定展示预览；文件身份在部分平台上可能是 bigint。
+  // 指纹绑定内容、版本与文件身份；调用 ID 不能让相同动作绕过用户拒绝，bigint 身份需安全序列化。
   const actionFingerprint = createHash("sha256")
     .update(
-      JSON.stringify(preparedTool, (_key, value: unknown) =>
-        typeof value === "bigint" ? value.toString() : value,
+      JSON.stringify(preparedTool, (key, value: unknown) =>
+        key === "toolCallId" ? undefined : typeof value === "bigint" ? value.toString() : value,
       ),
     )
     .digest("hex");

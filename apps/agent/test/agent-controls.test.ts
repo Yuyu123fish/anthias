@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type Agent, createAgentWithModelStream } from "../src/agent.js";
 import type { McpConnections, McpContent } from "../src/mcp/index.js";
 import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
@@ -301,3 +301,50 @@ function fakeMcp(session: Session, called: () => void): McpConnections {
     close: async () => undefined,
   };
 }
+
+it("stops members when storage fails while an input interruption is sealing", async () => {
+  const { session } = await setup();
+  const rootEntered = Promise.withResolvers<void>();
+  const memberEntered = Promise.withResolvers<void>();
+  const memberStopped = vi.fn();
+  const failingSession: Session = {
+    ...session,
+    get records() {
+      return session.records;
+    },
+    get header() {
+      return session.header;
+    },
+    async appendRunFinished() {
+      throw new Error("fixture storage failure");
+    },
+  };
+  const agent = own(
+    createAgentWithModelStream({
+      session: failingSession,
+      modelStream: async function* (request, signal) {
+        const memberRequest = request.messages.some(
+          (message) => message.role === "user" && message.content.includes("member fixture"),
+        );
+        if (memberRequest) memberEntered.resolve();
+        else rootEntered.resolve();
+        yield { type: "text_delta", delta: "working" };
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        if (memberRequest) memberStopped();
+      },
+    }),
+  );
+  await agent.prompt("root fixture");
+  await rootEntered.promise;
+  expect((await agent.collaboration.execute({ action: "spawn", task: "member fixture" })).ok).toBe(
+    true,
+  );
+  await memberEntered.promise;
+  await agent.prompt("queued direction");
+  expect(agent.interruptForInput().status).toBe("accepted");
+  await vi.waitFor(() => expect(memberStopped).toHaveBeenCalledTimes(1));
+  expect(agent.state.lastRunDiagnostic?.category).toBe("storage");
+  expect(agent.state.inputQueue.paused).toBe(true);
+});

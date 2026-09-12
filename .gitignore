@@ -1,12 +1,17 @@
 # 本地环境与敏感配置
-.env
-.env.*
+.env*
 !.env.example
 !.env.*.example
+.anthias/
 
 # IDE 配置
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
 
 # Node 与构建产物
 node_modules/
@@ -15,10 +20,17 @@ dist/
 release/
 out/
 .vite/
+.cache/
+.pnpm-store/
 *.tsbuildinfo
 
 # 本地运行日志
 *.log
+*.log.*
+/tmp/
+/temp/
+/test-results/
+/playwright-report/
 
 # Anthias 本地 Session 与记忆数据
 /data/

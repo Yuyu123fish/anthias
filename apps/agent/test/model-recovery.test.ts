@@ -479,7 +479,7 @@ describe("safe final model facts", () => {
           type: "tool_call",
           toolCallId: randomUUID(),
           toolName: "write_file",
-          input: { path: "result.txt", content: "saved once" },
+          input: { path: "result.txt", expectedVersion: "missing", content: "saved once" },
           invalid: false,
         };
         yield { type: "finish", finishReason: "tool_calls" };

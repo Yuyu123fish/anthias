@@ -1,3 +1,4 @@
+import type { RequestConfiguration } from "../message.js";
 import { retryModelStream } from "../model/model-retry.js";
 import {
   type ModelRequest,
@@ -85,6 +86,7 @@ function addUsage(previous: RequestUsageTotals, usage: PersistedUsage): RequestU
 /** Context 仅持有模型投影和预算；所有事实写入都经 Session 的串行提交。 */
 export function createContextController(options: {
   session: Session;
+  requestConfiguration?: (purpose: RequestPurpose) => RequestConfiguration | undefined;
   modelStream: ModelStream;
   modelId: string;
   budget: ContextBudget;
@@ -146,9 +148,11 @@ export function createContextController(options: {
       usage: ModelUsage | undefined,
     ) {
       const normalizedUsage = usage ?? UNKNOWN_USAGE;
+      const configuration = options.requestConfiguration?.(purpose);
       try {
         await session.appendRequestUsage(run.runId, {
           purpose,
+          ...(configuration ? { configuration } : {}),
           requestEntryId,
           contextVersion,
           usage: normalizedUsage,

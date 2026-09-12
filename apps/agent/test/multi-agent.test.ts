@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type Agent, createAgentWithModelStream } from "../src/agent.js";
 import { memoryHash } from "../src/memory/schema.js";
 import type { ModelRequest, ModelStream } from "../src/model/model-stream.js";
@@ -65,9 +65,21 @@ function value(result: Readonly<{ ok: true; value: string } | { ok: false; error
   if (!result.ok) throw new Error(result.error);
   return result.value;
 }
-async function spawn(agent: Agent, task: string, writable = false): Promise<MemberSummary> {
+async function spawn(
+  agent: Agent,
+  task: string,
+  writable = false,
+  worktreeId?: string,
+): Promise<MemberSummary> {
   return JSON.parse(
-    value(await agent.collaboration.execute({ action: "spawn", task, writable })),
+    value(
+      await agent.collaboration.execute({
+        action: "spawn",
+        task,
+        writable,
+        ...(worktreeId ? { worktreeId } : {}),
+      }),
+    ),
   ) as MemberSummary;
 }
 async function wait(agent: Agent, id: string) {
@@ -164,7 +176,7 @@ describe("MultiAgent through the Agent interface", () => {
     expect(agent.state.sessionId).toBe(session.sessionId);
   }, 120_000);
 
-  it("keeps a read-only member in Plan under a Full Access root", async () => {
+  it("keeps member read-only capability under a Full Access root", async () => {
     const requests: ModelRequest[] = [];
     const { agent } = await setup(async function* (request) {
       requests.push(request);
@@ -175,7 +187,7 @@ describe("MultiAgent through the Agent interface", () => {
     const member = await spawn(agent, "inspect only");
     await wait(agent, member.sessionId);
     expect(requests[0]?.tools.some((tool) => tool.name === "write_file")).toBe(false);
-    expect(JSON.stringify(requests[0]?.messages)).toContain("当前权限模式：Plan 模式");
+    expect(JSON.stringify(requests[0]?.messages)).toContain("当前成员只读");
   });
 
   it("persists delegation as sourced input and rejects recursive creation even when forged", async () => {
@@ -201,7 +213,7 @@ describe("MultiAgent through the Agent interface", () => {
     expect(requests[0]?.tools.some((tool) => tool.name === "agent_spawn")).toBe(false);
     expect(
       requests[1]?.messages.some(
-        (message) => message.role === "tool" && message.content.includes("成员不能"),
+        (message) => message.role === "tool" && message.content.includes("普通成员只能"),
       ),
     ).toBe(true);
     expect(agent.collaboration.snapshot().members).toHaveLength(1);
@@ -237,7 +249,11 @@ describe("MultiAgent through the Agent interface", () => {
           type: "tool_call",
           toolCallId: randomUUID(),
           toolName: "write_file",
-          input: { path: "member-only.txt", content: "member verified fact" },
+          input: {
+            path: "member-only.txt",
+            content: "member verified fact",
+            expectedVersion: "missing",
+          },
           invalid: false,
         };
       else if (count === 2)
@@ -273,7 +289,10 @@ describe("MultiAgent through the Agent interface", () => {
       if (event.type === "tool_approval_requested")
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
     });
-    const member = await spawn(agent, "验证成员自己的新文件并提交经验候选", true);
+    const worktree = JSON.parse(value(await agent.git.execute({ action: "create" }))) as {
+      id: string;
+    };
+    const member = await spawn(agent, "验证成员自己的新文件并提交经验候选", true, worktree.id);
     await wait(agent, member.sessionId);
     const queried = await agent.memory.query({ status: "all" });
     if (!queried.ok) throw new Error(queried.error);
@@ -342,7 +361,7 @@ describe("MultiAgent through the Agent interface", () => {
     expect(counts).toEqual({ root: 33, member: 33 });
   }, 60_000);
 
-  it("isolates writable members and delivers Git results through approved controls", async () => {
+  it("isolates members only in explicitly selected worktrees and delivers approved Git results", async () => {
     const requests = new Map<string, number>();
     const { agent, directory } = await setup(async function* (request) {
       const task = userText(request).includes("member B") ? "B" : "A";
@@ -353,7 +372,12 @@ describe("MultiAgent through the Agent interface", () => {
           type: "tool_call",
           toolCallId: randomUUID(),
           toolName: "write_file",
-          input: { path: "shared.txt", content: "result " + task },
+          input: {
+            path: "shared.txt",
+            content: "result " + task,
+            expectedVersion:
+              "sha256:" + createHash("sha256").update("committed baseline").digest("hex"),
+          },
           invalid: false,
         };
         yield { type: "finish", finishReason: "tool_calls" };
@@ -370,8 +394,14 @@ describe("MultiAgent through the Agent interface", () => {
         agent.respondToToolApproval(event.request.toolApprovalRequestId, "approve");
       }
     });
-    const first = await spawn(agent, "member A", true);
-    const second = await spawn(agent, "member B", true);
+    const firstWorktree = JSON.parse(value(await agent.git.execute({ action: "create" }))) as {
+      id: string;
+    };
+    const secondWorktree = JSON.parse(value(await agent.git.execute({ action: "create" }))) as {
+      id: string;
+    };
+    const first = await spawn(agent, "member A", true, firstWorktree.id);
+    const second = await spawn(agent, "member B", true, secondWorktree.id);
     await wait(agent, first.sessionId);
     await wait(agent, second.sessionId);
     expect(first.workspaceRoot).not.toBe(second.workspaceRoot);
@@ -407,7 +437,7 @@ describe("MultiAgent through the Agent interface", () => {
     ).toContain("finished A");
   }, 120_000);
 
-  it("keeps team messages queued while idle and resumes explicitly after reopening", async () => {
+  it("keeps paused member messages queued across restart until explicit continuation", async () => {
     const requests: ModelRequest[] = [];
     const stream: ModelStream = async function* (request) {
       requests.push(request);
@@ -421,6 +451,7 @@ describe("MultiAgent through the Agent interface", () => {
     ) as MemberSummary;
     await wait(agent, member.sessionId);
     expect(agent.collaboration.snapshot().tasks[0]?.status).toBe("completed");
+    value(await agent.collaboration.execute({ action: "stop", memberId: member.sessionId }));
     const before = requests.length;
     value(
       await agent.collaboration.execute({
@@ -444,7 +475,7 @@ describe("MultiAgent through the Agent interface", () => {
     });
     agents.push(reopened);
     expect(requests).toHaveLength(before);
-    expect(reopened.collaboration.snapshot().members[0]?.status).toBe("interrupted");
+    expect(reopened.collaboration.snapshot().members[0]?.status).toBe("paused");
     value(
       await reopened.collaboration.execute({
         action: "task_assign",
@@ -478,12 +509,16 @@ describe("MultiAgent through the Agent interface", () => {
       );
     });
     const member = await spawn(agent, "wait for cancellation");
-    await spawn(agent, "second bounded member");
-    await spawn(agent, "third bounded member");
-    const fourth = await agent.collaboration.execute({ action: "spawn", task: "over capacity" });
-    expect(fourth.ok).toBe(false);
-    if (!fourth.ok) expect(fourth.error).toContain("三个");
-    expect(agent.collaboration.snapshot().members).toHaveLength(3);
+    for (let index = 1; index < 9; index++) await spawn(agent, "bounded member " + index);
+    const queued = await agent.collaboration.execute({ action: "spawn", task: "queued capacity" });
+    expect(queued.ok).toBe(true);
+    await vi.waitFor(() =>
+      expect(
+        agent.collaboration.snapshot().members.filter((member) => member.status === "running"),
+      ).toHaveLength(9),
+    );
+    expect(agent.collaboration.snapshot().members).toHaveLength(10);
+    expect(agent.collaboration.snapshot().members.at(-1)?.status).toBe("queued");
     await entered.promise;
     const waiting = agent.collaboration.execute({
       action: "wait",
@@ -495,7 +530,9 @@ describe("MultiAgent through the Agent interface", () => {
     await waiting;
     expect(agent.state.running).toBe(false);
     expect(
-      agent.collaboration.snapshot().members.every((member) => member.status === "aborted"),
+      agent.collaboration
+        .snapshot()
+        .members.every((member) => ["paused", "interrupted", "closed"].includes(member.status)),
     ).toBe(true);
   });
   it("reviews delegated writes only against real root authorization", async () => {
@@ -544,7 +581,12 @@ describe("MultiAgent through the Agent interface", () => {
           type: "tool_call",
           toolCallId: randomUUID(),
           toolName: "write_file",
-          input: { path: "shared.txt", content: "root approved result" },
+          input: {
+            path: "shared.txt",
+            content: "root approved result",
+            expectedVersion:
+              "sha256:" + createHash("sha256").update("committed baseline").digest("hex"),
+          },
           invalid: false,
         };
         yield { type: "finish", finishReason: "tool_calls", usage };
@@ -562,14 +604,18 @@ describe("MultiAgent through the Agent interface", () => {
       }
     });
     expect(
-      (await promptToCompletion(agent, "请创建隔离成员，将 shared.txt 写为 root approved result。"))
-        .status,
+      (
+        await promptToCompletion(
+          agent,
+          "请创建成员，将共享工作区 shared.txt 写为 root approved result。",
+        )
+      ).status,
     ).toBe("completed");
     const member = agent.collaboration.snapshot().members[0];
     if (!member) throw new Error("member was not created");
     await wait(agent, member.sessionId);
     expect(manualApprovals).toBe(0);
-    expect(approvalPayloads.length).toBeGreaterThanOrEqual(2);
+    expect(approvalPayloads.length).toBeGreaterThanOrEqual(1);
     for (const payload of approvalPayloads) {
       expect(JSON.stringify(payload.authorizationSources)).not.toContain(
         "forged delegation authorization marker",
@@ -631,7 +677,12 @@ describe("MultiAgent through the Agent interface", () => {
             type: "tool_call",
             toolCallId: randomUUID(),
             toolName: "write_file",
-            input: { path: "shared.txt", content: "second task result" },
+            input: {
+              path: "shared.txt",
+              content: "second task result",
+              expectedVersion:
+                "sha256:" + createHash("sha256").update("committed baseline").digest("hex"),
+            },
             invalid: false,
           };
           yield { type: "finish", finishReason: "tool_calls", usage };

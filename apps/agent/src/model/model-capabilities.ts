@@ -4,6 +4,17 @@ export type ModelCapabilities = Readonly<{
   maxOutputTokens?: number;
 }>;
 
+const flashCapabilities = Object.freeze({
+  contextWindow: 1_048_576,
+  maxOutputTokens: 384_000,
+  version: "DeepSeek-V4.1-Flash",
+  verifiedAt: "2026-09-12",
+  sources: Object.freeze([
+    "https://api-docs.deepseek.com/quick_start/pricing/",
+    "https://api-docs.deepseek.com/quick_start/agent_integrations/codex/",
+    "https://deepseek.com/news/deepseek-v4-1-flash/",
+  ]),
+});
 const KNOWN_MODEL_CAPABILITIES: Readonly<
   Record<
     string,
@@ -15,16 +26,9 @@ const KNOWN_MODEL_CAPABILITIES: Readonly<
       }>
   >
 > = Object.freeze({
-  "deepseek-v4-flash": Object.freeze({
-    contextWindow: 1_048_576,
-    maxOutputTokens: 384_000,
-    version: "DeepSeek-V4-Flash-0731",
-    verifiedAt: "2026-09-05",
-    sources: Object.freeze([
-      "https://api-docs.deepseek.com/quick_start/agent_integrations/codex/",
-      "https://api-docs.deepseek.com/quick_start/pricing/",
-    ]),
-  }),
+  "deepseek-flash": flashCapabilities,
+  "deepseek-v4-flash": flashCapabilities,
+  "deepseek-v4-flash-vision-exp": flashCapabilities,
 });
 
 /** 只按已核验数据或显式声明解析能力，不从模型名数字推测窗口。 */

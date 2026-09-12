@@ -190,7 +190,7 @@ describe("Anthias TUI", () => {
   it("keeps plain output free of controls and routes local commands without model calls", async () => {
     const harness = createHarness(false);
     harness.input.write("/help\n");
-    harness.input.write("/mode plan\n");
+    harness.input.write("/mode auto_allow\n");
     harness.input.write("/context\n");
     await vi.waitFor(() => expect(harness.plain()).toContain("外部上下文 200"));
     expect(harness.plain()).toContain(harness.agent.state.workspaceRoot);
@@ -1240,12 +1240,10 @@ it("restores root and member summaries without opening member sessions", async (
   });
   await screenContains(harness.terminal, "主 Agent · 根 Session " + rootSessionId);
   expect(harness.terminal.text()).toContain("Saved root answer");
-  expect(harness.terminal.text()).toContain("成员 Reviewer [closed-member] · teammate · 已释放");
+  expect(harness.terminal.text()).toContain("成员 Reviewer [closed-member] · 已关闭");
   expect(harness.terminal.text()).toContain("Review existing changes");
   expect(harness.terminal.text()).toContain("Saved review result");
-  expect(harness.terminal.text()).toContain(
-    "成员 missing-member [missing-member] · subagent · 失败",
-  );
+  expect(harness.terminal.text()).toContain("成员 missing-member [missing-member] · 失败");
   expect(harness.terminal.text()).toContain("尚无结果摘要。");
   expect(harness.terminal.text()).toContain("Member log is missing");
   clickText(harness.terminal, "成员 Reviewer");
@@ -1317,4 +1315,26 @@ it("keeps plain member process in sourced details and relabels interrupted root 
   await vi.waitFor(() => expect(harness.agent.prompt).toHaveBeenCalledWith("Follow the root task"));
   expect(harness.agent.sessions.open).not.toHaveBeenCalled();
   expect(harness.agent.collaboration.execute).not.toHaveBeenCalled();
+});
+
+it("uses Esc for a queued input and keeps Ctrl+C as group stop", async () => {
+  const harness = await createHarness(true, 110, 28, undefined, {
+    running: true,
+    activeRun: { runId: "active", phase: "requesting_model" },
+    inputQueue: {
+      steer: [],
+      followUp: [
+        { inputId: "queued", content: "new direction", mode: "followUp", source: { kind: "user" } },
+      ],
+      paused: false,
+    },
+  });
+  await screenContains(harness.terminal, "Esc 立即处理");
+  harness.terminal.send("\u001b");
+  await vi.waitFor(() => expect(harness.agent.interruptForInput).toHaveBeenCalledTimes(1));
+  expect(harness.agent.abort).not.toHaveBeenCalled();
+  harness.emit({ type: "input_interruption_changed", inputId: "queued", status: "cancelling" });
+  await screenContains(harness.terminal, "正在打断并清理");
+  harness.terminal.send("\u0003");
+  expect(harness.agent.abort).toHaveBeenCalledTimes(1);
 });

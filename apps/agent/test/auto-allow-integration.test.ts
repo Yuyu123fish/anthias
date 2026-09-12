@@ -11,6 +11,7 @@ import {
   type ModelStream,
 } from "../src/model/model-stream.js";
 import { createSession, openSession, type Session } from "../src/session/index.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 
 import { promptToCompletion } from "./prompt-helper.js";
 
@@ -102,7 +103,11 @@ it("skips both approval paths in Full Access despite workspace revocation and re
       }
       if (responseCount++ === 0) {
         yield {
-          ...toolCall({ path: "full.txt", content: "full access fixture" }),
+          ...toolCall({
+            expectedVersion: "missing",
+            path: "full.txt",
+            content: "full access fixture",
+          }),
           type: "tool_call",
         };
         yield { type: "finish", finishReason: "tool_calls", usage };
@@ -238,7 +243,10 @@ describe("AutoAllow Agent integration", () => {
           yield { type: "text_delta", delta: reviewJson(session, "deny") };
           yield { type: "finish", finishReason: "stop", usage };
         } else if (normalRequests++ < 2) {
-          yield { ...toolCall({ path: "note.txt", content: "same action" }), type: "tool_call" };
+          yield {
+            ...toolCall({ expectedVersion: "missing", path: "note.txt", content: "same action" }),
+            type: "tool_call",
+          };
           yield { type: "finish", finishReason: "tool_calls", usage };
         } else {
           yield { type: "text_delta", delta: "尊重用户拒绝。" };
@@ -269,8 +277,8 @@ describe("AutoAllow Agent integration", () => {
     const session = await createFixture();
     const largeContent = "已批准正文".repeat(2_000);
     const calls = [
-      toolCall({ path: "large.txt", content: largeContent }),
-      toolCall({ path: "note.txt", content: "approved" }),
+      toolCall({ expectedVersion: "missing", path: "large.txt", content: largeContent }),
+      toolCall({ expectedVersion: "missing", path: "note.txt", content: "approved" }),
     ];
     const requests: ModelRequest[] = [];
     let responseCount = 0;
@@ -336,14 +344,14 @@ describe("AutoAllow Agent integration", () => {
     const session = await createFixture();
     const { agent, purposes } = makeAgent(
       session,
-      toolCall({ path: "note.txt", content: "approved" }),
+      toolCall({ expectedVersion: "missing", path: "note.txt", content: "approved" }),
       allowed(session),
     );
     const events: string[] = [];
     agent.subscribe((event) => {
       events.push(event.type);
       if (event.type === "tool_auto_review_start")
-        expect(agent.setPermissionMode("plan").status).toBe("rejected");
+        expect(agent.setPermissionMode("agent").status).toBe("rejected");
     });
     expect(
       await promptToCompletion(agent, "请在当前临时工作区创建 note.txt，内容 approved。"),
@@ -388,7 +396,7 @@ describe("AutoAllow Agent integration", () => {
       const session = await createFixture();
       const { agent, purposes } = makeAgent(
         session,
-        toolCall({ path: "note.txt", content: "approved" }),
+        toolCall({ expectedVersion: "missing", path: "note.txt", content: "approved" }),
         async function* () {
           yield { type: "text_delta", delta: reviewJson(session, decision) };
           yield { type: "finish", finishReason: "stop", usage };
@@ -435,7 +443,11 @@ describe("AutoAllow Agent integration", () => {
 
   it("stops with a paired unexecuted tool result after review recovery is exhausted", async () => {
     const session = await createFixture();
-    const call = toolCall({ path: "review-failed.txt", content: "must not execute" });
+    const call = toolCall({
+      expectedVersion: "missing",
+      path: "review-failed.txt",
+      content: "must not execute",
+    });
     let manualRequests = 0;
     let attempts = 0;
     const { agent, purposes } = makeAgent(session, call, () => {
@@ -480,7 +492,7 @@ describe("AutoAllow Agent integration", () => {
     const started = Promise.withResolvers<void>();
     const { agent } = makeAgent(
       session,
-      toolCall({ path: "late.txt", content: "late" }),
+      toolCall({ expectedVersion: "missing", path: "late.txt", content: "late" }),
       async function* (_request, signal) {
         started.resolve();
         await new Promise<void>((resolve) =>
@@ -504,7 +516,11 @@ describe("AutoAllow Agent integration", () => {
     await writeFile(path, "original");
     const { agent } = makeAgent(
       session,
-      toolCall({ path: "note.txt", content: "approved" }),
+      toolCall({
+        expectedVersion: fileContentVersion(Buffer.from("original")),
+        path: "note.txt",
+        content: "approved",
+      }),
       async function* () {
         await writeFile(path, "external update");
         yield { type: "text_delta", delta: reviewJson(session) };
@@ -532,7 +548,7 @@ describe("AutoAllow Agent integration", () => {
     };
     const { agent } = makeAgent(
       faultSession,
-      toolCall({ path: "note.txt", content: "approved" }),
+      toolCall({ expectedVersion: "missing", path: "note.txt", content: "approved" }),
       allowed(session),
     );
     expect(await promptToCompletion(agent, "请创建 note.txt。")).toMatchObject({

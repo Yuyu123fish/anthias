@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { CompletedMessage } from "../message.js";
+import { isRecord } from "../tool/input-validation.js";
 import {
   appendJsonLine,
   appendRecoveryRecords,
@@ -40,6 +41,7 @@ import {
   migrateLegacySession,
   upgradeSessionToSchema4,
 } from "./migration.js";
+import { readSessionHistory } from "./query.js";
 import {
   type AgentInputDetails,
   type AgentInputRecord,
@@ -141,6 +143,7 @@ export type OpenSessionOptions = Omit<
 > &
   Readonly<{
     sessionId: string;
+    memberWorkspaceBinding?: Readonly<{ rootSessionId: string; workspaceRoot: string }>;
   }>;
 
 /** 按环境覆盖或给定 Anthias Project Root 解析 Session 数据目录。 */
@@ -294,6 +297,7 @@ export async function openSession({
   sessionDirectory,
   shell,
   lockSystem = DEFAULT_SESSION_LOCK_SYSTEM,
+  memberWorkspaceBinding,
 }: OpenSessionOptions): Promise<Session> {
   if (!isUuid(sessionId)) throw new InvalidSessionError("Session ID 无效。");
   const normalizedWorkspaceRoot = await realpath(workspaceRoot);
@@ -318,7 +322,31 @@ export async function openSession({
     });
     if (journal.header.schemaVersion === 1 || journal.header.sessionId !== sessionId)
       throw new InvalidSessionError("Session Header 与请求的 Session ID 不匹配。");
-    if (!areSameWorkspace(journal.header.workspaceRoot, normalizedWorkspaceRoot))
+    if (memberWorkspaceBinding) {
+      const ownership = getSessionOwnership(journal.header);
+      if (
+        ownership.sessionKind === "primary" ||
+        ownership.rootSessionId !== memberWorkspaceBinding.rootSessionId ||
+        !areSameWorkspace(memberWorkspaceBinding.workspaceRoot, normalizedWorkspaceRoot)
+      )
+        throw new InvalidSessionError("受管成员工作区绑定身份不匹配。");
+      const rootHistory = await readSessionHistory({
+        sessionDirectory: normalizedSessionDirectory,
+        sessionId: ownership.rootSessionId,
+      });
+      const binding = rootHistory.records.findLast(
+        (record) =>
+          record.type === "coordination" && record.kind === "member" && record.key === sessionId,
+      );
+      const payload = binding?.type === "coordination" ? binding.payload : null;
+      if (
+        !isRecord(payload) ||
+        payload.sessionId !== sessionId ||
+        typeof payload.workspaceRoot !== "string" ||
+        !areSameWorkspace(payload.workspaceRoot, normalizedWorkspaceRoot)
+      )
+        throw new InvalidSessionError("根 Session 没有确认该成员的工作区绑定。");
+    } else if (!areSameWorkspace(journal.header.workspaceRoot, normalizedWorkspaceRoot))
       throw new SessionWorkspaceMismatchError(
         journal.header.workspaceRoot,
         normalizedWorkspaceRoot,
@@ -748,6 +776,9 @@ function createRequestUsageRecord(
     parentEntryId,
     ...(runId === undefined ? {} : { runId }),
     purpose: details.purpose,
+    ...(details.configuration
+      ? { configuration: Object.freeze({ ...details.configuration }) }
+      : {}),
     requestEntryId: details.requestEntryId,
     contextVersion: details.contextVersion,
     usage: snapshotUsage(details.usage),

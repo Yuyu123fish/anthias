@@ -3,14 +3,14 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPermissionMode, type PermissionMode } from "./permission/permission-mode.js";
 
-export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env-example 可提交，填入凭据的 .env 不提交。
+export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env.example 可提交，填入凭据的 .env 不提交。
 # 只读取 Anthias 根目录的 .env，不读取任务工作区中的同名文件。
 # 进程环境覆盖本文件，包括显式空值。值可用单引号或双引号包裹，不展开变量。
 ANTHIAS_MODEL_BASE_URL=
 ANTHIAS_MODEL_ID=
 ANTHIAS_MODEL_API_KEY=
 
-# 自定义模型必须声明上下文窗口；已知模型可使用内置能力数据。
+# deepseek-flash 可使用内置已核验能力；自定义模型必须声明上下文窗口。
 # ANTHIAS_MODEL_CONTEXT_WINDOW=128000
 # ANTHIAS_MODEL_MAX_OUTPUT_TOKENS=64000
 # 普通输出默认 64000；窗口不超过 84000 时沿用 16000，再按模型输出能力收窄。
@@ -27,14 +27,28 @@ ANTHIAS_MODEL_API_KEY=
 # 可选；缺少此 Key 只影响 web_search。
 SEARCHAPI_API_KEY=
 
-# agent / plan / auto_allow / full_access；AutoAllow 按工作区授权或真实用户要求审核。
+# agent / auto_allow / full_access；AutoAllow 按工作区授权或真实用户要求审核。
 # Full Access 跳过人工和模型审批，可访问系统用户权限内的工作区外文件；没有 OS 沙箱。
 # --mode 优先于此默认值；运行中的 /mode 不改写本文件。
 ANTHIAS_PERMISSION_MODE=agent
 `;
 
+const DIAGNOSTIC_VARIABLES = [
+  "ANTHIAS_MODEL_ID",
+  "ANTHIAS_MODEL_CONTEXT_WINDOW",
+  "ANTHIAS_MODEL_MAX_OUTPUT_TOKENS",
+  "ANTHIAS_RESPONSE_MAX_TOKENS",
+  "ANTHIAS_COMPACTION_MAX_TOKENS",
+  "ANTHIAS_RESPONSE_REASONING_EFFORT",
+  "ANTHIAS_APPROVAL_REASONING_EFFORT",
+] as const;
 export type LocalConfigurationResult =
-  | Readonly<{ ok: true; environment: NodeJS.ProcessEnv; permissionMode: PermissionMode }>
+  | Readonly<{
+      ok: true;
+      environment: NodeJS.ProcessEnv;
+      permissionMode: PermissionMode;
+      sources: Readonly<Record<string, string>>;
+    }>
   | Readonly<{ ok: false; error: string }>;
 
 /** 根配置属于安装位置；调用方只可由启动装配或测试显式给出根，不能以任务 cwd 推导。 */
@@ -104,10 +118,20 @@ function resolveConfiguration(
   if (!isPermissionMode(permissionMode)) {
     return {
       ok: false,
-      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、plan、auto_allow 或 full_access。",
+      error: "ANTHIAS_PERMISSION_MODE 配置无效；只能为 agent、auto_allow 或 full_access。",
     };
   }
-  return { ok: true, environment, permissionMode };
+  const sources = Object.fromEntries(
+    DIAGNOSTIC_VARIABLES.map((name) => [
+      name,
+      Object.hasOwn(processEnvironment, name)
+        ? "进程环境"
+        : Object.hasOwn(fileEnvironment, name)
+          ? "根 .env"
+          : "默认",
+    ]),
+  );
+  return { ok: true, environment, permissionMode, sources };
 }
 
 function parseEnvironment(

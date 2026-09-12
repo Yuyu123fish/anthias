@@ -19,7 +19,7 @@ export type ManagedOperation = Readonly<{
 /** 只统一两种内部工具的审批与结果协议，业务校验仍由各自 Module 持有。 */
 export function managedToolPlan(
   call: AssistantToolCallPart,
-  mode: PermissionMode,
+  _mode: PermissionMode,
   prepare: (signal?: AbortSignal) => Promise<ManagedOperation>,
 ): ToolCallPlan {
   return {
@@ -31,16 +31,6 @@ export function managedToolPlan(
         signal?.throwIfAborted();
         if (call.invalid) throw new Error("工具参数无效。");
         const operation = await prepare(signal);
-        if (operation.approval && mode === "plan") {
-          return {
-            ok: false,
-            result: {
-              status: "denied",
-              content: "Plan 模式不能执行此副作用操作。",
-              truncated: false,
-            },
-          };
-        }
         return {
           ok: true,
           preparedExecution: {

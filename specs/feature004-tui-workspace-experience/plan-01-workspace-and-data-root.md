@@ -8,7 +8,7 @@
 > **核心做法**：CLI 分别解析 Workspace、Anthias Project Root 和 Session Directory，再显式装配 Agent。<br>
 > **边界**：保留现有行式 TUI，不提前实现 Reasoning、Shiki 或动态终端布局。<br>
 > **风险 / 未验证**：模块位置解析、Windows 路径、Session mismatch 和旧目录兼容最易出错。<br>
-> **当前 / 请审阅**：已实现并提交为 `8b2f2f8`；T001–T003 与完整门禁通过。
+> **当前 / 请审阅**：已实现并提交为 `9207ef2`；T001–T003 与完整门禁通过。
 
 - 对应 Spec：[spec.md](spec.md)
 - 任务事实源：[tasks.md](tasks.md)

@@ -27,7 +27,6 @@ async function main(): Promise<number> {
     if (
       requestedMode !== undefined &&
       requestedMode !== "agent" &&
-      requestedMode !== "plan" &&
       requestedMode !== "auto_allow" &&
       requestedMode !== "full_access"
     ) {
@@ -36,7 +35,7 @@ async function main(): Promise<number> {
     permissionMode = requestedMode;
   } catch {
     process.stderr.write(
-      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|plan|auto_allow|full_access>。\n",
+      "命令行参数无效；支持 --workspace <path>、--session <UUID> 与 --mode <agent|auto_allow|full_access>。\n",
     );
     return 1;
   }

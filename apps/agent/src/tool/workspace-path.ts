@@ -1,13 +1,18 @@
 import { realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import type { WorkspaceAccess } from "./workspace-access.js";
 
 /** 提供固定 Tool 执行时唯一可见的工作区与保留目录。 */
 export type ToolWorkspace = Readonly<{
   workspaceRoot: string;
   sessionDirectory: string;
+  sessionId?: string;
   protectedPaths?: readonly string[];
   allowExternalPaths?: boolean;
+  workspaceAccess?: WorkspaceAccess;
+  assertWriteAllowed?: (toolCallId: string) => void;
+  resourceState?: (toolCallId: string, state: "waiting" | "acquired" | "released") => void;
 }>;
 
 /** 保存一个经过真实路径校验的工作区文件或目录。 */

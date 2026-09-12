@@ -15,6 +15,7 @@ export function createMcpToolSnapshot(options: {
   tools: readonly McpToolInfo[];
   reservedDefinitions: readonly ModelToolDefinition[];
   permissionMode: PermissionMode;
+  writable?: boolean;
 }): McpToolSnapshot {
   const tools = Object.freeze(
     [...structuredClone(options.tools)]
@@ -23,7 +24,7 @@ export function createMcpToolSnapshot(options: {
   );
   const definitions: ModelToolDefinition[] = [];
   let omittedToolCount = 0;
-  if (options.permissionMode !== "plan")
+  if (options.writable !== false)
     for (const tool of tools) {
       const definition: ModelToolDefinition = {
         name: tool.name,

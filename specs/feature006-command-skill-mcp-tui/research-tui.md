@@ -10,7 +10,7 @@
 > **风险 / 未验证**：Windows Terminal 的中文输入、复制、滚动锚点和主观流畅度仍需实际验收。<br>
 > **当前 / 请审阅**：全屏方向已由开发者选择，其余范围和技术取舍是待讨论建议。
 
-核验日期：2026-09-05。Anthias 代码基线：`main / 4855892`，开始研究时工作区干净。开发者本轮接受上一个已实现 Feature，Feature 005 验收状态已同步；这不把 Feature 004 的历史视觉验收自动改成通过。
+核验日期：2026-09-05。Anthias 代码基线：`main / 8a829b4`，开始研究时工作区干净。开发者本轮接受上一个已实现 Feature，Feature 005 验收状态已同步；这不把 Feature 004 的历史视觉验收自动改成通过。
 
 配套研究：[命令、Skills 与 MCP](research-commands-skills-mcp.md)。本文件记录 TUI 原因、体验建议和整个 Feature 的切分依据，不重复外部能力的规范清单。
 
@@ -26,7 +26,7 @@
 
 ### 每次刷新都擦掉整个动态区
 
-`apps/tui/src/terminal-driver.ts`（调研基线 `4855892`，本 Feature 实现时已移除） 的 `renderDynamic()` 无条件调用 `clearDynamic()`。后者逐行写擦除、移动光标指令，随后 `renderDynamic()` 再写入所有行与光标状态。没有相同帧判断，没有变更行比较，也没有同步输出帧边界。`writeStable()` 也会先清动态区，再交由上层恢复。
+`apps/tui/src/terminal-driver.ts`（调研基线 `8a829b4`，本 Feature 实现时已移除） 的 `renderDynamic()` 无条件调用 `clearDynamic()`。后者逐行写擦除、移动光标指令，随后 `renderDynamic()` 再写入所有行与光标状态。没有相同帧判断，没有变更行比较，也没有同步输出帧边界。`writeStable()` 也会先清动态区，再交由上层恢复。
 
 [Terminal Conversation](../../apps/tui/src/terminal-conversation.ts) 把每个 AgentEvent 串行处理后立即刷新动态区，按键也会请求刷新；Reasoning 或 Tool 活跃时，另有 250 ms 计时刷新。事件顺序值得保留，但事件处理次数不应等同于物理绘制次数。当前慢速文件解析或代码高亮还会占住同一串行队列。
 

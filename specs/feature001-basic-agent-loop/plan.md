@@ -8,7 +8,7 @@
 
 ## 1. 当前基线
 
-- 当前分支为 `main`，纠正前检查点为 `52726d9`，工作区干净。
+- 当前分支为 `main`，纠正前检查点为 `d3881bd`，工作区干净。
 - Feature 001 已有可运行实现，但生产 Model Adapter、模型配置和 AI SDK 依赖错误地位于 `apps/tui`，Model Stream 也从 Agent package 入口暴露给了 TUI。
 - 本次只纠正模块职责和测试 seam，不改变消息、事件、取消、失败、配置错误或 TUI 用户行为。
 - 本机运行时为 Node.js `24.13.1`、pnpm `10.33.0`。

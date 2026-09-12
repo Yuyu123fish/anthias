@@ -14,7 +14,7 @@ import {
   type ModelUsage,
 } from "../model/model-stream.js";
 import { APPROVAL_REVIEW_SYSTEM_PROMPT } from "../prompts/approval-review-prompt.js";
-import type { SessionRecord } from "../session/schema.js";
+import { type SessionRecord, userAuthorizationText } from "../session/schema.js";
 import { hasOnlyKeys, isRecord } from "../tool/input-validation.js";
 import type { ToolApprovalPlan } from "../tool/tool-runner.js";
 
@@ -88,16 +88,13 @@ export async function reviewToolApproval(
   // 历史人工批准只审计已绑定动作；其文件正文不能挤掉当前任务或更新限制。
   const authorizationSources: AuthorizationSource[] = [];
   for (const record of options.records) {
-    if (
-      record.type === "message" &&
-      record.message.role === "user" &&
-      record.message.source?.kind !== "agent"
-    ) {
+    const content = userAuthorizationText(record);
+    if (content !== null) {
       authorizationSources.push({
         entryId: record.entryId,
         seq: record.seq,
         source: "user",
-        content: record.message.content,
+        content,
       });
     }
   }

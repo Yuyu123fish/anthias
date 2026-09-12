@@ -119,7 +119,7 @@ describe("Agent", () => {
     await expect(promptResult).resolves.toEqual({ status: "aborted" });
     expect(events.at(-1)).toMatchObject({ type: "run_end", result: { status: "aborted" } });
     expect(agent.state.running).toBe(false);
-    expect(agent.setPermissionMode("plan")).toEqual({ status: "rejected", reason: "closed" });
+    expect(agent.setPermissionMode("auto_allow")).toEqual({ status: "rejected", reason: "closed" });
   });
 
   it("normalizes visible reasoning spans without changing the durable AssistantMessage", async () => {
@@ -289,7 +289,12 @@ describe("Agent", () => {
     expect(promptResult).toEqual({ status: "completed" });
     expect(agent.state).toMatchObject({
       operation: null,
-      collaboration: { rootSessionId: agent.state.sessionId, members: [], team: null, tasks: [] },
+      collaboration: {
+        rootSessionId: agent.state.sessionId,
+        members: [],
+        team: { id: agent.state.sessionId, name: "协作群组" },
+        tasks: [],
+      },
       messageHistory: [
         { role: "user", content: "你好" },
         {
@@ -420,7 +425,7 @@ describe("Agent", () => {
     expect(agent.state.messageHistory).toEqual([{ role: "user", content: "first" }]);
     responseGate.resolve();
     expect((await first).status).toBe("completed");
-    expect(modelCallCount).toBe(2);
+    await vi.waitFor(() => expect(modelCallCount).toBe(2));
     expect(agent.state.messageHistory.filter((message) => message.role === "user")).toEqual([
       { role: "user", content: "first" },
       { role: "user", content: "second" },

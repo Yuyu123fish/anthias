@@ -6,6 +6,7 @@ import type { AssistantToolCallPart } from "../src/message.js";
 import { executeGlobTool } from "../src/tool/basetool/glob.js";
 import { executeGrepTool } from "../src/tool/basetool/grep.js";
 import { executeReadFileTool } from "../src/tool/basetool/read-file.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 
 const temporaryDirectories = new Set<string>();
 
@@ -29,7 +30,10 @@ describe("read-only tools", () => {
 
     expect(result).toMatchObject({
       status: "completed",
-      content: "path: notes.txt\nlines: 2-2 of 3\nnextStartLine: 3\n---\n2| two",
+      content:
+        "path: notes.txt\nversion: " +
+        fileContentVersion(Buffer.from("one\ntwo\nthree\n")) +
+        "\nlines: 2-2 of 3\nnextStartLine: 3\n---\n2| two",
       truncated: true,
     });
   });

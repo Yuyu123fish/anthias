@@ -278,15 +278,17 @@ export function createConversationView(options: {
                   ? "思考中"
                   : state.activeAssistantMessage
                     ? "正在回答"
-                    : state.activeRun?.phase === "reviewing_tool"
-                      ? "自动审批"
-                      : state.activeRun?.phase === "executing_tool"
-                        ? "Tool 运行中"
-                        : state.activeRun?.phase === "retrying_model"
-                          ? "等待模型重试 · Ctrl+C 停止"
-                          : state.running
-                            ? "请求模型中"
-                            : "等待输入";
+                    : state.activeRun?.phase === "awaiting_workspace"
+                      ? "等待工作区资源"
+                      : state.activeRun?.phase === "reviewing_tool"
+                        ? "自动审批"
+                        : state.activeRun?.phase === "executing_tool"
+                          ? "Tool 运行中"
+                          : state.activeRun?.phase === "retrying_model"
+                            ? "等待模型重试 · Ctrl+C 停止"
+                            : state.running
+                              ? "请求模型中"
+                              : "等待输入";
       const usage = state.contextUsage;
       const contextText =
         usage.inputTokens === null
@@ -295,7 +297,7 @@ export function createConversationView(options: {
       const inputQueue = state.inputQueue;
       const queuedInputCount = inputQueue.steer.length + inputQueue.followUp.length;
       const queueText = queuedInputCount
-        ? ` · 待插入 ${inputQueue.steer.length}/${inputQueue.followUp.length}${inputQueue.paused ? " · 已暂停 /continue" : ""}`
+        ? ` · 已排队 ${queuedInputCount}${inputQueue.interruption ? (inputQueue.interruption.status === "blocked" ? " · 清理受阻 /agents" : " · 正在打断并清理") : inputQueue.paused ? " · 已暂停 /continue" : " · Esc 立即处理"}`
         : "";
       const scrollText = !conversationScroll.isFollowingEnd ? " · 阅读历史 · Ctrl+End 跟随" : "";
       const detailHint = detailsVisible ? " · Ctrl+T 关闭详情" : " · / 命令 · Ctrl+T 详情";
@@ -545,6 +547,20 @@ export function createConversationView(options: {
   function handleInput(data: string): boolean {
     if (closed) return true;
     if (handleMouse(data)) return true;
+    if (
+      matchesKey(data, Key.escape) &&
+      agent.state.running &&
+      [...agent.state.inputQueue.steer, ...agent.state.inputQueue.followUp].some(
+        (input) => input.source.kind === "user",
+      )
+    ) {
+      const result = agent.interruptForInput();
+      if (result.status === "accepted") {
+        invalidateConversation();
+        requestRender();
+        return true;
+      }
+    }
     if (matchesKey(data, Key.ctrl("c"))) {
       options.interrupt();
       return true;

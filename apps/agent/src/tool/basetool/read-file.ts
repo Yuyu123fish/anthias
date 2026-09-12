@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import type { AssistantToolCallPart } from "../../message.js";
 import {
   hasOnlyKeys,
@@ -19,13 +19,13 @@ import {
   type ToolWorkspace,
   validateWorkspaceRelativePath,
 } from "../workspace-path.js";
-import { readStrictUtf8File, splitTextLines } from "./text-file.js";
+import { decodeStrictUtf8, fileContentVersion, splitTextLines } from "./text-file.js";
 
 export const readFileTool: BaseTool = Object.freeze({
   definition: Object.freeze({
     name: "read_file",
     description:
-      "读取 UTF-8 文件的指定行范围，按 nextStartLine 继续；Full Access 可使用工作区外路径，其他模式限工作区。",
+      "读取 UTF-8 文件的指定行范围，返回同次读取的全文件 SHA-256 version；修改时把该版本作为 expectedVersion。按 nextStartLine 继续分页；Full Access 可使用工作区外路径。",
     inputSchema: Object.freeze({
       type: "object",
       additionalProperties: false,
@@ -79,7 +79,8 @@ export async function executeReadFileTool(
     if (!targetStats.isFile()) {
       return failedToolResult(`read_file 目标不是文件：${target.relativePath}`);
     }
-    const text = await readStrictUtf8File(target.absolutePath);
+    const originalBytes = await readFile(target.absolutePath);
+    const text = decodeStrictUtf8(originalBytes);
     if (abortSignal.aborted) {
       return failedToolResult("Tool 执行已停止。");
     }
@@ -90,6 +91,7 @@ export async function executeReadFileTool(
 
     const filePage = {
       path: target.relativePath,
+      version: fileContentVersion(originalBytes),
       startLine: startIndex + 1,
       totalLines: lines.length,
       lines: selectedLines,

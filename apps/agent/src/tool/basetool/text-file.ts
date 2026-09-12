@@ -1,6 +1,19 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+export type FileContentVersion = `sha256:${string}`;
+export type ExpectedFileVersion = FileContentVersion | "missing";
+
+/** 版本与显示内容必须来自同次原始读取，不能先解码再计算摘要。 */
+export function fileContentVersion(bytes: Uint8Array): FileContentVersion {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+export function isFileContentVersion(value: unknown): value is FileContentVersion {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
+}
 
 /** 读取严格 UTF-8 文本，并拒绝包含 NUL 的二进制内容。 */
 export async function readStrictUtf8File(filePath: string): Promise<string> {

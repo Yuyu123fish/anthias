@@ -1,11 +1,6 @@
 import type { AssistantToolCallPart } from "../../message.js";
-import { decideToolPolicy } from "../../permission/tool-policy.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "../input-validation.js";
-import {
-  createFileToolCallPlan,
-  createPolicyDeniedPlan,
-  createRejectedToolCallPlan,
-} from "../tool-plan.js";
+import { createFileToolCallPlan, createRejectedToolCallPlan } from "../tool-plan.js";
 import type { BaseTool } from "../tool-runner.js";
 import type { ToolWorkspace } from "../workspace-path.js";
 import {
@@ -13,17 +8,20 @@ import {
   type PreparedFileResult,
   prepareFileChange,
 } from "./file-change.js";
+import { type ExpectedFileVersion, isFileContentVersion } from "./text-file.js";
 
 export const writeFileTool: BaseTool = Object.freeze({
   definition: Object.freeze({
     name: "write_file",
-    description: "创建 UTF-8 文本文件或完整覆盖已有文件。",
+    description:
+      "创建或完整覆盖 UTF-8 文件。新建 expectedVersion 使用 missing；覆盖必须携带 read_file 实际返回的全文件版本。过期时重新读取并调整。",
     inputSchema: Object.freeze({
       type: "object",
       additionalProperties: false,
-      required: ["path", "content"],
+      required: ["path", "expectedVersion", "content"],
       properties: {
         path: { type: "string", minLength: 1 },
+        expectedVersion: { type: "string", pattern: "^(missing|sha256:[a-f0-9]{64})$" },
         content: { type: "string" },
       },
     }),
@@ -31,8 +29,7 @@ export const writeFileTool: BaseTool = Object.freeze({
   createPlan(toolCall, permissionMode, options) {
     const validationError = validateWriteFileToolCallInput(toolCall);
     if (validationError !== null) return createRejectedToolCallPlan(validationError);
-    if (permissionMode === "plan")
-      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "write_file" }));
+    if (options.writable === false) return createRejectedToolCallPlan("当前成员只能读取工作区。");
     return createFileToolCallPlan(
       toolCall,
       permissionMode,
@@ -45,6 +42,7 @@ export const writeFileTool: BaseTool = Object.freeze({
 /** 表示 write_file 已完成运行时校验后的固定输入。 */
 type WriteFileToolInput = Readonly<{
   path: string;
+  expectedVersion: ExpectedFileVersion;
   content: string;
 }>;
 
@@ -63,12 +61,18 @@ export async function prepareWriteFileTool(
   if (!inputResult.ok) {
     return failedFilePreparation(inputResult.error);
   }
-  return prepareFileChange("write_file", inputResult.input.path, workspace, ({ exists }) =>
-    Object.freeze({
-      ok: true,
-      content: inputResult.input.content,
-      operation: exists ? ("overwrite" as const) : ("create" as const),
-    }),
+  return prepareFileChange(
+    "write_file",
+    inputResult.input.path,
+    workspace,
+    inputResult.input.expectedVersion,
+    toolCall.toolCallId,
+    ({ exists }) =>
+      Object.freeze({
+        ok: true,
+        content: inputResult.input.content,
+        operation: exists ? ("overwrite" as const) : ("create" as const),
+      }),
   );
 }
 
@@ -84,14 +88,23 @@ function parseWriteFileToolInput(
   }
   const input = toolCall.input;
   if (
-    !hasOnlyKeys(input, ["path", "content"]) ||
+    !hasOnlyKeys(input, ["path", "expectedVersion", "content"]) ||
     !isNonEmptyString(input.path) ||
+    (input.expectedVersion !== "missing" && !isFileContentVersion(input.expectedVersion)) ||
     typeof input.content !== "string"
   ) {
-    return Object.freeze({ ok: false, error: "write_file 输入不符合 Schema。" });
+    return Object.freeze({
+      ok: false,
+      error:
+        "write_file 输入不符合 Schema；expectedVersion 必须使用 read_file 返回的 sha256 版本，新建使用 missing。",
+    });
   }
   return Object.freeze({
     ok: true,
-    input: Object.freeze({ path: input.path, content: input.content }),
+    input: Object.freeze({
+      path: input.path,
+      expectedVersion: input.expectedVersion,
+      content: input.content,
+    }),
   });
 }

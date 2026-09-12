@@ -104,7 +104,11 @@ describe("createAgentFromEnvironment", () => {
         collaboration: {
           rootSessionId: creationResult.agent.state.sessionId,
           members: [],
-          team: null,
+          team: {
+            id: creationResult.agent.state.sessionId,
+            name: "协作群组",
+            status: "closed",
+          },
           tasks: [],
         },
         sessionId: expect.any(String),
@@ -168,8 +172,8 @@ describe("createAgentFromEnvironment", () => {
     expect(JSON.stringify(creationResult)).not.toContain("ENOTDIR");
   });
 
-  it("creates a Plan-mode Agent without persisting the runtime mode", async () => {
-    const workspaceRoot = await createTemporaryDirectory("anthias-startup-plan-");
+  it("creates a AutoAllow Agent without persisting the runtime mode", async () => {
+    const workspaceRoot = await createTemporaryDirectory("anthias-startup-auto-");
     const sessionDirectory = join(workspaceRoot, "sessions");
     const environment = await createValidEnvironment(sessionDirectory);
 
@@ -177,14 +181,14 @@ describe("createAgentFromEnvironment", () => {
       environment,
       workspaceRoot,
       sessionDirectory,
-      permissionMode: "plan",
+      permissionMode: "auto_allow",
     });
 
     expect(creationResult.ok).toBe(true);
     if (!creationResult.ok) {
       return;
     }
-    expect(creationResult.agent.state.permissionMode).toBe("plan");
+    expect(creationResult.agent.state.permissionMode).toBe("auto_allow");
     const location = await locateSessionStorage(
       sessionDirectory,
       creationResult.agent.state.sessionId,

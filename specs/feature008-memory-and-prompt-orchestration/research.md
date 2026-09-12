@@ -10,7 +10,7 @@
 > **风险 / 未验证**：本文保留实施前研究证据；真实缓存收益尚未测量。<br>
 > **当前 / 请审阅**：已完成方案收束和实施；下文基线描述固定在调研时点。
 
-基线核验日期：2026-09-06。仓库：`main`，HEAD `a56c921adf91199ca57a68a0b0c3d99389d6bfa2`。2026-09-07 补充后续讨论并形成 [Spec](spec.md)。研究阶段未修改业务代码；后续实施结果单独记录于 Report。
+基线核验日期：2026-09-06。仓库：`main`，HEAD `dc5c58c2e6c485f59b18d47a1e18574ef6f52512`。2026-09-07 补充后续讨论并形成 [Spec](spec.md)。研究阶段未修改业务代码；后续实施结果单独记录于 Report。
 
 ## 研究问题与结论
 
@@ -221,7 +221,7 @@ token 命中率采用可知样本的 `ΣcachedInputTokens / ΣinputTokens`，同
 
 当前代码支持上述判断：
 
-- [Git 仓库识别](../../apps/agent/src/git/index.ts) 的 loadRepository 已读取工作树根和 commonGitDirectory，可以复用已有身份依据；[成员创建](../../apps/agent/src/multi-agent/members.ts) 会让可写成员使用独立工作树。
+- [Git 仓库识别](../../apps/agent/src/tool/basetool/git/index.ts) 的 loadRepository 已读取工作树根和 commonGitDirectory，可以复用已有身份依据；[成员创建](../../apps/agent/src/multi-agent/members.ts) 会让可写成员使用独立工作树。
 - [Session 来源记录](../../apps/agent/src/session/schema.ts) 已有 sourceId、fingerprint 与来源正文；现有 kind 只涵盖 Skill / MCP。[外部来源保存](../../apps/agent/src/external-capabilities.ts) 已遵循持久化成功后再更新投影，记忆可沿用这一顺序。
 - [压缩选择](../../apps/agent/src/context/selection.ts) 当前将 message 和 agent_input 绑定到持久消息后建立检查点；把来源正文移到消息中时，需要同时设计该关联、预算和恢复行为，不能只改文本拼接位置。
 - [自动审核](../../apps/agent/src/permission/auto-review.ts) 只读取真实用户消息与具有动作依据的人工批准。新增项目规则和记忆记录应保持这个授权边界。

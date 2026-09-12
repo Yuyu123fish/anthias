@@ -22,6 +22,7 @@ import {
   executePreparedCommand,
   prepareCommandTool,
 } from "../src/tool/basetool/execute-command.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { createToolRunner, type ToolApprovalPlan } from "../src/tool/tool-runner.js";
 
 type ReviewOptions = Parameters<typeof reviewToolApproval>[0];
@@ -98,7 +99,7 @@ describe("automatic tool approval review", () => {
     expect(attempts).toBe(2);
   });
 
-  it("allows a high-risk action using real authorization in one bounded private request", async () => {
+  it("allows a scoped local cleanup using real authorization in one bounded private request", async () => {
     const requests: ModelRequest[] = [];
     const recordedUsage: (ModelUsage | undefined)[] = [];
     const options = reviewOptions(
@@ -126,7 +127,9 @@ describe("automatic tool approval review", () => {
     if (request === undefined) throw new Error("Missing request");
     expect(request).toMatchObject({ purpose: "approval", maxOutputTokens: 2_000, tools: [] });
     expect(estimateModelRequestTokens(request)).toBeLessThanOrEqual(8_000);
-    expect(request.systemPrompt).toContain("包括高风险动作在内都可以 allow");
+    expect(request.systemPrompt).toContain("普通、必要且范围相符的实施步骤优先 allow");
+    expect(request.systemPrompt).toContain("极高风险操作");
+    expect(request.systemPrompt).toContain("返回 needs_user");
     expect(request.systemPrompt).toContain("人工批准仅允许");
     expect(request.messages).toEqual([
       {
@@ -790,7 +793,11 @@ describe("prepared approval action binding", () => {
     const fileCall: AssistantToolCallPart = {
       ...TOOL_CALL,
       toolName: "write_file",
-      input: { path: "target.txt", content: "after" },
+      input: {
+        path: "target.txt",
+        content: "after",
+        expectedVersion: fileContentVersion(Buffer.from("before")),
+      },
     };
     await writeFile(join(workspaceRoot, "target.txt"), "before");
     const first = await fingerprint(runner, fileCall);
@@ -799,11 +806,25 @@ describe("prepared approval action binding", () => {
     expect(
       await fingerprint(runner, {
         ...fileCall,
-        input: { path: "target.txt", content: "different" },
+        input: {
+          path: "target.txt",
+          content: "different",
+          expectedVersion: fileContentVersion(Buffer.from("before")),
+        },
       }),
     ).not.toBe(first);
     await writeFile(join(workspaceRoot, "target.txt"), "changed original");
-    expect(await fingerprint(runner, fileCall)).not.toBe(first);
+    expect(await runner.createPlan(fileCall, "auto_allow").prepare()).toMatchObject({ ok: false });
+    expect(
+      await fingerprint(runner, {
+        ...fileCall,
+        input: {
+          path: "target.txt",
+          content: "after",
+          expectedVersion: fileContentVersion(Buffer.from("changed original")),
+        },
+      }),
+    ).not.toBe(first);
     const commandCall = { ...TOOL_CALL, input: { command: "console.log(1)", cwd: "." } };
     const commandFingerprint = await fingerprint(runner, commandCall);
     expect(
@@ -860,9 +881,11 @@ describe("prepared approval action binding", () => {
     );
     expect(result).toEqual({
       status: "failed",
-      content: "execute_command cwd 已变化，命令未启动。",
+      content: expect.stringContaining("execute_command cwd 已变化，命令未启动。"),
       truncated: false,
       cleanupUncertain: false,
+      processStarted: false,
+      executionDurationMs: 0,
     });
     await expect(access(join(cwdPath, "spawned.txt"))).rejects.toThrow();
   });

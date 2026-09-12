@@ -39,10 +39,10 @@ describe("web_search", () => {
       ),
     );
     const extension = createWebSearchTools({ apiKey: syntheticKey, fetch: fixture.fetch });
-    expect(extension.tools("plan").map((tool) => tool.definition.name)).toEqual(["web_search"]);
-    const plan = createToolRunnerFromTools(extension.tools("plan")).createPlan(
+    expect(extension.tools("agent").map((tool) => tool.definition.name)).toEqual(["web_search"]);
+    const plan = createToolRunnerFromTools(extension.tools("agent")).createPlan(
       searchCall({ query: "Node API", page: 3 }),
-      "plan",
+      "agent",
     );
     expect(plan?.scheduling).toBe("parallel");
     const result = await execute(extension, { query: "Node API", page: 3 });
@@ -234,7 +234,8 @@ describe("web_search", () => {
     const agent = createAgentWithModelStream({
       modelStream,
       session,
-      permissionMode: "plan",
+      permissionMode: "agent",
+      writable: false,
       managedTools: createWebSearchTools({ apiKey: syntheticKey, fetch: fixture.fetch }),
     });
     cleanups.push(() => agent.close());
@@ -267,9 +268,9 @@ async function execute(
   input: JsonValue,
   signal = new AbortController().signal,
 ) {
-  const plan = createToolRunnerFromTools(extension.tools("plan")).createPlan(
+  const plan = createToolRunnerFromTools(extension.tools("agent")).createPlan(
     searchCall(input),
-    "plan",
+    "agent",
   );
   if (!plan) throw new Error("expected search plan");
   const preparation = await plan.prepare(signal);

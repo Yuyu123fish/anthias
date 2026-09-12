@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 async function setup(
   modelStream: ModelStream,
-  plan = false,
+  readOnly = false,
   failMemoryAdoption = false,
   workspaceSubdirectory = "",
 ) {
@@ -57,7 +57,7 @@ async function setup(
     session: runtimeSession,
     memoryDirectory,
     modelStream,
-    ...(plan ? { permissionMode: "plan" } : {}),
+    ...(readOnly ? { writable: false } : {}),
   });
   agents.push(agent);
   return { root, workspaceRoot, session, memory, agent };
@@ -142,7 +142,7 @@ describe("Memory and source orchestration", { timeout: 15_000 }, () => {
     ).toHaveLength(2);
   });
 
-  it("records explicit preferences in Plan mode and inserts one body after the complete tool group", async () => {
+  it("records explicit preferences with read-only workspace capability and inserts one body after the complete tool group", async () => {
     const requests: ModelRequest[] = [];
     const { agent, memory, workspaceRoot, session } = await setup(async function* (request) {
       requests.push(request);

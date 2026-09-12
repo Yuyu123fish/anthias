@@ -1,11 +1,6 @@
 import type { AssistantToolCallPart } from "../../message.js";
-import { decideToolPolicy } from "../../permission/tool-policy.js";
 import { hasOnlyKeys, isNonEmptyString, isRecord } from "../input-validation.js";
-import {
-  createFileToolCallPlan,
-  createPolicyDeniedPlan,
-  createRejectedToolCallPlan,
-} from "../tool-plan.js";
+import { createFileToolCallPlan, createRejectedToolCallPlan } from "../tool-plan.js";
 import type { BaseTool } from "../tool-runner.js";
 import type { ToolWorkspace } from "../workspace-path.js";
 import {
@@ -13,18 +8,20 @@ import {
   type PreparedFileResult,
   prepareFileChange,
 } from "./file-change.js";
+import { type FileContentVersion, isFileContentVersion } from "./text-file.js";
 
 export const editFileTool: BaseTool = Object.freeze({
   definition: Object.freeze({
     name: "edit_file",
     description:
-      "对已有 UTF-8 文本文件执行一组精确替换。replacements 是对象数组，每项必须包含 oldText 与 newText；不能直接传字符串或单个对象。",
+      "对已有 UTF-8 文件执行精确替换。expectedVersion 必须为 read_file 实际返回的全文件版本；过期时重新读取并调整。replacements 每项包含 oldText 与 newText。",
     inputSchema: Object.freeze({
       type: "object",
       additionalProperties: false,
-      required: ["path", "replacements"],
+      required: ["path", "expectedVersion", "replacements"],
       properties: {
         path: { type: "string", minLength: 1 },
+        expectedVersion: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
         replacements: {
           type: "array",
           minItems: 1,
@@ -44,8 +41,7 @@ export const editFileTool: BaseTool = Object.freeze({
   createPlan(toolCall, permissionMode, options) {
     const validationError = validateEditFileToolCallInput(toolCall);
     if (validationError !== null) return createRejectedToolCallPlan(validationError);
-    if (permissionMode === "plan")
-      return createPolicyDeniedPlan(decideToolPolicy({ permissionMode, toolName: "edit_file" }));
+    if (options.writable === false) return createRejectedToolCallPlan("当前成员只能读取工作区。");
     return createFileToolCallPlan(toolCall, permissionMode, options.workspace, prepareEditFileTool);
   },
 });
@@ -53,6 +49,7 @@ export const editFileTool: BaseTool = Object.freeze({
 /** 表示 edit_file 已完成运行时校验后的固定输入。 */
 type EditFileToolInput = Readonly<{
   path: string;
+  expectedVersion: FileContentVersion;
   replacements: readonly Readonly<{ oldText: string; newText: string }>[];
 }>;
 
@@ -75,6 +72,8 @@ export async function prepareEditFileTool(
     "edit_file",
     inputResult.input.path,
     workspace,
+    inputResult.input.expectedVersion,
+    toolCall.toolCallId,
     ({ exists, originalContent }) =>
       exists
         ? calculateExactEdit(originalContent, inputResult.input.replacements)
@@ -94,12 +93,16 @@ function parseEditFileToolInput(
   }
   const input = toolCall.input;
   if (
-    !hasOnlyKeys(input, ["path", "replacements"]) ||
+    !hasOnlyKeys(input, ["path", "expectedVersion", "replacements"]) ||
     !isNonEmptyString(input.path) ||
+    !isFileContentVersion(input.expectedVersion) ||
     !Array.isArray(input.replacements) ||
     input.replacements.length === 0
   ) {
-    return Object.freeze({ ok: false, error: "edit_file 输入不符合 Schema。" });
+    return Object.freeze({
+      ok: false,
+      error: "edit_file 输入不符合 Schema；expectedVersion 必须使用 read_file 返回的 sha256 版本。",
+    });
   }
   const replacements: Readonly<{ oldText: string; newText: string }>[] = [];
   for (const replacement of input.replacements) {
@@ -119,6 +122,7 @@ function parseEditFileToolInput(
     ok: true,
     input: Object.freeze({
       path: input.path,
+      expectedVersion: input.expectedVersion,
       replacements: Object.freeze(replacements),
     }),
   });

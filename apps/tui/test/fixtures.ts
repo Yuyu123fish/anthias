@@ -56,6 +56,10 @@ export function createFakeAgent() {
     ),
     close: vi.fn<Agent["close"]>(async () => {}),
     abort: vi.fn(),
+    interruptForInput: vi.fn<Agent["interruptForInput"]>(() => ({
+      status: "accepted",
+      inputId: "test-input",
+    })),
     subscribe(listener) {
       listeners.add(listener);
       return () => {

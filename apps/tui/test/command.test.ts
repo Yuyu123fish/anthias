@@ -80,7 +80,7 @@ describe("slash commands", () => {
       "/resume saved-id",
       "/context",
       "/compact",
-      "/mode plan",
+      "/mode auto_allow",
       "/skills",
       "/skills reload",
       "/skills clear",
@@ -346,7 +346,7 @@ describe("slash commands", () => {
       expect(help).toContain(prefix.split(" ")[0] + " " + value + " " + usage);
     }
     expect(help.split("\n").find((line) => line.startsWith("/agent ["))).toContain("artifact");
-    expect(help).toContain("/agent wait <id> [id2] [id3]");
+    expect(help).toContain("/agent wait <id> [其他成员，最多九个]");
     expect(agent.prompt).not.toHaveBeenCalled();
   });
 
@@ -379,7 +379,7 @@ describe("slash commands", () => {
   it("queries dynamic identities only for the declared command family", async () => {
     const { agent } = createFakeAgent();
     const provider = createCommandAutocomplete(agent);
-    for (const prefix of ["/agent assign ", "/team result ", "/mcp unknown "]) {
+    for (const prefix of ["/agent unknown ", "/team result ", "/mcp unknown "]) {
       const suggestions = await provider.getSuggestions([prefix], 0, prefix.length, {
         signal: new AbortController().signal,
       });
@@ -414,9 +414,9 @@ describe("slash commands", () => {
     const notice = vi.fn();
     for (const line of [
       "/agents",
-      "/agent spawn --write implement a bounded change",
-      "/team create Review team",
-      "/team message member-id queued message",
+      "/agent spawn implement a bounded change",
+      "/agent assign member-id Review task",
+      "/agent message member-id queued message",
       "/git status",
       '/git commit {"paths":["a file.ts"],"message":"change"}',
     ]) {

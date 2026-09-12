@@ -12,7 +12,7 @@
 
 ## 当前基线与授权
 
-基线为 main / a56c921adf91199ca57a68a0b0c3d99389d6bfa2，Strict TypeScript、Node.js 24、pnpm 10.33.0。开发者已确认 [Spec](spec.md) 和目录方向，明确要求“添加到 spec 后，直接开始按照流程一次性实现整个 feature”。本 Plan 和 [Tasks](tasks.md) 承接该授权，不在内部增量之间重复等待确认；不将该授权扩大到 Git 提交或真实 Provider。
+基线为 main / dc5c58c2e6c485f59b18d47a1e18574ef6f52512，Strict TypeScript、Node.js 24、pnpm 10.33.0。开发者已确认 [Spec](spec.md) 和目录方向，明确要求“添加到 spec 后，直接开始按照流程一次性实现整个 feature”。本 Plan 和 [Tasks](tasks.md) 承接该授权，不在内部增量之间重复等待确认；不将该授权扩大到 Git 提交或真实 Provider。
 
 保护已有 research/README.md 及 research/archive/2026-09-06-context-engineering/ 修改。此前三份上下文、兼容 Adapter 与能力测试共 24 项通过，源代码未变化；先检查当前类型与规范基线，新增测试只补实际行为缺口。
 

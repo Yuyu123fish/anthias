@@ -3,7 +3,7 @@ import type { JsonValue } from "../../../message.js";
 import { hasOnlyKeys, isRecord } from "../../input-validation.js";
 import type { AgentToolExtension } from "../../managed-tool.js";
 import { managedToolPlan } from "../../managed-tool.js";
-import type { GitWorkspace } from "./index.js";
+import type { BeforeGitMutation, GitWorkspace } from "./index.js";
 
 export type GitAction = Readonly<{
   action:
@@ -41,6 +41,8 @@ export function createGitTools(options: {
   primary: boolean;
   memberWorktreeId?: string;
   assertIdle(id: string): void;
+  assertWriteAllowed?: (toolCallId: string) => void;
+  resourceState?: (toolCallId: string, state: "waiting" | "acquired" | "released") => void;
 }): AgentToolExtension {
   const properties: Record<string, JSONSchema7> = {
     action: {
@@ -80,7 +82,7 @@ export function createGitTools(options: {
       : {}),
   };
   return {
-    tools: (mode) => [
+    tools: () => [
       {
         definition: {
           name: "git",
@@ -90,10 +92,7 @@ export function createGitTools(options: {
             type: "object",
             additionalProperties: false,
             required: ["action"],
-            properties:
-              mode === "plan" && options.primary
-                ? { ...properties, action: { type: "string", enum: [...queries] } }
-                : properties,
+            properties,
           },
         },
         createPlan(call, mode) {
@@ -120,14 +119,10 @@ export function createGitTools(options: {
                   ? { ref: action.ref }
                   : {}),
             };
-            const fingerprint =
-              mutation && mode !== "plan"
-                ? await options.git.captureApprovalState(approvalInput, signal)
-                : "";
-            const state =
-              mutation && mode !== "plan"
-                ? await describeGitState(options.git, action, signal)
-                : "";
+            const fingerprint = mutation
+              ? await options.git.captureApprovalState(approvalInput, signal)
+              : "";
+            const state = mutation ? await describeGitState(options.git, action, signal) : "";
             return {
               target:
                 "Git " +
@@ -139,13 +134,26 @@ export function createGitTools(options: {
                 (mutation ? "\n" + state + "\n状态指纹: " + fingerprint : ""),
               approval: mutation,
               async execute(signal) {
-                if (mutation && action.worktreeId) options.assertIdle(action.worktreeId);
-                if (
-                  mutation &&
-                  fingerprint !== (await options.git.captureApprovalState(approvalInput, signal))
-                )
-                  throw new Error("审批期间 Git 状态已经变化，请重新检查并发起操作。");
-                return executeGitAction(options.git, action, signal);
+                if (!mutation) return executeGitAction(options.git, action, signal);
+                options.resourceState?.(call.toolCallId, "waiting");
+                try {
+                  return await executeGitAction(options.git, action, signal, async () => {
+                    options.resourceState?.(call.toolCallId, "acquired");
+                    options.assertWriteAllowed?.(call.toolCallId);
+                    if (action.worktreeId) options.assertIdle(action.worktreeId);
+                    if (
+                      fingerprint !==
+                      (await options.git.captureApprovalState(approvalInput, signal))
+                    ) {
+                      throw new Error(
+                        "审批期间或等待写入期间 Git 状态已经变化，请重新检查并发起操作。",
+                      );
+                    }
+                    options.assertWriteAllowed?.(call.toolCallId);
+                  });
+                } finally {
+                  options.resourceState?.(call.toolCallId, "released");
+                }
               },
             };
           });
@@ -159,6 +167,7 @@ export async function executeGitAction(
   git: GitWorkspace,
   action: GitAction,
   signal?: AbortSignal,
+  beforeMutation?: BeforeGitMutation,
 ): Promise<string> {
   const target = action.worktreeId ? { worktreeId: action.worktreeId } : {};
   switch (action.action) {
@@ -174,7 +183,7 @@ export async function executeGitAction(
       );
     case "create":
       return JSON.stringify(
-        await git.createWorktree(action.ref ? { ref: action.ref } : {}, signal),
+        await git.createWorktree(action.ref ? { ref: action.ref } : {}, signal, beforeMutation),
       );
     case "inspect":
       return JSON.stringify(
@@ -182,7 +191,12 @@ export async function executeGitAction(
       );
     case "remove":
       return JSON.stringify(
-        await git.removeWorktree(required(action.worktreeId, "worktreeId"), signal, action.discard),
+        await git.removeWorktree(
+          required(action.worktreeId, "worktreeId"),
+          signal,
+          action.discard,
+          beforeMutation,
+        ),
       );
     case "commit":
       if (!action.paths?.length) throw new Error("提交必须明确 paths。");
@@ -190,6 +204,7 @@ export async function executeGitAction(
         await git.commit(
           { ...target, paths: action.paths, message: required(action.message, "message") },
           signal,
+          beforeMutation,
         ),
       );
     case "integrate":
@@ -200,11 +215,14 @@ export async function executeGitAction(
             commit: required(action.commit, "commit"),
           },
           signal,
+          beforeMutation,
         ),
       );
     case "continue":
     case "abort":
-      return JSON.stringify(await git.resolveIntegration({ action: action.action }, signal));
+      return JSON.stringify(
+        await git.resolveIntegration({ action: action.action }, signal, beforeMutation),
+      );
   }
 }
 

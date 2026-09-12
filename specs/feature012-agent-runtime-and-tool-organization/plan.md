@@ -12,7 +12,7 @@
 
 ## 当前基线
 
-- `main @ 3d2c01c`，开始时工作区干净；Node.js 24.13.1、pnpm 10.33.0。
+- `main @ c7b8853`，开始时工作区干净；Node.js 24.13.1、pnpm 10.33.0。
 - Agent 83 个生产 TypeScript 文件；Session 14 文件 / 7,991 行，Tool 23 文件 / 5,065 行，Git 3 文件 / 2,186 行；行数包含空行与注释。
 - package 入口有 1 个生产工厂、46 个类型导出。SessionAgent 1,334 行，Runtime 159 行。
 - 基线可信验证沿用 Feature 011 Report：577 个不同用例通过、1 个平台条件跳过；本 Feature 新改动单独验证，不重复启动基线全量测试。

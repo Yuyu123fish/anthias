@@ -17,6 +17,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { FIXED_TOOL_DEFINITIONS } from "../src/tool/definitions.js";
 
 import { promptToCompletion } from "./prompt-helper.js";
@@ -805,7 +806,11 @@ describe("createOpenAICompatibleModelStream", () => {
           {
             toolCallId: "00000000-0000-4000-8000-000000000102",
             toolName: "edit_file",
-            input: '{"path":"target.txt","replacements":[{"oldText":"old","newText":"new"}]}',
+            input: JSON.stringify({
+              path: "target.txt",
+              expectedVersion: fileContentVersion(Buffer.from("old\n")),
+              replacements: [{ oldText: "old", newText: "new" }],
+            }),
           },
           {
             toolCallId: "00000000-0000-4000-8000-000000000103",

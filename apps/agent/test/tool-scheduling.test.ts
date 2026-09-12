@@ -11,6 +11,7 @@ import {
   resolveSessionDirectory,
   resolveSessionShell,
 } from "../src/session/index.js";
+import { fileContentVersion } from "../src/tool/basetool/text-file.js";
 import { createToolRunner, type ToolRunner } from "../src/tool/tool-runner.js";
 import { selectConcurrentToolBatch } from "../src/tool/tool-scheduling.js";
 import { promptToCompletion } from "./prompt-helper.js";
@@ -68,7 +69,11 @@ describe("Tool batch scheduling", () => {
     let requests = 0;
     const modelStream: ModelStream = async function* () {
       if (++requests === 1) {
-        yield toolCallEvent(1, "write_file", { path: "write.txt", content: "written" });
+        yield toolCallEvent(1, "write_file", {
+          path: "write.txt",
+          expectedVersion: "missing",
+          content: "written",
+        });
         yield toolCallEvent(2, "read_file", { path: "read.txt" });
         yield finishEvent("tool_calls");
       } else {
@@ -109,10 +114,19 @@ describe("Tool batch scheduling", () => {
     const modelStream: ModelStream = async function* (request) {
       modelRequests.push(request);
       if (modelRequests.length === 1) {
-        yield toolCallEvent(1, "write_file", { path: "a.txt", content: "one" });
-        yield toolCallEvent(2, "write_file", { path: "b.txt", content: "other" });
+        yield toolCallEvent(1, "write_file", {
+          path: "a.txt",
+          expectedVersion: "missing",
+          content: "one",
+        });
+        yield toolCallEvent(2, "write_file", {
+          path: "b.txt",
+          expectedVersion: "missing",
+          content: "other",
+        });
         yield toolCallEvent(3, "edit_file", {
           path: "a.txt",
+          expectedVersion: fileContentVersion(Buffer.from("one")),
           replacements: [{ oldText: "one", newText: "two" }],
         });
         yield toolCallEvent(4, "read_file", { path: "a.txt" });

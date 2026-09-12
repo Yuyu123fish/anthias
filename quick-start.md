@@ -4,21 +4,22 @@
 
 ## 1. 安装依赖并构建
 
-需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）；Git/worktree 功能还需要 Git。先在 Anthias 仓库执行：
+需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）；Git/worktree 功能还需要 Git。首次使用先克隆仓库，再安装依赖：
 
 ```powershell
+git clone https://github.com/Yuyu123fish/anthias.git 'C:\projects\anthias'
 Set-Location 'C:\projects\anthias'
 node --version
-pnpm --version
-pnpm install --frozen-lockfile
-pnpm build
+corepack pnpm --version
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
 ```
 
 `pnpm build` 会生成 `apps/tui/dist/main.js`。修改或更新源码后重新构建；启动读取的是构建产物。
 
 ## 2. 在 Anthias 根目录配置一次
 
-Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录把 [.env-example](.env-example) 复制为 `.env`，填写自己的连接配置；已有 `.env` 时直接编辑。首次启动时若文件不存在，程序也会生成一份不含凭据的模板，并在模型配置不完整时提示缺少的变量。
+Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录把 [.env.example](.env.example) 复制为 `.env`，填写自己的连接配置；已有 `.env` 时直接编辑。首次启动时若文件不存在，程序也会生成一份不含凭据的模板，并在模型配置不完整时提示缺少的变量。
 
 | 变量 | 填写内容 |
 | --- | --- |
@@ -26,15 +27,17 @@ Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录
 | `ANTHIAS_MODEL_ID` | 服务实际支持的模型 ID |
 | `ANTHIAS_MODEL_API_KEY` | 自己的 API Key |
 | `SEARCHAPI_API_KEY` | 可选；留空只影响网页搜索 |
-| `ANTHIAS_PERMISSION_MODE` | `agent`、`plan` 或 `auto_allow`；模板默认 `agent` |
+| `ANTHIAS_PERMISSION_MODE` | `agent`、`auto_allow` 或 `full_access`；模板默认 `agent` |
 
 这份 `.env` 只从 Anthias 自身的项目或安装根目录加载，与启动时的当前目录、`--workspace` 和恢复的 Session 无关；不会读取任务项目里的同名文件。已有文件不会被启动流程覆盖，`.env` 已排除在版本控制之外。填写后重新启动即可采用；不要提交真实值。
 
 同名变量以进程环境覆盖 `.env`，进程里的显式空值也不会回退到文件中的 Key。模式优先级为 **`--mode` → 进程中的 `ANTHIAS_PERMISSION_MODE` → 根 `.env` → `agent`**。非法模式会提示错误。运行中的 `/mode` 只改变当前 Agent，不改写文件，也不授予工作区权限。
 
-DeepSeek V4 Flash 的日常参考配置为 Base URL `https://api.deepseek.com`、模型 ID `deepseek-v4-flash`，窗口能力内置。其他模型若没有内置能力数据，还需在 `.env` 中取消 `ANTHIAS_MODEL_CONTEXT_WINDOW` 的注释，并填写服务明确声明的窗口。
+DeepSeek V4.1 Flash 的日常参考配置为 Base URL `https://api.deepseek.com`、模型 ID `deepseek-flash`，窗口与输出能力内置；旧调用名继续兼容，核验来源见 [Feature 015 Research](specs/feature015-execution-recovery/research.md)。其他模型若没有内置能力数据，还需在 `.env` 中取消 `ANTHIAS_MODEL_CONTEXT_WINDOW` 的注释，并填写服务明确声明的窗口。
 
 安全余量固定为 20,000 token。普通输出默认 64,000；上下文窗口不超过 84,000 时沿用 16,000，再按已声明的模型输出能力收窄。摘要输出和保留原文目标仍为 8,000、32,000。`ANTHIAS_RESPONSE_MAX_TOKENS`、`ANTHIAS_COMPACTION_MAX_TOKENS`、`ANTHIAS_CONTEXT_KEEP_TOKENS` 可显式覆盖；`ANTHIAS_MODEL_MAX_OUTPUT_TOKENS` 声明模型输出能力，显式配置超限在启动时拒绝。
+
+`/diagnostics` 显示模型、最终窗口、回复/摘要预算、推理强度及“进程环境 / 根 .env / 默认”来源；不输出 Key 或 Endpoint。已有较低预算会覆盖默认值，修改后须重新启动。Session 的 request_usage 记录会保存实际请求使用的安全配置，便于与启动值核对。
 
 支持 `reasoning_effort` 的服务还可分别配置 `ANTHIAS_RESPONSE_REASONING_EFFORT` 与 `ANTHIAS_APPROVAL_REASONING_EFFORT`，可选 `low`、`medium`、`high`。前者用于普通生成，后者用于授权审核；未配置时不发送该参数。当前日常模型可使用 `low` 减少思考等待；更换服务时按其支持情况调整。
 
@@ -62,10 +65,10 @@ node 'C:\projects\anthias\apps\tui\dist\main.js'
 也可以留在当前目录，显式选择另一个工作区：
 
 ```powershell
-node 'C:\projects\anthias\apps\tui\dist\main.js' --workspace 'D:\你的项目' --mode plan
+node 'C:\projects\anthias\apps\tui\dist\main.js' --workspace 'D:\你的项目' --mode agent
 ```
 
-`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时采用第 2 节的默认配置。`plan` 允许读取、发现和搜索工作区文件、Session 产物及已配置的网页搜索，也允许受管的 Anthias 记忆维护；任务 Workspace 仍不可写。`auto_allow` 先核对当前限制和已明确授予的工作区权限，未命中授权的动作再独立审核，信息不足时转人工确认。
+`--workspace` 必须指向已经存在的目录；相对路径按执行命令时的当前目录解析。省略 `--mode` 时采用第 2 节的默认配置。`agent` 模式下只读请求立即执行，代码写入、命令与外部操作逐次批准；`auto_allow` 由独立审核放行普通必要操作，极高风险转人工；`full_access` 跳过人工和模型批准。组内通信、状态和受管笔记在三种模式下自动允许。
 
 ## 4. 使用 `anthias` 短命令
 
@@ -80,7 +83,7 @@ Set-Location 'D:\你的项目'
 anthias
 ```
 
-函数保留当前目录，并把参数原样传给 CLI。需要只读模式时使用 `anthias --mode plan`；指定工作区时使用 `anthias --workspace 'D:\另一个项目'`。
+函数保留当前目录，并把参数原样传给 CLI。需要逐次批准时使用 `anthias --mode agent`；指定工作区时使用 `anthias --workspace 'D:\另一个项目'`。
 
 想让新开的 PowerShell 窗口也有这个命令，打开个人 Profile，把上述函数定义加到文件末尾：
 
@@ -101,9 +104,9 @@ notepad $PROFILE
 | 提交任务 | `Enter` 提交；`Alt+Enter` 或支持的 `Shift+Enter` 换行，多行粘贴保持一条输入 |
 | 新建或恢复会话 | `/new`；`/resume` 列出 ID，`/resume <id>` 打开 |
 | 主动压缩 | `/compact`，只压缩历史投影，不产生额外普通回复 |
-| 查询或切换模式 | `/mode`、`/mode plan`、`/mode agent`、`/mode auto_allow`；只能在空闲时切换 |
+| 查询或切换模式 | `/mode`、`/mode agent`、`/mode auto_allow`、`/mode full_access`；只能在空闲时切换 |
 | 工作区授权 | `/permissions` 查看；授予与撤销见下文 |
-| 最近停止原因 | `/diagnostics` 查看安全分类、已知用量与重试事实 |
+| 最近停止原因与生效配置 | `/diagnostics` 查看安全分类、预算来源、已知用量与重试事实 |
 | 明确继续 | `/continue [补充要求]`，采用已保存事实开始新的 Run |
 | 恢复未接受输入 | `/draft`，用于当前交互 TUI 中保留的草稿 |
 | 记忆管理 | `/memory` 查看；`/memory help` 查看维护命令 |
@@ -113,7 +116,8 @@ notepad $PROFILE
 | 详情面板 | `/details` 或 `Ctrl+T` 打开；点击 `[<]`、`[>]` 切换详情，`[x]` 关闭；窄屏占满正文区 |
 | 批准当前副作用 | 完整阅读审批详情后输入 `approve`；详情未读完时阻止确认 |
 | 拒绝当前副作用 | 输入 `deny` |
-| 停止当前 Run | 运行中按 `Ctrl+C`，停止后可以继续输入 |
+| 提交与立即插入 | Enter 默认排入后续消息；运行中已有排队消息时按 Esc，立即取消当前回答并等待必要清理后处理最早一条 |
+| 停止群组 | 运行中按 `Ctrl+C`，同时停止根与成员并暂停输入；`/continue` 明确继续 |
 | 退出 | `/exit`，或空闲时按 `Ctrl+C` |
 
 所有工作区的 Session 默认集中保存在 Anthias 仓库的 `data/conversation/`，不会随当前工作目录改变。当前示例对应 `C:\projects\anthias\data\conversation`。
@@ -130,7 +134,7 @@ anthias --workspace 'D:\你的项目' --session '<完整的 Session UUID>'
 $env:ANTHIAS_SESSION_DIR = 'D:\AnthiasData\conversation'
 ```
 
-恢复旧 Session 时也需要使用原来的数据目录。显式打开该目录内的旧 Schema 1/2 Session 时会保存原始备份并升级到 Schema 3；程序不自动扫描其他工作区。
+恢复旧 Session 时也需要使用原来的数据目录。显式打开该目录内的旧 Schema 1/2/3 Session 时会保存原始备份并升级到 Schema 4；程序不自动扫描其他工作区。
 
 会话以 UTC 日期和创建时间戳分目录保存；日志、索引与工具产物归属于同一个 Session。每次启动会在后台检查最近使用时间，两周未使用且没有活动使用者的会话及其产物会被清理；协作会话按根和成员成组检查，未交付资源会阻止清理。压缩保留完整历史，只缩减模型输入；TUI 显示过程和结果，成功后自动继续。
 
@@ -157,9 +161,9 @@ Agent 模式中的文件修改和普通命令仍需要逐次确认；命中硬�
 
 第一条精确授权工作区根目录的检查命令；第二条允许 `scripts` 目录下 `python check.py` 及其后续字面参数，目录必须已存在。命令保留 `--` 后的引号，带空格的目录可写 `--cwd "app files"`。登记会合并当前命令，并继承当前记住/成员选项；没有当前授权时从默认 17 项开始。仍需浏览完整范围后输入 `grant` 确认，最多保存 49 个入口，完整记录不得超过 192,000 字节。
 
-`--prefix` 按参数边界匹配；授予 `python -c`、`powershell -Command` 等前缀即允许其后续字面脚本，需按实际需要选择范围。组合命令的每段均须已登记；动态展开、重定向、未登记命令以及可直接识别的 Git、清理、发布入口继续审核。旧授权不会自动扩大，Agent 模式仍逐动作确认，Plan 仍只读。命令以当前系统用户运行，cwd 不限制脚本的运行时副作用。
+`--prefix` 按参数边界匹配；授予 `python -c`、`powershell -Command` 等前缀即允许其后续字面脚本，需按实际需要选择范围。组合命令的每段均须已登记；动态展开、重定向、未登记命令以及可直接识别的 Git、清理、发布入口继续审核。旧授权不会自动扩大，Agent 模式仍逐动作确认，成员只读能力独立生效。命令以当前系统用户运行，cwd 不限制脚本的运行时副作用。
 
-确实希望成员继承时，使用 `/permissions grant --remember --members`，阅读后同样输入 `grant`。仅本次会话的 `--members` 覆盖当前任务创建并登记的成员 worktree；同时选择 `--remember` 时，还包括今后从同一根工作区发起任务所创建并登记的成员 worktree。不选择 `--members` 就不继承，也不会扩展到相邻目录或任意工作树。
+确实希望成员继承时，使用 `/permissions grant --remember --members`，阅读后同样输入 `grant`。`--members` 覆盖共享根工作区与受管工作树中的成员；选择 `--remember` 后，还适用于今后从同一根工作区发起的成员任务。不选择 `--members` 就不继承，也不会扩展到相邻目录或任意工作树。
 
 `/permissions revoke` 可在运行中撤销：尚未开始的根与成员动作、待批准请求失效；已经开始的动作可用 `Ctrl+C` 停止，已经产生的副作用不回滚。授权记录由 Agent 保存在 Anthias `data/permissions/`，与 Session、记忆和项目规则分开。保存失败会分别说明本次会话是否生效、跨启动设置是否保存；以 `/permissions` 的实际结果为准。
 
@@ -226,7 +230,7 @@ description: 检查项目的接口兼容性与错误处理
 - `/mcp prompt <id> <name> {"参数":"值"}`：选用模板，保存为外部上下文，然后自行输入任务。
 - `/mcp disconnect <id>`：断开并关闭 Anthias 启动的进程；退出会关闭全部连接。
 
-模型只获得已连接且符合预算的工具定义。MCP 工具经过当前模式的审批；Plan 拒绝未知外部工具。资源和模板不是新的用户授权。工具预览最多 32 KiB，原文产物最多保留 256 KiB，完整性单独标记；当前不支持 OAuth 登录、自动安装、二进制呈现及 MCP Apps。
+模型只获得已连接且符合预算的工具定义。MCP 工具经过当前模式的审批；只读成员拒绝未知外部工具。资源和模板不是新的用户授权。工具预览最多 32 KiB，原文产物最多保留 256 KiB，完整性单独标记；当前不支持 OAuth 登录、自动安装、二进制呈现及 MCP Apps。
 
 ## 8. 记忆与项目规则
 
@@ -255,7 +259,7 @@ description: 检查项目的接口兼容性与错误处理
 
 列表显示 `id @版本`；维护时使用最新版本，避免覆盖其他会话的修改。支持的状态为 `active`、`candidate`、`review`、`expired`、`forgotten`，`all` 表示全部状态。查询可在运行中使用，人工维护和开关切换需先停止当前 Run。
 
-自动记忆默认开启。可以直接告诉 Agent“记住，以后回答先给结论”，或要求它查找项目经验；模型通过同一受管入口查询和维护。推断出的偏好先成为候选，用户确认后才可采用；经验引用实际已完成的 Tool 结果。关闭自动记忆仍允许读取和用户明确要求的维护。Plan 模式允许维护 Anthias 记忆，不因此开放工作区写入。
+自动记忆默认开启。可以直接告诉 Agent“记住，以后回答先给结论”，或要求它查找项目经验；模型通过同一受管入口查询和维护。推断出的偏好先成为候选，用户确认后才可采用；经验引用实际已完成的 Tool 结果。关闭自动记忆仍允许读取和用户明确要求的维护。受管 Anthias 记忆维护不因此开放工作区写入。
 
 长期偏好没有统一到期天数；临时记忆可带到期时间，经验可关联复核时间、分支和文件内容。到期后退出默认采用，条件变化后进入待复核；读取不会刷新最后确认时间。需要设置这些条件时，通过自然语言明确告诉 Agent 期限和关联文件。确认候选也不会跳过仍不满足的条件。
 
@@ -277,27 +281,45 @@ description: 检查项目的接口兼容性与错误处理
 
 ## MultiAgent 与本地 Git
 
-[Feature 007](specs/feature007-multi-agent/spec.md) 增加了 SubAgent、AgentTeam 和受管 Git worktree，当前等待开发者验收。使用可写成员前，需要 PATH 中存在 Git，目标是已有提交的普通 Git 仓库；无仓库时仍可进行只读委派。
+[Feature 014](specs/feature014-unified-multi-agent/spec.md) 将成员统一为持续协作：根负责分工和生命周期，成员默认在当前工作区修改，普通目录也能使用；需要 Git 隔离或成果交付时，才要求已有提交的仓库和可用 Git。当前实现与验证边界见 [Report](specs/feature014-unified-multi-agent/report.md)。
 
 | 操作 | 用法 |
 | --- | --- |
-| 查看成员、任务和状态 | `/agents` |
-| 只读 / 可写委派 | `/agent spawn 检查会话恢复` / `/agent spawn --write 修复指定问题并报告验证` |
+| 查看成员、任务和状态 | `/agents`、`/agent list` |
+| 创建可写 / 只读成员 | `/agent spawn 修复指定问题并报告验证`、`/agent spawn --read-only 检查会话恢复` |
 | 等待、查看结果 | `/agent wait <成员ID>`、`/agent result <成员ID>` |
 | 查看完整工具产物 | `/agent artifact <成员ID> <产物ID> [cursor]` |
-| 停止 / 释放执行者 | `/agent stop <成员ID>` / `/agent release <成员ID>` |
-| 显式继续已有成员 | `/agent resume <成员ID> [新任务]` |
-| 建立团队、添加成员 | `/team create 修复小组`、`/team add --write 实施限定修改` |
-| 分派下一任务、发送消息 | `/team assign <成员ID> 下一任务`、`/team message <成员ID> 补充信息` |
-| 团队任务与结束 | `/team tasks`、`/team close` |
-| 查看仓库和工作区 | `/git status [worktreeID]`、`/git diff [worktreeID]`、`/git worktrees` |
-| 独立创建、核对工作区 | `/git create [已提交ref]`、`/git inspect <worktreeID>` |
+| 暂停 / 关闭成员 | `/agent stop <成员ID>`、`/agent release <成员ID>` |
+| 继续 / 重新打开 | `/agent resume <成员ID> [任务]`、`/agent reopen <成员ID>` |
+| 分派任务、发送邮箱消息 | `/agent assign <成员ID> 下一任务`、`/agent message <成员ID> 补充信息` |
+| 共享笔记 | `/agent notes read`、`/agent notes append 协作内容`、`/agent notes replace <读取版本> 整理后的内容` |
+| 暂停 / 继续群组 | `/agent group stop`、`/agent group continue` |
+| 查看 / 检查工作区阻塞 | `/agents` 查看来源，`/agent recover <blockId>` 请求原资源清理并检查结果 |
+| 查看仓库与工作树 | `/git status [worktreeID]`、`/git diff [worktreeID]`、`/git worktrees` |
+| 显式创建与绑定工作树 | `/git create [已提交ref]`、`/agent workspace <成员ID> <worktreeID>` |
+| 返回根工作区 | `/agent workspace <成员ID> root` |
 
-SubAgent 完成后释放执行者；Team 成员保留上下文等待下一次明确分派，两者共用三个名额。单 Run 的 12 次及根与成员共享的 60 次模型调用截止已移除；仍保留 30 分钟共享任务时限、每批 32 个 ToolCall 和只读四并发。成员不能继续创建 Agent 或 Team。普通消息只入队，不会唤醒空闲成员；正在执行时会在下次模型请求前接收。主 Agent 和成员的待确认操作统一在 TUI 中呈现，并标出成员来源。
+同时最多根加九名成员执行，更多任务排队；空闲成员保留上下文，不占执行位置。组内通信、状态和共享笔记自动允许，文件写入、命令与 Git 仍按当前三种权限模式执行。批准界面标出成员来源。只读成员可以协作，但不能写代码、执行 Shell 或未知副作用 MCP。
 
-可写成员从固定提交创建自己的目录，默认使用创建时的 HEAD；主目录的未提交修改不会带入。目录默认位于 Anthias 的 `data/worktrees/<根SessionID>/`，可用绝对路径环境变量 `ANTHIAS_WORKTREE_DIR` 覆盖。它独立于 `ANTHIAS_SESSION_DIR`，历史不会随 worktree 回收而消失。worktree 只隔离代码目录，外部服务、端口和数据库仍需任务自行安排。
+运行中的成员在工具批次结束后接收邮箱，空闲成员自动处理新消息。用户暂停的成员只由用户继续，关闭后的新消息明确拒绝，根可以显式重新打开。根正常完成后停止新唤醒，迟到消息保留历史；失败或用户停止则收束成员；Esc 只中断根当前回答，成员继续。共享任务时限三十分钟，消息不会重置它。共享笔记位于根 Session 的 `shared-notes.md`，每次追加有作者和修订；重整必须携带读取版本，内容不充当授权或控制命令。
 
-成员停止后，先查看差异，再通过明确文件列表提交：
+编辑文件时 Agent 必须先取得 `read_file` 返回的内容版本，再给 `edit_file/write_file` 传 `expectedVersion`；新建明确用 `missing`。成功写入或编辑返回 `newVersion`，可直接用于下一次修改；同一文件竞争时后写者会收到版本冲突，需要重新读取和调整。命令在自己的工作区占用独占写入阶段，等待和取消会显示在执行状态中。这些协调只覆盖 Anthias 受管操作，外部编辑器和脚本仍以当前系统用户权限运行。
+
+### 工作区受阻时
+
+命令可能仍在运行或持有管道时，Anthias 保留写入保护，并显示 `workspace_blocked`、blockId、成员与工具来源。相关排队和新写入会明确失败；命令 timeoutMs 仍限制执行时间，取锁另以同一数值为上限，结果分别给出等待/执行时长与是否启动。
+
+1. 用 `/agents` 查看来源；`/agent recover <blockId>` 请求重新检查原执行器持有的命令进程和输出流，必要时重试通用清理。根也可用 `agent_recover_workspace`，不经过被阻塞的写入队列，不重放原工具。
+2. 本次限时清理未完成时，可以稍后再次请求恢复，不要重试普通 Shell 或文件写入。若重启丢失句柄、无法核验归属或持续失败，再外部清理对应资源；确认后由用户直接输入 `/agent recover <blockId> confirm-cleanup`。普通对话中的“已清理”无效，模型不能代替直接确认。
+3. Esc 对应输入会在自己的阻塞解除后继续；若后来按过 Ctrl+C，输入仍暂停，需要明确 `/continue`。重复 Esc 不复制消息，未发送草稿不会被提交。
+
+已保存的阻塞位于 Session 数据目录的 `workspace-blocks/`，重启会重新加载；没有原句柄时需要用户核查。仅保存已发生的阻塞，无法保证进程崩溃前尚未落盘的状态。阻塞目录损坏时写入保持关闭，修复目录后重新启动。外部程序持续持有输出或清理失败时仍可能阻塞，详见 [事故记录](docs/incident/2026-09-11-multi-agent-workspace-blocking.md)。
+
+浏览器能力通过外部 CLI 或 MCP 使用，可按相应 Skill 操作。Anthias 执行通用权限与取消规则；浏览器会话、配置和关闭由外部工具负责，Anthias 不会自动配置或关闭浏览器。外部资源持续占用时，需要先通过对应工具或人工完成清理。完成构建后重新启动 Anthias 才会加载新代码。
+
+需要隔离时，先 `/git create`，再 `/agent spawn --worktree <ID> 任务`，或停止已有成员后绑定。工作树只含创建时指定提交，根工作区的未提交修改保留原地，不自动带入依赖、凭据或服务。默认代码目录为 `data/worktrees/<根SessionID>/`，可通过绝对路径 `ANTHIAS_WORKTREE_DIR` 覆盖；它独立于 Session 历史目录。
+
+成员停止后，先看差异，再明确提交文件列表：
 
 ```text
 /git commit {"worktreeId":"<worktreeID>","paths":["src/example.ts"],"message":"修复明确问题"}
@@ -307,8 +329,6 @@ SubAgent 完成后释放执行者；Team 成员保留上下文等待下一次明
 /git remove <worktreeID>
 ```
 
-`integrate` 将指定成果放入主目录的暂存区，`continue` 检查后形成一个本地集成提交；一次处理一个集成。冲突时保留现场，可修复冲突后 `continue`，或 `/git abort` 中止本次集成。提交、集成和回收均经过权限检查，不自动推送。主目录已有暂存或未完成 Git 操作时会拒绝集成。
+`integrate` 把成果放入根工作区暂存区，`continue` 核对后创建本地提交；冲突保留现场，修复后继续或用 `/git abort` 中止。提交、集成和回收都受权限约束，不自动推送。根目录有暂存内容或未完成 Git 操作时拒绝集成。
 
-移除只针对本根 Session 创建、已经停止且干净的受管 worktree；未集成的已提交成果需要显式 `/git remove <worktreeID> discard`。它不使用强制删除，也不删除分支。结束团队或释放成员只结束执行者，保留代码与历史。
-
-重开根 Session 时成员显示为中断，不自动发起模型请求或重放副作用。`/agent result` 不要求原工作目录存在；显式继续时会核对原目录及 Git 身份，资源缺失时保留诊断，不偷偷重建。已结束 Team 的旧成员仍可查看历史，继续工作需在新 Team 中分派。会话清理按根和成员成组检查，活动成员、待处理任务、待收消息、未移除 worktree 或不确定 Git 操作会阻止清理。
+移除只针对本根 Session 创建、已停止且干净的受管工作树。未集成的已提交成果需要显式 `/git remove <worktreeID> discard`，不会强制删除脏目录或删除分支。关闭成员保留代码与历史。应用退出会释放资源并保留恢复状态；重启不自动运行，使用 `/agent group continue` 明确继续，关闭成员则先 `reopen`。资源缺失时保留诊断，不偷偷重建。

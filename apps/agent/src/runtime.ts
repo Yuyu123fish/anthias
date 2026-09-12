@@ -16,6 +16,7 @@ import { createGitWorkspace } from "./tool/basetool/git/index.js";
 import { createGitTools } from "./tool/basetool/git/tool.js";
 import type { AgentToolExtension } from "./tool/managed-tool.js";
 import { createMultiAgentTools } from "./tool/multi-agent-tools.js";
+import { getWorkspaceAccess } from "./tool/workspace-access.js";
 
 /** 根与成员共享权限、Git 和任务时限；各自 Session、写锁、消息及 Memory 投影由各自 SessionAgent 持有。 */
 export function createAgentRuntime(
@@ -32,6 +33,9 @@ export function createAgentRuntime(
     ...sessionOptions
   } = options;
   const rootSession = options.session;
+  const workspaceAccess = getWorkspaceAccess(
+    resolve(rootSession.sessionDirectory, "workspace-blocks"),
+  );
   const mode = options.permissionMode;
   const memoryDirectory =
     configuredMemoryDirectory ?? resolve(rootSession.sessionDirectory, "memory");
@@ -45,6 +49,7 @@ export function createAgentRuntime(
     workspaceRoot: rootSession.workspaceRoot,
   });
   const git = createGitWorkspace({
+    workspaceAccess,
     workspaceRoot: rootSession.workspaceRoot,
     worktreeDirectory:
       worktreeDirectory ?? fileURLToPath(new URL("../../../data/worktrees", import.meta.url)),
@@ -77,6 +82,8 @@ export function createAgentRuntime(
         primary: !member,
         ...(member?.worktreeId ? { memberWorktreeId: member.worktreeId } : {}),
         assertIdle: (id) => coordinator.assertWorktreeIdle(id),
+        assertWriteAllowed: (id) => boundRuntime().agent.toolAccess.assertWriteAllowed(id),
+        resourceState: (id, state) => boundRuntime().agent.toolAccess.resourceState(id, state),
       }),
     ];
     return {
@@ -97,6 +104,25 @@ export function createAgentRuntime(
   ): SessionAgentOptions {
     return {
       session,
+      workspaceAccess,
+      ...(options.configurationSummary
+        ? { configurationSummary: options.configurationSummary }
+        : {}),
+      runtimeNotices: () => [
+        ...(coordinator.snapshot().workspaceBlocks ?? []).map(
+          (block) =>
+            "workspace_blocked: " +
+            block.blockId +
+            "; owner: " +
+            block.sessionId +
+            "; " +
+            block.reason,
+        ),
+        ...coordinator
+          .snapshot()
+          .members.filter((member) => member.error)
+          .map((member) => "成员 " + member.name + " (" + member.sessionId + "): " + member.error),
+      ],
       permissionMode,
       modelStream: coordinator.modelStream,
       ...(sessionOptions.modelContext ? { modelContext: sessionOptions.modelContext } : {}),
@@ -112,14 +138,20 @@ export function createAgentRuntime(
   }
   const coordinator = createMultiAgent({
     root: rootSession,
+    workspaceAccess,
     git,
     modelStream: sessionOptions.modelStream,
     permissionMode: () => boundRuntime().agent.state.permissionMode,
-    receiveRootInput: (input) => boundRuntime().agent.queueInternal(input),
+    receiveRootInput(input) {
+      const { agent, coordinator } = boundRuntime();
+      if (agent.state.running || agent.state.inputQueue.paused || !coordinator.schedulingEnabled())
+        agent.queueInternal(input);
+      else void agent.promptInternal(input).catch(() => undefined);
+    },
     abortRoot: (source) => boundRuntime().agent.abort(source),
     changed: (snapshot) => emit({ type: "collaboration_changed", snapshot }),
     memberEvent: (member, event) => events.memberEvent(event, member),
-    createMember(session, permissionMode) {
+    createMember(session, permissionMode, writable) {
       const { coordinator } = boundRuntime();
       const memberMemory = createMemory({
         directory: memoryDirectory,
@@ -141,6 +173,7 @@ export function createAgentRuntime(
         },
         authorizationRecords: () => rootSession.records,
         permissionMember: true,
+        writable,
       });
     },
   });
@@ -148,6 +181,15 @@ export function createAgentRuntime(
     ...sessionOptions,
     ...commonAgentOptions(rootSession, mode, coordinator),
     memory,
+    onRunSettled(result, interruptedForInput) {
+      if (
+        (interruptedForInput && result.status === "aborted") ||
+        boundRuntime().agent.state.running
+      )
+        return;
+      if (result.status === "completed") coordinator.endTask();
+      else coordinator.abort("parent");
+    },
   });
   bindings = { agent: primary, coordinator };
   return {
@@ -158,7 +200,7 @@ export function createAgentRuntime(
     permissions,
     abort(source?: "shutdown") {
       primary.abort(source);
-      coordinator.abort(source);
+      coordinator.abort(source ?? "user");
     },
     async close(reason: "closed" | "session_changed" = "closed") {
       // 成员可能向根写入终态；必须先收齐成员，再释放根的 Session 与写锁。

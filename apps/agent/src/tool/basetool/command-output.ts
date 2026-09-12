@@ -154,6 +154,7 @@ export function createCommandResult(
   durationMilliseconds: number,
   outputCollector: CommandOutputCollector,
   cleanupUncertain: boolean,
+  processStarted = false,
 ): CommandExecutionResult {
   const resultLines = [
     `termination: ${reason}`,
@@ -174,6 +175,8 @@ export function createCommandResult(
     content: rendered.content,
     truncated: outputCollector.truncated || rendered.truncated,
     cleanupUncertain,
+    processStarted,
+    executionDurationMs: processStarted ? Math.max(0, Math.round(durationMilliseconds)) : 0,
   });
 }
 

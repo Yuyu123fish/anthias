@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-状态：2026-09-06 确认工程验证方向；当前优先补齐 Coding Agent 剩余基本功能，工程验证能力留待后续 Feature。
+状态：截至 2026-09-12，当前实现包含 Coding Agent、全屏 TUI、上下文与记忆、多 Agent 协作和执行恢复；工程验证方向已确认，专用能力留待后续 Feature。
 
-Feature 003、005 已验收；Feature 004 四个 Plan、Feature 006 与 Feature 007 已完成本地实现，剩余验收边界见各自 Report。本次产品方向调整不改变这些实现与验收事实。
+Feature 003、005 已验收。当前协作以 Feature 014、执行恢复以 Feature 015 为准；其他功能的完成情况和验收边界见 [Feature 索引](../specs/README.md)及各自 Report。发布仓库不改变这些验收状态。
 
 ## 产品定位
 
@@ -70,13 +70,13 @@ Anthias 是本地优先、交互形态无关的 Coding Agent。
 
 - 仓库已有可构建、可启动的 Agent 与对话式 TUI；生产 OpenAI-compatible Model Adapter、线性 Session、Tool 和运行生命周期位于 Agent Module 内部，TUI 不持有这些行为权威。
 - 旧的 Electron Desktop、Utility Process Host、JSON-RPC、Protocol DTO 和 Renderer 状态投影已经撤销。
-- Feature 001–003 已累计实现多轮模型与 Tool 循环、六个固定 Tool、线性 JSONL Session、工作区文件和命令能力、逐次副作用确认、Agent / Plan 权限模式、`allow | ask | deny` 安全决策与只读 Tool 四并发；Feature 003 已由开发者验收。
+- Feature 001–003 已累计实现多轮模型与 Tool 循环、六个固定 Tool、线性 JSONL Session、工作区文件和命令能力、逐次副作用确认、权限模式（当前为请求批准、AutoAllow 和 Full Access）、`allow | ask | deny` 安全决策与只读 Tool 四并发；Feature 003 已由开发者验收。
 - 当前命令仍以 Anthias 所在用户权限运行，没有 OS 沙箱；真实 Provider 只有 Feature 005 报告所列的有限冒烟，长期人工终端体验仍待验收。
 - [Feature 006](../specs/feature006-command-skill-mcp-tui/spec.md) 已实现全屏 TUI、常用命令、外部 Skill 按需加载与 MCP 接入。正文支持可见滑块和鼠标滚动，任务结束后折叠执行过程，并可点击逐级展开；最终回答保持在主体中。会话和能力仍由 Agent 管理，外部内容不增加用户授权；当前交互替代了下面 Feature 004 的历史布局，主观体验待验收。
 - [Feature 004](../specs/feature004-tui-workspace-experience/spec.md) 已在本地实现现代对话层级：稳定 scrollback 与底部动态区域并存，完整 Workspace、模式、Session 和 Run 状态持续可见；Visible Reasoning 自动折叠并可用 `/details` 回看，超出终端高度时通过 `/details prev|next` 分页；Tool 按 `toolCallId` 呈现摘要与详情，Assistant 文件引用经 Workspace 校验，已标记代码块由 Shiki 按需着色。运行中窗口小到无法安全保留上下文时会暂停提交和确认，放大后恢复；非 TTY、无颜色和无 Unicode 均有等价降级。
 - Feature 004 的自动门禁和 Windows ConPTY loopback 已通过；真实 DeepSeek V4 Flash 冒烟与 Windows Terminal 主观视觉检查尚未完成，因此尚未进入“已实现”状态。
 - Feature 005 已于 2026-09-05 由开发者验收，形成上下文压缩和自动继续、完整历史与模型投影分离、工具原文访问、两周未使用会话的启动清理，以及 AutoAllow 模式。自动审核只能依据真实用户授权，不能覆盖硬禁止策略。
-- [Feature 007](../specs/feature007-multi-agent/spec.md) 已实现有界 SubAgent、一个活动 AgentTeam 和本地 Git 成果交付，可写成员使用独立 worktree。内部任务保留来源，重开只恢复历史；本地验证已完成，等待开发者验收，详见 [Report](../specs/feature007-multi-agent/report.md)。
+- Feature 007 建立本地 Git 成果交付与协作历史；其 SubAgent/Team 和自动工作树规则由 [Feature 014](../specs/feature014-unified-multi-agent/spec.md) 的统一持续成员替代。根统筹成员、邮箱和唯一共享笔记，默认共享工作区，按任务需要显式隔离；用户高于根，根高于成员，组内内容不构成用户授权。实现与验收状态见 [Report](../specs/feature014-unified-multi-agent/report.md)。
 - 工程验证方向尚未进入对应 Feature；数据准备、验证程序构造与证据交付尚未形成专门的产品闭环。Desktop 尚未实现。
 
 ## 核心产品术语

@@ -219,5 +219,5 @@ pnpm verify
 - 没有使用真实 Provider、外部网络、付费 API 或真实凭据；当前进程环境没有可用的 `DEEPSEEK_API_KEY`。尝试申请读取 User / Machine 级变量并发送到 `api.deepseek.com` 时，宿主要求额外明确授权，命令在执行前被拒绝；因此没有取得、映射、输出或持久化 Key。
 - `session_changed` 有稳定公开 reason 和真实 checkpoint 变化映射；自动测试覆盖既有 Run 期 checkpoint 变化，但没有用非确定性并发写入强制制造启动瞬间竞态。
 - 自动测试与真实 PTY 证明路径、持久化位置、resize 机械行为和文本合同；它们不证明 Windows Terminal 的主观视觉质量或长期交互稳定性。
-- 文档提交为 `0cbb45e`，Plan 01 为 `8b2f2f8`，Plan 02 为 `95611c8`，Plan 03 为 `83d2bba`。2026-09-05，开发者授权把 Plan 04 本地实现与命令安全修复、启动文档一并做成一次完整本地提交；外部验收仍待补，Feature 保持“实施中”。没有推送或创建 PR。
+- 文档提交为 `d7846ca`，Plan 01 为 `9207ef2`，Plan 02 为 `11f54c0`，Plan 03 为 `79ba2d6`。2026-09-05，开发者授权把 Plan 04 本地实现与命令安全修复、启动文档一并做成一次完整本地提交；外部验收仍待补，Feature 保持“实施中”。没有推送或创建 PR。
 - 开发者已授权连续完成整个 Feature，并要求每个 Plan 独立提交；读取未继承到进程的 User / Machine 级密钥并向外部 Provider 发送仍需精确授权。

@@ -46,10 +46,10 @@ describe("member result presentation", () => {
     expect(await runCollaborationCommand("agents", "", agent, notice)).toEqual({ kind: "handled" });
     const text = notice.mock.calls[0]?.[0] ?? "";
     expect(text).toContain("主 Agent · 根 Session：" + agent.state.sessionId);
-    expect(text).toContain("member-1 · subagent · 失败");
+    expect(text).toContain("member-1 · 失败");
     expect(text).toContain("尚无结果摘要。");
     expect(text).toContain("Member log is missing");
-    expect(text).toContain("Reviewer · teammate · 已释放");
+    expect(text).toContain("Reviewer · 已关闭");
     expect(text).toContain("Check the saved result");
     expect(text).toContain("Existing verification result");
     expect(agent.collaboration.execute).not.toHaveBeenCalled();
@@ -82,7 +82,7 @@ describe("member result presentation", () => {
     expect(resultText).toContain("根 Session：" + snapshot.rootSessionId);
     expect(resultText).not.toContain("another-root");
     expect(resultText).toContain("成员 Checker [member-1]");
-    expect(resultText).toContain("种类：subagent\n状态：已释放\n任务：Check the saved result");
+    expect(resultText).toContain("角色：普通成员\n状态：已关闭\n任务：Check the saved result");
     expect(resultText).toContain("尚无结果摘要。");
     expect(resultText).toContain("Saved tool result");
     expect(resultText).toContain("artifact-1");
@@ -144,6 +144,131 @@ describe("member result presentation", () => {
       expect.stringContaining("成员 member-unknown [member-unknown]"),
     );
     expect(notice).toHaveBeenCalledWith(expect.stringContaining("Broken member log"));
+    expectReadOnly(agent);
+  });
+});
+
+describe("unified member controls", () => {
+  it.each([
+    [
+      "spawn Fix the local issue",
+      { action: "spawn", task: "Fix the local issue", writable: true, name: "Fix the local issue" },
+    ],
+    [
+      "spawn --read-only --worktree worktree-1 Inspect files",
+      {
+        action: "spawn",
+        task: "Inspect files",
+        writable: false,
+        worktreeId: "worktree-1",
+        name: "Inspect files",
+      },
+    ],
+    [
+      "assign member-1 Implement the change",
+      { action: "task_assign", memberId: "member-1", task: "Implement the change" },
+    ],
+    [
+      "message member-1 Check this evidence",
+      { action: "message", memberId: "member-1", content: "Check this evidence" },
+    ],
+    ["stop member-1", { action: "stop", memberId: "member-1", release: false }],
+    ["release member-1", { action: "stop", memberId: "member-1", release: true }],
+    ["resume member-1", { action: "resume", memberId: "member-1" }],
+    ["reopen member-1", { action: "reopen", memberId: "member-1" }],
+    [
+      "workspace member-1 worktree-1",
+      { action: "workspace_bind", memberId: "member-1", worktreeId: "worktree-1" },
+    ],
+    ["workspace member-1 root", { action: "workspace_bind", memberId: "member-1" }],
+    ["group stop", { action: "group_stop" }],
+    ["group continue", { action: "group_continue" }],
+    ["notes read", { action: "notes_read" }],
+    ["notes append Shared finding", { action: "notes_append", content: "Shared finding" }],
+  ])("routes %s through the current root controls", async (command, action) => {
+    const { agent, notice } = setup();
+    expect(await runCollaborationCommand("agent", command, agent, notice)).toEqual({
+      kind: "handled",
+    });
+    expect(agent.collaboration.execute).toHaveBeenCalledWith(action);
+    expectReadOnly(agent);
+  });
+
+  it("forwards the read shared-notes version and preserves the replacement text", async () => {
+    const { agent, notice } = setup();
+    const expectedVersion = "sha256:" + "a".repeat(64);
+    await runCollaborationCommand(
+      "agent",
+      "notes replace " + expectedVersion + " Revised\nnotes",
+      agent,
+      notice,
+    );
+    expect(agent.collaboration.execute).toHaveBeenCalledWith({
+      action: "notes_replace",
+      expectedVersion,
+      content: "Revised\nnotes",
+    });
+  });
+
+  it("accepts nine wait targets and rejects an extra target or obsolete Team entry", async () => {
+    const { agent, notice } = setup();
+    const memberIds = Array.from({ length: 9 }, (_, index) => "member-" + index);
+    expect(
+      await runCollaborationCommand("agent", "wait " + memberIds.join(" "), agent, notice),
+    ).toEqual({ kind: "handled" });
+    expect(agent.collaboration.execute).toHaveBeenCalledWith({ action: "wait", memberIds });
+    expect(
+      await runCollaborationCommand(
+        "agent",
+        "wait " + [...memberIds, "overflow"].join(" "),
+        agent,
+        notice,
+      ),
+    ).toEqual({ kind: "rejected" });
+    expect(await runCollaborationCommand("team", "create Old team", agent, notice)).toEqual({
+      kind: "rejected",
+    });
+    expect(agent.collaboration.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows waiting, pause ownership, workspaces and closing without exposing legacy member kinds", async () => {
+    const { agent, notice } = setup([
+      member({ status: "queued", name: "Queued" }),
+      member({
+        sessionId: "member-2",
+        status: "running",
+        phase: "awaiting_tool_approval",
+        name: "Approval",
+      }),
+      member({
+        sessionId: "member-3",
+        status: "running",
+        phase: "awaiting_workspace",
+        name: "Resource",
+      }),
+      member({
+        sessionId: "member-4",
+        status: "paused",
+        pausedBy: "user",
+        lastActivityAt: "2026-09-11T00:00:00Z",
+        name: "Paused",
+      }),
+      member({ sessionId: "member-5", status: "closing", name: "Closing" }),
+    ]);
+    await runCollaborationCommand("agents", "", agent, notice);
+    const text = notice.mock.calls[0]?.[0] ?? "";
+    for (const expected of [
+      "协作群组",
+      "等待执行位置",
+      "等待批准",
+      "等待工作区资源",
+      "暂停来源: 用户",
+      "关闭中",
+      "2026-09-11T00:00:00Z",
+    ])
+      expect(text).toContain(expected);
+    expect(text).not.toContain("subagent");
+    expect(text).not.toContain("teammate");
     expectReadOnly(agent);
   });
 });

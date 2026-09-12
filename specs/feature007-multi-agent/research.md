@@ -16,9 +16,9 @@
 
 研究对象是 pi、Codex 和 Claude Code 如何委派工作、隔离上下文、传递消息与管理成员生命周期，以及 Anthias 需要增加哪些真实行为。目标是同时覆盖 SubAgent 与 AgentTeam，不建设通用工作流框架。
 
-- Anthias：当前 `main / 596c2cb`，以工作树中的实现和最新产品文档为准。开始时已有 `AGENTS.md`、`README.md`、`docs/product-definition.md`、`docs/technical-baseline.md` 四项未提交修改，本轮保持原样。
+- Anthias：当前 `main / 3a8530e`，以工作树中的实现和最新产品文档为准。开始时已有 `AGENTS.md`、`README.md`、`docs/product-definition.md`、`docs/technical-baseline.md` 四项未提交修改，本轮保持原样。
 - pi：本地参考为 `581d75a89cea21e50d6a26df840352f94427f633`，提交日期 2026-08-13；另实际读取了官方仓库当前 `main` 的 README 与 Subagent 扩展源码，确认下述关键机制。
-- Codex：本地 `C:/projects/codex-main` 是没有 `.git` 的源码快照，不能据此断言对应哪个发布版本。当前官方文档和官方 `main` 的通信、等待、控制器与权限代码补充交叉核对。源码 `main` 也不等于用户安装的 Codex 版本。
+- Codex：本地 `C:/reference/codex-main` 是没有 `.git` 的源码快照，不能据此断言对应哪个发布版本。当前官方文档和官方 `main` 的通信、等待、控制器与权限代码补充交叉核对。源码 `main` 也不等于用户安装的 Codex 版本。
 - Claude Code：依据官方 CLI 文档核对可观察合同，未取得可完整核验的核心实现源码。详见 [Claude Code 专项证据](research-claude-code.md)。
 - 研究阶段是源码与文档调查，没有运行 Anthias、pi 或 Claude Code 的真实模型验证，没有重新执行已有自动测试，也未修改实现、提交或推送。
 
@@ -158,7 +158,7 @@ Git 调用之前持久化意图，调用后核对真实状态并记录结果。G
 
 ### 保留现有平铺目录
 
-[locations.ts](../../apps/agent/src/session/locations.ts) 按 UTC 日期、创建时间及 Session ID 定位；[list.ts](../../apps/agent/src/session/list.ts) 扫描两层布局。[openSession](../../apps/agent/src/session/index.ts) 会先核对实际 Workspace，当前 [cleanup.ts](../../apps/agent/src/session/cleanup.ts) 则按独立 Session 判定两周期限。
+[locations.ts](../../apps/agent/src/session/locations.ts) 按 UTC 日期、创建时间及 Session ID 定位；[list.ts](../../apps/agent/src/session/query.ts) 扫描两层布局。[openSession](../../apps/agent/src/session/index.ts) 会先核对实际 Workspace，当前 [cleanup.ts](../../apps/agent/src/session/cleanup.ts) 则按独立 Session 判定两周期限。
 
 建议保持物理目录形状，父子关系写入可核对记录，不让定位器新增递归扫描。下列 ID 和目录为方案示意，本轮没有创建运行数据：
 
