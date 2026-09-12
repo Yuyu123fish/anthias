@@ -14,7 +14,7 @@
 
 当前 SessionAgent 的消息、审批、Run 和关闭状态散在工厂闭包中，完整运行环境只能沿多个装配调用追踪。基础 Tool 的定义、名称分派和执行实现分别维护；Git 已有完整受管行为，但目录与基础工具分离。Session 的 Schema 编码及清理恢复也混在较大文件中。
 
-基线为 `main @ 3d2c01c`。已有 Runtime 装配、Session writer、Tool batch、Context 投影和请求级 MCP 快照继续作为实现起点。
+基线为 `main @ c7b8853`。已有 Runtime 装配、Session writer、Tool batch、Context 投影和请求级 MCP 快照继续作为实现起点。
 
 ## 已确认决定
 

@@ -16,7 +16,7 @@
 
 ## 问题与依据
 
-调查基线为 `main @ 8581c269400fbd775e97c15bc281bc73b19a154d`。当前 Session 已采用 JSONL，但记录进入运行时后，writer、SessionAgent 和 Loop 分别维护消息列表，Context 再按持久身份关联它们。`Message` 与 `DurableMessage` 大量重复，调用方还需要理解 Run lease、不同追加入口和写入后的身份查找。
+调查基线为 `main @ 4a0c48b3c1c902ceb20ad758cc642a95596d02fa`。当前 Session 已采用 JSONL，但记录进入运行时后，writer、SessionAgent 和 Loop 分别维护消息列表，Context 再按持久身份关联它们。`Message` 与 `DurableMessage` 大量重复，调用方还需要理解 Run lease、不同追加入口和写入后的身份查找。
 
 恢复索引的生产调用先完整读取日志，返回的字节位置没有用于局部恢复；每次追加又重新校验全部记录并刷新索引。此前按编码、查询、清理等职责拆文件，仍未消除这些重复状态和调用协议。文件数与代码行数不作为本 Feature 的完成标准。
 

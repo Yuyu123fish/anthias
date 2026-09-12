@@ -1,6 +1,6 @@
 # Anthias 技术基线
 
-状态：Feature 003、005 已验收；Feature 006–008 已实现并完成本地验证；Feature 009 已实现，待开发者验收。本 Feature 未进行真实模型、SearchAPI 调用或 Windows Terminal 主观体验验收；历史真实外部调用证据仍按各 Feature Report 区分。
+状态：截至 2026-09-12，当前实现为 TypeScript Agent 与全屏 TUI；协作以 Feature 014、执行恢复以 Feature 015 为准。Feature 003、005 已验收，其他功能的本地验证、真实服务与人工体验边界按 [Feature 索引](../specs/README.md)和各自 Report 区分。
 
 2026-09-12，[Feature 015](../specs/feature015-execution-recovery/report.md) 已实现执行阻塞恢复、输入中断与预算诊断，并完成本地验证，等待开发者验收；后续修复纠正命令收尾与迟到关闭后的恢复。浏览器专用适配已撤销，外部工具的控制与内部故障仍由外部实现负责。
 
@@ -81,7 +81,7 @@ Session 使用 Schema 4 JSONL（兼容历史 Schema 1/2/3），持久化完整�
 
 ## 模型配置方向
 
-Agent 的生产启动工厂从自身模块所在的安装根目录加载 `.env`；任务 cwd、`--workspace` 与 Session 恢复均不改变配置来源。缺少文件时独占创建无凭据模板，仓库提供 `.env-example`，已有文件不覆盖。文件支持单行字面值、引号与注释，不进行变量展开；格式和读取失败只返回安全位置或变量名。无法创建文件但进程环境足够时通过启动警告继续运行。
+Agent 的生产启动工厂从自身模块所在的安装根目录加载 `.env`；任务 cwd、`--workspace` 与 Session 恢复均不改变配置来源。缺少文件时独占创建无凭据模板，仓库提供 `.env.example`，已有文件不覆盖。文件支持单行字面值、引号与注释，不进行变量展开；格式和读取失败只返回安全位置或变量名。无法创建文件但进程环境足够时通过启动警告继续运行。
 
 同名值以进程环境覆盖文件，显式空值也不会取得文件中的密钥。模式按显式 `--mode` → 进程 `ANTHIAS_PERMISSION_MODE` → 根 `.env` → `agent` 选择，非法模式拒绝启动；`/mode` 只改变当前 Agent，不写回默认值，也不授予权限。
 

@@ -27,7 +27,7 @@ describe("Anthias local configuration", () => {
     expect(generatedText).toBe(LOCAL_ENVIRONMENT_TEMPLATE);
     expect(generatedText).not.toContain("synthetic-process-key");
     expect(generatedText).toBe(
-      await readFile(fileURLToPath(new URL("../../../.env-example", import.meta.url)), "utf8"),
+      await readFile(fileURLToPath(new URL("../../../.env.example", import.meta.url)), "utf8"),
     );
     if (process.platform !== "win32")
       expect((await stat(join(anthiasRoot, ".env"))).mode & 0o777).toBe(0o600);

@@ -7,7 +7,7 @@
 | 发生时间 | 2026-09-11 20:22–20:34（北京时间） |
 | 记录日期 | 2026-09-12 |
 | 关联能力 | Feature 014 持续成员、共享工作区、文件写入协调；命令取消与 TUI 输入 |
-| 调查代码基线 | `21e92ba`，分支 `codex/feature014-unified-multi-agent` |
+| 调查代码基线 | `47b9021`，分支 `codex/feature014-unified-multi-agent` |
 | 原始记录 | `data/conversation/2026-09-11/20260911T122223735Z-af94c3e8-42d4-46e6-a7bf-8f9126b553d0` |
 | 证据范围 | 原调查覆盖根与三个成员共 400 条 JSONL 记录、调查基线源码和任务工作区；后续增加隔离本地浏览器复现与确定性测试，未调用真实模型 |
 
@@ -21,7 +21,7 @@
 
 ## 背景与影响
 
-用户要求“开启多Agent，做一个有趣的交互前端出来，技术栈不用复杂，一次性执行完毕”。根选择原生 HTML、CSS、JavaScript，实现包含粒子、音频与交互面板的“共振沙盘”，工作区为 `C:\projects\examples\ux`。
+用户要求“开启多Agent，做一个有趣的交互前端出来，技术栈不用复杂，一次性执行完毕”。根选择原生 HTML、CSS、JavaScript，实现包含粒子、音频与交互面板的“共振沙盘”，工作区为 `C:\projects\example-app`。
 
 根负责整合，创建粒子引擎、音频引擎、界面视觉三个成员。它们使用同一工作区，没有创建 worktree；任务分别涉及 `js/field.js`、`js/audio.js`、`index.html` 与 `css/style.css`，根负责 `js/ui.js` 和说明文档。这符合默认共享工作区的已确认方向，共享本身不是此次缺陷。
 
@@ -53,7 +53,7 @@
 触发命令：
 
 ~~~powershell
-agent-browser open "file:///C:/projects/examples/ux/index.html"; agent-browser set viewport 1440 900; agent-browser wait 500
+agent-browser open "file:///C:/projects/example-app/index.html"; agent-browser set viewport 1440 900; agent-browser wait 500
 ~~~
 
 关键结果节选：
@@ -205,13 +205,13 @@ Esc 请求提升同一条输入
 | 音频日志 | `members/1e2c0dc8-3df5-4276-975e-ecc3e9c34552/session.jsonl` |
 | 界面日志 | `members/fb47aa99-46fb-46bc-b6e5-6926c65ae3e7/session.jsonl` |
 
-源码与合同入口（历史原因分析以调查基线 21e92ba 为准，以下文件链接展示当前实现）：
+源码与合同入口（历史原因分析以调查基线 47b9021 为准，以下文件链接展示当前实现）：
 
 - [命令执行与清理](../../apps/agent/src/tool/basetool/execute-command.ts)：`executePreparedCommand`、`requestTermination`、子进程 `close` 与显式阻塞；原 `retainWriteLease` 已由阻塞记录接管。
 - [工作区写入协调](../../apps/agent/src/tool/workspace-access.ts)：活动写入、可取消排队和租约释放。
 - [成员状态与等待](../../apps/agent/src/multi-agent/members.ts)、[工具批次调度](../../apps/agent/src/tool/tool-scheduling.ts)：异常可见性与串行等待。
 - [Session 输入生命周期](../../apps/agent/src/session-agent.ts)、[TUI 输入](../../apps/tui/src/terminal-conversation.ts)、[TUI 按键](../../apps/tui/src/view.ts)：排队、输入身份与中断入口。
-- [模型能力表](../../apps/agent/src/model/model-capabilities.ts)、[预算计算](../../apps/agent/src/context/budget.ts)、[公开配置模板](../../.env-example)。
+- [模型能力表](../../apps/agent/src/model/model-capabilities.ts)、[预算计算](../../apps/agent/src/context/budget.ts)、[公开配置模板](../../.env.example)。
 - [Feature 014 Spec](../../specs/feature014-unified-multi-agent/spec.md) 与 [实施报告](../../specs/feature014-unified-multi-agent/report.md)。
 
 截至首次调查，仍未确认：最初未收口的是 Shell、子进程还是输出管道；Windows 进程树终止的具体结果；9 月 11 日每次请求的完整生效配置；用户所述排队消息滞留的精确触发路径。后续调查的新增证据如下，不能反推历史日志中没有记录的具体进程状态。
@@ -220,7 +220,7 @@ Feature 014 的历史门禁没有覆盖本次事故路径；Feature 015 已补�
 
 ## 2026-09-12 补充调查：命令输出滞留与恢复循环
 
-本次先按开发者要求将现有实现保存为本地提交 `6a8d34b`，未推送，再进行调查。代码以该提交为基线。原始记录为 `data/conversation/2026-09-12/20260912T025613104Z-b3a8d95e-399b-47cb-8992-7a786516328a`，覆盖根与两个成员共 281 条 JSONL 记录。
+本次先按开发者要求将现有实现保存为本地提交 `3a5104c`，未推送，再进行调查。代码以该提交为基线。原始记录为 `data/conversation/2026-09-12/20260912T025613104Z-b3a8d95e-399b-47cb-8992-7a786516328a`，覆盖根与两个成员共 281 条 JSONL 记录。
 
 ### 新会话中的实际过程
 

@@ -16,7 +16,7 @@
 
 ### 问题与依据
 
-基线为 `main @ f72c4e3`。开发者要求核对 `data/conversation/2026-09-08/20260908T004000501Z-fe4f9004-d866-4df0-84a1-727a677200f3/session.jsonl`，随后明确授权直接修复并记录增量。问题延续本 Feature 的授权体验、模型停止原因与 TUI 诊断，不新建 Feature 或 Stage。
+基线为 `main @ 4eadcdb`。开发者要求核对 `data/conversation/2026-09-08/20260908T004000501Z-fe4f9004-d866-4df0-84a1-727a677200f3/session.jsonl`，随后明确授权直接修复并记录增量。问题延续本 Feature 的授权体验、模型停止原因与 TUI 诊断，不新建 Feature 或 Stage。
 
 原始 Session 保持不变。调查快照包含 169 条记录：
 

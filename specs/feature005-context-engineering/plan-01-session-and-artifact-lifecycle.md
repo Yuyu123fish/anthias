@@ -12,7 +12,7 @@
 
 - 对应 Spec：[spec.md](spec.md)
 - 统一任务：[tasks.md](tasks.md)
-- 基线：`main` / `2eb5ab9f8100d9d9349b231fe61ee2a4f5cf52b8`。
+- 基线：`main` / `96b43df4d3ff1fccce317b9a332d272ed110fdcd`。
 - 授权：2026-09-05，开发者要求依次编写各 Plan 与 Tasks、文档提交、实施验证、实施提交，连续完成 Feature；各阶段通过约定门禁后继续，不重复等待确认。
 - 真实模型：开发者允许通过环境变量 `DEEPSEEK_API_KEY` 使用 `deepseek-v4-flash`，官方 Base URL 为 `https://api.deepseek.com`。本阶段无模型行为变化，使用确定性验证，真实调用额度留给 Plan 02/03。
 

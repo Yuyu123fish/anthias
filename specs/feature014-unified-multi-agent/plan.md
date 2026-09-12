@@ -11,7 +11,7 @@
 
 ## 当前基线与范围
 
-基线为 `main` 的 `7ea441a3d08a58eec7d825816976d1a68dcc64fa`。已有用户修改是 `agent-loop.ts` 的工具调用注释，必须保留且不纳入本 Feature 提交。现有 SubAgent/Team、Session 输入安全点和受管 Git 已有定向测试；当前阶段不重复运行相同基线测试。
+基线为 `main` 的 `2159f6c1749a902d8832b9761d8ad22b5c243ebe`。已有用户修改是 `agent-loop.ts` 的工具调用注释，必须保留且不纳入本 Feature 提交。现有 SubAgent/Team、Session 输入安全点和受管 Git 已有定向测试；当前阶段不重复运行相同基线测试。
 
 实施以 [Spec](spec.md) 为准。职责保持在 Agent 内：协调层持有群组、调度和权限来源；单 Session 执行器继续持有模型与 Run；文件工具持有内容版本与原子写入；TUI 只调用行为与呈现状态。
 

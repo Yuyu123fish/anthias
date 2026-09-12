@@ -3,7 +3,7 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPermissionMode, type PermissionMode } from "./permission/permission-mode.js";
 
-export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env-example 可提交，填入凭据的 .env 不提交。
+export const LOCAL_ENVIRONMENT_TEMPLATE = `# Anthias 配置：.env.example 可提交，填入凭据的 .env 不提交。
 # 只读取 Anthias 根目录的 .env，不读取任务工作区中的同名文件。
 # 进程环境覆盖本文件，包括显式空值。值可用单引号或双引号包裹，不展开变量。
 ANTHIAS_MODEL_BASE_URL=

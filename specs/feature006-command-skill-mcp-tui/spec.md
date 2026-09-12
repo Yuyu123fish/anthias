@@ -10,7 +10,7 @@
 > **风险 / 未验证**：真实终端主观体验和外部服务互操作仍需区分本地验证证据。<br>
 > **当前 / 请审阅**：开发者授权的三个 Plan 已全部完成；实现、验证和剩余验收边界见 [Report](report.md)。
 
-- 日期：2026-09-05；代码基线：`main / 4855892`。
+- 日期：2026-09-05；代码基线：`main / 8a829b4`。
 - 前置：[命令、Skills、MCP 研究](research-commands-skills-mcp.md)、[TUI 研究](research-tui.md)。
 - 本轮授权覆盖 Spec、三个 Plan、统一 Tasks、实现、必要本地验证和 Report，连续完成三个增量；不在阶段间重复等待。Git 提交、推送、PR 和真实 Provider/MCP 服务验证不在本轮授权中。
 - 已有 Feature 005 验收文档修改属于当前讨论结果，保护并保留；Feature 004 的历史视觉验收不改写为已通过。

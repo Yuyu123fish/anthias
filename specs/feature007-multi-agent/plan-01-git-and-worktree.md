@@ -10,7 +10,7 @@
 > **当前 / 请审阅**：Git/worktree 已完成本地验证，证据见统一 Report。
 
 ## 当前基线与范围
-基线 main / 596c2cb。保护现有产品方向文档修改。新增 git 内部 Module，使用 Git 可执行文件和现有权限/Tool Loop；不新增 package。
+基线 main / 3a8530e。保护现有产品方向文档修改。新增 git 内部 Module，使用 Git 可执行文件和现有权限/Tool Loop；不新增 package。
 Session 增加明确版本的协作事实记录和只读历史行为，为实际 Git 资源恢复服务。
 
 ## 实施

@@ -58,7 +58,7 @@ Session 生命周期和串行写入集中在 session/index.ts，writer.ts 的 le
 
 环境：Windows NT 10.0.26100.0、Node.js v24.13.1、pnpm 10.33.0，工作目录为本仓库。
 
-基线 main @ `8581c269400fbd775e97c15bc281bc73b19a154d` 的 `pnpm verify`：48 个文件，577 项通过、1 项跳过；Biome 有 176 条 info，无错误。
+基线 main @ `4a0c48b3c1c902ceb20ad758cc642a95596d02fa` 的 `pnpm verify`：48 个文件，577 项通过、1 项跳过；Biome 有 176 条 info，无错误。
 
 2026-09-10 最终 `pnpm verify` 通过：50 个测试文件全部通过，607 项通过、1 项跳过；Vitest 耗时 105.46 秒。Biome 检查 166 个文件，无错误，保留 177 条 info 提示；生产与测试 TypeScript 检查及构建均通过。该命令包含 Biome、生产及测试 TypeScript 检查、生产构建和全部 Vitest 测试。检查中发现的导入排序、默认 Header fixture，以及启动测试中的旧 Schema、索引和逐 Run 释放锁断言均已按新合同修正。两项四次串行启动 CLI 的测试使用四个进程的总时间预算，单个子进程仍限制为五秒；未放宽运行结果断言。启动与编译后 CLI 的定向验证分别为 11 项、10 项通过。各执行者的相同版本定向证据予以复用，统筹不逐项重复运行；最终整体验证覆盖最后合并版本。
 

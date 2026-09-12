@@ -18,7 +18,7 @@
 
 本轮只读取公开资料和现有源码，没有安装 Skill、启动 MCP Server、读取凭据或调用真实模型。TUI 的全屏布局、固定面板、应用内滚动和闪屏原因由同目录另一份调查负责；本文只涉及命令入口需要的选择、提示与状态。
 
-本地 Anthias 基线是 `main`、`4855892`。本地 pi 快照为 `581d75a89cea21e50d6a26df840352f94427f633`，不是最新上游；本文的当前 pi 行为另以当日上游文档核验。旧官方仓库地址已重定向到 [earendil-works/pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)。Codex 先读本地 `C:\projects\codex-main\docs\slash_commands.md` 和 `docs\skills.md`，两份文件指向官方文档，再在线核验；没有把未核对版本的本地枚举当作发布能力清单。
+本地 Anthias 基线是 `main`、`8a829b4`。本地 pi 快照为 `581d75a89cea21e50d6a26df840352f94427f633`，不是最新上游；本文的当前 pi 行为另以当日上游文档核验。旧官方仓库地址已重定向到 [earendil-works/pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)。Codex 先读本地 `C:\reference\codex-main\docs\slash_commands.md` 和 `docs\skills.md`，两份文件指向官方文档，再在线核验；没有把未核对版本的本地枚举当作发布能力清单。
 
 ## 事实：Anthias 已有的基础
 

@@ -4,21 +4,22 @@
 
 ## 1. 安装依赖并构建
 
-需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）；Git/worktree 功能还需要 Git。先在 Anthias 仓库执行：
+需要 Node.js 24 LTS、pnpm 10.33.0，以及 PATH 中可用的 PowerShell 7（`pwsh`）；Git/worktree 功能还需要 Git。首次使用先克隆仓库，再安装依赖：
 
 ```powershell
+git clone https://github.com/Yuyu123fish/anthias.git 'C:\projects\anthias'
 Set-Location 'C:\projects\anthias'
 node --version
-pnpm --version
-pnpm install --frozen-lockfile
-pnpm build
+corepack pnpm --version
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
 ```
 
 `pnpm build` 会生成 `apps/tui/dist/main.js`。修改或更新源码后重新构建；启动读取的是构建产物。
 
 ## 2. 在 Anthias 根目录配置一次
 
-Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录把 [.env-example](.env-example) 复制为 `.env`，填写自己的连接配置；已有 `.env` 时直接编辑。首次启动时若文件不存在，程序也会生成一份不含凭据的模板，并在模型配置不完整时提示缺少的变量。
+Anthias 使用 OpenAI-compatible Chat Completions 接口。在 Anthias 根目录把 [.env.example](.env.example) 复制为 `.env`，填写自己的连接配置；已有 `.env` 时直接编辑。首次启动时若文件不存在，程序也会生成一份不含凭据的模板，并在模型配置不完整时提示缺少的变量。
 
 | 变量 | 填写内容 |
 | --- | --- |

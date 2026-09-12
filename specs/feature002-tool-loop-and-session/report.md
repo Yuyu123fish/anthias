@@ -72,7 +72,7 @@ Stage 3 新增的生产 Adapter 集成测试只监听 `127.0.0.1` 的随机端�
 
 ## 6. Git 交付
 
-- Stage 01 提交：`8c34b78 feat: 完成线性 Session 恢复与独占写入`。
-- Stage 02 提交：`996556e feat: 完成基础 Tool Loop 与人工确认闭环`。
+- Stage 01 提交：`a0f3f8f feat: 完成线性 Session 恢复与独占写入`。
+- Stage 02 提交：`216a018 feat: 完成基础 Tool Loop 与人工确认闭环`。
 - Stage 03 由包含本报告、最终文档状态和集成验收测试的最终提交交付；具体提交号以包含本文件的 Git 历史为准。
 - 没有推送，也没有创建 PR。Feature 当前是“已实现、等待开发者验收”，不是“已验收”。

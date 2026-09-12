@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-状态：2026-09-06 确认工程验证方向；当前优先补齐 Coding Agent 剩余基本功能，工程验证能力留待后续 Feature。
+状态：截至 2026-09-12，当前实现包含 Coding Agent、全屏 TUI、上下文与记忆、多 Agent 协作和执行恢复；工程验证方向已确认，专用能力留待后续 Feature。
 
-Feature 003、005 已验收；Feature 004 四个 Plan、Feature 006 与 Feature 007 已完成本地实现，剩余验收边界见各自 Report。本次产品方向调整不改变这些实现与验收事实。
+Feature 003、005 已验收。当前协作以 Feature 014、执行恢复以 Feature 015 为准；其他功能的完成情况和验收边界见 [Feature 索引](../specs/README.md)及各自 Report。发布仓库不改变这些验收状态。
 
 ## 产品定位
 

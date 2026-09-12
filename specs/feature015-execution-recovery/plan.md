@@ -11,7 +11,7 @@
 
 ## 基线与范围
 
-基线 21e92ba，当前分支 codex/feature014-unified-multi-agent。保留 README 的事故入口、docs/incident 和 agent-loop.ts 已有用户注释。只修改本 Feature 所需代码与文档；不提交、不推送。
+基线 47b9021，当前分支 codex/feature014-unified-multi-agent。保留 README 的事故入口、docs/incident 和 agent-loop.ts 已有用户注释。只修改本 Feature 所需代码与文档；不提交、不推送。
 
 ## 实施步骤
 
@@ -33,7 +33,7 @@
 
 ## 后续修复增量（职责纠正）
 
-基线为 6a8d34b；原资源清理与解除依据保留。开发者已明确授权撤销越界的浏览器控制实现，按通用命令合同完成修复。
+基线为 3a5104c；原资源清理与解除依据保留。开发者已明确授权撤销越界的浏览器控制实现，按通用命令合同完成修复。
 
 1. 先更新 Spec 的项目与外部职责表、验收边界和统一 Tasks。
 2. 删除未提交的浏览器 Session、代理、专用测试及构建遗留；精确撤销 SessionAgent、ToolWorkspace 和 execute_command 的浏览器接线，保护其他修改。环境白名单回到通用命令内部，不保留只为浏览器复用引入的模块。

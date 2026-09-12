@@ -2,7 +2,7 @@
 
 状态：已确认共享受限账号及首期简化方向；具体执行器仍为候选，尚未安装或实施。检索截止：2026-09-09。
 
-本次核对的 Anthias 为 `main`，HEAD `c1dc459b9ddf5ea6fd418b2a9da8d3a1e9677a38`；开始时工作区干净。依据当前源码、官方文档和官方开源实现，不采用第三方文章作为结论依据。本次没有安装沙箱、修改系统权限、运行隔离实验或调用真实模型。
+本次核对的 Anthias 为 `main`，HEAD `ebce85e8cb96d38c20a64b73e88abf5e5946a3da`；开始时工作区干净。依据当前源码、官方文档和官方开源实现，不采用第三方文章作为结论依据。本次没有安装沙箱、修改系统权限、运行隔离实验或调用真实模型。
 
 ## 要回答的问题
 
@@ -21,14 +21,14 @@
 已认可的首期范围控制为以下五项：
 
 1. **只评估一个原生 Windows 执行器。** 优先验证现成 `sandbox-runtime`，不先开发账户、WFP、AppContainer 或通用多后端框架。候选不满足边界时重新选型，不为迁就它不断加补丁。
-2. **各任务登记固定资源范围，共享账号承载 OS 权限。** 工作区、该根任务的受管 worktree 目录、必要 Git commonDir、专用临时/缓存目录和工具只读目录在启动时确定；允许这些已开放目录的权限在共享账号上叠加。仓库已有按 `rootSessionId` 分组的 worktree 目录，可沿用；只开放实际需要的目录。[Git 目录管理](../../../apps/agent/src/git/index.ts)
+2. **各任务登记固定资源范围，共享账号承载 OS 权限。** 工作区、该根任务的受管 worktree 目录、必要 Git commonDir、专用临时/缓存目录和工具只读目录在启动时确定；允许这些已开放目录的权限在共享账号上叠加。仓库已有按 `rootSessionId` 分组的 worktree 目录，可沿用；只开放实际需要的目录。[Git 目录管理](../../../apps/agent/src/tool/basetool/git/index.ts)
 3. **进程入口集中，其他权限保留。** Shell 是第一条验证链路。宣称完整覆盖外部代码执行前，还必须接入内部 Git 和 stdio MCP 启动；内置文件 Tool 保持宿主内的受信路径检查，Session、授权记录和模型请求仍由主进程持有。不得将子进程沙箱称为全部 Tool 的 OS 沙箱。
 4. **AutoAllow 首期沿用。** 保留 Plan、Agent、AutoAllow、已有 grant 和独立审核；增加实际隔离状态核对，沙箱不可用就停止受影响的命令。暂缓逐命令自动扩目录、动态网络扩权、通用项目自动授权。沙箱内许可不因命令字符串相同就变成宿主执行许可。
 5. **资源变化在安全时点处理。** 固定范围不足时说明缺少的目录或网络权限，待受影响进程结束后显式重建范围。首期不建设在线 ACL 变更系统。网络先验证禁网；需要联网的开发流程再使用执行器已有的受控出口能力，不自建代理或凭据注入系统。
 
 共享账号是已确认的取舍。不同项目的已开放目录可以在该账号上形成共同的 OS 访问范围，项目之间不承诺系统级隔离，不再将跨项目权限叠加视为选型阻塞。任务与成员的动作授权仍由现有应用规则检查，AutoAllow grant 不因此自动转移给其他任务；并发只需核对资源持有和清理是否正确。
 
-本机只读核查发现：Node 位于 `C:\tools\Nodejs`，Git 和 PowerShell 7 位于 `C:\Program Files`，而 pnpm 启动脚本位于 `C:\Users\developer\AppData\Roaming\npm\pnpm.ps1`。低权限账户能否读取入口及其实际依赖、使用独立缓存，是比抽象平台扩展更早需要验证的兼容性问题；不能因此直接开放整个用户目录。
+本机只读核查发现：Node 位于 `C:\tools\node`，Git 和 PowerShell 7 位于 `C:\Program Files`，而 pnpm 启动脚本位于 `%APPDATA%\npm\pnpm.ps1`。低权限账户能否读取入口及其实际依赖、使用独立缓存，是比抽象平台扩展更早需要验证的兼容性问题；不能因此直接开放整个用户目录。
 
 ## Anthias 当前已有的基础
 
@@ -42,7 +42,7 @@
 | 审批等待 | 校验请求 ID、Run、phase，取消解除等待；先记录批准，再记录执行开始 | [session-agent.ts](../../../apps/agent/src/session-agent.ts) 第 514、594 行 |
 | 命令执行 | 复核 cwd 真实路径与身份后，以当前用户启动 Shell；有环境白名单，没有 OS 隔离 | [execute-command.ts](../../../apps/agent/src/tool/basetool/execute-command.ts) 第 147、179、498 行 |
 | MCP | 显式 connect 即启动 stdio server；后续工具审核不能约束已发生的启动副作用 | [mcp/index.ts](../../../apps/agent/src/mcp/index.ts) 第 468 行；[external-capabilities.ts](../../../apps/agent/src/external-capabilities.ts) 第 275 行 |
-| Git | 固定 argv，但仍直接启动当前用户 Git；应覆盖其 hooks 与外部 helper | [git/command.ts](../../../apps/agent/src/git/command.ts) 第 40 行 |
+| Git | 固定 argv，但仍直接启动当前用户 Git；应覆盖其 hooks 与外部 helper | [git/command.ts](../../../apps/agent/src/tool/basetool/git/command.ts) 第 40 行 |
 | 成员 | 同进程 SessionAgent；只读成员用 Plan，可写成员使用 worktree；共享 MCP 与根授权服务 | [members.ts](../../../apps/agent/src/multi-agent/members.ts) 第 156、298 行；[agent.ts](../../../apps/agent/src/agent.ts) 第 187 行 |
 
 最直接的缺口是：允许 `pnpm test` 只能说明允许启动这条命令，不能限制其测试脚本、依赖包或子进程访问工作区外的文件与网络。脚本内容还可能在授权后发生变化。这是加入执行隔离的原因，也说明继续扩充命令解析器无法独立解决问题。
@@ -107,7 +107,7 @@ Anthropic 独立 `sandbox-runtime` 的当前 README 已标记 Windows alpha，�
 
 共享身份与已确认方向一致：当前设计使用同一 `srt-sandbox` SID 施加不同会话的 ACL。基于 ACL 语义推断，某会话授予的访问可能对其他同 SID 进程也有效，这是接受的共享账号行为。并发引用计数用于正确清理；逐项目、逐成员 OS 隔离和单次扩权均不属于首期范围。[固定 Windows 说明](https://github.com/anthropics/sandbox-runtime/blob/66d35e5ffeba5f406db4343ef88bef0c2fd5bab6/README.md#windows-alpha)
 
-本地另有 `C:\projects\codex-main` 参考快照。抽查 `windows-sandbox-rs/src/token.rs`、`process.rs`、`env.rs`、`wfp.rs` 可见受限 token、按 token 创建进程、代理环境和 WFP 配置代码，但该目录没有可核对的 Git HEAD；本次不将其视为当前发布版证据，也不据此声称能够直接拆包复用。
+本地另有 `C:\reference\codex-main` 参考快照。抽查 `windows-sandbox-rs/src/token.rs`、`process.rs`、`env.rs`、`wfp.rs` 可见受限 token、按 token 创建进程、代理环境和 WFP 配置代码，但该目录没有可核对的 Git HEAD；本次不将其视为当前发布版证据，也不据此声称能够直接拆包复用。
 
 ### 复用的接入成本与限制
 

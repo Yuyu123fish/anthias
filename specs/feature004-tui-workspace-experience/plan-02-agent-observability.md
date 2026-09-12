@@ -8,7 +8,7 @@
 > **核心做法**：扩展内部 Model Stream 和少量 AgentEvent，Reasoning 保持瞬时，Tool 摘要由计划层形成。<br>
 > **边界**：不改变 Message、Session Schema、Tool Policy，也不展示隐藏 Chain-of-Thought。<br>
 > **风险 / 未验证**：Reasoning 收口、Tool continuation、并发归属和取消竞态最易出错。<br>
-> **当前 / 请审阅**：已实现并提交为 `95611c8`；事件、持久化与安全摘要门禁通过。
+> **当前 / 请审阅**：已实现并提交为 `11f54c0`；事件、持久化与安全摘要门禁通过。
 
 - 对应 Spec：[spec.md](spec.md)
 - 前置 Plan：[Plan 01](plan-01-workspace-and-data-root.md)

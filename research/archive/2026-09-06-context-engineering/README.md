@@ -22,7 +22,7 @@
 
 这次围绕三个问题调查：Codex 怎样让模型主动管理窗口；“先草稿、再最终摘要”到底对应什么过程；Anthias 为什么会因模型请求次数而停止。初步建议是把预算反馈、主动整理和取消默认请求次数截止作为主线，把原有自动压缩作为兜底。草稿的具体形式和收益需要继续比较。
 
-本研究以官方文档、工程文章和源码为依据；Codex 主线核验 OpenAI 一手资料及 `openai/codex`，补充案例核验 Anthropic、Letta 与 LangChain 的公开材料；未调用 Provider，未观察托管 Codex 的不可见后端，也未改动业务代码。核验日期为 2026-09-06（Asia/Shanghai）。官方仓库当时 `main` 固定为 [`ac192cd7937b0d73edc6dffe009940ae53782dd4`](https://github.com/openai/codex/commit/ac192cd7937b0d73edc6dffe009940ae53782dd4)，提交时间为 2026-09-06T07:42:32Z。`C:\projects\codex-main` 没有 `.git`，不能提供可复核的本地 HEAD 或状态；它只作为检索线索，以下结论以该官方固定提交为准。
+本研究以官方文档、工程文章和源码为依据；Codex 主线核验 OpenAI 一手资料及 `openai/codex`，补充案例核验 Anthropic、Letta 与 LangChain 的公开材料；未调用 Provider，未观察托管 Codex 的不可见后端，也未改动业务代码。核验日期为 2026-09-06（Asia/Shanghai）。官方仓库当时 `main` 固定为 [`ac192cd7937b0d73edc6dffe009940ae53782dd4`](https://github.com/openai/codex/commit/ac192cd7937b0d73edc6dffe009940ae53782dd4)，提交时间为 2026-09-06T07:42:32Z。`C:\reference\codex-main` 没有 `.git`，不能提供可复核的本地 HEAD 或状态；它只作为检索线索，以下结论以该官方固定提交为准。
 
 ## Codex 已经加入了什么，哪些条件下才会启用
 
@@ -66,7 +66,7 @@ Responses `/compact` 的不透明项并不公开其内部是否有多个推理�
 
 ## Anthias 现在缺的是什么
 
-这次核对的 Anthias 基线是 `main`，HEAD 为 `a56c921adf91199ca57a68a0b0c3d99389d6bfa2`，开始研究时工作区干净。下面是当前源码与已有用例给出的事实。
+这次核对的 Anthias 基线是 `main`，HEAD 为 `dc5c58c2e6c485f59b18d47a1e18574ef6f52512`，开始研究时工作区干净。下面是当前源码与已有用例给出的事实。
 
 ### 正常工作也会用完十二次机会
 

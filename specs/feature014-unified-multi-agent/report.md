@@ -12,7 +12,7 @@
 
 ## 实施范围与结果
 
-开发者于 2026-09-11 授权先保存 Spec，随后连续实施整个 Feature、更新文档并可做中间提交。本次先保存 [Spec](spec.md)、[Plan](plan.md) 和 [Tasks](tasks.md)，再从 main 的 7ea441a3d08a58eec7d825816976d1a68dcc64fa 创建 codex/feature014-unified-multi-agent 分支。原有 agent-loop.ts 工具调用注释保持原样，不纳入 Feature 提交。
+开发者于 2026-09-11 授权先保存 Spec，随后连续实施整个 Feature、更新文档并可做中间提交。本次先保存 [Spec](spec.md)、[Plan](plan.md) 和 [Tasks](tasks.md)，再从 main 的 2159f6c1749a902d8832b9761d8ad22b5c243ebe 创建 codex/feature014-unified-multi-agent 分支。原有 agent-loop.ts 工具调用注释保持原样，不纳入 Feature 提交。
 
 统一群组属于根 Session，首次创建成员即可使用。成员具有各自的 Session、上下文和 Run，正常一轮结束进入 idle；超出九个成员执行位置的任务排队，为根保留第十个位置。普通成员只能通信、更新自己的任务与访问公开协作状态，根保留创建、正式分派、暂停、关闭、重开、工作区绑定和 Git 成果交付权。
 

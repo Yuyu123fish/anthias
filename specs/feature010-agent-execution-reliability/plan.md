@@ -12,7 +12,7 @@
 
 ## 基线与范围
 
-依据 [Spec](spec.md)，起点 `main @ 6053b5d`。已有用户修改仅 `apps/agent/src/multi-agent/members.ts`；不重置、不覆盖、不纳入无关重命名。基线 `pnpm check` 通过，已有 127 条 info 级样式提示，不把这些旧提示扩大为本 Feature 的全库格式修改。复用此前相同源码的定向诊断及 Feature 009 全量证据，修改后统一跑全量。
+依据 [Spec](spec.md)，起点 `main @ 3ced8ac`。已有用户修改仅 `apps/agent/src/multi-agent/members.ts`；不重置、不覆盖、不纳入无关重命名。基线 `pnpm check` 通过，已有 127 条 info 级样式提示，不把这些旧提示扩大为本 Feature 的全库格式修改。复用此前相同源码的定向诊断及 Feature 009 全量证据，修改后统一跑全量。
 
 ## 实施步骤
 

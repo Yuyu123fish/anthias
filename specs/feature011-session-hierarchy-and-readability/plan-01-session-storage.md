@@ -8,11 +8,11 @@
 > **核心做法**：集中位置规则，保持 Session 产物边界，以整组执行可恢复清理。<br>
 > **边界**：保持日志 Schema 与公开 Agent 接口，TUI 归组留到 Plan 03。<br>
 > **风险 / 未验证**：本地定向验证通过，真实 Provider 与人工终端体验未验证。<br>
-> **当前 / 请审阅**：实现、定向验证及审查完成，已提交 aea8813；完整交付见 Report。
+> **当前 / 请审阅**：实现、定向验证及审查完成，已提交 1da57ba；完整交付见 Report。
 
 ## 基线与范围
 
-基线为 main @ 865baac，原有修改仅为 Feature 011 Spec 和 Windows 沙箱 Research。locations.ts 只识别平铺目录，list.ts、groups.ts、cleanup.ts 各自枚举；组清理逐 Session 移动，直接套用到嵌套目录会重复移动父子路径。
+基线为 main @ 75450a0，原有修改仅为 Feature 011 Spec 和 Windows 沙箱 Research。locations.ts 只识别平铺目录，list.ts、groups.ts、cleanup.ts 各自枚举；组清理逐 Session 移动，直接套用到嵌套目录会重复移动父子路径。
 
 本 Plan 完成 Spec A01–A03、A05–A08 及这些路径对应的 A14–A15；A04 的浏览呈现交给 Plan 03。允许修改 session/ 中定位、列表、分组、创建、历史、清理与必要兼容调用点及定向测试。产物仍由执行 Session 持有；仅在适配路径必需时改 multi-agent/ 的产物读取，不扩张分享权限。
 

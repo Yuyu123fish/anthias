@@ -15,7 +15,7 @@
 - 核验日期：2026-09-05
 - 开发者确认日期：2026-09-05
 - 开发者验收日期：2026-09-05；验收范围与验证边界见 [Report](report.md)。
-- 代码基线：`main`，`2eb5ab9f8100d9d9349b231fe61ee2a4f5cf52b8`
+- 代码基线：`main`，`96b43df4d3ff1fccce317b9a332d272ed110fdcd`
 - 关联基线：[产品定义](../../docs/product-definition.md)、[技术基线](../../docs/technical-baseline.md)、[Feature 003](../feature003-tool-execution-safety/spec.md)、[Feature 004](../feature004-tui-workspace-experience/spec.md)
 - 执行授权：2026-09-05，开发者要求逐 Plan 编写文档与 Tasks、文档提交、实施验收和实现提交，连续完成 Feature；该授权覆盖本 Feature 的实施与上述提交，不包含推送或 PR。
 - 真实模型授权：使用环境变量 DEEPSEEK_API_KEY 与 deepseek-v4-flash 做必要、少量验证；整个 Feature 最多 6 次真实模型请求（含失败尝试），优先使用确定性本地测试，密钥不进入输出或文件。
